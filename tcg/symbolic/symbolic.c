@@ -323,6 +323,23 @@ inline static void parse_plt_info(char* path)
     fclose(fp);
 }
 
+static void print_query_loc(Query *query, uint64_t pc, const char *msg) {
+    if (!query) return;
+    if (symbolic_start_code > 0 && pc >= symbolic_start_code) {
+        uintptr_t offset = pc - symbolic_start_code;
+        printf("[query] [known] [idx %ld] [pc 0x%lx] [msg %s]\n", GET_QUERY_IDX(query), offset, msg);
+    } else {
+        printf("[query] [unknown] [idx %ld] [pc 0x%lx] [msg %s]\n", GET_QUERY_IDX(query), pc, msg);
+    }
+}
+
+static void add_query(Expr *q, uintptr_t address, uintptr_t pc, const char *msg) {
+    next_query->query = q;
+    next_query->address = address;
+    print_query_loc(next_query, pc, msg);
+    next_query++;
+}
+
 void load_image(char* name, uintptr_t addr)
 {
     if (plt_info) {
@@ -1715,9 +1732,10 @@ static void add_consistency_check(Expr* e, uintptr_t value, size_t size, OPKIND 
     consistency_expr->op1      = e;
     SET_EXPR_CONST_OP(consistency_expr->op2, consistency_expr->op2_is_const, value);
     //
-    next_query[0].query   = consistency_expr;
-    next_query[0].address = current_tb_pc;
-    next_query++;
+    add_query(consistency_expr, current_tb_pc, current_tb_pc, "add_consistency_check");
+    // next_query[0].query   = consistency_expr;
+    // next_query[0].address = current_tb_pc;
+    // next_query++;
     //
     if (size == 0) {
         size = 8;
@@ -2828,10 +2846,10 @@ static inline void load_concretization(Expr* addr_expr, uintptr_t addr)
 
         // printf("\nSymbolic Load (base_expr=%lu)\n", GET_EXPR_IDX(base_expr));
         // print_expr(addr_expr);
-
-        next_query[0].query   = e;
-        next_query[0].address = 0;
-        next_query++;
+        add_query(e, 0, current_tb_pc, "load_concretization");
+        // next_query[0].query   = e;
+        // next_query[0].address = 0;
+        // next_query++;
 
     } else {
         // printf("Symbolic Load (already concretized)\n");
@@ -2853,9 +2871,10 @@ static inline void store_concretization(Expr* addr_expr, uintptr_t addr)
         // printf("\nSymbolic Store (base_expr=%lu)\n",
         // GET_EXPR_IDX(base_expr)); print_expr(addr_expr);
 
-        next_query[0].query   = e;
-        next_query[0].address = 0;
-        next_query++;
+        add_query(e, 0, current_tb_pc, "store_concretization");
+        // next_query[0].query   = e;
+        // next_query[0].address = 0;
+        // next_query++;
 
     } else {
         // printf("Symbolic Store (already concretized)\n");
@@ -3051,10 +3070,11 @@ static inline void qemu_load_helper(uintptr_t orig_addr,
 
                 symbolic_access_id += 1;
                 s_temps[val_idx] = e;
-
-                next_query[0].query   = q;
-                next_query[0].address = 0;
-                next_query++;
+                
+                add_query(q, 0, current_tb_pc, "qemu_load_helper_1");
+                // next_query[0].query   = q;
+                // next_query[0].address = 0;
+                // next_query++;
 
 #if DEBUG_EXPR_CONSISTENCY
                 add_consistency_check_load(e, addr, size);
@@ -3108,9 +3128,10 @@ static inline void qemu_load_helper(uintptr_t orig_addr,
                     symbolic_access_id += 1;
                     s_temps[val_idx] = e;
 
-                    next_query[0].query   = q;
-                    next_query[0].address = 0;
-                    next_query++;
+                    add_query(q, 0, current_tb_pc, "qemu_load_helper_2");
+                    // next_query[0].query   = q;
+                    // next_query[0].address = 0;
+                    // next_query++;
 
                     return;
 
@@ -4366,6 +4387,7 @@ static inline void branch_helper_internal(uintptr_t a, uintptr_t b,
     next_query[0].args16.index_inv = index;
     next_query[0].args16.count_inv = virgin_bitmap[index];
 #endif
+    print_query_loc(next_query, current_tb_pc, "branch_helper_internal");
     next_query++;
 #endif
     // assert(next_query[0].query == 0);
@@ -5557,9 +5579,10 @@ static inline void concretize_mem(uintptr_t addr, uintptr_t size)
                     e->op1    = bytes_expr;
                     SET_EXPR_CONST_OP(e->op2, e->op2_is_const, bytes_value);
                     //
-                    next_query[0].query   = e;
-                    next_query[0].address = 0;
-                    next_query++;
+                    add_query(e, 0, current_tb_pc, "concretize_mem_1");
+                    // next_query[0].query   = e;
+                    // next_query[0].address = 0;
+                    // next_query++;
                     //
                     bytes_expr  = NULL;
                     bytes_value = 0;
@@ -5576,9 +5599,10 @@ static inline void concretize_mem(uintptr_t addr, uintptr_t size)
         e->op1    = bytes_expr;
         SET_EXPR_CONST_OP(e->op2, e->op2_is_const, bytes_value);
         //
-        next_query[0].query   = e;
-        next_query[0].address = 0;
-        next_query++;
+        add_query(e, 0, current_tb_pc, "concretize_mem_2");
+        // next_query[0].query   = e;
+        // next_query[0].address = 0;
+        // next_query++;
     }
 }
 

@@ -1,3 +1,4 @@
+#include "symbolic-struct.h"
 static inline void clear_call_args_temps(void)
 {
     s_temps[temp_idx(tcg_find_temp_arch_reg(tcg_ctx, "rax"))] = 0;
@@ -7,6 +8,19 @@ static inline void clear_call_args_temps(void)
     s_temps[temp_idx(tcg_find_temp_arch_reg(tcg_ctx, "rcx"))] = 0;
     s_temps[temp_idx(tcg_find_temp_arch_reg(tcg_ctx, "r8"))] = 0;
     s_temps[temp_idx(tcg_find_temp_arch_reg(tcg_ctx, "r9"))] = 0;
+}
+
+static void add_query_with_model(Expr *q, uintptr_t address, MODEL_T model, const char *msg) {
+    next_query->query = q;
+    next_query->address = address;
+    next_query->model = model;
+    if (symbolic_start_code > 0 && address >= symbolic_start_code) {
+        uintptr_t offset = address - symbolic_start_code;
+        printf("[query] [mod-k] [idx %ld] [pc 0x%lx] [msg %s]\n", GET_QUERY_IDX(next_query), offset, msg);
+    } else {
+        printf("[query] [mod-u] [idx %ld] [pc 0x%lx] [msg %s]\n", GET_QUERY_IDX(next_query), address, msg);
+    }
+    next_query++;
 }
 
 // clear xmm registers
@@ -116,10 +130,11 @@ static inline int model_strcmp(CPUX86State* env, uintptr_t pc, uintptr_t n)
     e->op2 = s2_expr;
     SET_EXPR_CONST_OP(e->op3, e->op3_is_const, v);
 
-    next_query[0].query   = e;
-    next_query[0].address = pc;
-    next_query[0].model   = MODEL_STRCMP;
-    next_query++;
+    add_query_with_model(e, pc, MODEL_STRCMP, "model_strcmp");
+    // next_query[0].query   = e;
+    // next_query[0].address = pc;
+    // next_query[0].model   = MODEL_STRCMP;
+    // next_query++;
 
     return mode;
 }
@@ -166,10 +181,11 @@ static inline int model_strlen(CPUX86State* env, uintptr_t pc, uintptr_t n)
     e->op1 = s1_expr;
     SET_EXPR_CONST_OP(e->op2, e->op2_is_const, v);
 
-    next_query[0].query   = e;
-    next_query[0].address = pc;
-    next_query[0].model   = MODEL_STRLEN;
-    next_query++;
+    add_query_with_model(e, pc, MODEL_STRLEN, "model_strlen");
+    // next_query[0].query   = e;
+    // next_query[0].address = pc;
+    // next_query[0].model   = MODEL_STRLEN;
+    // next_query++;
 
     return mode;
 }
@@ -221,10 +237,11 @@ static inline int model_memchr(CPUX86State* env, uintptr_t pc)
     e->op1 = expr;
     SET_EXPR_CONST_OP(e->op2, e->op2_is_const, v);
 
-    next_query[0].query   = e;
-    next_query[0].address = pc;
-    next_query[0].model   = MODEL_MEMCHR;
-    next_query++;
+    add_query_with_model(e, pc, MODEL_MEMCHR, "model_memchr");
+    // next_query[0].query   = e;
+    // next_query[0].address = pc;
+    // next_query[0].model   = MODEL_MEMCHR;
+    // next_query++;
 
     return mode;
 }
@@ -284,10 +301,11 @@ static inline int model_memcmp(CPUX86State* env, uintptr_t pc)
     e->op2 = s2_expr;
     SET_EXPR_CONST_OP(e->op3, e->op3_is_const, v);
 
-    next_query[0].query   = e;
-    next_query[0].address = pc;
-    next_query[0].model   = MODEL_MEMCMP;
-    next_query++;
+    add_query_with_model(e, pc, MODEL_MEMCMP, "model_memcmp");
+    // next_query[0].query   = e;
+    // next_query[0].address = pc;
+    // next_query[0].model   = MODEL_MEMCMP;
+    // next_query++;
 
     return mode;
 }
@@ -318,9 +336,10 @@ static inline void model_alloc(CPUX86State* env, uintptr_t pc, uintptr_t reg_wit
     e->opkind = MODEL;
     e->op1 = size_expr;
     SET_EXPR_CONST_OP(e->op2, e->op2_is_const, size);
-
-    next_query[0].query   = e;
-    next_query[0].address = pc;
-    next_query[0].model   = MODEL_MALLOC;
-    next_query++;
+    
+    add_query_with_model(e, pc, MODEL_MALLOC, "model_alloc");
+    // next_query[0].query   = e;
+    // next_query[0].address = pc;
+    // next_query[0].model   = MODEL_MALLOC;
+    // next_query++;
 }

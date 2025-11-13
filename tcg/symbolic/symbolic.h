@@ -32,23 +32,23 @@ typedef struct temp_to_restore_t {
     temp_to_restore_t temps_to_restore_var[TCG_MAX_TEMPS];                     \
     size_t            temp_to_restores_count = 0;
 
-inline uint8_t is_instrumentation(const TCGOp* op)
+static inline uint8_t is_instrumentation(const TCGOp* op)
 {
     return op->args[MAX_OPC_PARAM - 1] > 0;
 }
 
-inline void set_conditional_instrumentation_label(TCGOp* op, unsigned label_id)
+static inline void set_conditional_instrumentation_label(TCGOp* op, unsigned label_id)
 {
     // increase by one the label since it may be zero
     op->args[MAX_OPC_PARAM - 1] = (uint64_t)label_id + 1;
 }
 
-inline uint8_t get_conditional_instrumentation_label(const TCGOp* op)
+static inline uint8_t get_conditional_instrumentation_label(const TCGOp* op)
 {
     return op->args[MAX_OPC_PARAM - 1] - 1;
 }
 
-inline void add_temp_reg_to_restore(TCGTemp* ts, TCGReg reg,
+static inline void add_temp_reg_to_restore(TCGTemp* ts, TCGReg reg,
                                     temp_to_restore_t* temps_to_restore,
                                     size_t*            temps_to_restore_count)
 {
