@@ -325,9 +325,9 @@ inline static void parse_plt_info(char* path)
 
 static void print_query_loc(Query *query, uint64_t pc, const char *msg) {
     if (!query) return;
-    if (symbolic_start_code > 0 && pc >= symbolic_start_code) {
+    if (symbolic_start_code > 0 && pc >= symbolic_start_code && pc < symbolic_end_code) {
         uintptr_t offset = pc - symbolic_start_code;
-        printf("[query] [known] [idx %ld] [pc 0x%lx] [msg %s]\n", GET_QUERY_IDX(query), offset, msg);
+        printf("[query] [known] [idx %ld] [pc 0x%lx] [msg %s] [syms 0x%lx] [syme 0x%lx]\n", GET_QUERY_IDX(query), offset, msg, symbolic_start_code, symbolic_end_code);
     } else {
         printf("[query] [unknown] [idx %ld] [pc 0x%lx] [msg %s]\n", GET_QUERY_IDX(query), pc, msg);
     }
