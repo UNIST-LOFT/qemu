@@ -15,8 +15,7 @@ static void add_query_with_model(Expr *q, uintptr_t address, MODEL_T model, cons
     next_query->address = address;
     next_query->model = model;
     if (symbolic_start_code > 0 && address >= symbolic_start_code) {
-        uintptr_t offset = address - symbolic_start_code;
-        printf("[query] [mod-k] [idx %ld] [pc 0x%lx] [msg %s] [syms 0x%lx] [syme 0x%lx]\n", GET_QUERY_IDX(next_query), offset, msg, symbolic_start_code, symbolic_end_code);
+        printf("[query] [mod-k] [idx %ld] [pc 0x%lx] [msg %s] [syms 0x%lx] [syme 0x%lx]\n", GET_QUERY_IDX(next_query), address, msg, symbolic_start_code, symbolic_end_code);
     } else {
         printf("[query] [mod-u] [idx %ld] [pc 0x%lx] [msg %s]\n", GET_QUERY_IDX(next_query), address, msg);
     }
