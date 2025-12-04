@@ -842,9 +842,9 @@ static inline int host_to_target_sock_type(int host_type)
     return target_type;
 }
 
-static abi_ulong target_brk;
-static abi_ulong target_original_brk;
-static abi_ulong brk_page;
+abi_ulong target_brk;
+abi_ulong target_original_brk;
+abi_ulong brk_page;
 
 void target_set_brk(abi_ulong new_brk)
 {

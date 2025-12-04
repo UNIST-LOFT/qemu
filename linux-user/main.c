@@ -44,6 +44,7 @@
 #include "target_elf.h"
 #include "cpu_loop-common.h"
 #include "crypto/init.h"
+#include "snapshot.h"
 
 char *exec_path;
 
@@ -854,6 +855,7 @@ int main(int argc, char **argv, char **envp)
         }
         gdb_handlesig(cpu, 0);
     }
+    snapshot_init();
     cpu_loop(env);
     /* never exits */
     return 0;

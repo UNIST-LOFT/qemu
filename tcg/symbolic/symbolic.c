@@ -12,6 +12,7 @@
 #include "symbolic.h"
 #include "config.h"
 #include "symbolic-instrumentation.h"
+#include "../../linux-user/snapshot.h"
 
 #define DEBUG_CONSISTENCY_CHECK 0
 
@@ -3584,6 +3585,8 @@ static inline void qemu_store_helper(uintptr_t orig_addr,
 
     size_t    size = get_mem_op_size(mem_op);
     uintptr_t addr = orig_addr + offset;
+    
+    snapshot_access(addr, size);
 
 #if 0
     printf("Store %lu bytes at %lx\n", size, addr);
@@ -5948,6 +5951,15 @@ int        parse_translation_block(TranslationBlock* tb, uintptr_t tb_pc,
 
                 hit_first_instr = 1;
                 pc              = op->args[0];
+                
+                if (pc >= symbolic_start_code && pc < symbolic_end_code) {
+                    printf("[pc] [pc %llx]\n", (long long unsigned int)pc);
+                    if (pc == 0x401190) {
+                        printf("[snapshot] [instrument]\n");
+                        add_void_call_0(snapshot_save, op, NULL, tcg_ctx);
+                    }
+                }
+
 
                 jump_table_finder_prev_instr = jump_table_finder_curr_instr;
                 memset(&jump_table_finder_curr_instr, 0,
