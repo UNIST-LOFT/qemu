@@ -20,6 +20,7 @@
 #include "qemu/osdep.h"
 #include "qemu/cutils.h"
 #include "qemu/path.h"
+#include "snapshot.h"
 #include <elf.h>
 #include <endian.h>
 #include <grp.h>
@@ -8736,6 +8737,10 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
         return get_errno(ret);
 #endif
     case TARGET_NR_munmap:
+        if (!snapshot_is_unmap_allowed(arg1, arg2)) {
+            // return 0 on success, return -TARGET_EINVAL on fail
+            return 0;
+        }
         return get_errno(target_munmap(arg1, arg2));
     case TARGET_NR_mprotect:
         {
@@ -12077,6 +12082,7 @@ abi_long do_syscall(void *cpu_env, int num, abi_long arg1,
     }
 
 #ifdef SYMBOLIC_INSTRUMENTATION
+    snapshot_syscall(num, arg1, arg2, arg3, arg4, arg5, arg6, arg7, ret);
     if (syscall_no != SYS_NOT_INTERESTING) {
         qemu_syscall_helper(syscall_no, arg1, arg2, arg3, arg4, arg5, arg6, arg7, ret);
     }

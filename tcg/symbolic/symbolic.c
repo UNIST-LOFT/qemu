@@ -3586,7 +3586,9 @@ static inline void qemu_store_helper(uintptr_t orig_addr,
     size_t    size = get_mem_op_size(mem_op);
     uintptr_t addr = orig_addr + offset;
     
-    snapshot_access(addr, size);
+    if (snapshot_is_taken()) {
+        snapshot_access(addr, size);
+    }
 
 #if 0
     printf("Store %lu bytes at %lx\n", size, addr);
