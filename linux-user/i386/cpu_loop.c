@@ -21,6 +21,7 @@
 #include "qemu-common.h"
 #include "qemu.h"
 #include "cpu_loop-common.h"
+#include "../snapshot.h"
 
 /***********************************************************/
 /* CPUX86 core interface */
@@ -94,6 +95,8 @@ void cpu_loop(CPUX86State *env)
         trapnr = cpu_exec(cs);
         cpu_exec_end(cs);
         process_queued_cpu_work(cs);
+        pc = env->segs[R_CS].base + env->eip;
+        fprintf(stderr, "[run] [pc %lx]\n", pc);
 
         switch(trapnr) {
         case 0x80:
@@ -107,6 +110,12 @@ void cpu_loop(CPUX86State *env)
                              env->regs[R_EDI],
                              env->regs[R_EBP],
                              0, 0);
+            // if (restoring_to_snapshot){
+            //     fprintf(stderr, "[snapshot] [restore] [loop1]\n");
+            //     tb_flush(cs);
+            //     restoring_to_snapshot = false;
+            //     continue;
+            // }
             if (ret == -TARGET_ERESTARTSYS) {
                 env->eip -= 2;
             } else if (ret != -TARGET_QEMU_ESIGRETURN) {
@@ -125,6 +134,12 @@ void cpu_loop(CPUX86State *env)
                              env->regs[8],
                              env->regs[9],
                              0, 0);
+            // if (restoring_to_snapshot) {
+            //     fprintf(stderr, "[snapshot] [restore] [loop2]\n");
+            //     tb_flush(cs);
+            //     restoring_to_snapshot = false;
+            //     continue;
+            // }
             if (ret == -TARGET_ERESTARTSYS) {
                 env->eip -= 2;
             } else if (ret != -TARGET_QEMU_ESIGRETURN) {

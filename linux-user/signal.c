@@ -24,6 +24,7 @@
 #include "qemu.h"
 #include "trace.h"
 #include "signal-common.h"
+#include "snapshot.h"
 
 static struct target_sigaction sigact_table[TARGET_NSIG];
 
@@ -664,6 +665,11 @@ static void host_signal_handler(int host_signum, siginfo_t *info,
        we forward to it some signals */
     if ((host_signum == SIGSEGV || host_signum == SIGBUS)
         && info->si_code > 0) {
+        // if (snapshot_is_taken()) {
+        //     fprintf(stderr, "[snapshot] [restore] [exit %d]\n", host_signum);
+        //     snapshot_restore(env);
+        //     return;
+        // }
         if (cpu_signal_handler(host_signum, info, puc))
             return;
     }

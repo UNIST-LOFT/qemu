@@ -137,7 +137,7 @@ static inline int load_temp_to_reg(TCGContext* ctx,
 
 void init_symbolic_mode(void);
 int  parse_translation_block(TranslationBlock* tb, uintptr_t pc,
-                             uint8_t* tb_code, TCGContext* tcg_ctx);
+                             uint8_t* tb_code, TCGContext* tcg_ctx, CPUArchState *cpu_env);
 
 typedef enum {
     INSTRUMENT_BEFORE,

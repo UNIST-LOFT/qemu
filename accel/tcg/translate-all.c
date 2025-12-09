@@ -1789,7 +1789,7 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
     ti = profile_getclock();
 #endif
 
-    gen_code_size = tcg_gen_code(tcg_ctx, tb);
+    gen_code_size = tcg_gen_code(tcg_ctx, tb, env);
 #ifdef SYMBOLIC_INSTRUMENTATION
     if (symbolic_force_flush_cache)
         tb_flush(cpu);

@@ -5819,7 +5819,7 @@ static inline int detect_load_loop(TCGContext* tcg_ctx)
 
 static int instrument = 0;
 int        parse_translation_block(TranslationBlock* tb, uintptr_t tb_pc,
-                                   uint8_t* tb_code, TCGContext* tcg_ctx)
+                                   uint8_t* tb_code, TCGContext* tcg_ctx, CPUArchState *cpu_env)
 {
 #if 0
     {
@@ -5958,7 +5958,9 @@ int        parse_translation_block(TranslationBlock* tb, uintptr_t tb_pc,
                     printf("[pc] [pc %llx]\n", (long long unsigned int)pc);
                     if (pc == 0x401190) {
                         printf("[snapshot] [instrument]\n");
-                        add_void_call_0(snapshot_save, op, NULL, tcg_ctx);
+                        TCGTemp *t_cpu_env = new_non_conflicting_temp(TCG_TYPE_PTR);
+                        tcg_movi(t_cpu_env, (uintptr_t)cpu_env, 0, op, NULL, tcg_ctx);
+                        add_void_call_1(snapshot_save, t_cpu_env, op, NULL, tcg_ctx);
                     }
                 }
 

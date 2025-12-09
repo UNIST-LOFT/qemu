@@ -6,6 +6,7 @@
 #include <sys/mman.h>
 
 extern target_ulong target_brk;
+bool restoring_to_snapshot;
 
 static SnapshotState g_snapshot;
 static __thread SnapshotTLS *g_tls = NULL;
@@ -27,6 +28,8 @@ void snapshot_init(void) {
     memset(&g_snapshot, 0, sizeof(SnapshotState));
     g_snapshot.pages = g_hash_table_new_full(g_int64_hash, g_int64_equal, NULL, g_free);
     g_snapshot.is_snapshot_taken = false;
+    g_snapshot.cpu_state = malloc(sizeof(CPUArchState));
+    memset(g_snapshot.cpu_state, 0, sizeof(CPUArchState));
 }
 
 static int walk_memory_cb(void *priv, target_ulong start, target_ulong end,
@@ -51,10 +54,16 @@ static int walk_memory_cb(void *priv, target_ulong start, target_ulong end,
     return 0;
 }
 
-void snapshot_save(void) {
+void snapshot_save(CPUArchState *cpu) {
     if (g_snapshot.pages == NULL) snapshot_init();
     if (g_snapshot.is_snapshot_taken) return;
     fprintf(stderr, "[snapshot] [mem] [start]\n");
+    // CPU state
+    if (g_snapshot.cpu_state) {
+        fprintf(stderr, "[snapshot] [cpu] [at %lx] [size %ld]\n", (uintptr_t)cpu, sizeof(CPUArchState));
+        memcpy(g_snapshot.cpu_state, cpu, sizeof(CPUArchState));
+    }
+    // Memory
     walk_memory_regions(&g_snapshot, walk_memory_cb);
 
     g_snapshot.start_brk = target_brk;
@@ -91,12 +100,20 @@ void snapshot_access(target_ulong addr, int size) {
     }
 }
 
-void snapshot_restore(void) {
+void snapshot_restore(CPUArchState *cpu) {
+    // CPU state
+    restoring_to_snapshot = true;
+    if (g_snapshot.cpu_state) {
+        fprintf(stderr, "[snapshot] [restore-cpu]\n");
+        memcpy(cpu, g_snapshot.cpu_state, sizeof(CPUArchState));
+    }
+    
     SnapshotTLS *tls = get_tls();
     // mmap
     while (g_snapshot.new_mappings != NULL) {
         SnapshotMapping *map = (SnapshotMapping *)g_snapshot.new_mappings->data;
         // Remove new mmap
+        fprintf(stderr, "[snapshot] [restore] [munmap] [addr %lx]\n", map->start);
         target_munmap(map->start, map->len);
         g_free(map);
         g_snapshot.new_mappings = g_list_delete_link(g_snapshot.new_mappings, g_snapshot.new_mappings);
@@ -105,14 +122,14 @@ void snapshot_restore(void) {
     // brk
     // The heap has shrunk - restore missing pages
     if (target_brk < g_snapshot.start_brk) {
-        target_ulong aligned_new_brk = (target_brk + (SNAPSHOT_PAGE_SIZE - 1)) & (!(SNAPSHOT_PAGE_SIZE - 1));
+        target_ulong aligned_new_brk = (target_brk + (SNAPSHOT_PAGE_SIZE - 1)) & (~(SNAPSHOT_PAGE_SIZE - 1));
         fprintf(stderr, "[snapshot] [restore] [brk-s] [snap %lx] [new %lx] [aligned %lx] [size %lx]\n", target_brk, g_snapshot.start_brk, aligned_new_brk, g_snapshot.start_brk - aligned_new_brk);
         abi_long brk_ret = do_brk(g_snapshot.start_brk);
         if (brk_ret != g_snapshot.start_brk) {
             fprintf(stderr, "[snapshot] [restore] [brk-s-err] [grow-failed %lx]\n", brk_ret);
         }
     } else if (target_brk > g_snapshot.start_brk) { // Remove new allocations
-        
+        fprintf(stderr, "[snapshot] [restore] [brk-l] [snap %lx] [new %lx]\n", target_brk, g_snapshot.start_brk);
     }
 
     // 3. Dirty Page
@@ -130,14 +147,19 @@ void snapshot_restore(void) {
             
             // mprotect(host_addr, SNAPSHOT_PAGE_SIZE, PROT_READ | PROT_WRITE); 
             memcpy(host_addr, info->data, SNAPSHOT_PAGE_SIZE);
+            fprintf(stderr, "[snapshot] [restore] [dirty] [addr %lx]\n", (uintptr_t)addr);
         } else {
-            void *host_addr = g2h(addr);
-            memset(host_addr, 0, SNAPSHOT_PAGE_SIZE);
+            // void *host_addr = g2h(addr);
+            // memset(host_addr, 0, SNAPSHOT_PAGE_SIZE);
+            fprintf(stderr, "[snapshot] [restore] [dirty-unknown] [addr %lx]\n", (uintptr_t)addr);
         }
     }
 
     g_hash_table_remove_all(tls->dirty_pages);
     for(int i=0; i<4; i++) tls->access_cache[i] = -1;
+    
+    fprintf(stderr, "[snapshot] [restore] [fin]\n");
+    fflush(stderr);
 }
 
 // Syscall Hook

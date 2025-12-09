@@ -10,6 +10,8 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+extern bool restoring_to_snapshot;
+
 #define SNAPSHOT_PAGE_SIZE 4096
 #define SNAPSHOT_PAGE_MASK ~(SNAPSHOT_PAGE_SIZE - 1)
 
@@ -35,15 +37,17 @@ typedef struct {
     target_ulong start_brk;
     target_ulong start_mmap;
     
-    GList *new_mappings;          
+    GList *new_mappings;
+    
+    CPUArchState *cpu_state;
     
     bool is_snapshot_taken;
 } SnapshotState;
 
 void snapshot_init(void);
 bool snapshot_is_taken(void);
-void snapshot_save(void);
-void snapshot_restore(void);
+void snapshot_save(CPUArchState *cpu);
+void snapshot_restore(CPUArchState *cpu);
 
 void snapshot_access(target_ulong addr, int size);
 

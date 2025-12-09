@@ -4309,7 +4309,7 @@ void enable_symbolic_mode(void)
     symbolic_mode = 1;
 }
 
-int tcg_gen_code(TCGContext *s, TranslationBlock *tb)
+int tcg_gen_code(TCGContext *s, TranslationBlock *tb, CPUArchState *cpu_env)
 {
 #ifdef CONFIG_PROFILER
     TCGProfile *prof = &s->prof;
@@ -4418,7 +4418,7 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb)
 
 #ifdef TCG_INSTRUMENTATION
     if (symbolic_mode) {
-        symbolic_force_flush_cache = parse_translation_block(tb, tb->pc, tb->tc.ptr, tcg_ctx);
+        symbolic_force_flush_cache = parse_translation_block(tb, tb->pc, tb->tc.ptr, tcg_ctx, cpu_env);
     }
 #endif
 

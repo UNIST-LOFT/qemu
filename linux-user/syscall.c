@@ -12034,6 +12034,13 @@ abi_long do_syscall(void *cpu_env, int num, abi_long arg1,
             syscall_no = SYS_NOT_INTERESTING;
     }
     if (syscall_no == SYS_EXIT) {
+        // if (restoring_to_snapshot) {
+        //     if (snapshot_is_taken()) {
+        //         fprintf(stderr, "[snapshot] [restore] [exit]\n");
+        //         snapshot_restore(cpu_env);
+        //         return 0;
+        //     }
+        // }
         qemu_syscall_helper(syscall_no, arg1, arg2, arg3, arg4, arg5, arg6, arg7, pthread_self());
     }
     if (kSyscallDesc[num].nargs) {
