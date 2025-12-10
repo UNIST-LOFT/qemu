@@ -11,6 +11,7 @@
 #include <stdbool.h>
 
 extern bool restoring_to_snapshot;
+extern target_ulong binradar_entrypoint;
 
 #define SNAPSHOT_PAGE_SIZE 4096
 #define SNAPSHOT_PAGE_MASK ~(SNAPSHOT_PAGE_SIZE - 1)
@@ -61,5 +62,8 @@ int snapshot_is_unmap_allowed(target_ulong addr, target_ulong len);
 
 void snapshot_add_mapping(target_ulong addr, target_ulong len);
 void snapshot_remove_mapping(target_ulong addr, target_ulong len);
+
+void snapshot_fork_setup(void);
+void snapshot_forkserver(CPUState *cpu);
 
 #endif /* BINRADAR_SNAPSHOT_H */

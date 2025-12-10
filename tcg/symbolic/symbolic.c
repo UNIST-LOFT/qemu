@@ -378,6 +378,7 @@ int mode = 0;
 static SymbolicConfig s_config = {0};
 static inline void    load_configuration(void)
 {
+    printf("Load config\n");
     char* var = getenv("COVERAGE_TRACER_LOG");
     if (var) {
         s_config.coverage_tracer_log_bb = var;
@@ -444,6 +445,7 @@ static inline void    load_configuration(void)
            "Need to specify symbolic exec stop address.");
 #endif
     var = getenv("SYMBOLIC_INJECT_INPUT_MODE");
+    printf("SYMBOL_INJECT_INPUT_MODE: %s\n", var);
     if (var) {
         if (strcmp(var, "READ_FD_0") == 0)
             s_config.symbolic_inject_input_mode = READ_FD_0;
@@ -454,6 +456,7 @@ static inline void    load_configuration(void)
         else if (strcmp(var, "FROM_FILE") == 0) {
             s_config.symbolic_inject_input_mode = FROM_FILE;
             s_config.inputfile = getenv("SYMBOLIC_TESTCASE_NAME");
+            printf("inputfile: %s\n", s_config.inputfile);
             assert(s_config.inputfile && "Need to specify testcase path.");
         }
     }
@@ -4864,7 +4867,7 @@ void qemu_syscall_helper(uintptr_t syscall_no, uintptr_t syscall_arg0,
                                                    : (const char*)syscall_arg1;
                 last_open_file = basename(fname);
                 last_open_fp = fp;
-                // printf("Opening file [%d]: %s\n", fp, basename(fname));
+                printf("Opening file [%d]: %s, sym_mode: %d, sym_input: %s\n", fp, fname, s_config.symbolic_inject_input_mode, s_config.inputfile);
                 if (s_config.symbolic_inject_input_mode == FROM_FILE && strcmp(fname, s_config.inputfile) == 0) {
 
                     if (input_fp[fp]) {
@@ -4879,7 +4882,7 @@ void qemu_syscall_helper(uintptr_t syscall_no, uintptr_t syscall_arg0,
                     input_fp[fp]         = malloc(sizeof(FileDescriptorStatus));
                     input_fp[fp]->offset = 0;
                     input_fp[fp]->shared_counter = 1;
-                    // printf("Opening input file: %s\n", fname);
+                    printf("Opening input file: %s\n", fname);
                 }
             }
             break;
@@ -4923,7 +4926,7 @@ void qemu_syscall_helper(uintptr_t syscall_no, uintptr_t syscall_arg0,
         //
         case SYS_READ:
             fp = syscall_arg0;
-            // printf("read from %d %s %lu bytes\n", fp, last_open_file, ret_val);
+            printf("read from %d %s %lu bytes\n", fp, last_open_file, ret_val);
             if (fp >= 0 && !input_fp[fp]) {
                 // debug: check if we are reading from stdin
                 if (s_config.symbolic_inject_input_mode == READ_FD_0 &&
@@ -4932,10 +4935,14 @@ void qemu_syscall_helper(uintptr_t syscall_no, uintptr_t syscall_arg0,
                            "closed. What do we need to do?");
                     tcg_abort();
                 }
+                printf("Not registered file: %lx %d\n", (uintptr_t)input_fp[fp], (int)fp);
                 clear_mem(syscall_arg1, ret_val);
             } else if (((int)ret_val) >= 0) {
+                printf("read_from_input\n");
                 read_from_input(input_fp[fp]->offset, syscall_arg1, ret_val);
                 input_fp[fp]->offset += ret_val;
+            } else {
+                printf("read_from_input failed %d\n", (int)ret_val);
             }
             break;
         //
@@ -5955,12 +5962,18 @@ int        parse_translation_block(TranslationBlock* tb, uintptr_t tb_pc,
                 pc              = op->args[0];
                 
                 if (pc >= symbolic_start_code && pc < symbolic_end_code) {
-                    printf("[pc] [pc %llx]\n", (long long unsigned int)pc);
-                    if (pc == 0x401190) {
-                        printf("[snapshot] [instrument]\n");
-                        TCGTemp *t_cpu_env = new_non_conflicting_temp(TCG_TYPE_PTR);
-                        tcg_movi(t_cpu_env, (uintptr_t)cpu_env, 0, op, NULL, tcg_ctx);
-                        add_void_call_1(snapshot_save, t_cpu_env, op, NULL, tcg_ctx);
+                    printf("[sympc] [pc %llx]\n", (long long unsigned int)pc);
+                    // if (pc == 0x401190) {
+                    //     printf("[snapshot] [instrument]\n");
+                    //     TCGTemp *t_cpu_env = new_non_conflicting_temp(TCG_TYPE_PTR);
+                    //     tcg_movi(t_cpu_env, (uintptr_t)cpu_env, 0, op, NULL, tcg_ctx);
+                    //     add_void_call_1(snapshot_save, t_cpu_env, op, NULL, tcg_ctx);
+                    // }
+                    if (binradar_entrypoint == pc) {
+                        printf("[snapshot] [instrument] [addr %lx]\n", pc);
+                        TCGTemp *t_cpu_state = new_non_conflicting_temp(TCG_TYPE_PTR);
+                        tcg_movi(t_cpu_state, (uintptr_t)env_cpu(cpu_env), 0, op, NULL, tcg_ctx);
+                        add_void_call_1(snapshot_forkserver, t_cpu_state, op, NULL, tcg_ctx);
                     }
                 }
 

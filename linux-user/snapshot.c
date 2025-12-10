@@ -1,12 +1,17 @@
 #include "snapshot.h"
 
+#include "qemu/rcu.h"
+
 #include <stdio.h>
 #include <stdint.h>
 
 #include <sys/mman.h>
 
+#define FORKSRV_FD 198
+
 extern target_ulong target_brk;
 bool restoring_to_snapshot;
+target_ulong binradar_entrypoint = (target_ulong)-1;
 
 static SnapshotState g_snapshot;
 static __thread SnapshotTLS *g_tls = NULL;
@@ -210,7 +215,7 @@ void snapshot_syscall(uintptr_t syscall_no, uintptr_t syscall_arg0,
     case TARGET_NR_brk: // heap adjustment
         // brk(new_brk_addr)
         // Handled in snapshot_restore
-        fprintf(stderr, "New brk %lx received.", syscall_arg0);
+        fprintf(stderr, "New brk %lx received.\n", syscall_arg0);
         break;
     // System call that changes heap shape:
     case TARGET_NR_mmap: // Memory map to file
@@ -264,4 +269,147 @@ void snapshot_remove_mapping(target_ulong addr, target_ulong len) {
         fprintf(stderr, "[snapshot] [munmap] [remove] [addr %lx]\n", addr);
         return;
     }
+}
+
+bool forkserver_installed = false;
+unsigned char afl_fork_child;
+unsigned int  afl_forksrv_pid;
+
+void snapshot_fork_setup(void) {
+    fprintf(stderr, "[forkserver] [setup]\n");
+}
+
+void snapshot_forkserver(CPUState *cpu) {
+    fprintf(stderr, "[snapshot] [forkserver] [called %d]\n", forkserver_installed);
+    if (forkserver_installed) return;
+    forkserver_installed = true;
+    pid_t child_pid;
+    // int   t_fd[2];
+    
+    unsigned int dropped_rcu = 0;
+    while (rcu_reader.depth > 0) {
+        rcu_read_unlock();
+        dropped_rcu++;
+    } 
+    
+    bool  child_stopped = false;
+    uint32_t   was_killed;
+    uint32_t version = 0x41464c00;
+    uint32_t tmp = version ^ 0xffffffff, status2, status = version;
+    uint8_t *msg = (uint8_t *)&status;
+    uint8_t *reply = (uint8_t *)&status2;
+  
+    /* Tell the parent that we're alive. If the parent doesn't want
+       to talk, assume that we're not running in forkserver mode. */
+  
+    if (write(FORKSRV_FD + 1, msg, 4) != 4) {
+        fprintf(stderr, "[snapshot] [forkserver] [error] failed to write to %d %d\n", FORKSRV_FD + 1, status);
+        _exit(1);
+    }
+  
+    afl_forksrv_pid = getpid();
+  
+    if (read(FORKSRV_FD, reply, 4) != 4) {
+        fprintf(stderr, "[snapshot] [forkserver] [error] fuzzolic not responding to %d\n", FORKSRV_FD); 
+        _exit(1);
+    }
+    if (tmp != status2) {
+      fprintf(stderr, "wrong forkserver message from fuzzolic.py");
+      _exit(1);
+    }
+
+    // send welcome message as final message
+    if (write(FORKSRV_FD + 1, msg, 4) != 4) { 
+        fprintf(stderr, "[snapshot] [forkserver] [error] failed to send final handshake to %d %d\n", FORKSRV_FD + 1, status);
+        _exit(1);
+    }
+  
+  
+    // END forkserver handshake
+    fprintf(stderr, "[forkserver] [start]\n");
+  
+    /* All right, let's await orders... */
+  
+    while (1) {
+  
+      /* Whoops, parent dead? */
+  
+      if (read(FORKSRV_FD, &was_killed, 4) != 4) {
+          fprintf(stderr, "[forkserver] [error] dead?\n");
+          exit(2); 
+      }
+  
+      /* If we stopped the child in persistent mode, but there was a race
+         condition and afl-fuzz already issued SIGKILL, write off the old
+         process. */
+  
+      if (child_stopped && was_killed) {
+  
+        child_stopped = 0;
+        if (waitpid(child_pid, (int *)&status, 0) < 0) exit(8);
+  
+      }
+  
+      if (!child_stopped) {
+  
+        /* Establish a channel with child to grab translation commands. We'll
+         read from t_fd[0], child will write to TSL_FD. */
+  
+        // if (pipe(t_fd) || dup2(t_fd[1], TSL_FD) < 0) exit(3);
+        // close(t_fd[1]);
+  
+        child_pid = fork();
+        if (child_pid < 0) exit(4);
+  
+        if (!child_pid) {
+  
+          /* Child process. Close descriptors and run free. */
+          while (dropped_rcu--) {
+              rcu_read_lock();
+          }
+          afl_fork_child = 1;
+          close(FORKSRV_FD);
+          close(FORKSRV_FD + 1);
+          // close(t_fd[0]);
+          return;
+  
+        }
+  
+        /* Parent. */
+  
+        // close(TSL_FD);
+  
+      } else {
+  
+        /* Special handling for persistent mode: if the child is alive but
+           currently stopped, simply restart it with SIGCONT. */
+  
+        kill(child_pid, SIGCONT);
+        child_stopped = 0;
+  
+      }
+  
+      /* Parent. */
+  
+      if (write(FORKSRV_FD + 1, &child_pid, 4) != 4) exit(5);
+  
+      /* Collect translation requests until child dies and closes the pipe. */
+  
+      // afl_wait_tsl(cpu, t_fd[0]);
+  
+      /* Get and relay exit status to parent. */
+  
+      if (waitpid(child_pid, (int *)&status, 0) < 0) exit(6);
+  
+      /* In persistent mode, the child stops itself with SIGSTOP to indicate
+         a successful run. In this case, we want to wake it up without forking
+         again. */
+  
+      if (WIFSTOPPED(status))
+        child_stopped = 1;
+  
+      if (write(FORKSRV_FD + 1, &status, 4) != 4) exit(7);
+  
+    }
+
 }

@@ -23,6 +23,7 @@
 #define ELF_OSABI   ELFOSABI_SYSV
 
 #include "../tcg/symbolic/symbolic-instrumentation.h"
+#include "snapshot.h"
 
 /* from personality.h */
 
@@ -2518,6 +2519,15 @@ static void load_elf_image(const char *image_name, int image_fd,
     if (qemu_log_enabled()) {
         load_symbols(ehdr, image_fd, load_bias);
     }
+    
+    char *binradar_entrypoint_str = getenv("BINRADAR_ENTRYPOINT");
+    if (binradar_entrypoint_str) {
+        binradar_entrypoint = strtoul(binradar_entrypoint_str, NULL, 16);
+    }
+    if (binradar_entrypoint == 0) {
+        binradar_entrypoint = info->entry;
+    }
+    fprintf(stderr, "[snapshot] [entrypoint] [addr %lx]\n", binradar_entrypoint);
 
     mmap_unlock();
 

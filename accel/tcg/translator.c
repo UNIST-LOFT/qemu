@@ -80,6 +80,18 @@ void translator_loop(const TranslatorOps *ops, DisasContextBase *db,
                 break;
             }
         }
+        // if (db->pc_next >= symbolic_start_code && db->pc_next < symbolic_end_code) {
+        //     fprintf(stderr, "[pc] [tran %lx] [start %lx] [end %lx]\n", db->pc_next, symbolic_start_code, symbolic_end_code);
+        //     if (binradar_entrypoint == db->pc_next) {
+        //         static bool first = true;
+        //         if (first) {
+        //             snapshot_fork_setup();
+        //             tb_flush(cpu);
+        //             first = false;
+        //         }
+        //         gen_helper_binradar_entry_routine(cpu_env);
+        //     }
+        // }
 
         /* Disassemble one instruction.  The translate_insn hook should
            update db->pc_next and db->is_jmp to indicate what should be
