@@ -1,4 +1,5 @@
 #include "symbolic-struct.h"
+#include "../../linux-user/snapshot.h"
 static inline void clear_call_args_temps(void)
 {
     s_temps[temp_idx(tcg_find_temp_arch_reg(tcg_ctx, "rax"))] = 0;
@@ -325,11 +326,12 @@ static inline void model_alloc(CPUX86State* env, uintptr_t pc, uintptr_t reg_wit
             tcg_abort();
     }
     
+    size_t size = (size_t)(uintptr_t)env->regs[reg_with_size];
+    snapshot_trace_pending_allocs((target_ulong)size, pc);
+    
     if (size_expr == NULL) {
         return;
     }
-
-    size_t size = (size_t)(uintptr_t)env->regs[reg_with_size];
 
     Expr* e = new_expr();
     e->opkind = MODEL;

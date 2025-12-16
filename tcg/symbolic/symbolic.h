@@ -27,6 +27,8 @@ typedef struct temp_to_restore_t {
     tcg_target_long const_val;
 } temp_to_restore_t;
 
+
+extern int symbolic_mode;
 // FixMe: refactor this
 #define DEFINE_TEMPS_TO_RECOVER(temps_to_restore_var, temp_to_restores_count)  \
     temp_to_restore_t temps_to_restore_var[TCG_MAX_TEMPS];                     \

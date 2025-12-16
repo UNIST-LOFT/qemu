@@ -109,7 +109,7 @@ typedef struct {
     off_t  offset;
 } FileDescriptorStatus;
 
-static int symbolic_mode = 0;
+int symbolic_mode = 0;
 
 #define FD_STDIN 0
 static Expr* input_exprs[MAX_INPUT_SIZE] = {0};
@@ -2917,6 +2917,10 @@ static inline void qemu_load_helper(uintptr_t orig_addr,
     // number of bytes to load
     size_t    size = get_mem_op_size(mem_op);
     uintptr_t addr = orig_addr + offset;
+    
+    if (snapshot_is_taken()) {
+        snapshot_write_access(addr, size);
+    }
 #if 0
     if (GET_QUERY_IDX(next_query) >= 116753 && GET_QUERY_IDX(next_query) <= 116773) {
         printf("[0x%lx] load addr=%lx size=%lu value=%lu\n", current_tb_pc, addr, size, *((uint64_t*)addr));
@@ -3590,7 +3594,7 @@ static inline void qemu_store_helper(uintptr_t orig_addr,
     uintptr_t addr = orig_addr + offset;
     
     if (snapshot_is_taken()) {
-        snapshot_access(addr, size);
+        snapshot_write_access(addr, size);
     }
 
 #if 0
@@ -8128,12 +8132,14 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
             mode = 1;
         } else if (model == REALLOC) {
             // printf("[0x%lx] realloc(0x%lx, %lu)\n", model_caller_addr, (uintptr_t)env->regs[R_EDI], (uintptr_t)env->regs[R_ESI]);
+            snapshot_trace_free(env->regs[R_EDI], model_caller_addr);
             model_alloc(env, model_caller_addr, R_ESI);
             clear_call_args_temps();
             clear_xmm_regs(env);
             mode = 1;
         } else if (model == FREE) {
             // printf("[0x%lx] free(0x%lx)\n", model_caller_addr, (uintptr_t)env->regs[R_EDI]);
+            snapshot_trace_free(env->regs[R_EDI], model_caller_addr);
             clear_call_args_temps();
             clear_xmm_regs(env);
             mode = 1;
@@ -8214,6 +8220,11 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
             r = 1; // switch code cache
         }
         mode = 0;
+        PendingAlloc alloc_info = snapshot_trace_get_pending_allocs(pc);
+        if (alloc_info.size != 0 && alloc_info.pc != 0) {
+            target_ulong base = env->regs[R_EAX];
+            snapshot_trace_alloc(base, alloc_info.size, alloc_info.pc);
+        }
         return r;
     }
     return 0;

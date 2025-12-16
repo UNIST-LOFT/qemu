@@ -8737,10 +8737,10 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
         return get_errno(ret);
 #endif
     case TARGET_NR_munmap:
-        if (!snapshot_is_unmap_allowed(arg1, arg2)) {
-            // return 0 on success, return -TARGET_EINVAL on fail
-            return 0;
-        }
+        // if (!snapshot_is_unmap_allowed(arg1, arg2)) {
+        //     // return 0 on success, return -TARGET_EINVAL on fail
+        //     return 0;
+        // }
         return get_errno(target_munmap(arg1, arg2));
     case TARGET_NR_mprotect:
         {

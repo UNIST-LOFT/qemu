@@ -4301,7 +4301,6 @@ int64_t tcg_cpu_exec_time(void)
 }
 #endif
 
-static uint8_t symbolic_mode = 0;
 void enable_symbolic_mode(void)
 {
     if (symbolic_mode == 0)

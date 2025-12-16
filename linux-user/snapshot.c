@@ -14,19 +14,114 @@ bool restoring_to_snapshot;
 target_ulong binradar_entrypoint = (target_ulong)-1;
 
 static SnapshotState g_snapshot;
-static __thread SnapshotTLS *g_tls = NULL;
+static __thread SnapshotTLS *g_tls_w = NULL;
+static __thread SnapshotTLS *g_tls_r = NULL;
+static GTree *g_memtree = NULL;
+static GArray *pending_allocs = NULL;
 
-static SnapshotTLS* get_tls(void) {
-    if (g_tls == NULL) {
-        g_tls = g_malloc0(sizeof(SnapshotTLS));
-        g_tls->dirty_pages = g_hash_table_new(g_int64_hash, g_int64_equal);
-        for(int i=0; i<4; i++) g_tls->access_cache[i] = -1;
+static GArray *get_pending_allocs(void) {
+    if (pending_allocs == NULL) {
+        pending_allocs = g_array_new(FALSE, FALSE, sizeof(PendingAlloc));
     }
-    return g_tls;
+    return pending_allocs;
+}
+
+void snapshot_trace_pending_allocs(target_ulong size, target_ulong pc) {
+    GArray *stack = get_pending_allocs();
+    PendingAlloc alloc = {size, pc};
+    g_array_append_val(stack, alloc);
+    fprintf(stderr, "temp alloc size %lx pc %lx\n", size, pc);
+}
+
+PendingAlloc snapshot_trace_get_pending_allocs(target_ulong pc) {
+    GArray *stack = get_pending_allocs();
+    PendingAlloc result = {0, 0};
+    if (stack->len == 0) {
+        // This should not happen
+        return result;
+    }
+    result = g_array_index(stack, PendingAlloc, stack->len - 1);
+    if (result.pc != pc) {
+        result = (PendingAlloc){0, 0};
+        return result;
+    }
+    g_array_set_size(stack, stack->len - 1);
+    return result;
+}
+
+
+static SnapshotTLS* get_tls_w(void) {
+    if (g_tls_w == NULL) {
+        g_tls_w = g_malloc0(sizeof(SnapshotTLS));
+        g_tls_w->dirty_pages = g_hash_table_new(g_int64_hash, g_int64_equal);
+        for(int i=0; i<4; i++) g_tls_w->access_cache[i] = -1;
+    }
+    return g_tls_w;
+}
+
+static SnapshotTLS *get_tls_r(void) {
+    if (g_tls_r == NULL) {
+        g_tls_r = g_malloc0(sizeof(SnapshotTLS));
+        g_tls_r->dirty_pages = g_hash_table_new(g_int64_hash, g_int64_equal);
+        for(int i=0; i<4; i++) g_tls_r->access_cache[i] = -1;
+    }
+    return g_tls_r;
+}
+
+gint compare_regions(gconstpointer a, gconstpointer b, gpointer user_data);
+gint search_region(gconstpointer key, gconstpointer user_data);
+
+gint compare_regions(gconstpointer a, gconstpointer b, gpointer user_data) {
+    const SnapshotMemObject *ra = (const SnapshotMemObject *)a;
+    const SnapshotMemObject *rb = (const SnapshotMemObject *)b;
+    if (ra->base < rb->base) return -1;
+    if (ra->base > rb->base) return 1;
+    return 0;
+}
+
+gint search_region(gconstpointer key, gconstpointer user_data) {
+    const SnapshotMemObject *region = (const SnapshotMemObject *)key;
+    const target_ulong addr = *(const target_ulong *)user_data;
+    if (addr < region->base) return 1;
+    if (addr >= region->base + region->size) return -1;
+    return 0;
+}
+
+static GTree *get_memtree(void) {
+    if (g_memtree == NULL) {
+        g_memtree = g_tree_new_full(
+            (GCompareDataFunc)compare_regions,
+            NULL,
+            g_free,
+            NULL
+        );
+    }
+    return g_memtree;
+}
+
+void snapshot_trace_alloc(target_ulong base, target_ulong size, target_ulong pc) {
+    SnapshotMemObject *obj = g_new(SnapshotMemObject, 1);
+    obj->base = base;
+    obj->size = size;
+    obj->pc = pc;
+    GTree *memtree = get_memtree();
+    g_tree_insert(memtree, obj, obj);
+    fprintf(stderr, "[alloc] [done] [base %lx] [size %lx] [pc %lx]\n", base, size, pc);
+}
+
+void snapshot_trace_free(target_ulong base, target_ulong pc) {
+    GTree *memtree = get_memtree();
+    SnapshotMemObject key = {base, 0, 0};
+    if (!g_tree_remove(memtree, &key)) {
+        fprintf(stderr, "[free] [error] [base %lx] [pc %lx] not exist\n", base, pc);
+    } else {
+        fprintf(stderr, "[free] [done] [base %lx] [pc %lx]\n", base, pc);
+    }
 }
 
 bool snapshot_is_taken(void) {
-    return g_snapshot.is_snapshot_taken;
+    // return g_snapshot.is_snapshot_taken;
+    return true;
 }
 
 void snapshot_init(void) {
@@ -78,11 +173,11 @@ void snapshot_save(CPUArchState *cpu) {
     fprintf(stderr, "[snapshot] [result] [brk %llx] [mmap %llx] [pages %d]\n", (long long int)target_brk, (long long int)mmap_next_start, g_hash_table_size(g_snapshot.pages));
 }
 
-void snapshot_access(target_ulong addr, int size) {
-    SnapshotTLS *tls = get_tls();
+void snapshot_write_access(target_ulong addr, int size) {
+    SnapshotTLS *tls = get_tls_w();
     target_ulong start = addr & SNAPSHOT_PAGE_MASK;
     target_ulong end = (addr + size - 1) & SNAPSHOT_PAGE_MASK;
-    fprintf(stderr, "[snapshot] [access] [mem] [addr %lx] [size %d]\n", addr, size);
+    fprintf(stderr, "[snapshot] [waccess] [mem] [addr %lx] [size %d]\n", addr, size);
 
     for (target_ulong page = start; page <= end; page += SNAPSHOT_PAGE_SIZE) {
         bool cached = false;
@@ -105,6 +200,34 @@ void snapshot_access(target_ulong addr, int size) {
     }
 }
 
+void snapshot_read_access(target_ulong addr, int size) {
+    SnapshotTLS *tls = get_tls_r();
+    target_ulong start = addr & SNAPSHOT_PAGE_MASK;
+    target_ulong end = (addr + size - 1) & SNAPSHOT_PAGE_MASK;
+    fprintf(stderr, "[snapshot] [raccess] [mem] [addr %lx] [size %d]\n", addr, size);
+
+    for (target_ulong page = start; page <= end; page += SNAPSHOT_PAGE_SIZE) {
+        bool cached = false;
+        for (int i = 0; i < 4; i++) {
+            if (tls->access_cache[i] == page) {
+                cached = true;
+                break;
+            }
+        }
+        if (cached) continue;
+
+        tls->access_cache[tls->access_cache_idx] = page;
+        tls->access_cache_idx = (tls->access_cache_idx + 1) % 4;
+        
+        if (!g_hash_table_contains(tls->dirty_pages, &page)) {
+            target_ulong *key = g_malloc(sizeof(target_ulong));
+            *key = page;
+            g_hash_table_add(tls->dirty_pages, key);
+        }
+    }
+}
+
+// Unused: replaced by fork server
 void snapshot_restore(CPUArchState *cpu) {
     // CPU state
     restoring_to_snapshot = true;
@@ -113,7 +236,7 @@ void snapshot_restore(CPUArchState *cpu) {
         memcpy(cpu, g_snapshot.cpu_state, sizeof(CPUArchState));
     }
     
-    SnapshotTLS *tls = get_tls();
+    SnapshotTLS *tls = get_tls_w();
     // mmap
     while (g_snapshot.new_mappings != NULL) {
         SnapshotMapping *map = (SnapshotMapping *)g_snapshot.new_mappings->data;
@@ -179,38 +302,44 @@ void snapshot_syscall(uintptr_t syscall_no, uintptr_t syscall_arg0,
         // read(fd, buf, count) -> read count
         if ((long)ret_val > 0) {
             // addr
-            snapshot_access(syscall_arg1, ret_val);
+            snapshot_write_access(syscall_arg1, ret_val);
+        }
+        break;
+    case TARGET_NR_write:
+    case TARGET_NR_pwrite64: // write to file
+        if ((long)ret_val > 0) {
+            snapshot_read_access(syscall_arg1, ret_val);
         }
         break;
     case TARGET_NR_readlinkat: // Read path from symbolic link
         // readlinkat(dirfd, pathname, buf, bufsize)
-        snapshot_access(syscall_arg2, syscall_arg3);
+        // snapshot_write_access(syscall_arg2, syscall_arg3);
 #if defined(TARGET_NR_futex)
     case TARGET_NR_futex: // Fast user mutex
         // futex(uaddr, op, val, timeout)
-        snapshot_access(syscall_arg0, syscall_arg3);
+        // snapshot_write_access(syscall_arg0, syscall_arg3);
         break;
 #endif
 #if defined(TARGET_NR_newfstatat)
     case TARGET_NR_newfstatat: // Return file status as stat
         // newfstatat(dirfd, pathname, statbuf, flags)
-        snapshot_access(syscall_arg2, 4096);
+        // snapshot_write_access(syscall_arg2, 4096);
         break;
 #endif
 #if defined(TARGET_NR_fstatat64)
     case TARGET_NR_fstatat64:
-        snapshot_access(syscall_arg2, 4096);
+        // snapshot_write_access(syscall_arg2, 4096);
         break;
 #endif
     case TARGET_NR_statfs:
     case TARGET_NR_fstat:
     case TARGET_NR_fstatfs:
         // fstat(fd, statbuf)
-        snapshot_access(syscall_arg1, 4096);
+        // snapshot_write_access(syscall_arg1, 4096);
         break;
     case TARGET_NR_getrandom:
         // getrandom(buf, buflen, flags)
-        snapshot_access(syscall_arg0, syscall_arg1);
+        snapshot_write_access(syscall_arg0, syscall_arg1);
         break;
     case TARGET_NR_brk: // heap adjustment
         // brk(new_brk_addr)
@@ -279,6 +408,10 @@ void snapshot_fork_setup(void) {
     fprintf(stderr, "[forkserver] [setup]\n");
 }
 
+static void snapshot_modify_memory(void) {
+    
+}
+
 void snapshot_forkserver(CPUState *cpu) {
     fprintf(stderr, "[snapshot] [forkserver] [called %d]\n", forkserver_installed);
     if (forkserver_installed) return;
@@ -314,8 +447,8 @@ void snapshot_forkserver(CPUState *cpu) {
         _exit(1);
     }
     if (tmp != status2) {
-      fprintf(stderr, "wrong forkserver message from fuzzolic.py");
-      _exit(1);
+        fprintf(stderr, "wrong forkserver message from fuzzolic.py");
+        _exit(1);
     }
 
     // send welcome message as final message
@@ -332,83 +465,84 @@ void snapshot_forkserver(CPUState *cpu) {
   
     while (1) {
   
-      /* Whoops, parent dead? */
-  
-      if (read(FORKSRV_FD, &was_killed, 4) != 4) {
-          fprintf(stderr, "[forkserver] [error] dead?\n");
-          exit(2); 
-      }
-  
-      /* If we stopped the child in persistent mode, but there was a race
-         condition and afl-fuzz already issued SIGKILL, write off the old
-         process. */
-  
-      if (child_stopped && was_killed) {
-  
-        child_stopped = 0;
-        if (waitpid(child_pid, (int *)&status, 0) < 0) exit(8);
-  
-      }
-  
-      if (!child_stopped) {
-  
-        /* Establish a channel with child to grab translation commands. We'll
-         read from t_fd[0], child will write to TSL_FD. */
-  
-        // if (pipe(t_fd) || dup2(t_fd[1], TSL_FD) < 0) exit(3);
-        // close(t_fd[1]);
-  
-        child_pid = fork();
-        if (child_pid < 0) exit(4);
-  
-        if (!child_pid) {
-  
-          /* Child process. Close descriptors and run free. */
-          while (dropped_rcu--) {
-              rcu_read_lock();
-          }
-          afl_fork_child = 1;
-          close(FORKSRV_FD);
-          close(FORKSRV_FD + 1);
-          // close(t_fd[0]);
-          return;
-  
+        /* Whoops, parent dead? */
+    
+        if (read(FORKSRV_FD, &was_killed, 4) != 4) {
+            fprintf(stderr, "[forkserver] [error] dead?\n");
+            exit(2); 
         }
-  
+    
+        /* If we stopped the child in persistent mode, but there was a race
+            condition and afl-fuzz already issued SIGKILL, write off the old
+            process. */
+    
+        if (child_stopped && was_killed) {
+    
+            child_stopped = 0;
+            if (waitpid(child_pid, (int *)&status, 0) < 0) exit(8);
+    
+        }
+    
+        if (!child_stopped) {
+    
+            /* Establish a channel with child to grab translation commands. We'll
+            read from t_fd[0], child will write to TSL_FD. */
+    
+            // if (pipe(t_fd) || dup2(t_fd[1], TSL_FD) < 0) exit(3);
+            // close(t_fd[1]);
+    
+            child_pid = fork();
+            if (child_pid < 0) exit(4);
+    
+            if (!child_pid) {
+                
+                /* Child process. Close descriptors and run free. */
+                snapshot_modify_memory();
+                while (dropped_rcu--) {
+                    rcu_read_lock();
+                }
+                afl_fork_child = 1;
+                close(FORKSRV_FD);
+                close(FORKSRV_FD + 1);
+                // close(t_fd[0]);
+                return;
+    
+            }
+    
+            /* Parent. */
+    
+            // close(TSL_FD);
+    
+        } else {
+    
+            /* Special handling for persistent mode: if the child is alive but
+            currently stopped, simply restart it with SIGCONT. */
+            
+            kill(child_pid, SIGCONT);
+            child_stopped = 0;
+    
+        }
+    
         /* Parent. */
-  
-        // close(TSL_FD);
-  
-      } else {
-  
-        /* Special handling for persistent mode: if the child is alive but
-           currently stopped, simply restart it with SIGCONT. */
-  
-        kill(child_pid, SIGCONT);
-        child_stopped = 0;
-  
-      }
-  
-      /* Parent. */
-  
-      if (write(FORKSRV_FD + 1, &child_pid, 4) != 4) exit(5);
-  
-      /* Collect translation requests until child dies and closes the pipe. */
-  
-      // afl_wait_tsl(cpu, t_fd[0]);
-  
-      /* Get and relay exit status to parent. */
-  
-      if (waitpid(child_pid, (int *)&status, 0) < 0) exit(6);
-  
-      /* In persistent mode, the child stops itself with SIGSTOP to indicate
-         a successful run. In this case, we want to wake it up without forking
-         again. */
-  
-      if (WIFSTOPPED(status))
-        child_stopped = 1;
-  
-      if (write(FORKSRV_FD + 1, &status, 4) != 4) exit(7);
+    
+        if (write(FORKSRV_FD + 1, &child_pid, 4) != 4) exit(5);
+    
+        /* Collect translation requests until child dies and closes the pipe. */
+    
+        // afl_wait_tsl(cpu, t_fd[0]);
+    
+        /* Get and relay exit status to parent. */
+    
+        if (waitpid(child_pid, (int *)&status, 0) < 0) exit(6);
+    
+        /* In persistent mode, the child stops itself with SIGSTOP to indicate
+            a successful run. In this case, we want to wake it up without forking
+            again. */
+    
+        if (WIFSTOPPED(status))
+            child_stopped = 1;
+    
+        if (write(FORKSRV_FD + 1, &status, 4) != 4) exit(7);
   
     }
 

@@ -45,12 +45,28 @@ typedef struct {
     bool is_snapshot_taken;
 } SnapshotState;
 
+typedef struct {
+    target_ulong base;
+    target_ulong size;
+    target_ulong pc;
+} SnapshotMemObject;
+
+typedef struct {
+    target_ulong size;
+    target_ulong pc;
+} PendingAlloc;
+
 void snapshot_init(void);
 bool snapshot_is_taken(void);
 void snapshot_save(CPUArchState *cpu);
 void snapshot_restore(CPUArchState *cpu);
 
-void snapshot_access(target_ulong addr, int size);
+void snapshot_write_access(target_ulong addr, int size);
+void snapshot_read_access(target_ulong addr, int size);
+void snapshot_trace_alloc(target_ulong base, target_ulong size, target_ulong pc);
+void snapshot_trace_free(target_ulong base, target_ulong pc);
+void snapshot_trace_pending_allocs(target_ulong size, target_ulong pc);
+PendingAlloc snapshot_trace_get_pending_allocs(target_ulong pc);
 
 void snapshot_syscall(uintptr_t syscall_no, uintptr_t syscall_arg0,
                       uintptr_t syscall_arg1, uintptr_t syscall_arg2,
