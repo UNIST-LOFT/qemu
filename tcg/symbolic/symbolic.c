@@ -2917,10 +2917,8 @@ static inline void qemu_load_helper(uintptr_t orig_addr,
     // number of bytes to load
     size_t    size = get_mem_op_size(mem_op);
     uintptr_t addr = orig_addr + offset;
+    printf("[loadh] [addr %lx] [orig %lx] [offset %lx]\n", addr, orig_addr, offset);
     
-    if (snapshot_is_taken()) {
-        snapshot_write_access(addr, size);
-    }
 #if 0
     if (GET_QUERY_IDX(next_query) >= 116753 && GET_QUERY_IDX(next_query) <= 116773) {
         printf("[0x%lx] load addr=%lx size=%lu value=%lu\n", current_tb_pc, addr, size, *((uint64_t*)addr));
@@ -3161,29 +3159,48 @@ static inline void qemu_load_helper(uintptr_t orig_addr,
 
     uintptr_t  l1_page_idx = addr >> (L1_PAGE_BITS + L2_PAGE_BITS);
     l2_page_t* l2_page     = s_memory.table.entries[l1_page_idx];
-    if (l2_page == NULL) // early exit
-    {
-        s_temps[val_idx] = NULL;
-        return;
-    }
-
-    uintptr_t  l2_page_idx = (addr >> L2_PAGE_BITS) & 0xFFFF;
-    l3_page_t* l3_page     = l2_page->entries[l2_page_idx];
-    if (l3_page == NULL) // early exit
-    {
-        s_temps[val_idx] = NULL;
-        return;
-    }
-
-    uintptr_t l3_page_idx = addr & 0xFFFF;
-    assert(l3_page_idx + size <= 1 << L3_PAGE_BITS); // ToDo: cross page access
-
-    assert(size <= 8);
+    bool early_exit = false;
     Expr*   exprs[8]         = {NULL};
     uint8_t expr_is_not_null = 0;
-    for (size_t i = 0; i < size; i++) {
-        exprs[i]         = l3_page->entries[l3_page_idx + i];
-        expr_is_not_null = expr_is_not_null | (exprs[i] != 0);
+    uintptr_t  l2_page_idx = (addr >> L2_PAGE_BITS) & 0xFFFF;
+    l3_page_t* l3_page = NULL;
+    uintptr_t l3_page_idx = addr & 0xFFFF;
+    if (l2_page != NULL) {
+        l3_page     = l2_page->entries[l2_page_idx];
+        if (l3_page != NULL) {
+            assert(l3_page_idx + size <= 1 << L3_PAGE_BITS); // ToDo: cross page access
+            assert(size <= 8);
+            for (size_t i = 0; i < size; i++) {
+                exprs[i]         = l3_page->entries[l3_page_idx + i];
+                expr_is_not_null = expr_is_not_null | (exprs[i] != 0);
+            }
+        } else {
+            early_exit = true;
+        }
+    } else {
+        early_exit = true;
+    }
+    
+    if (size <= 8) {
+        SnapshotMemAccess mem_access = {
+            .symbolic_addr = (addr_idx < TCG_MAX_TEMPS && s_temps[addr_idx] != NULL),
+            .symbolic_value = (early_exit),
+            .addr = addr,
+            .target = {0},
+            .ptr = NULL,
+            .size = size
+        };
+        if (is_valid_address(addr)) {
+            void *addr_h = g2h(addr);
+            memcpy(mem_access.target, addr_h, size);
+            snapshot_read_access(&mem_access);
+        }
+    }
+    
+    
+    if (early_exit) {
+        s_temps[val_idx] = NULL;
+        return;
     }
 
     if (expr_is_not_null == 0) // early exit
@@ -3581,20 +3598,29 @@ static uint16_t store_bitmap[MEMORY_BITMAP_SIZE] = { 0 };
 static inline void qemu_store_helper(uintptr_t orig_addr,
                                      uintptr_t mem_op_offset,
                                      uintptr_t addr_idx, 
-                                     uintptr_t val_idx
-#if DEBUG_EXPR_CONSISTENCY
-                                     , uintptr_t concrete_val
-#endif
-                                     )
+                                     uintptr_t val_idx, 
+                                     uintptr_t concrete_val)
 {
     TCGMemOp  mem_op = get_mem_op(mem_op_offset);
     uintptr_t offset = get_mem_offset(mem_op_offset);
 
     size_t    size = get_mem_op_size(mem_op);
     uintptr_t addr = orig_addr + offset;
+    printf("[storeh] [addr %lx] [orig %lx] [offset %lx]\n", addr, orig_addr, offset);
     
-    if (snapshot_is_taken()) {
-        snapshot_write_access(addr, size);
+    if (size <= 8) {
+        SnapshotMemAccess mem_access = {
+            .symbolic_addr = (addr_idx < TCG_MAX_TEMPS && s_temps[addr_idx] != NULL),
+            .symbolic_value = (addr_idx < TCG_MAX_TEMPS && s_temps[val_idx] != NULL),
+            .addr = addr,
+            .target = {0},
+            .ptr = NULL,
+            .size = size
+        };
+        if (is_valid_address(addr)) {
+            memcpy(mem_access.target, (void *)&concrete_val, size);
+            snapshot_write_access(&mem_access);
+        }
     }
 
 #if 0
@@ -6388,17 +6414,11 @@ int        parse_translation_block(TranslationBlock* tb, uintptr_t tb_pc,
                         tcg_movi(t_val_idx, (uintptr_t)temp_idx(t_val), 0, op,
                                  NULL, tcg_ctx);
                         MARK_TEMP_AS_ALLOCATED(t_ptr);
-#if DEBUG_EXPR_CONSISTENCY
                         MARK_TEMP_AS_ALLOCATED(t_val);
                         add_void_call_5(qemu_store_helper, t_ptr, t_mem_op,
                                         t_ptr_idx, t_val_idx, t_val,
                                         op, NULL, tcg_ctx);
                         MARK_TEMP_AS_NOT_ALLOCATED(t_val);
-#else
-                        add_void_call_4(qemu_store_helper, t_ptr, t_mem_op,
-                                        t_ptr_idx, t_val_idx, op, NULL,
-                                        tcg_ctx);
-#endif
                         MARK_TEMP_AS_NOT_ALLOCATED(t_ptr);
                         tcg_temp_free_internal(t_mem_op);
                         tcg_temp_free_internal(t_ptr_idx);

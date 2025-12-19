@@ -18,6 +18,35 @@ static __thread SnapshotTLS *g_tls_w = NULL;
 static __thread SnapshotTLS *g_tls_r = NULL;
 static GTree *g_memtree = NULL;
 static GArray *pending_allocs = NULL;
+// static GHashTable *g_pointer_access = NULL;
+
+bool is_valid_address(target_ulong addr) {
+    if (g_snapshot.pages == NULL) {
+        fprintf(stderr, "ERROR! No valid pages\n");
+        return false;
+    }
+    target_ulong page = addr & SNAPSHOT_PAGE_MASK;
+    SnapshotPageInfo *info = g_hash_table_lookup(g_snapshot.pages, &page);
+    if (info != NULL) {
+        return true;
+    }
+    return false;
+}
+
+// static GHashTable *get_pointer_access_table(void) {
+//     if (g_pointer_access == NULL) {
+//         g_pointer_access = g_hash_table_new_full(g_int64_hash, g_int64_equal, NULL, g_free);
+//     }
+//     return g_pointer_access;
+// }
+
+// static void access_pointer(target_ulong addr, target_ulong value, bool is_read) {
+//     GHashTable *pointer_access = get_pointer_access_table();
+//     if (is_read) {
+//         fprintf(stderr, "%lx\n", (uintptr_t)pointer_access);
+//     }
+// }
+
 
 static GArray *get_pending_allocs(void) {
     if (pending_allocs == NULL) {
@@ -126,10 +155,10 @@ bool snapshot_is_taken(void) {
 
 void snapshot_init(void) {
     memset(&g_snapshot, 0, sizeof(SnapshotState));
-    g_snapshot.pages = g_hash_table_new_full(g_int64_hash, g_int64_equal, NULL, g_free);
+    g_snapshot.pages = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, g_free);
     g_snapshot.is_snapshot_taken = false;
-    g_snapshot.cpu_state = malloc(sizeof(CPUArchState));
-    memset(g_snapshot.cpu_state, 0, sizeof(CPUArchState));
+    // g_snapshot.cpu_state = malloc(sizeof(CPUArchState));
+    // memset(g_snapshot.cpu_state, 0, sizeof(CPUArchState));
 }
 
 static int walk_memory_cb(void *priv, target_ulong start, target_ulong end,
@@ -143,7 +172,7 @@ static int walk_memory_cb(void *priv, target_ulong start, target_ulong end,
             info->data = g_malloc(SNAPSHOT_PAGE_SIZE);
             
             void *host_addr = g2h(addr);
-            memcpy(info->data, host_addr, SNAPSHOT_PAGE_SIZE);
+            // memcpy(info->data, host_addr, SNAPSHOT_PAGE_SIZE);
 
             target_ulong *key = g_malloc(sizeof(target_ulong));
             *key = addr;
@@ -154,15 +183,15 @@ static int walk_memory_cb(void *priv, target_ulong start, target_ulong end,
     return 0;
 }
 
-void snapshot_save(CPUArchState *cpu) {
+void snapshot_save(void) {
     if (g_snapshot.pages == NULL) snapshot_init();
     if (g_snapshot.is_snapshot_taken) return;
     fprintf(stderr, "[snapshot] [mem] [start]\n");
     // CPU state
-    if (g_snapshot.cpu_state) {
-        fprintf(stderr, "[snapshot] [cpu] [at %lx] [size %ld]\n", (uintptr_t)cpu, sizeof(CPUArchState));
-        memcpy(g_snapshot.cpu_state, cpu, sizeof(CPUArchState));
-    }
+    // if (g_snapshot.cpu_state) {
+    //     fprintf(stderr, "[snapshot] [cpu] [at %lx] [size %ld]\n", (uintptr_t)cpu, sizeof(CPUArchState));
+    //     memcpy(g_snapshot.cpu_state, cpu, sizeof(CPUArchState));
+    // }
     // Memory
     walk_memory_regions(&g_snapshot, walk_memory_cb);
 
@@ -173,11 +202,21 @@ void snapshot_save(CPUArchState *cpu) {
     fprintf(stderr, "[snapshot] [result] [brk %llx] [mmap %llx] [pages %d]\n", (long long int)target_brk, (long long int)mmap_next_start, g_hash_table_size(g_snapshot.pages));
 }
 
-void snapshot_write_access(target_ulong addr, int size) {
+void snapshot_write_access(SnapshotMemAccess *mem_access) {
     SnapshotTLS *tls = get_tls_w();
+    uint64_t addr = mem_access->addr;
+    uint64_t size = mem_access->size;
+    if (size == sizeof(target_ulong)) {
+        target_ulong target;
+        memcpy(&target, mem_access->target, sizeof(target_ulong));
+        if (is_valid_address(target)) {
+            // Trace
+        }
+    }
+    
     target_ulong start = addr & SNAPSHOT_PAGE_MASK;
     target_ulong end = (addr + size - 1) & SNAPSHOT_PAGE_MASK;
-    fprintf(stderr, "[snapshot] [waccess] [mem] [addr %lx] [size %d]\n", addr, size);
+    fprintf(stderr, "[snapshot] [waccess] [mem] [addr %lx] [size %ld]\n", addr, size);
 
     for (target_ulong page = start; page <= end; page += SNAPSHOT_PAGE_SIZE) {
         bool cached = false;
@@ -200,11 +239,13 @@ void snapshot_write_access(target_ulong addr, int size) {
     }
 }
 
-void snapshot_read_access(target_ulong addr, int size) {
+void snapshot_read_access(SnapshotMemAccess *mem_access) {
     SnapshotTLS *tls = get_tls_r();
+    uintptr_t addr = mem_access->addr;
+    uintptr_t size = mem_access->size;
     target_ulong start = addr & SNAPSHOT_PAGE_MASK;
     target_ulong end = (addr + size - 1) & SNAPSHOT_PAGE_MASK;
-    fprintf(stderr, "[snapshot] [raccess] [mem] [addr %lx] [size %d]\n", addr, size);
+    fprintf(stderr, "[snapshot] [raccess] [mem] [addr %lx] [size %ld]\n", addr, size);
 
     for (target_ulong page = start; page <= end; page += SNAPSHOT_PAGE_SIZE) {
         bool cached = false;
@@ -298,17 +339,41 @@ void snapshot_syscall(uintptr_t syscall_no, uintptr_t syscall_arg0,
                       uintptr_t ret_val) {
     switch (syscall_no) {
     case TARGET_NR_read:
-    case TARGET_NR_pread64: // read from file
+    case TARGET_NR_pread64: // read from file (write to buffer)
         // read(fd, buf, count) -> read count
         if ((long)ret_val > 0) {
             // addr
-            snapshot_write_access(syscall_arg1, ret_val);
+            SnapshotMemAccess mem_access = {
+                .symbolic_addr = false,
+                .symbolic_value = false,
+                .addr = syscall_arg1,
+                .target = {0},
+                .ptr = NULL,
+                .size = ret_val
+            };
+            if (ret_val <= 8) {
+                void *buf = g2h(syscall_arg1);
+                memcpy(mem_access.target, buf, ret_val);
+            }
+            snapshot_write_access(&mem_access);
         }
         break;
     case TARGET_NR_write:
-    case TARGET_NR_pwrite64: // write to file
+    case TARGET_NR_pwrite64: // write to file (read from buffer)
         if ((long)ret_val > 0) {
-            snapshot_read_access(syscall_arg1, ret_val);
+            SnapshotMemAccess mem_access = {
+                .symbolic_addr = false,
+                .symbolic_value = false,
+                .addr = syscall_arg1,
+                .target = {0},
+                .ptr = NULL,
+                .size = ret_val
+            };
+            if (ret_val <= 8) {
+                void *buf = g2h(syscall_arg1);
+                memcpy(mem_access.target, buf, ret_val);
+            }
+            snapshot_read_access(&mem_access);
         }
         break;
     case TARGET_NR_readlinkat: // Read path from symbolic link
@@ -337,10 +402,23 @@ void snapshot_syscall(uintptr_t syscall_no, uintptr_t syscall_arg0,
         // fstat(fd, statbuf)
         // snapshot_write_access(syscall_arg1, 4096);
         break;
-    case TARGET_NR_getrandom:
+    case TARGET_NR_getrandom: {
         // getrandom(buf, buflen, flags)
-        snapshot_write_access(syscall_arg0, syscall_arg1);
+        SnapshotMemAccess mem_access = {
+            .symbolic_addr = false,
+            .symbolic_value = false,
+            .addr = syscall_arg0,
+            .target = {0},
+            .ptr = NULL,
+            .size = syscall_arg1
+        };
+        if (syscall_arg1 <= 8) {
+            void *buf = g2h(syscall_arg0);
+            memcpy(mem_access.target, buf, syscall_arg1);
+        }
+        snapshot_write_access(&mem_access);
         break;
+    }
     case TARGET_NR_brk: // heap adjustment
         // brk(new_brk_addr)
         // Handled in snapshot_restore
@@ -416,6 +494,7 @@ void snapshot_forkserver(CPUState *cpu) {
     fprintf(stderr, "[snapshot] [forkserver] [called %d]\n", forkserver_installed);
     if (forkserver_installed) return;
     forkserver_installed = true;
+    snapshot_save();
     pid_t child_pid;
     // int   t_fd[2];
     

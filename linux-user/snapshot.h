@@ -56,13 +56,24 @@ typedef struct {
     target_ulong pc;
 } PendingAlloc;
 
+typedef struct {
+    bool symbolic_addr;
+    bool symbolic_value;
+    uintptr_t addr;
+    uint8_t target[8];
+    uint8_t *ptr;
+    uintptr_t size;
+} SnapshotMemAccess;
+
+bool is_valid_address(target_ulong addr);
+
 void snapshot_init(void);
 bool snapshot_is_taken(void);
-void snapshot_save(CPUArchState *cpu);
+void snapshot_save(void);
 void snapshot_restore(CPUArchState *cpu);
 
-void snapshot_write_access(target_ulong addr, int size);
-void snapshot_read_access(target_ulong addr, int size);
+void snapshot_write_access(SnapshotMemAccess *mem_access);
+void snapshot_read_access(SnapshotMemAccess *mem_access);
 void snapshot_trace_alloc(target_ulong base, target_ulong size, target_ulong pc);
 void snapshot_trace_free(target_ulong base, target_ulong pc);
 void snapshot_trace_pending_allocs(target_ulong size, target_ulong pc);
