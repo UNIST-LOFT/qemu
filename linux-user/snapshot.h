@@ -65,7 +65,22 @@ typedef struct {
     uintptr_t size;
 } SnapshotMemAccess;
 
+typedef struct {
+    uintptr_t base;
+    uint64_t offset;
+} PointerDecomposition;
+
+typedef struct {
+    GHashTable *table;
+    GQueue *queue;
+    guint max_size;
+} FixedSizeMap;
+
 bool is_valid_address(target_ulong addr);
+
+PointerDecomposition* fixed_size_map_lookup(uintptr_t key);
+void fixed_size_map_insert(uintptr_t key, uintptr_t base, uint64_t offset);
+void pointer_map_init(void);
 
 void snapshot_init(void);
 bool snapshot_is_taken(void);

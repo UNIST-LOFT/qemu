@@ -18,7 +18,43 @@ static __thread SnapshotTLS *g_tls_w = NULL;
 static __thread SnapshotTLS *g_tls_r = NULL;
 static GTree *g_memtree = NULL;
 static GArray *pending_allocs = NULL;
+
+static FixedSizeMap g_fixed_size_map;
 // static GHashTable *g_pointer_access = NULL;
+
+void pointer_map_init(void) {
+    if (g_fixed_size_map.table != NULL) return;
+    g_fixed_size_map.max_size = 1024;
+    g_fixed_size_map.table = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, g_free);
+    g_fixed_size_map.queue = g_queue_new();
+}
+
+void fixed_size_map_insert(uintptr_t key, uintptr_t base, uint64_t offset) {
+    FixedSizeMap *map = &g_fixed_size_map;
+    if (map->table == NULL) pointer_map_init();
+    if (g_hash_table_contains(map->table, GUINT_TO_POINTER(key))) {
+        g_queue_remove(map->queue, GUINT_TO_POINTER(key));
+        g_hash_table_remove(map->table, GUINT_TO_POINTER(key));
+    }
+
+    if (g_queue_get_length(map->queue) >= map->max_size) {
+        gpointer oldest_key = g_queue_pop_head(map->queue);
+        g_hash_table_remove(map->table, oldest_key);
+    }
+
+    PointerDecomposition *val = g_new(PointerDecomposition, 1);
+    val->base = base;
+    val->offset = offset;
+
+    g_hash_table_insert(map->table, GUINT_TO_POINTER(key), val);
+    g_queue_push_tail(map->queue, GUINT_TO_POINTER(key));
+}
+
+PointerDecomposition* fixed_size_map_lookup(uintptr_t key) {
+    FixedSizeMap *map = &g_fixed_size_map;
+    if (map->table == NULL) pointer_map_init();
+    return (PointerDecomposition*)g_hash_table_lookup(map->table, GUINT_TO_POINTER(key));
+}
 
 bool is_valid_address(target_ulong addr) {
     if (g_snapshot.pages == NULL) {
