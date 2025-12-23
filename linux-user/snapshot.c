@@ -5,6 +5,16 @@
 #include <stdio.h>
 #include <stdint.h>
 
+#define SNAPSHOT_DEBUG
+
+#ifdef SNAPSHOT_DEBUG
+#include <execinfo.h>
+#include <signal.h>
+#include <unistd.h>
+
+#define SNAPSHOT_BT_DEPTH 64
+#endif
+
 #include <sys/mman.h>
 
 #define FORKSRV_FD 198
@@ -517,6 +527,27 @@ static void snapshot_modify_memory(void) {
     
 }
 
+#ifdef SNAPSHOT_DEBUG
+static void snapshot_sig_handler(int sig, siginfo_t *si, void *ctx) {
+    void *frames[SNAPSHOT_BT_DEPTH];
+    int n = backtrace(frames, SNAPSHOT_BT_DEPTH);
+    dprintf(STDERR_FILENO, "[forkserver-child] fata signal %d (%s) addr=%p\n", sig, strsignal(sig), si ? si->si_addr : NULL);
+    backtrace_symbols_fd(frames, n, STDERR_FILENO);
+    _exit(128 + sig);
+}
+
+static void snapshot_install_crash_handler(void) {
+    struct sigaction sa = {
+        .sa_sigaction = snapshot_sig_handler,
+        .sa_flags = SA_SIGINFO | SA_RESETHAND
+    };
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL);
+    sigaction(SIGABRT, &sa, NULL);
+}
+#endif
+
 void snapshot_forkserver(CPUState *cpu) {
     fprintf(stderr, "[snapshot] [forkserver] [called %d]\n", forkserver_installed);
     if (forkserver_installed) return;
@@ -601,7 +632,9 @@ void snapshot_forkserver(CPUState *cpu) {
             if (child_pid < 0) exit(4);
     
             if (!child_pid) {
-                
+#ifdef SNAPSHOT_DEBUG
+                snapshot_install_crash_handler();
+#endif
                 /* Child process. Close descriptors and run free. */
                 snapshot_modify_memory();
                 while (dropped_rcu--) {
