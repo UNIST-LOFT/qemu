@@ -3184,7 +3184,7 @@ static inline void qemu_load_helper(uintptr_t orig_addr,
     if (size <= 8) {
         SnapshotMemAccess mem_access = {
             .symbolic_addr = (addr_idx < TCG_MAX_TEMPS && s_temps[addr_idx] != NULL),
-            .symbolic_value = (early_exit),
+            .symbolic_value = (!early_exit),
             .addr = addr,
             .target = {0},
             .ptr = NULL,
@@ -3194,6 +3194,8 @@ static inline void qemu_load_helper(uintptr_t orig_addr,
             void *addr_h = g2h(addr);
             memcpy(mem_access.target, addr_h, size);
             snapshot_read_access(&mem_access);
+        } else {
+            printf("Invalid addr %lx\n", addr);
         }
     }
     

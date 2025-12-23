@@ -16,6 +16,9 @@ extern target_ulong binradar_entrypoint;
 #define SNAPSHOT_PAGE_SIZE 4096
 #define SNAPSHOT_PAGE_MASK ~(SNAPSHOT_PAGE_SIZE - 1)
 
+#define MAX_POINTER_ACCESS 4096
+#define MAX_PRIMITIVE_ACCESS 4096
+
 typedef struct {
     target_ulong addr;
     int perms;
@@ -71,21 +74,29 @@ typedef struct {
 } PointerDecomposition;
 
 typedef struct {
+    uintptr_t key;
+    void *data;
+    GList *node;
+} OrderedMapEntry;
+
+// Ordered map
+// Key: uintptr_t
+typedef struct {
     GHashTable *table;
     GQueue *queue;
-    guint max_size;
-} FixedSizeMap;
+    int max_size;
+} OrderedMap;
 
 bool is_valid_address(target_ulong addr);
 
-PointerDecomposition* fixed_size_map_lookup(uintptr_t key);
-void fixed_size_map_insert(uintptr_t key, uintptr_t base, uint64_t offset);
-void pointer_map_init(void);
+OrderedMap *ordered_map_init(int max_size);
+void ordered_map_insert(OrderedMap *map, uintptr_t key, void *data);
+OrderedMapEntry* ordered_map_lookup(OrderedMap *map, uintptr_t key);
 
 void snapshot_init(void);
 bool snapshot_is_taken(void);
 void snapshot_save(void);
-void snapshot_restore(CPUArchState *cpu);
+// void snapshot_restore(CPUArchState *cpu);
 
 void snapshot_write_access(SnapshotMemAccess *mem_access);
 void snapshot_read_access(SnapshotMemAccess *mem_access);

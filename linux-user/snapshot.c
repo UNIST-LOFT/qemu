@@ -13,47 +13,86 @@ extern target_ulong target_brk;
 bool restoring_to_snapshot;
 target_ulong binradar_entrypoint = (target_ulong)-1;
 
+bool forkserver_installed = false;
+unsigned char afl_fork_child;
+unsigned int  afl_forksrv_pid;
+
 static SnapshotState g_snapshot;
-static __thread SnapshotTLS *g_tls_w = NULL;
-static __thread SnapshotTLS *g_tls_r = NULL;
 static GTree *g_memtree = NULL;
 static GArray *pending_allocs = NULL;
 
-static FixedSizeMap g_fixed_size_map;
 // static GHashTable *g_pointer_access = NULL;
+typedef struct {
+    int size;
+    uintptr_t addr;
+} PrimitiveAccess;
 
-void pointer_map_init(void) {
-    if (g_fixed_size_map.table != NULL) return;
-    g_fixed_size_map.max_size = 1024;
-    g_fixed_size_map.table = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, g_free);
-    g_fixed_size_map.queue = g_queue_new();
+typedef struct {
+    uintptr_t addr;
+    uintptr_t target;
+} PointerAccess;
+
+static OrderedMap *g_read_access_tainted_primitives = NULL;
+static OrderedMap *g_read_access_pointers = NULL;
+
+static void free_ordered_map_entry(gpointer data) {
+    OrderedMapEntry *entry = (OrderedMapEntry *)data;
+    g_free(entry->data);
+    g_free(entry);
 }
 
-void fixed_size_map_insert(uintptr_t key, uintptr_t base, uint64_t offset) {
-    FixedSizeMap *map = &g_fixed_size_map;
-    if (map->table == NULL) pointer_map_init();
-    if (g_hash_table_contains(map->table, GUINT_TO_POINTER(key))) {
-        g_queue_remove(map->queue, GUINT_TO_POINTER(key));
+OrderedMap *ordered_map_init(int max_size) {
+    OrderedMap *map = g_new(OrderedMap, 1);
+    map->max_size = max_size;
+    map->table = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, free_ordered_map_entry);
+    map->queue = g_queue_new();
+    return map;
+}
+
+void ordered_map_insert(OrderedMap *map, uintptr_t key, void *data) {
+    OrderedMapEntry *existing = g_hash_table_lookup(map->table, GUINT_TO_POINTER(key));
+    if (existing != NULL) {
+        g_queue_delete_link(map->queue, existing->node);
         g_hash_table_remove(map->table, GUINT_TO_POINTER(key));
     }
 
-    if (g_queue_get_length(map->queue) >= map->max_size) {
-        gpointer oldest_key = g_queue_pop_head(map->queue);
-        g_hash_table_remove(map->table, oldest_key);
+    if (map->max_size > 0 && g_queue_get_length(map->queue) >= map->max_size) {
+        GList *head_node = g_queue_pop_head_link(map->queue);
+        OrderedMapEntry *oldest_entry = (OrderedMapEntry *)head_node->data;
+        g_hash_table_remove(map->table, GUINT_TO_POINTER(oldest_entry->key));
+        g_list_free_1(head_node);
     }
 
-    PointerDecomposition *val = g_new(PointerDecomposition, 1);
-    val->base = base;
-    val->offset = offset;
+    OrderedMapEntry *entry = g_new(OrderedMapEntry, 1);
+    entry->key = key;
+    entry->data = data;
 
-    g_hash_table_insert(map->table, GUINT_TO_POINTER(key), val);
-    g_queue_push_tail(map->queue, GUINT_TO_POINTER(key));
+    g_queue_push_tail(map->queue, entry);
+    entry->node = map->queue->tail;
+    g_hash_table_insert(map->table, GUINT_TO_POINTER(key), entry);
 }
 
-PointerDecomposition* fixed_size_map_lookup(uintptr_t key) {
-    FixedSizeMap *map = &g_fixed_size_map;
-    if (map->table == NULL) pointer_map_init();
-    return (PointerDecomposition*)g_hash_table_lookup(map->table, GUINT_TO_POINTER(key));
+OrderedMapEntry* ordered_map_lookup(OrderedMap *map, uintptr_t key) {
+    OrderedMapEntry *entry = (OrderedMapEntry *)g_hash_table_lookup(map->table, GUINT_TO_POINTER(key));
+    return entry;
+}
+
+static void add_read_access_pointer(uintptr_t addr, uintptr_t target) {
+    if (g_read_access_pointers == NULL) g_read_access_pointers = ordered_map_init(MAX_POINTER_ACCESS);
+    PointerAccess *ptr = g_new(PointerAccess, 1);
+    ptr->addr = addr;
+    ptr->target = target;
+    ordered_map_insert(g_read_access_pointers, addr, ptr);
+    fprintf(stderr, "[rpo] [addr %lx] [target %lx]\n", addr, target);
+}
+
+static void add_read_access_primitive(uintptr_t addr, int size) {
+    if (g_read_access_tainted_primitives == NULL) g_read_access_tainted_primitives = ordered_map_init(MAX_PRIMITIVE_ACCESS);
+    PrimitiveAccess *prim = g_new(PrimitiveAccess, 1);
+    prim->addr = addr;
+    prim->size = size;
+    ordered_map_insert(g_read_access_tainted_primitives, addr, prim);
+    fprintf(stderr, "[rpi] [addr %lx] [size %d]\n", addr, size);
 }
 
 bool is_valid_address(target_ulong addr) {
@@ -112,25 +151,6 @@ PendingAlloc snapshot_trace_get_pending_allocs(target_ulong pc) {
     }
     g_array_set_size(stack, stack->len - 1);
     return result;
-}
-
-
-static SnapshotTLS* get_tls_w(void) {
-    if (g_tls_w == NULL) {
-        g_tls_w = g_malloc0(sizeof(SnapshotTLS));
-        g_tls_w->dirty_pages = g_hash_table_new(g_int64_hash, g_int64_equal);
-        for(int i=0; i<4; i++) g_tls_w->access_cache[i] = -1;
-    }
-    return g_tls_w;
-}
-
-static SnapshotTLS *get_tls_r(void) {
-    if (g_tls_r == NULL) {
-        g_tls_r = g_malloc0(sizeof(SnapshotTLS));
-        g_tls_r->dirty_pages = g_hash_table_new(g_int64_hash, g_int64_equal);
-        for(int i=0; i<4; i++) g_tls_r->access_cache[i] = -1;
-    }
-    return g_tls_r;
 }
 
 gint compare_regions(gconstpointer a, gconstpointer b, gpointer user_data);
@@ -239,133 +259,108 @@ void snapshot_save(void) {
 }
 
 void snapshot_write_access(SnapshotMemAccess *mem_access) {
-    SnapshotTLS *tls = get_tls_w();
+    if (!forkserver_installed) return;
     uint64_t addr = mem_access->addr;
     uint64_t size = mem_access->size;
     if (size == sizeof(target_ulong)) {
         target_ulong target;
         memcpy(&target, mem_access->target, sizeof(target_ulong));
         if (is_valid_address(target)) {
-            // Trace
+            // Trace?
         }
     }
-    
-    target_ulong start = addr & SNAPSHOT_PAGE_MASK;
-    target_ulong end = (addr + size - 1) & SNAPSHOT_PAGE_MASK;
+    // target_ulong start = addr & SNAPSHOT_PAGE_MASK;
+    // target_ulong end = (addr + size - 1) & SNAPSHOT_PAGE_MASK;
     fprintf(stderr, "[snapshot] [waccess] [mem] [addr %lx] [size %ld]\n", addr, size);
-
-    for (target_ulong page = start; page <= end; page += SNAPSHOT_PAGE_SIZE) {
-        bool cached = false;
-        for (int i = 0; i < 4; i++) {
-            if (tls->access_cache[i] == page) {
-                cached = true;
-                break;
-            }
-        }
-        if (cached) continue;
-
-        tls->access_cache[tls->access_cache_idx] = page;
-        tls->access_cache_idx = (tls->access_cache_idx + 1) % 4;
-        
-        if (!g_hash_table_contains(tls->dirty_pages, &page)) {
-            target_ulong *key = g_malloc(sizeof(target_ulong));
-            *key = page;
-            g_hash_table_add(tls->dirty_pages, key);
-        }
-    }
 }
 
 void snapshot_read_access(SnapshotMemAccess *mem_access) {
-    SnapshotTLS *tls = get_tls_r();
+    if (!forkserver_installed) return;
     uintptr_t addr = mem_access->addr;
     uintptr_t size = mem_access->size;
-    target_ulong start = addr & SNAPSHOT_PAGE_MASK;
-    target_ulong end = (addr + size - 1) & SNAPSHOT_PAGE_MASK;
-    fprintf(stderr, "[snapshot] [raccess] [mem] [addr %lx] [size %ld]\n", addr, size);
-
-    for (target_ulong page = start; page <= end; page += SNAPSHOT_PAGE_SIZE) {
-        bool cached = false;
-        for (int i = 0; i < 4; i++) {
-            if (tls->access_cache[i] == page) {
-                cached = true;
-                break;
-            }
-        }
-        if (cached) continue;
-
-        tls->access_cache[tls->access_cache_idx] = page;
-        tls->access_cache_idx = (tls->access_cache_idx + 1) % 4;
-        
-        if (!g_hash_table_contains(tls->dirty_pages, &page)) {
-            target_ulong *key = g_malloc(sizeof(target_ulong));
-            *key = page;
-            g_hash_table_add(tls->dirty_pages, key);
+    // target_ulong start = addr & SNAPSHOT_PAGE_MASK;
+    // target_ulong end = (addr + size - 1) & SNAPSHOT_PAGE_MASK;
+    bool is_value_pointer = false;
+    if (size == sizeof(target_ulong)) {
+        target_ulong target;
+        memcpy(&target, mem_access->target, sizeof(target_ulong));
+        if (is_valid_address(target)) {
+            // Add to pointer
+            add_read_access_pointer(addr, target);
+            is_value_pointer = true;
         }
     }
+    if (!is_value_pointer) {
+        if (mem_access->symbolic_value) {
+            // Tainted value
+            add_read_access_primitive(addr, size);
+        }
+    }
+    fprintf(stderr, "[snapshot] [raccess] [mem] [addr %lx] [size %ld]\n", addr, size);
 }
 
 // Unused: replaced by fork server
-void snapshot_restore(CPUArchState *cpu) {
-    // CPU state
-    restoring_to_snapshot = true;
-    if (g_snapshot.cpu_state) {
-        fprintf(stderr, "[snapshot] [restore-cpu]\n");
-        memcpy(cpu, g_snapshot.cpu_state, sizeof(CPUArchState));
-    }
+// void snapshot_restore(CPUArchState *cpu) {
+//     // CPU state
+//     restoring_to_snapshot = true;
+//     if (g_snapshot.cpu_state) {
+//         fprintf(stderr, "[snapshot] [restore-cpu]\n");
+//         memcpy(cpu, g_snapshot.cpu_state, sizeof(CPUArchState));
+//     }
     
-    SnapshotTLS *tls = get_tls_w();
-    // mmap
-    while (g_snapshot.new_mappings != NULL) {
-        SnapshotMapping *map = (SnapshotMapping *)g_snapshot.new_mappings->data;
-        // Remove new mmap
-        fprintf(stderr, "[snapshot] [restore] [munmap] [addr %lx]\n", map->start);
-        target_munmap(map->start, map->len);
-        g_free(map);
-        g_snapshot.new_mappings = g_list_delete_link(g_snapshot.new_mappings, g_snapshot.new_mappings);
-    }
+//     SnapshotTLS *tls = get_tls_w();
+//     // mmap
+//     while (g_snapshot.new_mappings != NULL) {
+//         SnapshotMapping *map = (SnapshotMapping *)g_snapshot.new_mappings->data;
+//         // Remove new mmap
+//         fprintf(stderr, "[snapshot] [restore] [munmap] [addr %lx]\n", map->start);
+//         target_munmap(map->start, map->len);
+//         g_free(map);
+//         g_snapshot.new_mappings = g_list_delete_link(g_snapshot.new_mappings, g_snapshot.new_mappings);
+//     }
 
-    // brk
-    // The heap has shrunk - restore missing pages
-    if (target_brk < g_snapshot.start_brk) {
-        target_ulong aligned_new_brk = (target_brk + (SNAPSHOT_PAGE_SIZE - 1)) & (~(SNAPSHOT_PAGE_SIZE - 1));
-        fprintf(stderr, "[snapshot] [restore] [brk-s] [snap %lx] [new %lx] [aligned %lx] [size %lx]\n", target_brk, g_snapshot.start_brk, aligned_new_brk, g_snapshot.start_brk - aligned_new_brk);
-        abi_long brk_ret = do_brk(g_snapshot.start_brk);
-        if (brk_ret != g_snapshot.start_brk) {
-            fprintf(stderr, "[snapshot] [restore] [brk-s-err] [grow-failed %lx]\n", brk_ret);
-        }
-    } else if (target_brk > g_snapshot.start_brk) { // Remove new allocations
-        fprintf(stderr, "[snapshot] [restore] [brk-l] [snap %lx] [new %lx]\n", target_brk, g_snapshot.start_brk);
-    }
+//     // brk
+//     // The heap has shrunk - restore missing pages
+//     if (target_brk < g_snapshot.start_brk) {
+//         target_ulong aligned_new_brk = (target_brk + (SNAPSHOT_PAGE_SIZE - 1)) & (~(SNAPSHOT_PAGE_SIZE - 1));
+//         fprintf(stderr, "[snapshot] [restore] [brk-s] [snap %lx] [new %lx] [aligned %lx] [size %lx]\n", target_brk, g_snapshot.start_brk, aligned_new_brk, g_snapshot.start_brk - aligned_new_brk);
+//         abi_long brk_ret = do_brk(g_snapshot.start_brk);
+//         if (brk_ret != g_snapshot.start_brk) {
+//             fprintf(stderr, "[snapshot] [restore] [brk-s-err] [grow-failed %lx]\n", brk_ret);
+//         }
+//     } else if (target_brk > g_snapshot.start_brk) { // Remove new allocations
+//         fprintf(stderr, "[snapshot] [restore] [brk-l] [snap %lx] [new %lx]\n", target_brk, g_snapshot.start_brk);
+//     }
 
-    // 3. Dirty Page
-    GHashTableIter iter;
-    gpointer key, value;
-    g_hash_table_iter_init(&iter, tls->dirty_pages);
+//     // 3. Dirty Page
+//     GHashTableIter iter;
+//     gpointer key, value;
+//     g_hash_table_iter_init(&iter, tls->dirty_pages);
 
-    while (g_hash_table_iter_next(&iter, &key, &value)) {
-        target_ulong addr = *(target_ulong*)key;
+//     while (g_hash_table_iter_next(&iter, &key, &value)) {
+//         target_ulong addr = *(target_ulong*)key;
         
-        SnapshotPageInfo *info = g_hash_table_lookup(g_snapshot.pages, &addr);
-        if (info) {
-            // memcpy with original data
-            void *host_addr = g2h(addr);
+//         SnapshotPageInfo *info = g_hash_table_lookup(g_snapshot.pages, &addr);
+//         if (info) {
+//             // memcpy with original data
+//             void *host_addr = g2h(addr);
             
-            // mprotect(host_addr, SNAPSHOT_PAGE_SIZE, PROT_READ | PROT_WRITE); 
-            memcpy(host_addr, info->data, SNAPSHOT_PAGE_SIZE);
-            fprintf(stderr, "[snapshot] [restore] [dirty] [addr %lx]\n", (uintptr_t)addr);
-        } else {
-            // void *host_addr = g2h(addr);
-            // memset(host_addr, 0, SNAPSHOT_PAGE_SIZE);
-            fprintf(stderr, "[snapshot] [restore] [dirty-unknown] [addr %lx]\n", (uintptr_t)addr);
-        }
-    }
+//             // mprotect(host_addr, SNAPSHOT_PAGE_SIZE, PROT_READ | PROT_WRITE); 
+//             memcpy(host_addr, info->data, SNAPSHOT_PAGE_SIZE);
+//             fprintf(stderr, "[snapshot] [restore] [dirty] [addr %lx]\n", (uintptr_t)addr);
+//         } else {
+//             // void *host_addr = g2h(addr);
+//             // memset(host_addr, 0, SNAPSHOT_PAGE_SIZE);
+//             fprintf(stderr, "[snapshot] [restore] [dirty-unknown] [addr %lx]\n", (uintptr_t)addr);
+//         }
+//     }
 
-    g_hash_table_remove_all(tls->dirty_pages);
-    for(int i=0; i<4; i++) tls->access_cache[i] = -1;
+//     g_hash_table_remove_all(tls->dirty_pages);
+//     for(int i=0; i<4; i++) tls->access_cache[i] = -1;
     
-    fprintf(stderr, "[snapshot] [restore] [fin]\n");
-    fflush(stderr);
-}
+//     fprintf(stderr, "[snapshot] [restore] [fin]\n");
+//     fflush(stderr);
+// }
 
 // Syscall Hook
 void snapshot_syscall(uintptr_t syscall_no, uintptr_t syscall_arg0,
@@ -467,12 +462,12 @@ void snapshot_syscall(uintptr_t syscall_no, uintptr_t syscall_arg0,
         break;
     case TARGET_NR_mremap: // memory remap
         // mremap(old_addr, old_size, new_size, flags, new_addr) -> new addr
-        snapshot_remove_mapping(syscall_arg0, syscall_arg1);
+        // snapshot_remove_mapping(syscall_arg0, syscall_arg1);
         snapshot_add_mapping(ret_val, syscall_arg2);
         break;
     case TARGET_NR_munmap: // unmap
         // munmap(addr, length)
-        snapshot_remove_mapping(syscall_arg0, syscall_arg1);
+        // snapshot_remove_mapping(syscall_arg0, syscall_arg1);
         break;
     case TARGET_NR_mprotect: // permission
         // mprotect(start, len, prot)
@@ -513,10 +508,6 @@ void snapshot_remove_mapping(target_ulong addr, target_ulong len) {
         return;
     }
 }
-
-bool forkserver_installed = false;
-unsigned char afl_fork_child;
-unsigned int  afl_forksrv_pid;
 
 void snapshot_fork_setup(void) {
     fprintf(stderr, "[forkserver] [setup]\n");
