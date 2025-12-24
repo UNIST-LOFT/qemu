@@ -1,4 +1,5 @@
 #include "../../target/i386/cpu.h"
+#include "../../linux-user/snapshot.h"
 
 #define XMM_BYTES 16
 
@@ -573,6 +574,22 @@ static inline void qemu_memmove(uintptr_t src, uintptr_t dst, uintptr_t size)
     }
 
     // printf("Memmove from=%lx to=%lx size=%lu\n", src, dst, size);
+    SnapshotMemAccess mem_access = {
+        .symbolic_addr = false,
+        .symbolic_value = (src_exprs != NULL),
+        .addr = src,
+        .target = {0},
+        .ptr = NULL,
+        .size = size
+    };
+    if (size <= 8) {
+        if (is_valid_address(src)) {
+            void *addr_h = g2h(src);
+            memcpy(mem_access.target, addr_h, size);
+        }
+    }
+    snapshot_read_access(&mem_access);
+    // Add snapshot_write_access to dst if needed
 
     if (src_exprs == NULL && dst_exprs == NULL) {
         return;
