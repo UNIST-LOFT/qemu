@@ -35,33 +35,42 @@ static GArray *pending_allocs = NULL;
 typedef struct {
     int size;
     uintptr_t addr;
+    uint64_t access_id;
 } PrimitiveAccess;
 
 typedef struct {
     uintptr_t addr;
     uintptr_t target;
+    uint64_t access_id;
 } PointerAccess;
+
+typedef struct {
+    uint32_t prim_idx;
+    uint32_t ptr_idx;
+    uint64_t prim_access_cnt;
+    uint64_t ptr_access_cnt;
+    PrimitiveAccess primitives[MAX_PRIMITIVE_ACCESS];
+    PointerAccess pointers[MAX_POINTER_ACCESS];
+} SharedTraceData;
+
+static SharedTraceData *shared_trace_data = NULL;
 
 static OrderedMap *g_read_access_tainted_primitives = NULL;
 static OrderedMap *g_read_access_pointers = NULL;
 
-static void free_ordered_map_entry(gpointer data) {
-    OrderedMapEntry *entry = (OrderedMapEntry *)data;
-    g_free(entry->data);
-    g_free(entry);
-}
-
 OrderedMap *ordered_map_init(int max_size) {
     OrderedMap *map = g_new(OrderedMap, 1);
     map->max_size = max_size;
-    map->table = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, free_ordered_map_entry);
+    map->table = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, g_free);
     map->queue = g_queue_new();
     return map;
 }
 
-void ordered_map_insert(OrderedMap *map, uintptr_t key, void *data) {
+OrderedMapEntry *ordered_map_insert(OrderedMap *map, uintptr_t key, void *data) {
     OrderedMapEntry *existing = g_hash_table_lookup(map->table, GUINT_TO_POINTER(key));
+    int old_index = -1;
     if (existing != NULL) {
+        old_index = existing->shared_index;
         g_queue_delete_link(map->queue, existing->node);
         g_hash_table_remove(map->table, GUINT_TO_POINTER(key));
     }
@@ -69,17 +78,21 @@ void ordered_map_insert(OrderedMap *map, uintptr_t key, void *data) {
     if (map->max_size > 0 && g_queue_get_length(map->queue) >= map->max_size) {
         GList *head_node = g_queue_pop_head_link(map->queue);
         OrderedMapEntry *oldest_entry = (OrderedMapEntry *)head_node->data;
+        old_index = oldest_entry->shared_index;
         g_hash_table_remove(map->table, GUINT_TO_POINTER(oldest_entry->key));
         g_list_free_1(head_node);
     }
 
     OrderedMapEntry *entry = g_new(OrderedMapEntry, 1);
+    memset(entry, 0, sizeof(OrderedMapEntry));
     entry->key = key;
     entry->data = data;
+    entry->shared_index = old_index;
 
     g_queue_push_tail(map->queue, entry);
     entry->node = map->queue->tail;
     g_hash_table_insert(map->table, GUINT_TO_POINTER(key), entry);
+    return entry;
 }
 
 OrderedMapEntry* ordered_map_lookup(OrderedMap *map, uintptr_t key) {
@@ -88,21 +101,53 @@ OrderedMapEntry* ordered_map_lookup(OrderedMap *map, uintptr_t key) {
 }
 
 static void add_read_access_pointer(uintptr_t addr, uintptr_t target) {
+    if (shared_trace_data == NULL) return;
     if (g_read_access_pointers == NULL) g_read_access_pointers = ordered_map_init(MAX_POINTER_ACCESS);
-    PointerAccess *ptr = g_new(PointerAccess, 1);
+    OrderedMapEntry *entry = ordered_map_insert(g_read_access_pointers, addr, NULL);
+    PointerAccess *ptr = NULL;
+    if (entry->shared_index < 0) {
+        int new_index = __atomic_fetch_add(&shared_trace_data->ptr_idx, 1, __ATOMIC_RELAXED);
+        entry->shared_index = new_index;
+        if (new_index < MAX_POINTER_ACCESS) {
+            ptr = &shared_trace_data->pointers[new_index];
+        }
+    } else if (entry->shared_index < MAX_POINTER_ACCESS) {
+        ptr = &shared_trace_data->pointers[entry->shared_index];
+    }
+    if (ptr == NULL) {
+        fprintf(stderr, "[rpo] ptr shared_index error!!! %d\n", entry->shared_index);
+        exit(1);
+    }
     ptr->addr = addr;
     ptr->target = target;
-    ordered_map_insert(g_read_access_pointers, addr, ptr);
-    fprintf(stderr, "[rpo] [addr %lx] [target %lx]\n", addr, target);
+    ptr->access_id = __atomic_fetch_add(&shared_trace_data->ptr_access_cnt, 1, __ATOMIC_RELAXED);
+    entry->data = ptr;
+    fprintf(stderr, "[rpo] [addr %lx] [target %lx] [index %d] [id %ld]\n", addr, target, entry->shared_index, ptr->access_id);
 }
 
 static void add_read_access_primitive(uintptr_t addr, int size) {
+    if (shared_trace_data == NULL) return;
     if (g_read_access_tainted_primitives == NULL) g_read_access_tainted_primitives = ordered_map_init(MAX_PRIMITIVE_ACCESS);
-    PrimitiveAccess *prim = g_new(PrimitiveAccess, 1);
+    PrimitiveAccess *prim = NULL;
+    OrderedMapEntry *entry = ordered_map_insert(g_read_access_tainted_primitives, addr, NULL);
+    if (entry->shared_index < 0) {
+        int new_index = __atomic_fetch_add(&shared_trace_data->prim_idx, 1, __ATOMIC_RELAXED);
+        entry->shared_index = new_index;
+        if (new_index < MAX_PRIMITIVE_ACCESS) {
+            prim = &shared_trace_data->primitives[new_index];
+        }
+    } else if (entry->shared_index < MAX_PRIMITIVE_ACCESS) {
+        prim = &shared_trace_data->primitives[entry->shared_index];
+    }
+    if (prim == NULL) {
+        fprintf(stderr, "[rpo] prim shared_index error!!! %d\n", entry->shared_index);
+        exit(1);
+    }
     prim->addr = addr;
     prim->size = size;
-    ordered_map_insert(g_read_access_tainted_primitives, addr, prim);
-    fprintf(stderr, "[rpi] [addr %lx] [size %d]\n", addr, size);
+    prim->access_id = __atomic_fetch_add(&shared_trace_data->prim_access_cnt, 1, __ATOMIC_RELAXED);
+    entry->data = prim;
+    fprintf(stderr, "[rpi] [addr %lx] [size %d] [index %d] [id %ld]\n", addr, size, entry->shared_index, prim->access_id);
 }
 
 bool is_valid_address(target_ulong addr) {
@@ -225,6 +270,13 @@ void snapshot_init(void) {
     g_snapshot.is_snapshot_taken = false;
     // g_snapshot.cpu_state = malloc(sizeof(CPUArchState));
     // memset(g_snapshot.cpu_state, 0, sizeof(CPUArchState));
+    size_t shm_size = sizeof(SharedTraceData);
+    shared_trace_data = mmap(NULL, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (shared_trace_data == MAP_FAILED) {
+        perror("mmap shared memory failed");
+        exit(1);
+    }
+    memset(shared_trace_data, 0, shm_size);
 }
 
 static int walk_memory_cb(void *priv, target_ulong start, target_ulong end,
@@ -523,6 +575,8 @@ void snapshot_fork_setup(void) {
     fprintf(stderr, "[forkserver] [setup]\n");
 }
 
+// Modify guest program's state
+// Called after fork to prevent mutation accumulation
 static void snapshot_modify_memory(void) {
     
 }
@@ -548,6 +602,26 @@ static void snapshot_install_crash_handler(void) {
 }
 #endif
 
+// Called after child execution
+static void analyze_collected_data(void) {
+    if (shared_trace_data == NULL) {
+        fprintf(stderr, "Snapshot init error: shared_trace_data is null\n");
+        exit(1);
+    }
+    // Analyze shared_trace_data
+    // 1. Sort by access_id
+    for (int i = 0; i < shared_trace_data->prim_idx; i++) {
+        PrimitiveAccess *prim = &shared_trace_data->primitives[i];
+        fprintf(stderr, "[analyze] [primitive] [index %d] [addr %lx] [size %d] [id %ld]\n", i, prim->addr, prim->size, prim->access_id);
+    }
+    for (int i = 0; i < shared_trace_data->ptr_idx; i++) {
+        PointerAccess *ptr = &shared_trace_data->pointers[i];
+        fprintf(stderr, "[analyze] [pointer] [index %d] [addr %lx] [target %lx] [id %ld]\n", i, ptr->addr, ptr->target, ptr->access_id);
+    }
+    // Reset shared_trace_data
+    memset(shared_trace_data, 0, sizeof(SharedTraceData));
+}
+
 void snapshot_forkserver(CPUState *cpu) {
     fprintf(stderr, "[snapshot] [forkserver] [called %d]\n", forkserver_installed);
     if (forkserver_installed) return;
@@ -562,7 +636,6 @@ void snapshot_forkserver(CPUState *cpu) {
         dropped_rcu++;
     } 
     
-    bool  child_stopped = false;
     uint32_t   was_killed;
     uint32_t version = 0x41464c00;
     uint32_t tmp = version ^ 0xffffffff, status2, status = version;
@@ -605,62 +678,40 @@ void snapshot_forkserver(CPUState *cpu) {
         /* Whoops, parent dead? */
     
         if (read(FORKSRV_FD, &was_killed, 4) != 4) {
-            fprintf(stderr, "[forkserver] [error] dead?\n");
-            exit(2); 
+            fprintf(stderr, "[forkserver] [error] parent (fuzzolic) dead?\n");
+            exit(2);
         }
     
-        /* If we stopped the child in persistent mode, but there was a race
-            condition and afl-fuzz already issued SIGKILL, write off the old
-            process. */
-    
-        if (child_stopped && was_killed) {
-    
-            child_stopped = 0;
-            if (waitpid(child_pid, (int *)&status, 0) < 0) exit(8);
-    
-        }
-    
-        if (!child_stopped) {
-    
-            /* Establish a channel with child to grab translation commands. We'll
-            read from t_fd[0], child will write to TSL_FD. */
-    
-            // if (pipe(t_fd) || dup2(t_fd[1], TSL_FD) < 0) exit(3);
-            // close(t_fd[1]);
-    
-            child_pid = fork();
-            if (child_pid < 0) exit(4);
-    
-            if (!child_pid) {
+        /* Establish a channel with child to grab translation commands. We'll
+        read from t_fd[0], child will write to TSL_FD. */
+
+        // if (pipe(t_fd) || dup2(t_fd[1], TSL_FD) < 0) exit(3);
+        // close(t_fd[1]);
+
+        child_pid = fork();
+        if (child_pid < 0) exit(4);
+
+        if (!child_pid) {
 #ifdef SNAPSHOT_DEBUG
-                snapshot_install_crash_handler();
+            snapshot_install_crash_handler();
 #endif
-                /* Child process. Close descriptors and run free. */
-                snapshot_modify_memory();
-                while (dropped_rcu--) {
-                    rcu_read_lock();
-                }
-                afl_fork_child = 1;
-                close(FORKSRV_FD);
-                close(FORKSRV_FD + 1);
-                // close(t_fd[0]);
-                return;
-    
+            /* Child process. Close descriptors and run free. */
+            snapshot_modify_memory();
+            while (dropped_rcu--) {
+                rcu_read_lock();
             }
-    
-            /* Parent. */
-    
-            // close(TSL_FD);
-    
-        } else {
-    
-            /* Special handling for persistent mode: if the child is alive but
-            currently stopped, simply restart it with SIGCONT. */
-            
-            kill(child_pid, SIGCONT);
-            child_stopped = 0;
-    
+            afl_fork_child = 1;
+            close(FORKSRV_FD);
+            close(FORKSRV_FD + 1);
+            // close(t_fd[0]);
+            return;
+
         }
+
+        /* Parent. */
+
+        // close(TSL_FD);
+
     
         /* Parent. */
     
@@ -673,14 +724,11 @@ void snapshot_forkserver(CPUState *cpu) {
         /* Get and relay exit status to parent. */
     
         if (waitpid(child_pid, (int *)&status, 0) < 0) exit(6);
+        
+        // Child process exit
+        analyze_collected_data();
     
-        /* In persistent mode, the child stops itself with SIGSTOP to indicate
-            a successful run. In this case, we want to wake it up without forking
-            again. */
-    
-        if (WIFSTOPPED(status))
-            child_stopped = 1;
-    
+        // Send exit status
         if (write(FORKSRV_FD + 1, &status, 4) != 4) exit(7);
   
     }

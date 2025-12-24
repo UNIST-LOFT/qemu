@@ -74,6 +74,7 @@ typedef struct {
 } PointerDecomposition;
 
 typedef struct {
+    int shared_index;
     uintptr_t key;
     void *data;
     GList *node;
@@ -90,7 +91,7 @@ typedef struct {
 bool is_valid_address(target_ulong addr);
 
 OrderedMap *ordered_map_init(int max_size);
-void ordered_map_insert(OrderedMap *map, uintptr_t key, void *data);
+OrderedMapEntry *ordered_map_insert(OrderedMap *map, uintptr_t key, void *data);
 OrderedMapEntry* ordered_map_lookup(OrderedMap *map, uintptr_t key);
 
 void snapshot_init(void);
