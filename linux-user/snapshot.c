@@ -31,7 +31,18 @@ static SnapshotState g_snapshot;
 static GTree *g_memtree = NULL;
 static GArray *pending_allocs = NULL;
 
-// static GHashTable *g_pointer_access = NULL;
+typedef struct {
+    uintptr_t addr;
+    uintptr_t size;
+    uint8_t target[8];
+} SingleModification;
+
+typedef struct {
+    GQueue *modifications;
+    GArray *current;
+    GArray *done;
+} ModificationManager;
+
 typedef struct {
     int size;
     uintptr_t addr;
@@ -58,6 +69,8 @@ static SharedTraceData *shared_trace_data = NULL;
 static OrderedMap *g_read_access_tainted_primitives = NULL;
 static OrderedMap *g_read_access_pointers = NULL;
 
+static ModificationManager *mod_manager = NULL;
+
 OrderedMap *ordered_map_init(int max_size) {
     OrderedMap *map = g_new(OrderedMap, 1);
     map->max_size = max_size;
@@ -76,11 +89,12 @@ OrderedMapEntry *ordered_map_insert(OrderedMap *map, uintptr_t key, void *data) 
     }
 
     if (map->max_size > 0 && g_queue_get_length(map->queue) >= map->max_size) {
-        GList *head_node = g_queue_pop_head_link(map->queue);
-        OrderedMapEntry *oldest_entry = (OrderedMapEntry *)head_node->data;
-        old_index = oldest_entry->shared_index;
-        g_hash_table_remove(map->table, GUINT_TO_POINTER(oldest_entry->key));
-        g_list_free_1(head_node);
+        OrderedMapEntry *oldest_entry = (OrderedMapEntry *)g_queue_pop_head(map->queue);
+        if (oldest_entry != NULL) {
+            old_index = oldest_entry->shared_index;
+            uintptr_t old_key = oldest_entry->key;
+            g_hash_table_remove(map->table, GUINT_TO_POINTER(old_key));
+        }
     }
 
     OrderedMapEntry *entry = g_new(OrderedMapEntry, 1);
@@ -158,7 +172,8 @@ bool is_valid_address(target_ulong addr) {
     target_ulong page = addr & SNAPSHOT_PAGE_MASK;
     SnapshotPageInfo *info = g_hash_table_lookup(g_snapshot.pages, &page);
     if (info != NULL) {
-        return true;
+        // Valid only if it has write permission
+        return (info->perms & PAGE_WRITE) != 0;
     }
     return false;
 }
@@ -176,7 +191,6 @@ bool is_valid_address(target_ulong addr) {
 //         fprintf(stderr, "%lx\n", (uintptr_t)pointer_access);
 //     }
 // }
-
 
 static GArray *get_pending_allocs(void) {
     if (pending_allocs == NULL) {
@@ -543,6 +557,7 @@ void snapshot_syscall(uintptr_t syscall_no, uintptr_t syscall_arg0,
 // Syscall Hook: munmap (linux-user/syscall.c do_syscall1())
 // Do not unmap if any page in the range is in the snapshot
 int snapshot_is_unmap_allowed(target_ulong addr, target_ulong len) {
+    return 1;
     target_ulong end = addr + len;
     for (target_ulong p = addr; p < end; p += SNAPSHOT_PAGE_SIZE) {
         if (g_hash_table_contains(g_snapshot.pages, &p)) {
@@ -575,10 +590,25 @@ void snapshot_fork_setup(void) {
     fprintf(stderr, "[forkserver] [setup]\n");
 }
 
-// Modify guest program's state
-// Called after fork to prevent mutation accumulation
+// Modify guest program's state base on mod_manager (check analyze_collected_data)
+// Called after fork to keep clean initial state
 static void snapshot_modify_memory(void) {
-    
+    if (mod_manager == NULL) {
+        // Initial run: no modification
+        return;
+    }
+    // Select one from modifications
+    GArray *mods = mod_manager->current;
+    if (mods == NULL) {
+        fprintf(stderr, "ERROR: empty modification\n");
+        exit(1);
+    }
+    for (int i = 0; i < mods->len; i++) {
+        SingleModification mod = g_array_index(mods, SingleModification, i);
+        void *target_addr_h = g2h(mod.addr);
+        memcpy(target_addr_h, mod.target, mod.size);
+        fprintf(stderr, "[mod] [addr %lx] [size %ld] [total %d]\n", mod.addr, mod.size, g_queue_get_length(mod_manager->modifications));
+    }
 }
 
 #ifdef SNAPSHOT_DEBUG
@@ -602,6 +632,30 @@ static void snapshot_install_crash_handler(void) {
 }
 #endif
 
+static int compare_prim_id_desc(const void *a, const void *b) {
+    const PrimitiveAccess *pa = (const PrimitiveAccess *)a;
+    const PrimitiveAccess *pb = (const PrimitiveAccess *)b;
+    
+    if (pa->access_id > pb->access_id) return -1;
+    if (pa->access_id < pb->access_id) return 1;
+    return 0;
+}
+
+static int compare_ptr_id_desc(const void *a, const void *b) {
+    const PointerAccess *pa = (const PointerAccess *)a;
+    const PointerAccess *pb = (const PointerAccess *)b;
+    
+    if (pa->access_id > pb->access_id) return -1;
+    if (pa->access_id < pb->access_id) return 1;
+    return 0;
+}
+
+static void flip_bits(uint8_t *target, int size) {
+    for (int i = 0; i < size; i++) {
+        target[i] = ~target[i];
+    }
+}
+
 // Called after child execution
 static void analyze_collected_data(void) {
     if (shared_trace_data == NULL) {
@@ -609,17 +663,168 @@ static void analyze_collected_data(void) {
         exit(1);
     }
     // Analyze shared_trace_data
-    // 1. Sort by access_id
-    for (int i = 0; i < shared_trace_data->prim_idx; i++) {
-        PrimitiveAccess *prim = &shared_trace_data->primitives[i];
-        fprintf(stderr, "[analyze] [primitive] [index %d] [addr %lx] [size %d] [id %ld]\n", i, prim->addr, prim->size, prim->access_id);
+    // First run: collect all data
+    if (mod_manager == NULL) {
+        mod_manager = g_new(ModificationManager, 1);
+        mod_manager->modifications = g_queue_new();
+        mod_manager->done = g_array_new(FALSE, FALSE, sizeof(GArray *));
+        mod_manager->current = NULL;
+        // 1. Sort by access_id
+        qsort(shared_trace_data->primitives, shared_trace_data->prim_idx, sizeof(PrimitiveAccess), compare_prim_id_desc);
+        qsort(shared_trace_data->pointers, shared_trace_data->ptr_idx, sizeof(PointerAccess), compare_ptr_id_desc);
+        // 2.  Update mod_manager
+        for (int i = 0; i < shared_trace_data->prim_idx; i++) {
+            PrimitiveAccess *prim = &shared_trace_data->primitives[i];
+            fprintf(stderr, "[analyze] [primitive] [index %d] [addr %lx] [size %d] [id %ld]\n", i, prim->addr, prim->size, prim->access_id);
+            SingleModification mod = {
+                .addr = prim->addr,
+                .size = prim->size,
+                .target = {0}
+            };
+            // Get actual value
+            if (prim->size <= 8) {
+                void *ptr_h = g2h(prim->addr);
+                memcpy(mod.target, ptr_h, prim->size);
+            }
+            // Set to 0, Set to 1, bitflip
+            // TODO: better modification methods
+            // TODO: multi loc modification
+            switch (mod.size) {
+                case 1: {
+                    uint8_t val = mod.target[0];
+                    if (val != 0) {
+                        GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
+                        mod.target[0] = 0;
+                        g_array_append_val(arr, mod);
+                        g_queue_push_tail(mod_manager->modifications, arr);
+                    }
+                    if (val != 1) {
+                        GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
+                        mod.target[0] = 1;
+                        g_array_append_val(arr, mod);
+                        g_queue_push_tail(mod_manager->modifications, arr);
+                    }
+                    GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
+                    flip_bits(mod.target, mod.size);
+                    g_array_append_val(arr, mod);
+                    g_queue_push_tail(mod_manager->modifications, arr);
+                    break;
+                }
+                case 2: {
+                    uint16_t val;
+                    memcpy(&val, mod.target, 2);
+                    if (val != 0) {
+                        GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
+                        memset(mod.target, 0, 2);
+                        g_array_append_val(arr, mod);
+                        g_queue_push_tail(mod_manager->modifications, arr);
+                    }
+                    if (val != 1) {
+                        GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
+                        uint16_t one = 1;
+                        memcpy(mod.target, &one, 2);
+                        g_array_append_val(arr, mod);
+                        g_queue_push_tail(mod_manager->modifications, arr);
+                    }
+                    GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
+                    flip_bits(mod.target, mod.size);
+                    g_array_append_val(arr, mod);
+                    g_queue_push_tail(mod_manager->modifications, arr);
+                    break;
+                }
+                case 4: {
+                    uint32_t val;
+                    memcpy(&val, mod.target, 4);
+                    if (val != 0) {
+                        GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
+                        memset(mod.target, 0, 4);
+                        g_array_append_val(arr, mod);
+                        g_queue_push_tail(mod_manager->modifications, arr);
+                    }
+                    if (val != 1) {
+                        GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
+                        uint32_t one = 1;
+                        memcpy(mod.target, &one, 4);
+                        g_array_append_val(arr, mod);
+                        g_queue_push_tail(mod_manager->modifications, arr);
+                    }
+                    GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
+                    flip_bits(mod.target, mod.size);
+                    g_array_append_val(arr, mod);
+                    g_queue_push_tail(mod_manager->modifications, arr);
+                    break;
+                }
+                case 8: {
+                    uint64_t val;
+                    memcpy(&val, mod.target, 8);
+                    if (val != 0) {
+                        GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
+                        memset(mod.target, 0, 8);
+                        g_array_append_val(arr, mod);
+                        g_queue_push_tail(mod_manager->modifications, arr);
+                    }
+                    if (val != 1) {
+                        GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
+                        uint64_t one = 1;
+                        memcpy(mod.target, &one, 8);
+                        g_array_append_val(arr, mod);
+                        g_queue_push_tail(mod_manager->modifications, arr);
+                    }
+                    GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
+                    flip_bits(mod.target, mod.size);
+                    g_array_append_val(arr, mod);
+                    g_queue_push_tail(mod_manager->modifications, arr);
+                    break;
+                }
+                default: {
+                    // From real memcpy/memmove (if plt is given) or file write
+                    if (mod.size < 8) {
+                        flip_bits(mod.target, mod.size);
+                        GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
+                        g_array_append_val(arr, mod);
+                        g_queue_push_tail(mod_manager->modifications, arr);
+                    } else {
+                        // TODO: fuzzing
+                    }
+                }
+            }
+        }
+        for (int i = 0; i < shared_trace_data->ptr_idx; i++) {
+            PointerAccess *ptr = &shared_trace_data->pointers[i];
+            fprintf(stderr, "[analyze] [pointer] [index %d] [addr %lx] [target %lx] [id %ld]\n", i, ptr->addr, ptr->target, ptr->access_id);
+            SingleModification mod = {
+                .addr = ptr->addr,
+                .size = sizeof(target_ulong),
+                .target = {0}
+            };
+            // Get actual value
+            target_ulong actual_value;
+            memcpy(&actual_value, g2h(ptr->addr), sizeof(target_ulong));
+            memcpy(mod.target, &actual_value, sizeof(target_ulong));
+            // Fix pointer
+            if (actual_value != 0) {
+                // Set to NULL
+                GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
+                target_ulong null_ptr = 0;
+                memcpy(mod.target, &null_ptr, sizeof(target_ulong));
+                g_array_append_val(arr, mod);
+                g_queue_push_tail(mod_manager->modifications, arr);
+            } else {
+                // Pointer to new object
+                // TODO: recognize null pointer
+                // TODO: allocate new page with mmap, cache it and reuse it
+            }
+        }
+        fprintf(stderr, "[analyze] [queue] [len %d]\n", g_queue_get_length(mod_manager->modifications));
+    } else {
+        // TODO: collect only delta, use feedback
     }
-    for (int i = 0; i < shared_trace_data->ptr_idx; i++) {
-        PointerAccess *ptr = &shared_trace_data->pointers[i];
-        fprintf(stderr, "[analyze] [pointer] [index %d] [addr %lx] [target %lx] [id %ld]\n", i, ptr->addr, ptr->target, ptr->access_id);
-    }
-    // Reset shared_trace_data
+    // Select one modification
+    g_array_append_val(mod_manager->done, mod_manager->current);
+    mod_manager->current = g_queue_pop_head(mod_manager->modifications);
+    // Finished: reset shared_trace_data
     memset(shared_trace_data, 0, sizeof(SharedTraceData));
+    // TODO: restore file offset if needed
 }
 
 void snapshot_forkserver(CPUState *cpu) {
