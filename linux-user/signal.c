@@ -570,7 +570,7 @@ void force_sigsegv(int oldsig)
 #endif
 
 /* abort execution with signal */
-static void QEMU_NORETURN dump_core_and_abort(int target_sig)
+static void QEMU_NORETURN dump_core_and_abort(int target_sig, const target_siginfo_t *info)
 {
     CPUState *cpu = thread_cpu;
     CPUArchState *env = cpu->env_ptr;
@@ -581,6 +581,10 @@ static void QEMU_NORETURN dump_core_and_abort(int target_sig)
     host_sig = target_to_host_signal(target_sig);
     trace_user_force_sig(env, target_sig, host_sig);
     gdb_signalled(env, target_sig);
+    
+    target_ulong fault_addr = info ? info->_sifields._sigfault._addr : 0;
+    int si_code = info ? info->si_code : 0;
+    snapshot_record_guest_crash(env, target_sig, host_sig, si_code, fault_addr, 0, "unhandled_target_signal");
 
     /* dump core if supported by target binary format */
     if (core_dump_signal(target_sig) && (ts->bprm->core_dump != NULL)) {
@@ -882,12 +886,12 @@ static void handle_pending_signal(CPUArchState *cpu_env, int sig,
                    sig != TARGET_SIGURG &&
                    sig != TARGET_SIGWINCH &&
                    sig != TARGET_SIGCONT) {
-            dump_core_and_abort(sig);
+            dump_core_and_abort(sig, &k->info);
         }
     } else if (handler == TARGET_SIG_IGN) {
         /* ignore sig */
     } else if (handler == TARGET_SIG_ERR) {
-        dump_core_and_abort(sig);
+        dump_core_and_abort(sig, &k->info);
     } else {
         /* compute the blocked signals during the handler execution */
         sigset_t *blocked_set;

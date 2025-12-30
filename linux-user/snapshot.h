@@ -94,6 +94,13 @@ OrderedMap *ordered_map_init(int max_size);
 OrderedMapEntry *ordered_map_insert(OrderedMap *map, uintptr_t key, void *data);
 OrderedMapEntry* ordered_map_lookup(OrderedMap *map, uintptr_t key);
 
+void snapshot_record_guest_normal_exit(CPUArchState *cpu_env, int exit_code, const char *reason);
+void snapshot_record_guest_crash(CPUArchState *cpu_env, int target_signal,
+                                 int host_signal, int si_code,
+                                 target_ulong fault_addr,
+                                 uintptr_t host_fault_addr,
+                                 const char *reason);
+
 void snapshot_init(void);
 bool snapshot_is_taken(void);
 void snapshot_save(void);

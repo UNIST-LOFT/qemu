@@ -5,14 +5,14 @@
 #include <stdio.h>
 #include <stdint.h>
 
-#define SNAPSHOT_DEBUG
+#define SNAPSHOT_EXIT_DESC_LEN 256
+#define SNAPSHOT_BT_DEPTH 64
+// #define SNAPSHOT_DEBUG
 
 #ifdef SNAPSHOT_DEBUG
 #include <execinfo.h>
 #include <signal.h>
 #include <unistd.h>
-
-#define SNAPSHOT_BT_DEPTH 64
 #endif
 
 #include <sys/mman.h>
@@ -30,6 +30,22 @@ unsigned int  afl_forksrv_pid;
 static SnapshotState g_snapshot;
 static GTree *g_memtree = NULL;
 static GArray *pending_allocs = NULL;
+
+typedef struct {
+    uint32_t valid;
+    uint32_t crashed;
+    int32_t target_signal;
+    int32_t host_signal;
+    int32_t si_code;
+    int32_t exit_code;
+    target_ulong guest_pc;
+    target_ulong guest_cs_base;
+    target_ulong fault_addr;
+    uintptr_t host_fault_addr;
+    // uint32_t bt_depth;
+    // uintptr_t bt[SNAPSHOT_BT_DEPTH];
+    char description[SNAPSHOT_EXIT_DESC_LEN];
+} SnapshotExitInfo;
 
 typedef struct {
     uintptr_t addr;
@@ -60,6 +76,7 @@ typedef struct {
     uint32_t ptr_idx;
     uint64_t prim_access_cnt;
     uint64_t ptr_access_cnt;
+    SnapshotExitInfo exit_info;
     PrimitiveAccess primitives[MAX_PRIMITIVE_ACCESS];
     PointerAccess pointers[MAX_POINTER_ACCESS];
 } SharedTraceData;
@@ -112,6 +129,69 @@ OrderedMapEntry *ordered_map_insert(OrderedMap *map, uintptr_t key, void *data) 
 OrderedMapEntry* ordered_map_lookup(OrderedMap *map, uintptr_t key) {
     OrderedMapEntry *entry = (OrderedMapEntry *)g_hash_table_lookup(map->table, GUINT_TO_POINTER(key));
     return entry;
+}
+
+static SnapshotExitInfo *snapshot_exit_info_ptr(void) {
+    if (shared_trace_data == NULL) return NULL;
+    return &shared_trace_data->exit_info;
+}
+
+static void snapshot_exit_info_capture(SnapshotExitInfo *info, CPUArchState *env) {
+    if (!info || !env) return;
+    target_ulong pc = 0;
+    target_ulong cs_base = 0;
+    uint32_t flags = 0;
+    cpu_get_tb_cpu_state(env, &pc, &cs_base, &flags);
+    info->guest_pc = pc;
+    info->guest_cs_base = cs_base;
+}
+
+static void snapshot_exit_info_set_reason(SnapshotExitInfo *info, const char *reason) {
+    if (!info) return;
+    if (!reason) {
+        info->description[0] = '\0';
+        return;
+    }
+    g_strlcpy(info->description, reason, SNAPSHOT_EXIT_DESC_LEN);
+}
+
+static bool snapshot_exit_info_should_update(const SnapshotExitInfo *info, bool crashed) {
+    if (info == NULL) return false;
+    if (!info->valid) return true;
+    return crashed;  // Prevent update for exit() after error handling
+}
+
+void snapshot_record_guest_normal_exit(CPUArchState *cpu_env, int exit_code, const char *reason) {
+    SnapshotExitInfo *info = snapshot_exit_info_ptr();
+    if (!snapshot_exit_info_should_update(info, false)) return;
+    info->valid = 1;
+    info->crashed = 0;
+    info->exit_code = exit_code;
+    snapshot_exit_info_capture(info, cpu_env);
+    snapshot_exit_info_set_reason(info, reason ? reason : "normal_exit");
+}
+
+void snapshot_record_guest_crash(CPUArchState *cpu_env, int target_signal, int host_signal, int si_code, target_ulong fault_addr, uintptr_t host_fault_addr, const char *reason) {
+    SnapshotExitInfo *info = snapshot_exit_info_ptr();
+    if (!snapshot_exit_info_should_update(info, true)) return;
+    info->valid = 1;
+    info->crashed = 1;
+    info->target_signal = target_signal;
+    info->host_signal = host_signal;
+    info->si_code = si_code;
+    info->exit_code = (host_signal > 0) ? (128 + host_signal) : -target_signal;
+    info->fault_addr = fault_addr;
+    info->host_fault_addr = host_fault_addr;
+    snapshot_exit_info_capture(info, cpu_env);
+    char buffer[SNAPSHOT_EXIT_DESC_LEN];
+    const char *base = reason ? reason : "unhandled signal";
+    const char *host_name = (host_signal > 0) ? strsignal(host_signal) : NULL;
+    if (host_name) {
+        g_snprintf(buffer, sizeof(buffer), "%s (host=%s[%d], target=%d)", base, host_name, host_signal, target_signal);
+    } else {
+        g_snprintf(buffer, sizeof(buffer), "%s (host=%d, target=%d)", base, host_signal, target_signal);
+    }
+    snapshot_exit_info_set_reason(info, buffer);
 }
 
 static void add_read_access_pointer(uintptr_t addr, uintptr_t target) {
@@ -613,6 +693,9 @@ static void snapshot_modify_memory(void) {
 
 #ifdef SNAPSHOT_DEBUG
 static void snapshot_sig_handler(int sig, siginfo_t *si, void *ctx) {
+    CPUState *cpu = thread_cpu;
+    CPUArchState *env = cpu ? cpu->env_ptr : NULL;
+    snapshot_record_guest_crash(env, 0, sig, si ? si->si_code : 0, 0, si ? (uintptr_t)si->si_addr : 0, "host crashed!!");
     void *frames[SNAPSHOT_BT_DEPTH];
     int n = backtrace(frames, SNAPSHOT_BT_DEPTH);
     dprintf(STDERR_FILENO, "[forkserver-child] fata signal %d (%s) addr=%p\n", sig, strsignal(sig), si ? si->si_addr : NULL);
@@ -656,11 +739,29 @@ static void flip_bits(uint8_t *target, int size) {
     }
 }
 
-// Called after child execution
+// In parent process, called after child execution
 static void analyze_collected_data(void) {
     if (shared_trace_data == NULL) {
         fprintf(stderr, "Snapshot init error: shared_trace_data is null\n");
         exit(1);
+    }
+    // Analyze exit reason
+    SnapshotExitInfo *exit_info = snapshot_exit_info_ptr();
+    if (!exit_info || !exit_info->valid) {
+        fprintf(stderr, "[analyze] [exit-error] no exit info!!!\n");
+        return;
+    }
+    bool is_crash = exit_info->crashed;
+    if (is_crash) {
+        const char *host_name =
+                    (exit_info->host_signal > 0) ? strsignal(exit_info->host_signal) : NULL;
+        if (exit_info->target_signal == 0) {
+            fprintf(stderr, "[analyze] [host-crash] [exit %d] [addr %lx] [reason %s] [name %s] Host crashed!!!\n", exit_info->host_signal, exit_info->host_fault_addr, exit_info->description, host_name ? host_name : "unknown");
+            exit(1);
+        }
+        fprintf(stderr, "[analyze] [crash] [exit %d] [target %d] [host %d] [name %s] [fault-addr %lx] [guest-pc %lx] [guest-cs %lx] [si-code %d]\n", exit_info->exit_code, exit_info->target_signal, exit_info->host_signal, host_name ? host_name : "unknown", exit_info->fault_addr, exit_info->guest_pc, exit_info->guest_cs_base, exit_info->si_code);
+    } else {
+        fprintf(stderr, "[analyze] [normal] [exit %d] [guest-pc %lx] [guest-cs %lx] [reason %s]\n", exit_info->exit_code, exit_info->guest_pc, exit_info->guest_cs_base, exit_info->description);
     }
     // Analyze shared_trace_data
     // First run: collect all data
