@@ -45,6 +45,7 @@ ConditionalTempSync conditional_temp_syncs[TCG_MAX_TEMPS] = {0};
 uint64_t symbolic_start_code = 0;
 uint64_t symbolic_end_code = 0;
 
+// Excluding dynamically linked library
 uint64_t last_translation_block;
 
 // symbolic temps
@@ -5860,6 +5861,10 @@ static inline int detect_load_loop(TCGContext* tcg_ctx)
     return 0;
 }
 
+static void update_last_translation_block(uintptr_t pc) {
+    last_translation_block = pc;
+}
+
 static int instrument = 0;
 int        parse_translation_block(TranslationBlock* tb, uintptr_t tb_pc,
                                    uint8_t* tb_code, TCGContext* tcg_ctx, CPUArchState *cpu_env)
@@ -5999,17 +6004,16 @@ int        parse_translation_block(TranslationBlock* tb, uintptr_t tb_pc,
                 
                 if (pc >= symbolic_start_code && pc < symbolic_end_code) {
                     printf("[sympc] [pc %lx]\n", pc);
-                    // if (pc == 0x401190) {
-                    //     printf("[snapshot] [instrument]\n");
-                    //     TCGTemp *t_cpu_env = new_non_conflicting_temp(TCG_TYPE_PTR);
-                    //     tcg_movi(t_cpu_env, (uintptr_t)cpu_env, 0, op, NULL, tcg_ctx);
-                    //     add_void_call_1(snapshot_save, t_cpu_env, op, NULL, tcg_ctx);
-                    // }
+                    TCGTemp* t_pc = new_non_conflicting_temp(TCG_TYPE_PTR);
+                    tcg_movi(t_pc, (uintptr_t)op->args[0], 0, op, NULL, tcg_ctx);
+                    add_void_call_1(update_last_translation_block, t_pc, op, NULL, tcg_ctx);
+                    tcg_temp_free_internal(t_pc);
                     if (binradar_entrypoint == pc) {
                         printf("[snapshot] [instrument] [addr %lx]\n", pc);
                         TCGTemp *t_cpu_state = new_non_conflicting_temp(TCG_TYPE_PTR);
                         tcg_movi(t_cpu_state, (uintptr_t)env_cpu(cpu_env), 0, op, NULL, tcg_ctx);
                         add_void_call_1(snapshot_forkserver, t_cpu_state, op, NULL, tcg_ctx);
+                        tcg_temp_free_internal(t_cpu_state);
                     }
                 }
 
