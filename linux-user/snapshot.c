@@ -60,9 +60,9 @@ typedef struct {
 } SingleModification;
 
 typedef struct {
-    GQueue *modifications;
-    GArray *current;
-    GArray *done;
+    GQueue *modifications; // Queue<Array<SingleModification>>
+    GArray *current; // Array<SingleModification>
+    GArray *done;    // Array<Array<SingleModification>>
 } ModificationManager;
 
 typedef struct {
@@ -91,6 +91,12 @@ static SharedTraceData *shared_trace_data = NULL;
 
 static OrderedMap *g_read_access_tainted_primitives = NULL;
 static OrderedMap *g_read_access_pointers = NULL;
+
+static GHashTable *g_read_access_tainted_primitives_original = NULL;
+static GHashTable *g_read_access_pointers_original = NULL;
+
+static GHashTable *g_read_access_tainted_primitives_all = NULL;
+static GHashTable *g_read_access_pointers_all = NULL;
 
 static ModificationManager *mod_manager = NULL;
 
@@ -809,18 +815,27 @@ static void analyze_collected_data(void) {
         fprintf(stderr, "[analyze] [normal] [exit %d] [guest-pc %lx] [guest-cs %lx] [reason %s] [last %lx]\n", exit_info->exit_code, exit_info->guest_pc, exit_info->guest_cs_base, exit_info->description, exit_info->guest_last_translation_block);
     }
     // Analyze shared_trace_data
+    // Sort by access_id
+    qsort(shared_trace_data->primitives, shared_trace_data->prim_idx, sizeof(PrimitiveAccess), compare_prim_id_desc);
+    qsort(shared_trace_data->pointers, shared_trace_data->ptr_idx, sizeof(PointerAccess), compare_ptr_id_desc);
     // First run: collect all data
     if (mod_manager == NULL) {
         mod_manager = g_new(ModificationManager, 1);
         mod_manager->modifications = g_queue_new();
         mod_manager->done = g_array_new(FALSE, FALSE, sizeof(GArray *));
         mod_manager->current = NULL;
-        // 1. Sort by access_id
-        qsort(shared_trace_data->primitives, shared_trace_data->prim_idx, sizeof(PrimitiveAccess), compare_prim_id_desc);
-        qsort(shared_trace_data->pointers, shared_trace_data->ptr_idx, sizeof(PointerAccess), compare_ptr_id_desc);
-        // 2.  Update mod_manager
+        
+        g_read_access_tainted_primitives_original = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, NULL);
+        g_read_access_pointers_original = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, NULL);
+        g_read_access_tainted_primitives_all = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, NULL);
+        g_read_access_pointers_all = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, NULL);
+        // Create modification list
         for (int i = 0; i < shared_trace_data->prim_idx; i++) {
             PrimitiveAccess *prim = &shared_trace_data->primitives[i];
+            PrimitiveAccess *prim_data = g_new(PrimitiveAccess, 1);
+            memcpy(prim_data, prim, sizeof(PrimitiveAccess));
+            g_hash_table_insert(g_read_access_tainted_primitives_original, GUINT_TO_POINTER(prim_data->addr), prim_data);
+            g_hash_table_insert(g_read_access_tainted_primitives_all, GUINT_TO_POINTER(prim_data->addr), prim_data);
             fprintf(stderr, "[analyze] [primitive] [index %d] [addr %lx] [size %d] [id %ld]\n", i, prim->addr, prim->size, prim->access_id);
             SingleModification mod = {
                 .addr = prim->addr,
@@ -938,6 +953,10 @@ static void analyze_collected_data(void) {
         }
         for (int i = 0; i < shared_trace_data->ptr_idx; i++) {
             PointerAccess *ptr = &shared_trace_data->pointers[i];
+            PointerAccess *ptr_data = g_new(PointerAccess, 1);
+            memcpy(ptr_data, ptr, sizeof(PointerAccess));
+            g_hash_table_insert(g_read_access_pointers_original, GUINT_TO_POINTER(ptr_data->addr), ptr_data);
+            g_hash_table_insert(g_read_access_pointers_all, GUINT_TO_POINTER(ptr_data->addr), ptr_data);
             fprintf(stderr, "[analyze] [pointer] [index %d] [addr %lx] [target %lx] [id %ld]\n", i, ptr->addr, ptr->target, ptr->access_id);
             SingleModification mod = {
                 .addr = ptr->addr,
@@ -964,7 +983,169 @@ static void analyze_collected_data(void) {
         }
         fprintf(stderr, "[analyze] [queue] [len %d]\n", g_queue_get_length(mod_manager->modifications));
     } else {
-        // TODO: collect only delta, use feedback
+        // Collect only delta, give feedback
+        // Append modification list
+        for (int i = 0; i < shared_trace_data->prim_idx; i++) {
+            PrimitiveAccess *prim = &shared_trace_data->primitives[i];
+            if (!g_hash_table_lookup(g_read_access_tainted_primitives_original, GUINT_TO_POINTER(prim->addr))) {
+                // TODO: New value
+            }
+            if (!g_hash_table_lookup(g_read_access_tainted_primitives_all, GUINT_TO_POINTER(prim->addr))) {
+                // Found new read
+                PrimitiveAccess *prim_data = g_new(PrimitiveAccess, 1);
+                memcpy(prim_data, prim, sizeof(PrimitiveAccess));
+                g_hash_table_insert(g_read_access_tainted_primitives_all, GUINT_TO_POINTER(prim_data->addr), prim_data);
+                fprintf(stderr, "[analyze] [new-primitive] [index %d] [addr %lx] [size %d] [id %ld]\n", i, prim->addr, prim->size, prim->access_id);
+                SingleModification mod = {
+                    .addr = prim->addr,
+                    .size = prim->size,
+                    .target = {0}
+                };
+                // Get actual value
+                if (prim->size <= 8) {
+                    void *ptr_h = g2h(prim->addr);
+                    memcpy(mod.target, ptr_h, prim->size);
+                }
+                // Set to 0, Set to 1, bitflip
+                // TODO: better modification methods
+                // TODO: multi loc modification
+                // TODO: remove partial pointer access (memcpy(target, ptr, 8))
+                switch (mod.size) {
+                    case 1: {
+                        uint8_t val = mod.target[0];
+                        if (val != 0) {
+                            GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
+                            mod.target[0] = 0;
+                            g_array_append_val(arr, mod);
+                            g_queue_push_tail(mod_manager->modifications, arr);
+                        }
+                        if (val != 1) {
+                            GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
+                            mod.target[0] = 1;
+                            g_array_append_val(arr, mod);
+                            g_queue_push_tail(mod_manager->modifications, arr);
+                        }
+                        GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
+                        flip_bits(mod.target, mod.size);
+                        g_array_append_val(arr, mod);
+                        g_queue_push_tail(mod_manager->modifications, arr);
+                        break;
+                    }
+                    case 2: {
+                        uint16_t val;
+                        memcpy(&val, mod.target, 2);
+                        if (val != 0) {
+                            GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
+                            memset(mod.target, 0, 2);
+                            g_array_append_val(arr, mod);
+                            g_queue_push_tail(mod_manager->modifications, arr);
+                        }
+                        if (val != 1) {
+                            GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
+                            uint16_t one = 1;
+                            memcpy(mod.target, &one, 2);
+                            g_array_append_val(arr, mod);
+                            g_queue_push_tail(mod_manager->modifications, arr);
+                        }
+                        GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
+                        flip_bits(mod.target, mod.size);
+                        g_array_append_val(arr, mod);
+                        g_queue_push_tail(mod_manager->modifications, arr);
+                        break;
+                    }
+                    case 4: {
+                        uint32_t val;
+                        memcpy(&val, mod.target, 4);
+                        if (val != 0) {
+                            GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
+                            memset(mod.target, 0, 4);
+                            g_array_append_val(arr, mod);
+                            g_queue_push_tail(mod_manager->modifications, arr);
+                        }
+                        if (val != 1) {
+                            GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
+                            uint32_t one = 1;
+                            memcpy(mod.target, &one, 4);
+                            g_array_append_val(arr, mod);
+                            g_queue_push_tail(mod_manager->modifications, arr);
+                        }
+                        GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
+                        flip_bits(mod.target, mod.size);
+                        g_array_append_val(arr, mod);
+                        g_queue_push_tail(mod_manager->modifications, arr);
+                        break;
+                    }
+                    case 8: {
+                        uint64_t val;
+                        memcpy(&val, mod.target, 8);
+                        if (val != 0) {
+                            GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
+                            memset(mod.target, 0, 8);
+                            g_array_append_val(arr, mod);
+                            g_queue_push_tail(mod_manager->modifications, arr);
+                        }
+                        if (val != 1) {
+                            GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
+                            uint64_t one = 1;
+                            memcpy(mod.target, &one, 8);
+                            g_array_append_val(arr, mod);
+                            g_queue_push_tail(mod_manager->modifications, arr);
+                        }
+                        GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
+                        flip_bits(mod.target, mod.size);
+                        g_array_append_val(arr, mod);
+                        g_queue_push_tail(mod_manager->modifications, arr);
+                        break;
+                    }
+                    default: {
+                        // From real memcpy/memmove (if plt is given) or file write
+                        if (mod.size < 8) {
+                            flip_bits(mod.target, mod.size);
+                            GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
+                            g_array_append_val(arr, mod);
+                            g_queue_push_tail(mod_manager->modifications, arr);
+                        } else {
+                            // TODO: fuzzing
+                        }
+                    }
+                }
+            }
+        }
+        for (int i = 0; i < shared_trace_data->ptr_idx; i++) {
+            PointerAccess *ptr = &shared_trace_data->pointers[i];
+            if (!g_hash_table_lookup(g_read_access_pointers_original, GUINT_TO_POINTER(ptr->addr))) {
+                // New pointer read
+            }
+            if (!g_hash_table_lookup(g_read_access_pointers_all, GUINT_TO_POINTER(ptr->addr))) {
+                // Found new read
+                PointerAccess *ptr_data = g_new(PointerAccess, 1);
+                memcpy(ptr_data, ptr, sizeof(PointerAccess));
+                g_hash_table_insert(g_read_access_pointers_all, GUINT_TO_POINTER(ptr_data->addr), ptr_data);
+                fprintf(stderr, "[analyze] [new-pointer] [index %d] [addr %lx] [target %lx] [id %ld]\n", i, ptr->addr, ptr->target, ptr->access_id);
+                SingleModification mod = {
+                    .addr = ptr->addr,
+                    .size = sizeof(target_ulong),
+                    .target = {0}
+                };
+                // Get actual value
+                target_ulong actual_value;
+                memcpy(&actual_value, g2h(ptr->addr), sizeof(target_ulong));
+                memcpy(mod.target, &actual_value, sizeof(target_ulong));
+                // Fix pointer
+                if (actual_value != 0) {
+                    // Set to NULL
+                    GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
+                    target_ulong null_ptr = 0;
+                    memcpy(mod.target, &null_ptr, sizeof(target_ulong));
+                    g_array_append_val(arr, mod);
+                    g_queue_push_tail(mod_manager->modifications, arr);
+                } else {
+                    // Pointer to new object
+                    // TODO: recognize null pointer
+                    // TODO: allocate new page with mmap, cache it and reuse it
+                }
+            }
+        }
     }
     // Select one modification
     g_array_append_val(mod_manager->done, mod_manager->current);
