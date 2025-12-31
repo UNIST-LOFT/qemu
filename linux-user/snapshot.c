@@ -1,4 +1,5 @@
 #include "snapshot.h"
+#include "../tcg/symbolic/symbolic-struct.h"
 
 #include "qemu/rcu.h"
 
@@ -31,6 +32,10 @@ static SnapshotState g_snapshot;
 static GTree *g_memtree = NULL;
 static GArray *pending_allocs = NULL;
 
+// TODO: memset shared memory if needed
+static Expr *next_free_expr_old;
+static Query *next_query_old;
+
 typedef struct {
     uint32_t valid;
     uint32_t crashed;
@@ -42,6 +47,7 @@ typedef struct {
     target_ulong guest_cs_base;
     target_ulong fault_addr;
     uintptr_t host_fault_addr;
+    uint64_t guest_last_translation_block;
     // uint32_t bt_depth;
     // uintptr_t bt[SNAPSHOT_BT_DEPTH];
     char description[SNAPSHOT_EXIT_DESC_LEN];
@@ -144,6 +150,7 @@ static void snapshot_exit_info_capture(SnapshotExitInfo *info, CPUArchState *env
     cpu_get_tb_cpu_state(env, &pc, &cs_base, &flags);
     info->guest_pc = pc;
     info->guest_cs_base = cs_base;
+    info->guest_last_translation_block = last_translation_block;
 }
 
 static void snapshot_exit_info_set_reason(SnapshotExitInfo *info, const char *reason) {
@@ -194,6 +201,32 @@ void snapshot_record_guest_crash(CPUArchState *cpu_env, int target_signal, int h
     snapshot_exit_info_set_reason(info, buffer);
 }
 
+static void remove_read_access_primitive(uintptr_t addr) {
+    if (g_read_access_tainted_primitives == NULL) return;
+    OrderedMapEntry *entry = ordered_map_lookup(g_read_access_tainted_primitives, addr);
+    if (entry == NULL) return;
+    // Remove from queue
+    int idx_to_remove = entry->shared_index;
+    g_queue_delete_link(g_read_access_tainted_primitives->queue, entry->node);
+    int last_idx = __atomic_sub_fetch(&shared_trace_data->prim_idx, 1, __ATOMIC_RELAXED);
+    if (idx_to_remove < last_idx) {
+        PrimitiveAccess *src = &shared_trace_data->primitives[last_idx];
+        PrimitiveAccess *dst = &shared_trace_data->primitives[idx_to_remove];
+        *dst = *src;
+        OrderedMapEntry *moved_entry = ordered_map_lookup(g_read_access_tainted_primitives, dst->addr);
+        if (moved_entry != NULL) {
+            moved_entry->shared_index = idx_to_remove;
+            moved_entry->data = dst; // 데이터 포인터도 갱신
+        }
+        memset(src, 0, sizeof(PrimitiveAccess));
+    } else if (idx_to_remove == last_idx) {
+        memset(&shared_trace_data->primitives[idx_to_remove], 0, sizeof(PrimitiveAccess));
+    } else {
+        fprintf(stderr, "[rpi] ERROR! remove primtive failed! idx %d > last %d\n", idx_to_remove, last_idx);
+    }
+    g_hash_table_remove(g_read_access_tainted_primitives->table, GUINT_TO_POINTER(addr));
+}
+
 static void add_read_access_pointer(uintptr_t addr, uintptr_t target) {
     if (shared_trace_data == NULL) return;
     if (g_read_access_pointers == NULL) g_read_access_pointers = ordered_map_init(MAX_POINTER_ACCESS);
@@ -221,6 +254,14 @@ static void add_read_access_pointer(uintptr_t addr, uintptr_t target) {
 
 static void add_read_access_primitive(uintptr_t addr, int size) {
     if (shared_trace_data == NULL) return;
+    if (g_read_access_pointers) {
+        uintptr_t aligned_addr = addr & ~(uintptr_t)0x07;
+        OrderedMapEntry *ptr_entry = ordered_map_lookup(g_read_access_pointers, aligned_addr);
+        if (ptr_entry != NULL) {
+            remove_read_access_primitive(addr);
+            return;
+        }
+    }
     if (g_read_access_tainted_primitives == NULL) g_read_access_tainted_primitives = ordered_map_init(MAX_PRIMITIVE_ACCESS);
     PrimitiveAccess *prim = NULL;
     OrderedMapEntry *entry = ordered_map_insert(g_read_access_tainted_primitives, addr, NULL);
@@ -412,6 +453,10 @@ void snapshot_save(void) {
     
     g_snapshot.is_snapshot_taken = true;
     fprintf(stderr, "[snapshot] [result] [brk %llx] [mmap %llx] [pages %d]\n", (long long int)target_brk, (long long int)mmap_next_start, g_hash_table_size(g_snapshot.pages));
+
+    // Backup expr, query
+    next_free_expr_old = next_free_expr;
+    next_query_old = next_query;
 }
 
 void snapshot_write_access(SnapshotMemAccess *mem_access) {
@@ -756,12 +801,12 @@ static void analyze_collected_data(void) {
         const char *host_name =
                     (exit_info->host_signal > 0) ? strsignal(exit_info->host_signal) : NULL;
         if (exit_info->target_signal == 0) {
-            fprintf(stderr, "[analyze] [host-crash] [exit %d] [addr %lx] [reason %s] [name %s] Host crashed!!!\n", exit_info->host_signal, exit_info->host_fault_addr, exit_info->description, host_name ? host_name : "unknown");
+            fprintf(stderr, "[analyze] [host-crash] [exit %d] [addr %lx] [reason %s] [name %s] [last %lx] Host crashed!!!\n", exit_info->host_signal, exit_info->host_fault_addr, exit_info->description, host_name ? host_name : "unknown", exit_info->guest_last_translation_block);
             exit(1);
         }
-        fprintf(stderr, "[analyze] [crash] [exit %d] [target %d] [host %d] [name %s] [fault-addr %lx] [guest-pc %lx] [guest-cs %lx] [si-code %d]\n", exit_info->exit_code, exit_info->target_signal, exit_info->host_signal, host_name ? host_name : "unknown", exit_info->fault_addr, exit_info->guest_pc, exit_info->guest_cs_base, exit_info->si_code);
+        fprintf(stderr, "[analyze] [crash] [exit %d] [target %d] [host %d] [name %s] [fault-addr %lx] [guest-pc %lx] [guest-cs %lx] [si-code %d] [last %lx]\n", exit_info->exit_code, exit_info->target_signal, exit_info->host_signal, host_name ? host_name : "unknown", exit_info->fault_addr, exit_info->guest_pc, exit_info->guest_cs_base, exit_info->si_code, exit_info->guest_last_translation_block);
     } else {
-        fprintf(stderr, "[analyze] [normal] [exit %d] [guest-pc %lx] [guest-cs %lx] [reason %s]\n", exit_info->exit_code, exit_info->guest_pc, exit_info->guest_cs_base, exit_info->description);
+        fprintf(stderr, "[analyze] [normal] [exit %d] [guest-pc %lx] [guest-cs %lx] [reason %s] [last %lx]\n", exit_info->exit_code, exit_info->guest_pc, exit_info->guest_cs_base, exit_info->description, exit_info->guest_last_translation_block);
     }
     // Analyze shared_trace_data
     // First run: collect all data
@@ -790,6 +835,7 @@ static void analyze_collected_data(void) {
             // Set to 0, Set to 1, bitflip
             // TODO: better modification methods
             // TODO: multi loc modification
+            // TODO: remove partial pointer access (memcpy(target, ptr, 8))
             switch (mod.size) {
                 case 1: {
                     uint8_t val = mod.target[0];
@@ -935,7 +981,6 @@ void snapshot_forkserver(CPUState *cpu) {
     snapshot_save();
     pid_t child_pid;
     // int   t_fd[2];
-    
     unsigned int dropped_rcu = 0;
     while (rcu_reader.depth > 0) {
         rcu_read_unlock();

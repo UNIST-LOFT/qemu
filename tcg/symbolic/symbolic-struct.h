@@ -230,8 +230,14 @@ typedef struct Query {
 } Query;
 
 extern Expr* pool;
+extern Expr* next_free_expr;
 #define GET_EXPR_IDX(e)  (((Expr*)e) - ((Expr*)pool))
 #define GET_QUERY_IDX(q) ((((Query*)q) - ((Query*)query_queue)) - 1)
+
+extern Query *query_queue;
+extern Query *next_query;
+
+extern uint64_t last_translation_block;
 
 static inline const char* opkind_to_str(uint8_t opkind)
 {
@@ -503,7 +509,7 @@ static inline size_t get_opkind_width(OPKIND opkind)
 }
 
 #define MAX_PRINT_CHECK (1024 * 1024)
-uint8_t            printed[MAX_PRINT_CHECK];
+extern uint8_t printed[MAX_PRINT_CHECK];
 static inline void print_expr_internal(Expr* expr, uint8_t reset)
 {
     if (reset)

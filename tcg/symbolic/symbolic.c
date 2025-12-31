@@ -27,6 +27,8 @@
 #define VISIT_LINEARIZATION     1
 #define VISIT_LINEARIZATION_TR  (1024 * 6)
 
+uint8_t printed[MAX_PRINT_CHECK];
+
 #define printf(...) fprintf(stderr, __VA_ARGS__)
 
 #define QUEUE_OP_MAX_SIZE 128
@@ -42,6 +44,8 @@ int                 symb_restore_pass                     = 0;
 ConditionalTempSync conditional_temp_syncs[TCG_MAX_TEMPS] = {0};
 uint64_t symbolic_start_code = 0;
 uint64_t symbolic_end_code = 0;
+
+uint64_t last_translation_block;
 
 // symbolic temps
 Expr* s_temps[TCG_MAX_TEMPS] = {0};
@@ -5994,7 +5998,7 @@ int        parse_translation_block(TranslationBlock* tb, uintptr_t tb_pc,
                 pc              = op->args[0];
                 
                 if (pc >= symbolic_start_code && pc < symbolic_end_code) {
-                    printf("[sympc] [pc %llx]\n", (long long unsigned int)pc);
+                    printf("[sympc] [pc %lx]\n", pc);
                     // if (pc == 0x401190) {
                     //     printf("[snapshot] [instrument]\n");
                     //     TCGTemp *t_cpu_env = new_non_conflicting_temp(TCG_TYPE_PTR);
