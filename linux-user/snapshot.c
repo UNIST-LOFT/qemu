@@ -32,10 +32,6 @@ static SnapshotState g_snapshot;
 static GTree *g_memtree = NULL;
 static GArray *pending_allocs = NULL;
 
-// TODO: memset shared memory if needed
-static Expr *next_free_expr_old;
-static Query *next_query_old;
-
 // TODO: add trace or coverage info
 typedef struct {
     uint32_t valid;
@@ -49,6 +45,8 @@ typedef struct {
     target_ulong fault_addr;
     uintptr_t host_fault_addr;
     uint64_t guest_last_translation_block;
+    Expr *next_free_expr;
+    Query *next_query;
     // uint32_t bt_depth;
     // uintptr_t bt[SNAPSHOT_BT_DEPTH];
     char description[SNAPSHOT_EXIT_DESC_LEN];
@@ -159,6 +157,8 @@ static void snapshot_exit_info_capture(SnapshotExitInfo *info, CPUArchState *env
     info->guest_pc = pc;
     info->guest_cs_base = cs_base;
     info->guest_last_translation_block = last_translation_block;
+    info->next_free_expr = next_free_expr;
+    info->next_query = next_query;
 }
 
 static void snapshot_exit_info_set_reason(SnapshotExitInfo *info, const char *reason) {
@@ -461,10 +461,6 @@ void snapshot_save(void) {
     
     g_snapshot.is_snapshot_taken = true;
     fprintf(stderr, "[snapshot] [result] [brk %llx] [mmap %llx] [pages %d]\n", (long long int)target_brk, (long long int)mmap_next_start, g_hash_table_size(g_snapshot.pages));
-
-    // Backup expr, query
-    next_free_expr_old = next_free_expr;
-    next_query_old = next_query;
 }
 
 void snapshot_write_access(SnapshotMemAccess *mem_access) {
@@ -833,6 +829,12 @@ static int analyze_collected_data(void) {
         g_read_access_pointers_original = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, NULL);
         g_read_access_tainted_primitives_all = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, NULL);
         g_read_access_pointers_all = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, NULL);
+        // TODO: analyze added queries
+        Query *query_top = exit_info->next_query;
+        for (Query *q = next_query; q < query_top; q++) {
+            fprintf(stderr, "[analyze] [query] [op %s] [addr %lx]\n", opkind_to_str(q->query->opkind), q->address);
+        }
+        
         // Create modification list
         for (int i = 0; i < shared_trace_data->prim_idx; i++) {
             PrimitiveAccess *prim = &shared_trace_data->primitives[i];
@@ -1159,13 +1161,24 @@ static int analyze_collected_data(void) {
     // Select one modification
     g_array_append_val(mod_manager->done, mod_manager->current);
     mod_manager->current = g_queue_pop_head(mod_manager->modifications);
-    // Finished: reset shared_trace_data
-    memset(shared_trace_data, 0, sizeof(SharedTraceData));
     // TODO: restore file offset if needed
     if (mod_manager->current == NULL) {
         fprintf(stderr, "[analyze] [done] consumed all modifications\n");
         return 1;
     }
+    // Clean expr and query added during child execution
+    uint8_t *expr_base = (uint8_t *)next_free_expr;
+    uint8_t *expr_top  = (uint8_t *)exit_info->next_free_expr;
+    if (expr_top > expr_base) {
+        memset(next_free_expr, 0, expr_top - expr_base);
+    }
+    uint8_t *query_base = (uint8_t *)next_query;
+    uint8_t *query_top  = (uint8_t *)exit_info->next_query;
+    if (query_top > query_base) {
+        memset(next_query, 0, query_top - query_base);
+    }
+    // Finished: reset shared_trace_data
+    memset(shared_trace_data, 0, sizeof(SharedTraceData));
     return 0;
 }
 
