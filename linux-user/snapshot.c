@@ -36,6 +36,7 @@ static GArray *pending_allocs = NULL;
 static Expr *next_free_expr_old;
 static Query *next_query_old;
 
+// TODO: add trace or coverage info
 typedef struct {
     uint32_t valid;
     uint32_t crashed;
@@ -99,6 +100,7 @@ static GHashTable *g_read_access_tainted_primitives_all = NULL;
 static GHashTable *g_read_access_pointers_all = NULL;
 
 static ModificationManager *mod_manager = NULL;
+static SnapshotExitInfo original_exit_info;
 
 OrderedMap *ordered_map_init(int max_size) {
     OrderedMap *map = g_new(OrderedMap, 1);
@@ -222,7 +224,7 @@ static void remove_read_access_primitive(uintptr_t addr) {
         OrderedMapEntry *moved_entry = ordered_map_lookup(g_read_access_tainted_primitives, dst->addr);
         if (moved_entry != NULL) {
             moved_entry->shared_index = idx_to_remove;
-            moved_entry->data = dst; // 데이터 포인터도 갱신
+            moved_entry->data = dst;
         }
         memset(src, 0, sizeof(PrimitiveAccess));
     } else if (idx_to_remove == last_idx) {
@@ -791,7 +793,8 @@ static void flip_bits(uint8_t *target, int size) {
 }
 
 // In parent process, called after child execution
-static void analyze_collected_data(void) {
+// Return 1: halt execution
+static int analyze_collected_data(void) {
     if (shared_trace_data == NULL) {
         fprintf(stderr, "Snapshot init error: shared_trace_data is null\n");
         exit(1);
@@ -800,7 +803,7 @@ static void analyze_collected_data(void) {
     SnapshotExitInfo *exit_info = snapshot_exit_info_ptr();
     if (!exit_info || !exit_info->valid) {
         fprintf(stderr, "[analyze] [exit-error] no exit info!!!\n");
-        return;
+        return 1;
     }
     bool is_crash = exit_info->crashed;
     if (is_crash) {
@@ -825,6 +828,7 @@ static void analyze_collected_data(void) {
         mod_manager->done = g_array_new(FALSE, FALSE, sizeof(GArray *));
         mod_manager->current = NULL;
         
+        memcpy(&original_exit_info, exit_info, sizeof(SnapshotExitInfo));
         g_read_access_tainted_primitives_original = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, NULL);
         g_read_access_pointers_original = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, NULL);
         g_read_access_tainted_primitives_all = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, NULL);
@@ -984,6 +988,11 @@ static void analyze_collected_data(void) {
         fprintf(stderr, "[analyze] [queue] [len %d]\n", g_queue_get_length(mod_manager->modifications));
     } else {
         // Collect only delta, give feedback
+        if (original_exit_info.crashed && exit_info->crashed) {
+            
+        } else if (original_exit_info.crashed && !exit_info->crashed) {
+            
+        }
         // Append modification list
         for (int i = 0; i < shared_trace_data->prim_idx; i++) {
             PrimitiveAccess *prim = &shared_trace_data->primitives[i];
@@ -1153,6 +1162,11 @@ static void analyze_collected_data(void) {
     // Finished: reset shared_trace_data
     memset(shared_trace_data, 0, sizeof(SharedTraceData));
     // TODO: restore file offset if needed
+    if (mod_manager->current == NULL) {
+        fprintf(stderr, "[analyze] [done] consumed all modifications\n");
+        return 1;
+    }
+    return 0;
 }
 
 void snapshot_forkserver(CPUState *cpu) {
@@ -1257,11 +1271,14 @@ void snapshot_forkserver(CPUState *cpu) {
     
         if (waitpid(child_pid, (int *)&status, 0) < 0) exit(6);
         
-        // Child process exit
-        analyze_collected_data();
-    
-        // Send exit status
+        // Send return code
         if (write(FORKSRV_FD + 1, &status, 4) != 4) exit(7);
+        
+        // Child process exit
+        int should_halt = analyze_collected_data();
+    
+        // Send halt signal
+        if (write(FORKSRV_FD + 1, &should_halt, 4) != 4) exit(8);
   
     }
 
