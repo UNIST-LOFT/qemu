@@ -102,6 +102,38 @@ static GHashTable *g_read_access_pointers_all = NULL;
 static ModificationManager *mod_manager = NULL;
 static SnapshotExitInfo original_exit_info;
 
+static int   use_trace = 2;
+static FILE* trace_file_fp;
+
+void trace_mem(const char* fmt, ...) {
+    if (use_trace == 2 && trace_file_fp == NULL) {
+        char* trace_file = getenv("BINRADAR_TRACE_FILE");
+        if (trace_file == NULL) {
+            use_trace = 1;
+        } else if (strcmp(trace_file, "none") == 0) {
+            use_trace = 0;
+        } else {
+            use_trace = 1;
+            trace_file_fp = fopen(trace_file, "a");
+            if (trace_file_fp == NULL) {
+                fprintf( stderr, "ERROR: cannot open trace file %s\n",
+                        trace_file);
+                exit(1);
+            }
+        }
+    }
+    if (!use_trace)
+        return;
+    va_list ap;
+    va_start(ap, fmt);
+    if (trace_file_fp) {
+        vfprintf(trace_file_fp, fmt, ap);
+    } else {
+        vfprintf( stderr, fmt, ap);
+    }
+    va_end(ap);
+}
+
 OrderedMap *ordered_map_init(int max_size) {
     OrderedMap *map = g_new(OrderedMap, 1);
     map->max_size = max_size;
@@ -232,7 +264,7 @@ static void remove_read_access_primitive(uintptr_t addr) {
     } else if (idx_to_remove == last_idx) {
         memset(&shared_trace_data->primitives[idx_to_remove], 0, sizeof(PrimitiveAccess));
     } else {
-        fprintf(stderr, "[rpi] ERROR! remove primtive failed! idx %d > last %d\n", idx_to_remove, last_idx);
+        trace_mem("[rpi] ERROR! remove primtive failed! idx %d > last %d\n", idx_to_remove, last_idx);
     }
     g_hash_table_remove(g_read_access_tainted_primitives->table, GUINT_TO_POINTER(addr));
 }
@@ -252,7 +284,7 @@ static void add_read_access_pointer(uintptr_t addr, uintptr_t target, uintptr_t 
         ptr = &shared_trace_data->pointers[entry->shared_index];
     }
     if (ptr == NULL) {
-        fprintf(stderr, "[rpo] ptr shared_index error!!! %d\n", entry->shared_index);
+        trace_mem("[rpo] ptr shared_index error!!! %d\n", entry->shared_index);
         exit(1);
     }
     ptr->addr = addr;
@@ -260,7 +292,7 @@ static void add_read_access_pointer(uintptr_t addr, uintptr_t target, uintptr_t 
     ptr->pc = pc;
     ptr->access_id = __atomic_fetch_add(&shared_trace_data->ptr_access_cnt, 1, __ATOMIC_RELAXED);
     entry->data = ptr;
-    fprintf(stderr, "[rpo] [addr %lx] [target %lx] [pc %lx] [index %d] [id %ld]\n", addr, target, pc, entry->shared_index, ptr->access_id);
+    trace_mem("[rpo] [addr %lx] [target %lx] [pc %lx] [index %d] [id %ld]\n", addr, target, pc, entry->shared_index, ptr->access_id);
 }
 
 static void add_read_access_primitive(uintptr_t addr, int size, uintptr_t pc) {
@@ -286,7 +318,7 @@ static void add_read_access_primitive(uintptr_t addr, int size, uintptr_t pc) {
         prim = &shared_trace_data->primitives[entry->shared_index];
     }
     if (prim == NULL) {
-        fprintf(stderr, "[rpo] prim shared_index error!!! %d\n", entry->shared_index);
+        trace_mem("[rpo] prim shared_index error!!! %d\n", entry->shared_index);
         exit(1);
     }
     prim->addr = addr;
@@ -294,12 +326,12 @@ static void add_read_access_primitive(uintptr_t addr, int size, uintptr_t pc) {
     prim->pc = pc;
     prim->access_id = __atomic_fetch_add(&shared_trace_data->prim_access_cnt, 1, __ATOMIC_RELAXED);
     entry->data = prim;
-    fprintf(stderr, "[rpi] [addr %lx] [size %d] [pc %lx] [index %d] [id %ld]\n", addr, size, pc, entry->shared_index, prim->access_id);
+    trace_mem("[rpi] [addr %lx] [size %d] [pc %lx] [index %d] [id %ld]\n", addr, size, pc, entry->shared_index, prim->access_id);
 }
 
 bool is_valid_address(target_ulong addr) {
     if (g_snapshot.pages == NULL) {
-        fprintf(stderr, "ERROR! No valid pages\n");
+        trace_mem("ERROR! No valid pages\n");
         return false;
     }
     target_ulong page = addr & SNAPSHOT_PAGE_MASK;
@@ -321,7 +353,7 @@ bool is_valid_address(target_ulong addr) {
 // static void access_pointer(target_ulong addr, target_ulong value, bool is_read) {
 //     GHashTable *pointer_access = get_pointer_access_table();
 //     if (is_read) {
-//         fprintf(stderr, "%lx\n", (uintptr_t)pointer_access);
+//         trace_mem("%lx\n", (uintptr_t)pointer_access);
 //     }
 // }
 
@@ -336,7 +368,7 @@ void snapshot_trace_pending_allocs(target_ulong size, target_ulong pc) {
     GArray *stack = get_pending_allocs();
     PendingAlloc alloc = {size, pc};
     g_array_append_val(stack, alloc);
-    fprintf(stderr, "temp alloc size %lx pc %lx\n", size, pc);
+    trace_mem("[alloc] [temp] [size %lx] [pc %lx]\n", size, pc);
 }
 
 PendingAlloc snapshot_trace_get_pending_allocs(target_ulong pc) {
@@ -393,16 +425,16 @@ void snapshot_trace_alloc(target_ulong base, target_ulong size, target_ulong pc)
     obj->pc = pc;
     GTree *memtree = get_memtree();
     g_tree_insert(memtree, obj, obj);
-    fprintf(stderr, "[alloc] [done] [base %lx] [size %lx] [pc %lx]\n", base, size, pc);
+    trace_mem("[alloc] [done] [base %lx] [size %lx] [pc %lx]\n", base, size, pc);
 }
 
 void snapshot_trace_free(target_ulong base, target_ulong pc) {
     GTree *memtree = get_memtree();
     SnapshotMemObject key = {base, 0, 0};
     if (!g_tree_remove(memtree, &key)) {
-        fprintf(stderr, "[free] [error] [base %lx] [pc %lx] not exist\n", base, pc);
+        trace_mem("[free] [error] [base %lx] [pc %lx] not exist\n", base, pc);
     } else {
-        fprintf(stderr, "[free] [done] [base %lx] [pc %lx]\n", base, pc);
+        trace_mem("[free] [done] [base %lx] [pc %lx]\n", base, pc);
     }
 }
 
@@ -442,7 +474,7 @@ static int walk_memory_cb(void *priv, target_ulong start, target_ulong end,
             target_ulong *key = g_malloc(sizeof(target_ulong));
             *key = addr;
             g_hash_table_insert(g_snapshot.pages, key, info);
-            fprintf(stderr, "[snapshot] [memwalk] [addr %lx] [perms %ld] [host %lx]\n", (uint64_t)addr, flags, (uint64_t)host_addr);
+            trace_mem("[snapshot] [memwalk] [addr %lx] [perms %ld] [host %lx]\n", (uint64_t)addr, flags, (uint64_t)host_addr);
         }
     }
     return 0;
@@ -451,10 +483,10 @@ static int walk_memory_cb(void *priv, target_ulong start, target_ulong end,
 void snapshot_save(void) {
     if (g_snapshot.pages == NULL) snapshot_init();
     if (g_snapshot.is_snapshot_taken) return;
-    fprintf(stderr, "[snapshot] [mem] [start]\n");
+    trace_mem("[snapshot] [mem] [start]\n");
     // CPU state
     // if (g_snapshot.cpu_state) {
-    //     fprintf(stderr, "[snapshot] [cpu] [at %lx] [size %ld]\n", (uintptr_t)cpu, sizeof(CPUArchState));
+    //     trace_mem("[snapshot] [cpu] [at %lx] [size %ld]\n", (uintptr_t)cpu, sizeof(CPUArchState));
     //     memcpy(g_snapshot.cpu_state, cpu, sizeof(CPUArchState));
     // }
     // Memory
@@ -464,7 +496,7 @@ void snapshot_save(void) {
     g_snapshot.start_mmap = mmap_next_start;
     
     g_snapshot.is_snapshot_taken = true;
-    fprintf(stderr, "[snapshot] [result] [brk %llx] [mmap %llx] [pages %d]\n", (long long int)target_brk, (long long int)mmap_next_start, g_hash_table_size(g_snapshot.pages));
+    trace_mem("[snapshot] [result] [brk %llx] [mmap %llx] [pages %d]\n", (long long int)target_brk, (long long int)mmap_next_start, g_hash_table_size(g_snapshot.pages));
 }
 
 void snapshot_write_access(SnapshotMemAccess *mem_access) {
@@ -480,7 +512,7 @@ void snapshot_write_access(SnapshotMemAccess *mem_access) {
     }
     // target_ulong start = addr & SNAPSHOT_PAGE_MASK;
     // target_ulong end = (addr + size - 1) & SNAPSHOT_PAGE_MASK;
-    fprintf(stderr, "[snapshot] [waccess] [mem] [addr %lx] [size %ld]\n", addr, size);
+    trace_mem("[snapshot] [waccess] [mem] [addr %lx] [size %ld]\n", addr, size);
 }
 
 void snapshot_read_access(SnapshotMemAccess *mem_access) {
@@ -505,7 +537,7 @@ void snapshot_read_access(SnapshotMemAccess *mem_access) {
             add_read_access_primitive(addr, size, mem_access->pc);
         }
     }
-    fprintf(stderr, "[snapshot] [raccess] [mem] [addr %lx] [size %ld]\n", addr, size);
+    trace_mem("[snapshot] [raccess] [mem] [addr %lx] [size %ld]\n", addr, size);
 }
 
 // Unused: replaced by fork server
@@ -513,7 +545,7 @@ void snapshot_read_access(SnapshotMemAccess *mem_access) {
 //     // CPU state
 //     restoring_to_snapshot = true;
 //     if (g_snapshot.cpu_state) {
-//         fprintf(stderr, "[snapshot] [restore-cpu]\n");
+//         trace_mem("[snapshot] [restore-cpu]\n");
 //         memcpy(cpu, g_snapshot.cpu_state, sizeof(CPUArchState));
 //     }
     
@@ -522,7 +554,7 @@ void snapshot_read_access(SnapshotMemAccess *mem_access) {
 //     while (g_snapshot.new_mappings != NULL) {
 //         SnapshotMapping *map = (SnapshotMapping *)g_snapshot.new_mappings->data;
 //         // Remove new mmap
-//         fprintf(stderr, "[snapshot] [restore] [munmap] [addr %lx]\n", map->start);
+//         trace_mem("[snapshot] [restore] [munmap] [addr %lx]\n", map->start);
 //         target_munmap(map->start, map->len);
 //         g_free(map);
 //         g_snapshot.new_mappings = g_list_delete_link(g_snapshot.new_mappings, g_snapshot.new_mappings);
@@ -532,13 +564,13 @@ void snapshot_read_access(SnapshotMemAccess *mem_access) {
 //     // The heap has shrunk - restore missing pages
 //     if (target_brk < g_snapshot.start_brk) {
 //         target_ulong aligned_new_brk = (target_brk + (SNAPSHOT_PAGE_SIZE - 1)) & (~(SNAPSHOT_PAGE_SIZE - 1));
-//         fprintf(stderr, "[snapshot] [restore] [brk-s] [snap %lx] [new %lx] [aligned %lx] [size %lx]\n", target_brk, g_snapshot.start_brk, aligned_new_brk, g_snapshot.start_brk - aligned_new_brk);
+//         trace_mem("[snapshot] [restore] [brk-s] [snap %lx] [new %lx] [aligned %lx] [size %lx]\n", target_brk, g_snapshot.start_brk, aligned_new_brk, g_snapshot.start_brk - aligned_new_brk);
 //         abi_long brk_ret = do_brk(g_snapshot.start_brk);
 //         if (brk_ret != g_snapshot.start_brk) {
-//             fprintf(stderr, "[snapshot] [restore] [brk-s-err] [grow-failed %lx]\n", brk_ret);
+//             trace_mem("[snapshot] [restore] [brk-s-err] [grow-failed %lx]\n", brk_ret);
 //         }
 //     } else if (target_brk > g_snapshot.start_brk) { // Remove new allocations
-//         fprintf(stderr, "[snapshot] [restore] [brk-l] [snap %lx] [new %lx]\n", target_brk, g_snapshot.start_brk);
+//         trace_mem("[snapshot] [restore] [brk-l] [snap %lx] [new %lx]\n", target_brk, g_snapshot.start_brk);
 //     }
 
 //     // 3. Dirty Page
@@ -556,18 +588,18 @@ void snapshot_read_access(SnapshotMemAccess *mem_access) {
             
 //             // mprotect(host_addr, SNAPSHOT_PAGE_SIZE, PROT_READ | PROT_WRITE); 
 //             memcpy(host_addr, info->data, SNAPSHOT_PAGE_SIZE);
-//             fprintf(stderr, "[snapshot] [restore] [dirty] [addr %lx]\n", (uintptr_t)addr);
+//             trace_mem("[snapshot] [restore] [dirty] [addr %lx]\n", (uintptr_t)addr);
 //         } else {
 //             // void *host_addr = g2h(addr);
 //             // memset(host_addr, 0, SNAPSHOT_PAGE_SIZE);
-//             fprintf(stderr, "[snapshot] [restore] [dirty-unknown] [addr %lx]\n", (uintptr_t)addr);
+//             trace_mem("[snapshot] [restore] [dirty-unknown] [addr %lx]\n", (uintptr_t)addr);
 //         }
 //     }
 
 //     g_hash_table_remove_all(tls->dirty_pages);
 //     for(int i=0; i<4; i++) tls->access_cache[i] = -1;
     
-//     fprintf(stderr, "[snapshot] [restore] [fin]\n");
+//     trace_mem("[snapshot] [restore] [fin]\n");
 //     fflush(stderr);
 // }
 
@@ -665,7 +697,7 @@ void snapshot_syscall(uintptr_t syscall_no, uintptr_t syscall_arg0,
     case TARGET_NR_brk: // heap adjustment
         // brk(new_brk_addr)
         // Handled in snapshot_restore
-        fprintf(stderr, "New brk %lx received.\n", syscall_arg0);
+        trace_mem("New brk %lx received.\n", syscall_arg0);
         break;
     // System call that changes heap shape:
     case TARGET_NR_mmap: // Memory map to file
@@ -710,20 +742,20 @@ void snapshot_add_mapping(target_ulong addr, target_ulong len) {
     map->start = addr;
     map->len = len;
     g_snapshot.new_mappings = g_list_prepend(g_snapshot.new_mappings, map);
-    fprintf(stderr, "[snapshot] [mmap] [add] [addr %lx] [len %ld]\n", addr, len);
+    trace_mem("[snapshot] [mmap] [add] [addr %lx] [len %ld]\n", addr, len);
 }
 
 void snapshot_remove_mapping(target_ulong addr, target_ulong len) {
     for (GList *l = g_snapshot.new_mappings; l != NULL; l = l->next) {
         SnapshotMapping *map = (SnapshotMapping *)l->data;
         g_free(map);
-        fprintf(stderr, "[snapshot] [munmap] [remove] [addr %lx]\n", addr);
+        trace_mem("[snapshot] [munmap] [remove] [addr %lx]\n", addr);
         return;
     }
 }
 
 void snapshot_fork_setup(void) {
-    fprintf(stderr, "[forkserver] [setup]\n");
+    trace_mem("[forkserver] [setup]\n");
 }
 
 // Modify guest program's state base on mod_manager (check analyze_collected_data)
@@ -736,14 +768,14 @@ static void snapshot_modify_memory(void) {
     // Select one from modifications
     GArray *mods = mod_manager->current;
     if (mods == NULL) {
-        fprintf(stderr, "ERROR: empty modification\n");
+        trace_mem("ERROR: empty modification\n");
         exit(1);
     }
     for (int i = 0; i < mods->len; i++) {
         SingleModification mod = g_array_index(mods, SingleModification, i);
         void *target_addr_h = g2h(mod.addr);
         memcpy(target_addr_h, mod.target, mod.size);
-        fprintf(stderr, "[mod] [addr %lx] [size %ld] [total %d]\n", mod.addr, mod.size, g_queue_get_length(mod_manager->modifications));
+        trace_mem("[mod] [addr %lx] [size %ld] [total %d]\n", mod.addr, mod.size, g_queue_get_length(mod_manager->modifications));
     }
 }
 
@@ -799,13 +831,13 @@ static void flip_bits(uint8_t *target, int size) {
 // Return 1: halt execution
 static int analyze_collected_data(void) {
     if (shared_trace_data == NULL) {
-        fprintf(stderr, "Snapshot init error: shared_trace_data is null\n");
+        trace_mem("Snapshot init error: shared_trace_data is null\n");
         exit(1);
     }
     // Analyze exit reason
     SnapshotExitInfo *exit_info = snapshot_exit_info_ptr();
     if (!exit_info || !exit_info->valid) {
-        fprintf(stderr, "[analyze] [exit-error] no exit info!!!\n");
+        trace_mem("[analyze] [exit-error] no exit info!!!\n");
         return 1;
     }
     bool is_crash = exit_info->crashed;
@@ -813,12 +845,12 @@ static int analyze_collected_data(void) {
         const char *host_name =
                     (exit_info->host_signal > 0) ? strsignal(exit_info->host_signal) : NULL;
         if (exit_info->target_signal == 0) {
-            fprintf(stderr, "[analyze] [host-crash] [exit %d] [addr %lx] [reason %s] [name %s] [last %lx] Host crashed!!!\n", exit_info->host_signal, exit_info->host_fault_addr, exit_info->description, host_name ? host_name : "unknown", exit_info->guest_last_translation_block);
+            trace_mem("[analyze] [host-crash] [exit %d] [addr %lx] [reason %s] [name %s] [last %lx] Host crashed!!!\n", exit_info->host_signal, exit_info->host_fault_addr, exit_info->description, host_name ? host_name : "unknown", exit_info->guest_last_translation_block);
             exit(1);
         }
-        fprintf(stderr, "[analyze] [crash] [exit %d] [target %d] [host %d] [name %s] [fault-addr %lx] [guest-pc %lx] [guest-cs %lx] [si-code %d] [last %lx]\n", exit_info->exit_code, exit_info->target_signal, exit_info->host_signal, host_name ? host_name : "unknown", exit_info->fault_addr, exit_info->guest_pc, exit_info->guest_cs_base, exit_info->si_code, exit_info->guest_last_translation_block);
+        trace_mem("[analyze] [crash] [exit %d] [target %d] [host %d] [name %s] [fault-addr %lx] [guest-pc %lx] [guest-cs %lx] [si-code %d] [last %lx]\n", exit_info->exit_code, exit_info->target_signal, exit_info->host_signal, host_name ? host_name : "unknown", exit_info->fault_addr, exit_info->guest_pc, exit_info->guest_cs_base, exit_info->si_code, exit_info->guest_last_translation_block);
     } else {
-        fprintf(stderr, "[analyze] [normal] [exit %d] [guest-pc %lx] [guest-cs %lx] [reason %s] [last %lx]\n", exit_info->exit_code, exit_info->guest_pc, exit_info->guest_cs_base, exit_info->description, exit_info->guest_last_translation_block);
+        trace_mem("[analyze] [normal] [exit %d] [guest-pc %lx] [guest-cs %lx] [reason %s] [last %lx]\n", exit_info->exit_code, exit_info->guest_pc, exit_info->guest_cs_base, exit_info->description, exit_info->guest_last_translation_block);
     }
     // Analyze shared_trace_data
     // Sort by access_id
@@ -839,7 +871,7 @@ static int analyze_collected_data(void) {
         // TODO: analyze added queries
         Query *query_top = exit_info->next_query;
         for (Query *q = next_query; q < query_top; q++) {
-            fprintf(stderr, "[analyze] [query] [op %s] [addr %lx]\n", opkind_to_str(q->query->opkind), q->address);
+            trace_mem("[analyze] [query] [op %s] [addr %lx]\n", opkind_to_str(q->query->opkind), q->address);
         }
         
         // Create modification list
@@ -849,7 +881,7 @@ static int analyze_collected_data(void) {
             memcpy(prim_data, prim, sizeof(PrimitiveAccess));
             g_hash_table_insert(g_read_access_tainted_primitives_original, GUINT_TO_POINTER(prim_data->addr), prim_data);
             g_hash_table_insert(g_read_access_tainted_primitives_all, GUINT_TO_POINTER(prim_data->addr), prim_data);
-            fprintf(stderr, "[analyze] [primitive] [index %d] [addr %lx] [size %d] [id %ld]\n", i, prim->addr, prim->size, prim->access_id);
+            trace_mem("[analyze] [primitive] [index %d] [addr %lx] [size %d] [id %ld]\n", i, prim->addr, prim->size, prim->access_id);
             SingleModification mod = {
                 .addr = prim->addr,
                 .size = prim->size,
@@ -970,7 +1002,7 @@ static int analyze_collected_data(void) {
             memcpy(ptr_data, ptr, sizeof(PointerAccess));
             g_hash_table_insert(g_read_access_pointers_original, GUINT_TO_POINTER(ptr_data->addr), ptr_data);
             g_hash_table_insert(g_read_access_pointers_all, GUINT_TO_POINTER(ptr_data->addr), ptr_data);
-            fprintf(stderr, "[analyze] [pointer] [index %d] [addr %lx] [target %lx] [id %ld]\n", i, ptr->addr, ptr->target, ptr->access_id);
+            trace_mem("[analyze] [pointer] [index %d] [addr %lx] [target %lx] [id %ld]\n", i, ptr->addr, ptr->target, ptr->access_id);
             SingleModification mod = {
                 .addr = ptr->addr,
                 .size = sizeof(target_ulong),
@@ -994,7 +1026,7 @@ static int analyze_collected_data(void) {
                 // TODO: allocate new page with mmap, cache it and reuse it
             }
         }
-        fprintf(stderr, "[analyze] [queue] [len %d]\n", g_queue_get_length(mod_manager->modifications));
+        trace_mem("[analyze] [queue] [len %d]\n", g_queue_get_length(mod_manager->modifications));
     } else {
         // Collect only delta, give feedback
         if (original_exit_info.crashed && exit_info->crashed) {
@@ -1013,7 +1045,7 @@ static int analyze_collected_data(void) {
                 PrimitiveAccess *prim_data = g_new(PrimitiveAccess, 1);
                 memcpy(prim_data, prim, sizeof(PrimitiveAccess));
                 g_hash_table_insert(g_read_access_tainted_primitives_all, GUINT_TO_POINTER(prim_data->addr), prim_data);
-                fprintf(stderr, "[analyze] [new-primitive] [index %d] [addr %lx] [size %d] [id %ld]\n", i, prim->addr, prim->size, prim->access_id);
+                trace_mem("[analyze] [new-primitive] [index %d] [addr %lx] [size %d] [id %ld]\n", i, prim->addr, prim->size, prim->access_id);
                 SingleModification mod = {
                     .addr = prim->addr,
                     .size = prim->size,
@@ -1139,7 +1171,7 @@ static int analyze_collected_data(void) {
                 PointerAccess *ptr_data = g_new(PointerAccess, 1);
                 memcpy(ptr_data, ptr, sizeof(PointerAccess));
                 g_hash_table_insert(g_read_access_pointers_all, GUINT_TO_POINTER(ptr_data->addr), ptr_data);
-                fprintf(stderr, "[analyze] [new-pointer] [index %d] [addr %lx] [target %lx] [id %ld]\n", i, ptr->addr, ptr->target, ptr->access_id);
+                trace_mem("[analyze] [new-pointer] [index %d] [addr %lx] [target %lx] [id %ld]\n", i, ptr->addr, ptr->target, ptr->access_id);
                 SingleModification mod = {
                     .addr = ptr->addr,
                     .size = sizeof(target_ulong),
@@ -1170,7 +1202,7 @@ static int analyze_collected_data(void) {
     mod_manager->current = g_queue_pop_head(mod_manager->modifications);
     // TODO: restore file offset if needed
     if (mod_manager->current == NULL) {
-        fprintf(stderr, "[analyze] [done] consumed all modifications\n");
+        trace_mem("[analyze] [done] consumed all modifications\n");
         return 1;
     }
     // Clean expr and query added during child execution
@@ -1190,7 +1222,7 @@ static int analyze_collected_data(void) {
 }
 
 void snapshot_forkserver(CPUState *cpu) {
-    fprintf(stderr, "[snapshot] [forkserver] [called %d]\n", forkserver_installed);
+    trace_mem("[snapshot] [forkserver] [called %d]\n", forkserver_installed);
     if (forkserver_installed) return;
     forkserver_installed = true;
     snapshot_save();
@@ -1212,30 +1244,30 @@ void snapshot_forkserver(CPUState *cpu) {
        to talk, assume that we're not running in forkserver mode. */
   
     if (write(FORKSRV_FD + 1, msg, 4) != 4) {
-        fprintf(stderr, "[snapshot] [forkserver] [error] failed to write to %d %d\n", FORKSRV_FD + 1, status);
+        trace_mem("[snapshot] [forkserver] [error] failed to write to %d %d\n", FORKSRV_FD + 1, status);
         _exit(1);
     }
   
     afl_forksrv_pid = getpid();
   
     if (read(FORKSRV_FD, reply, 4) != 4) {
-        fprintf(stderr, "[snapshot] [forkserver] [error] fuzzolic not responding to %d\n", FORKSRV_FD); 
+        trace_mem("[snapshot] [forkserver] [error] fuzzolic not responding to %d\n", FORKSRV_FD); 
         _exit(1);
     }
     if (tmp != status2) {
-        fprintf(stderr, "wrong forkserver message from fuzzolic.py");
+        trace_mem("wrong forkserver message from fuzzolic.py");
         _exit(1);
     }
 
     // send welcome message as final message
     if (write(FORKSRV_FD + 1, msg, 4) != 4) { 
-        fprintf(stderr, "[snapshot] [forkserver] [error] failed to send final handshake to %d %d\n", FORKSRV_FD + 1, status);
+        trace_mem("[snapshot] [forkserver] [error] failed to send final handshake to %d %d\n", FORKSRV_FD + 1, status);
         _exit(1);
     }
   
   
     // END forkserver handshake
-    fprintf(stderr, "[forkserver] [start]\n");
+    trace_mem("[forkserver] [start]\n");
   
     /* All right, let's await orders... */
   
@@ -1244,7 +1276,7 @@ void snapshot_forkserver(CPUState *cpu) {
         /* Whoops, parent dead? */
     
         if (read(FORKSRV_FD, &was_killed, 4) != 4) {
-            fprintf(stderr, "[forkserver] [error] parent (fuzzolic) dead?\n");
+            trace_mem("[forkserver] [error] parent (fuzzolic) dead?\n");
             exit(2);
         }
     

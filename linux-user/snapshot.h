@@ -9,6 +9,9 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdarg.h>
+
+void trace_mem(const char* fmt, ...);
 
 extern bool restoring_to_snapshot;
 extern target_ulong binradar_entrypoint;
