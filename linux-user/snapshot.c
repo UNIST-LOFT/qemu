@@ -67,12 +67,14 @@ typedef struct {
 typedef struct {
     int size;
     uintptr_t addr;
+    uintptr_t pc;
     uint64_t access_id;
 } PrimitiveAccess;
 
 typedef struct {
     uintptr_t addr;
     uintptr_t target;
+    uintptr_t pc;
     uint64_t access_id;
 } PointerAccess;
 
@@ -235,7 +237,7 @@ static void remove_read_access_primitive(uintptr_t addr) {
     g_hash_table_remove(g_read_access_tainted_primitives->table, GUINT_TO_POINTER(addr));
 }
 
-static void add_read_access_pointer(uintptr_t addr, uintptr_t target) {
+static void add_read_access_pointer(uintptr_t addr, uintptr_t target, uintptr_t pc) {
     if (shared_trace_data == NULL) return;
     if (g_read_access_pointers == NULL) g_read_access_pointers = ordered_map_init(MAX_POINTER_ACCESS);
     OrderedMapEntry *entry = ordered_map_insert(g_read_access_pointers, addr, NULL);
@@ -255,12 +257,13 @@ static void add_read_access_pointer(uintptr_t addr, uintptr_t target) {
     }
     ptr->addr = addr;
     ptr->target = target;
+    ptr->pc = pc;
     ptr->access_id = __atomic_fetch_add(&shared_trace_data->ptr_access_cnt, 1, __ATOMIC_RELAXED);
     entry->data = ptr;
-    fprintf(stderr, "[rpo] [addr %lx] [target %lx] [index %d] [id %ld]\n", addr, target, entry->shared_index, ptr->access_id);
+    fprintf(stderr, "[rpo] [addr %lx] [target %lx] [pc %lx] [index %d] [id %ld]\n", addr, target, pc, entry->shared_index, ptr->access_id);
 }
 
-static void add_read_access_primitive(uintptr_t addr, int size) {
+static void add_read_access_primitive(uintptr_t addr, int size, uintptr_t pc) {
     if (shared_trace_data == NULL) return;
     if (g_read_access_pointers) {
         uintptr_t aligned_addr = addr & ~(uintptr_t)0x07;
@@ -288,9 +291,10 @@ static void add_read_access_primitive(uintptr_t addr, int size) {
     }
     prim->addr = addr;
     prim->size = size;
+    prim->pc = pc;
     prim->access_id = __atomic_fetch_add(&shared_trace_data->prim_access_cnt, 1, __ATOMIC_RELAXED);
     entry->data = prim;
-    fprintf(stderr, "[rpi] [addr %lx] [size %d] [index %d] [id %ld]\n", addr, size, entry->shared_index, prim->access_id);
+    fprintf(stderr, "[rpi] [addr %lx] [size %d] [pc %lx] [index %d] [id %ld]\n", addr, size, pc, entry->shared_index, prim->access_id);
 }
 
 bool is_valid_address(target_ulong addr) {
@@ -491,14 +495,14 @@ void snapshot_read_access(SnapshotMemAccess *mem_access) {
         memcpy(&target, mem_access->target, sizeof(target_ulong));
         if (is_valid_address(target)) {
             // Add to pointer
-            add_read_access_pointer(addr, target);
+            add_read_access_pointer(addr, target, mem_access->pc);
             is_value_pointer = true;
         }
     }
     if (!is_value_pointer) {
         if (mem_access->symbolic_value) {
             // Tainted value
-            add_read_access_primitive(addr, size);
+            add_read_access_primitive(addr, size, mem_access->pc);
         }
     }
     fprintf(stderr, "[snapshot] [raccess] [mem] [addr %lx] [size %ld]\n", addr, size);
@@ -583,6 +587,7 @@ void snapshot_syscall(uintptr_t syscall_no, uintptr_t syscall_arg0,
                 .symbolic_addr = false,
                 .symbolic_value = false,
                 .addr = syscall_arg1,
+                .pc = 0,
                 .target = {0},
                 .ptr = NULL,
                 .size = ret_val
@@ -601,6 +606,7 @@ void snapshot_syscall(uintptr_t syscall_no, uintptr_t syscall_arg0,
                 .symbolic_addr = false,
                 .symbolic_value = false,
                 .addr = syscall_arg1,
+                .pc = 0,
                 .target = {0},
                 .ptr = NULL,
                 .size = ret_val
@@ -644,6 +650,7 @@ void snapshot_syscall(uintptr_t syscall_no, uintptr_t syscall_arg0,
             .symbolic_addr = false,
             .symbolic_value = false,
             .addr = syscall_arg0,
+            .pc = 0,
             .target = {0},
             .ptr = NULL,
             .size = syscall_arg1

@@ -63,6 +63,7 @@ typedef struct {
     bool symbolic_addr;
     bool symbolic_value;
     uintptr_t addr;
+    uintptr_t pc;
     uint8_t target[8];
     uint8_t *ptr;
     uintptr_t size;
