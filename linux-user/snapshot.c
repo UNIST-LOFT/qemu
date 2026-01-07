@@ -102,11 +102,11 @@ static GHashTable *g_read_access_pointers_all = NULL;
 static ModificationManager *mod_manager = NULL;
 static SnapshotExitInfo original_exit_info;
 
-static int   use_trace = 2;
+static int   use_trace = -1;
 static FILE* trace_file_fp;
 
 void trace_mem(const char* fmt, ...) {
-    if (use_trace == 2 && trace_file_fp == NULL) {
+    if (use_trace == -1 && trace_file_fp == NULL) {
         char* trace_file = getenv("BINRADAR_TRACE_FILE");
         if (trace_file == NULL) {
             use_trace = 1;
@@ -391,15 +391,15 @@ gint compare_regions(gconstpointer a, gconstpointer b, gpointer user_data);
 gint search_region(gconstpointer key, gconstpointer user_data);
 
 gint compare_regions(gconstpointer a, gconstpointer b, gpointer user_data) {
-    const SnapshotMemObject *ra = (const SnapshotMemObject *)a;
-    const SnapshotMemObject *rb = (const SnapshotMemObject *)b;
+    const SnapshotMemRegion *ra = (const SnapshotMemRegion *)a;
+    const SnapshotMemRegion *rb = (const SnapshotMemRegion *)b;
     if (ra->base < rb->base) return -1;
     if (ra->base > rb->base) return 1;
     return 0;
 }
 
 gint search_region(gconstpointer key, gconstpointer user_data) {
-    const SnapshotMemObject *region = (const SnapshotMemObject *)key;
+    const SnapshotMemRegion *region = (const SnapshotMemRegion *)key;
     const target_ulong addr = *(const target_ulong *)user_data;
     if (addr < region->base) return 1;
     if (addr >= region->base + region->size) return -1;
@@ -419,7 +419,9 @@ static GTree *get_memtree(void) {
 }
 
 void snapshot_trace_alloc(target_ulong base, target_ulong size, target_ulong pc) {
-    SnapshotMemObject *obj = g_new(SnapshotMemObject, 1);
+    SnapshotMemRegion *obj = g_new(SnapshotMemRegion, 1);
+    obj->is_heap = true;
+    obj->is_stack = false;
     obj->base = base;
     obj->size = size;
     obj->pc = pc;
@@ -430,7 +432,7 @@ void snapshot_trace_alloc(target_ulong base, target_ulong size, target_ulong pc)
 
 void snapshot_trace_free(target_ulong base, target_ulong pc) {
     GTree *memtree = get_memtree();
-    SnapshotMemObject key = {base, 0, 0};
+    SnapshotMemRegion key = {base, 0, 0};
     if (!g_tree_remove(memtree, &key)) {
         trace_mem("[free] [error] [base %lx] [pc %lx] not exist\n", base, pc);
     } else {

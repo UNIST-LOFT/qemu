@@ -543,7 +543,7 @@ void symbolic_clear_mem(uintptr_t addr, uintptr_t size)
     }
 }
 
-static inline void qemu_memmove(uintptr_t src, uintptr_t dst, uintptr_t size)
+static inline void qemu_memmove(CPUArchState *cpu_env, uintptr_t src, uintptr_t dst, uintptr_t size)
 {
     size_t overflow_n_bytes = 0;
     // printf("A overflow_n_bytes: %lu\n", overflow_n_bytes);
@@ -557,7 +557,7 @@ static inline void qemu_memmove(uintptr_t src, uintptr_t dst, uintptr_t size)
         assert(overflow_n_bytes < size);
         size -= overflow_n_bytes;
         assert(size);
-        qemu_memmove(src + size, dst + size, overflow_n_bytes);
+        qemu_memmove(cpu_env, src + size, dst + size, overflow_n_bytes);
     }
     overflow_n_bytes = 0;
     Expr** dst_exprs =
@@ -570,7 +570,7 @@ static inline void qemu_memmove(uintptr_t src, uintptr_t dst, uintptr_t size)
         assert(overflow_n_bytes < size);
         size -= overflow_n_bytes;
         assert(size);
-        qemu_memmove(src + size, dst + size, overflow_n_bytes);
+        qemu_memmove(cpu_env, src + size, dst + size, overflow_n_bytes);
     }
 
     // printf("Memmove from=%lx to=%lx size=%lu\n", src, dst, size);
@@ -588,6 +588,12 @@ static inline void qemu_memmove(uintptr_t src, uintptr_t dst, uintptr_t size)
             memcpy(mem_access.target, addr_h, size);
         }
     }
+    static char buf[4096];
+    size_t len = 0;
+    for (int i = 0; i < CPU_NB_REGS; i++) {
+        len += snprintf(buf + len, 4096 - len, "[r%d %lx] ", i, cpu_env->regs[i]);
+    }
+    printf("[memmoveh] [addr %lx] [size %lx] %s\n", src, size, buf);
     snapshot_read_access(&mem_access);
     // Add snapshot_write_access to dst if needed
 
@@ -1481,7 +1487,7 @@ static void qemu_fxsave(CPUX86State* env, uintptr_t ptr)
 
     addr = ptr + XO(legacy.xmm_regs);
     for (i = 0; i < nb_xmm_regs; i++) {
-        qemu_memmove((uintptr_t)&(env->xmm_regs[i]), addr, XMM_BYTES);
+        qemu_memmove(env, (uintptr_t)&(env->xmm_regs[i]), addr, XMM_BYTES);
         addr += XMM_BYTES;
     }
 }
@@ -1499,7 +1505,7 @@ static void qemu_fxrstor(CPUX86State* env, uintptr_t ptr)
 
     addr = ptr + XO(legacy.xmm_regs);
     for (i = 0; i < nb_xmm_regs; i++) {
-        qemu_memmove(addr, (uintptr_t)&(env->xmm_regs[i]), XMM_BYTES);
+        qemu_memmove(env, addr, (uintptr_t)&(env->xmm_regs[i]), XMM_BYTES);
         addr += XMM_BYTES;
     }
 }

@@ -52,10 +52,12 @@ typedef struct {
 } SnapshotState;
 
 typedef struct {
+    bool         is_heap;
+    bool         is_stack; // else: global
     target_ulong base;
     target_ulong size;
     target_ulong pc;
-} SnapshotMemObject;
+} SnapshotMemRegion;
 
 typedef struct {
     target_ulong size;

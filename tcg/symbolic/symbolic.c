@@ -2912,7 +2912,7 @@ static void add_consistency_check_load(Expr* e, uintptr_t addr, size_t size)
 }
 #endif
 
-static inline void qemu_load_helper(uintptr_t orig_addr,
+static inline void qemu_load_helper(CPUArchState *env, uintptr_t orig_addr,
                                     uintptr_t mem_op_offset, uintptr_t addr_idx,
                                     uintptr_t val_idx)
 {
@@ -2922,7 +2922,12 @@ static inline void qemu_load_helper(uintptr_t orig_addr,
     // number of bytes to load
     size_t    size = get_mem_op_size(mem_op);
     uintptr_t addr = orig_addr + offset;
-    printf("[loadh] [addr %lx] [orig %lx] [offset %lx]\n", addr, orig_addr, offset);
+    static char buf[4096];
+    size_t len = 0;
+    for (int i = 0; i < CPU_NB_REGS; i++) {
+        len += snprintf(buf + len, 4096 - len, "[r%d %lx] ", i, env->regs[i]);
+    }
+    printf("[loadh] [addr %lx] [orig %lx] [offset %lx] [size %lx] %s\n", addr, orig_addr, offset, size, buf);
     
 #if 0
     if (GET_QUERY_IDX(next_query) >= 116753 && GET_QUERY_IDX(next_query) <= 116773) {
@@ -3603,7 +3608,8 @@ static inline void qemu_multi_page_store(l2_page_t* l2_page, uintptr_t l2_page_i
 static uint16_t store_bitmap[MEMORY_BITMAP_SIZE] = { 0 };
 #endif
 
-static inline void qemu_store_helper(uintptr_t orig_addr,
+static inline void qemu_store_helper(CPUArchState *env, 
+                                     uintptr_t orig_addr,
                                      uintptr_t mem_op_offset,
                                      uintptr_t addr_idx, 
                                      uintptr_t val_idx, 
@@ -3614,7 +3620,12 @@ static inline void qemu_store_helper(uintptr_t orig_addr,
 
     size_t    size = get_mem_op_size(mem_op);
     uintptr_t addr = orig_addr + offset;
-    printf("[storeh] [addr %lx] [orig %lx] [offset %lx]\n", addr, orig_addr, offset);
+    static char buf[4096];
+    size_t len = 0;
+    for (int i = 0; i < CPU_NB_REGS; i++) {
+        len += snprintf(buf + len, 4096 - len, "[r%d %lx] ", i, env->regs[i]);
+    }
+    printf("[storeh] [addr %lx] [orig %lx] [offset %lx] [size %lx] %s\n", addr, orig_addr, offset, size, buf);
     
     if (size <= 8) {
         SnapshotMemAccess mem_access = {
@@ -6302,14 +6313,17 @@ int        parse_translation_block(TranslationBlock* tb, uintptr_t tb_pc,
                         MARK_TEMP_AS_ALLOCATED(t_env);
                         tcg_binop(t_dst, t_dst, t_env, 0, 0, 0, ADD, op, NULL,
                                   tcg_ctx);
+                        TCGTemp *t_cpu_env = new_non_conflicting_temp(TCG_TYPE_PTR);
+                        tcg_movi(t_cpu_env, (uintptr_t)cpu_env, 0, op, NULL, tcg_ctx);
                         MARK_TEMP_AS_NOT_ALLOCATED(t_env);
 
                         MARK_TEMP_AS_ALLOCATED(t_src);
-                        add_void_call_3(qemu_memmove, t_src, t_dst, t_size, op,
+                        add_void_call_4(qemu_memmove, t_cpu_env, t_src, t_dst, t_size, op,
                                         NULL, tcg_ctx);
                         MARK_TEMP_AS_NOT_ALLOCATED(t_src);
                         tcg_temp_free_internal(t_dst);
                         tcg_temp_free_internal(t_size);
+                        tcg_temp_free_internal(t_cpu_env);
 
                     } else {
                         TCGTemp* t_val = arg_temp(op->args[0]);
@@ -6334,14 +6348,17 @@ int        parse_translation_block(TranslationBlock* tb, uintptr_t tb_pc,
                             new_non_conflicting_temp(TCG_TYPE_PTR);
                         tcg_movi(t_val_idx, (uintptr_t)temp_idx(t_val), 0, op,
                                  NULL, tcg_ctx);
+                        TCGTemp *t_cpu_env = new_non_conflicting_temp(TCG_TYPE_PTR);
+                        tcg_movi(t_cpu_env, (uintptr_t)cpu_env, 0, op, NULL, tcg_ctx);
                         MARK_TEMP_AS_ALLOCATED(t_ptr);
-                        add_void_call_4(qemu_load_helper, t_ptr, t_mem_op,
+                        add_void_call_5(qemu_load_helper, t_cpu_env, t_ptr, t_mem_op,
                                         t_ptr_idx, t_val_idx, op, NULL,
                                         tcg_ctx);
                         MARK_TEMP_AS_NOT_ALLOCATED(t_ptr);
                         tcg_temp_free_internal(t_mem_op);
                         tcg_temp_free_internal(t_ptr_idx);
                         tcg_temp_free_internal(t_val_idx);
+                        tcg_temp_free_internal(t_cpu_env);
 #endif
                         // jump table finder
                         if (jump_table_finder_curr_instr.displacement > 0 &&
@@ -6397,11 +6414,14 @@ int        parse_translation_block(TranslationBlock* tb, uintptr_t tb_pc,
                         MARK_TEMP_AS_NOT_ALLOCATED(t_env);
 
                         MARK_TEMP_AS_ALLOCATED(t_dst);
-                        add_void_call_3(qemu_memmove, t_src, t_dst, t_size, op,
+                        TCGTemp *t_cpu_env = new_non_conflicting_temp(TCG_TYPE_PTR);
+                        tcg_movi(t_cpu_env, (uintptr_t)cpu_env, 0, op, NULL, tcg_ctx);
+                        add_void_call_4(qemu_memmove, t_cpu_env, t_src, t_dst, t_size, op,
                                         NULL, tcg_ctx);
                         MARK_TEMP_AS_NOT_ALLOCATED(t_dst);
                         tcg_temp_free_internal(t_src);
                         tcg_temp_free_internal(t_size);
+                        tcg_temp_free_internal(t_cpu_env);
 
                     } else {
                         TCGTemp* t_val = arg_temp(op->args[0]);
@@ -6425,9 +6445,11 @@ int        parse_translation_block(TranslationBlock* tb, uintptr_t tb_pc,
                             new_non_conflicting_temp(TCG_TYPE_PTR);
                         tcg_movi(t_val_idx, (uintptr_t)temp_idx(t_val), 0, op,
                                  NULL, tcg_ctx);
+                        TCGTemp *t_cpu_env = new_non_conflicting_temp(TCG_TYPE_PTR);
+                        tcg_movi(t_cpu_env, (uintptr_t)cpu_env, 0, op, NULL, tcg_ctx);
                         MARK_TEMP_AS_ALLOCATED(t_ptr);
                         MARK_TEMP_AS_ALLOCATED(t_val);
-                        add_void_call_5(qemu_store_helper, t_ptr, t_mem_op,
+                        add_void_call_6(qemu_store_helper, t_cpu_env, t_ptr, t_mem_op,
                                         t_ptr_idx, t_val_idx, t_val,
                                         op, NULL, tcg_ctx);
                         MARK_TEMP_AS_NOT_ALLOCATED(t_val);
@@ -6435,6 +6457,7 @@ int        parse_translation_block(TranslationBlock* tb, uintptr_t tb_pc,
                         tcg_temp_free_internal(t_mem_op);
                         tcg_temp_free_internal(t_ptr_idx);
                         tcg_temp_free_internal(t_val_idx);
+                        tcg_temp_free_internal(t_cpu_env);
 #endif
                     }
                 }
@@ -6480,12 +6503,15 @@ int        parse_translation_block(TranslationBlock* tb, uintptr_t tb_pc,
                             MARK_TEMP_AS_NOT_ALLOCATED(t_env);
 
                             MARK_TEMP_AS_ALLOCATED(t_src);
-                            add_void_call_3(qemu_memmove, t_src, t_dst, t_size,
+                            TCGTemp *t_cpu_env = new_non_conflicting_temp(TCG_TYPE_PTR);
+                            tcg_movi(t_cpu_env, (uintptr_t)cpu_env, 0, op, NULL, tcg_ctx);
+                            add_void_call_4(qemu_memmove, t_cpu_env, t_src, t_dst, t_size,
                                             op, NULL, tcg_ctx);
                             MARK_TEMP_AS_NOT_ALLOCATED(t_src);
                             tcg_temp_free_internal(t_dst);
                             tcg_temp_free_internal(t_src);
                             tcg_temp_free_internal(t_size);
+                            tcg_temp_free_internal(t_cpu_env);
 
                         } else if (op->opc == INDEX_op_ld_i64 ||
                                    op->opc == INDEX_op_ld32u_i64) {
@@ -6513,13 +6539,16 @@ int        parse_translation_block(TranslationBlock* tb, uintptr_t tb_pc,
                                 new_non_conflicting_temp(TCG_TYPE_PTR);
                             tcg_movi(t_val_idx, (uintptr_t)temp_idx(t_val), 0,
                                      op, NULL, tcg_ctx);
-                            add_void_call_4(qemu_load_helper, t_ptr, t_mem_op,
+                            TCGTemp *t_cpu_env = new_non_conflicting_temp(TCG_TYPE_PTR);
+                            tcg_movi(t_cpu_env, (uintptr_t)cpu_env, 0, op, NULL, tcg_ctx);
+                            add_void_call_5(qemu_load_helper, t_cpu_env, t_ptr, t_mem_op,
                                             t_ptr_idx, t_val_idx, op, NULL,
                                             tcg_ctx);
                             MARK_TEMP_AS_NOT_ALLOCATED(t_ptr);
                             tcg_temp_free_internal(t_mem_op);
                             tcg_temp_free_internal(t_ptr_idx);
                             tcg_temp_free_internal(t_val_idx);
+                            tcg_temp_free_internal(t_cpu_env);
 
                         } else if (op->opc == INDEX_op_ld32s_i64) {
                             printf("load from xmm data (offset=%lu) at %lx\n",
@@ -8204,7 +8233,7 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
         } else if (model == MEMMOVE || model == MEMCPY) {
             // printf("[0x%lx] %s(%p, %p, %lu)\n", model_caller_addr, model == MEMMOVE ? "memmove" : "memcpy", (char *)(uintptr_t)env->regs[R_EDI], (char*)(uintptr_t)env->regs[R_ESI], (uintptr_t)env->regs[R_EDX]);
             // FixMe: memmove may overlap!
-            qemu_memmove((uintptr_t)env->regs[R_ESI], (uintptr_t)env->regs[R_EDI], (uintptr_t)env->regs[R_EDX]);
+            qemu_memmove(env, (uintptr_t)env->regs[R_ESI], (uintptr_t)env->regs[R_EDI], (uintptr_t)env->regs[R_EDX]);
             mode = 2;
             clear_call_args_temps();
             clear_xmm_regs(env);
@@ -8219,7 +8248,7 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
             // printf("[0x%lx] strcpy(%p, %p)\n", model_caller_addr, (char *)(uintptr_t)env->regs[R_EDI], (char*)(uintptr_t)env->regs[R_ESI]);
             uintptr_t len = strlen((char*)(uintptr_t)env->regs[R_ESI]);
             mode = model_strlen(env, model_caller_addr, 0);
-            qemu_memmove((uintptr_t)env->regs[R_ESI], (uintptr_t)env->regs[R_EDI], len + 1);
+            qemu_memmove(env, (uintptr_t)env->regs[R_ESI], (uintptr_t)env->regs[R_EDI], len + 1);
             clear_call_args_temps();
             clear_xmm_regs(env);
         } else if (model == STRNCPY) {
@@ -8228,7 +8257,7 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
             mode = model_strlen(env, model_caller_addr, n);
             uintptr_t len = strnlen((char*)(uintptr_t)env->regs[R_ESI], n);
             if (len < n) len += 1;
-            qemu_memmove((uintptr_t)env->regs[R_ESI], (uintptr_t)env->regs[R_EDI], len);
+            qemu_memmove(env, (uintptr_t)env->regs[R_ESI], (uintptr_t)env->regs[R_EDI], len);
             clear_call_args_temps();
             clear_xmm_regs(env);
         }  else if (model == FPUTC) {
