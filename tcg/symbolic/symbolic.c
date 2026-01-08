@@ -1325,13 +1325,32 @@ typedef struct {
 
 static CallStack callstack = {.depth = 0};
 
+static inline target_ulong cpu_get_current_sp(void)
+{
+    if (thread_cpu == NULL || thread_cpu->env_ptr == NULL) {
+        return 0;
+    }
+    /* x86/x64 specific: get stack pointer from CPUArchState */
+    CPUArchState *env = thread_cpu->env_ptr;
+#ifdef TARGET_I386
+    return env->regs[R_ESP];
+#elif defined(TARGET_X86_64)
+    return env->regs[R_RSP];
+#else
+    return 0;
+#endif
+}
+
 void helper_instrument_call(target_ulong pc)
 {
-    // printf("CALL from %lx\n", (uintptr_t) pc);
-    pc = (pc >> 4) ^ (pc << 8);
-    pc &= BRANCH_BITMAP_SIZE - 1;
-    callstack.entries[callstack.depth].address = pc;
-    callstack.hash ^= pc;
+    /* Record call with estimated stack frame size */
+    snapshot_trace_stack_push(cpu_get_current_sp(), pc);
+
+    /* Original callstack hashing for coverage */
+    target_ulong hash_pc = (pc >> 4) ^ (pc << 8);
+    hash_pc &= BRANCH_BITMAP_SIZE - 1;
+    callstack.entries[callstack.depth].address = hash_pc;
+    callstack.hash ^= hash_pc;
     callstack.depth += 1;
     if (callstack.depth >= CALLSTACK_MAX_SIZE) {
         tcg_abort();
@@ -1340,30 +1359,28 @@ void helper_instrument_call(target_ulong pc)
 
 void helper_instrument_ret(target_ulong pc)
 {
-    // printf("RET to %lx\n", (uintptr_t) pc);
+    /* Pop stack frame from tracker */
+    snapshot_trace_stack_pop(cpu_get_current_sp());
 
     intptr_t initial_depth          = callstack.depth;
     uint16_t initial_callstack_hash = callstack.hash;
 
-    pc = (pc >> 4) ^ (pc << 8);
-    pc &= BRANCH_BITMAP_SIZE - 1;
+    target_ulong hash_pc = (pc >> 4) ^ (pc << 8);
+    hash_pc &= BRANCH_BITMAP_SIZE - 1;
 
     callstack.depth -= 1;
     while (callstack.depth >= 0 &&
-           callstack.entries[callstack.depth].address != pc) {
+           callstack.entries[callstack.depth].address != hash_pc) {
 
         callstack.hash ^= callstack.entries[callstack.depth].address;
         callstack.depth -= 1;
-        // printf("Skipping RET address\n");
     }
 
     if (callstack.depth >= 0) {
-        callstack.hash ^= pc;
-        // printf("Found RET address\n");
-    } else { // not found
+        callstack.hash ^= hash_pc;
+    } else { /* not found */
         callstack.depth = initial_depth;
         callstack.hash  = initial_callstack_hash;
-        // printf("RET address not found. Restoring\n");
     }
 }
 
@@ -2922,12 +2939,22 @@ static inline void qemu_load_helper(CPUArchState *env, uintptr_t orig_addr,
     // number of bytes to load
     size_t    size = get_mem_op_size(mem_op);
     uintptr_t addr = orig_addr + offset;
+
     static char buf[4096];
-    size_t len = 0;
-    for (int i = 0; i < CPU_NB_REGS; i++) {
-        len += snprintf(buf + len, 4096 - len, "[r%d %lx] ", i, env->regs[i]);
+
+    SnapshotMemRegion *mr = snapshot_mem_region_search(addr);
+    
+    if (mr) {
+        size_t len = 0;
+        for (int i = 0; i < CPU_NB_REGS; i++) {
+            len += snprintf(buf + len, 4096 - len, "[r%d %lx] ", i, env->regs[i]);
+        }
+        trace_mem("[loadh] [addr %lx] [orig %lx] [offset %lx] [size %lx] %s\n", addr, orig_addr, offset, size, buf);
+    } else {
+        trace_mem("[loadh-error] [addr %lx] [size %lx] failed to detect memory region\n", addr, size);
     }
-    trace_mem("[loadh] [addr %lx] [orig %lx] [offset %lx] [size %lx] %s\n", addr, orig_addr, offset, size, buf);
+    
+
     
 #if 0
     if (GET_QUERY_IDX(next_query) >= 116753 && GET_QUERY_IDX(next_query) <= 116773) {
@@ -3621,11 +3648,18 @@ static inline void qemu_store_helper(CPUArchState *env,
     size_t    size = get_mem_op_size(mem_op);
     uintptr_t addr = orig_addr + offset;
     static char buf[4096];
-    size_t len = 0;
-    for (int i = 0; i < CPU_NB_REGS; i++) {
-        len += snprintf(buf + len, 4096 - len, "[r%d %lx] ", i, env->regs[i]);
+
+    SnapshotMemRegion *mr = snapshot_mem_region_search(addr);
+    
+    if (mr) {
+        size_t len = 0;
+        for (int i = 0; i < CPU_NB_REGS; i++) {
+            len += snprintf(buf + len, 4096 - len, "[r%d %lx] ", i, env->regs[i]);
+        }
+        trace_mem("[storeh] [addr %lx] [orig %lx] [offset %lx] [size %lx] %s\n", addr, orig_addr, offset, size, buf);
+    } else {
+        trace_mem("[storeh-error] [addr %lx] [size %lx] failed to detect memory region\n", addr, size);
     }
-    trace_mem("[storeh] [addr %lx] [orig %lx] [offset %lx] [size %lx] %s\n", addr, orig_addr, offset, size, buf);
     
     if (size <= 8) {
         SnapshotMemAccess mem_access = {

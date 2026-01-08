@@ -31,15 +31,17 @@ unsigned int  afl_forksrv_pid;
 static SnapshotState g_snapshot;
 
 #define SNAPSHOT_MEM_REG_CACHE 4
+#define SNAPSHOT_STACK_LAZY_WINDOW (SNAPSHOT_PAGE_SIZE * 16)
 typedef struct {
     // Determine region by address
     SnapshotMemRegion stack_region;
     SnapshotMemRegion global_region; // else: heap
     // Cache
-    int stack_cache_index;
+    // Don't use stack cache for now
+    // int stack_cache_index;
     int heap_cache_index;
     int global_cache_index;
-    SnapshotMemRegion* stack_cache[SNAPSHOT_MEM_REG_CACHE];
+    // SnapshotMemRegion* stack_cache[SNAPSHOT_MEM_REG_CACHE];
     SnapshotMemRegion* heap_cache[SNAPSHOT_MEM_REG_CACHE];
     SnapshotMemRegion* global_cache[SNAPSHOT_MEM_REG_CACHE];
     // Data
@@ -423,6 +425,25 @@ static gint compare_regions_ptr(gconstpointer a, gconstpointer b) {
 }
 
 static int check_addr_in_region(SnapshotMemRegion *mr, target_ulong addr) {
+    if (mr->is_stack) {
+        // If frame size not known, accept addresses just below
+        // the current stack top as belonging to this frame.
+        if (mr->size != 0) {
+            if (addr > mr->base) {
+                return 1;
+            } else if (addr < mr->base && addr + mr->size > mr->base) {
+                return 0;
+            }
+            return -1;
+        }
+        if (mr->base > addr) {
+            if (mr->base - addr < SNAPSHOT_STACK_LAZY_WINDOW) {
+                return 0;
+            }
+            return -1;
+        }
+        return 1;
+    }
     if (mr->base + mr->size < addr) return -1;
     if (mr->base > addr) return 1;
     return 0;
@@ -442,7 +463,7 @@ static void init_mr_manager(void) {
 static int mr_manager_search_cache(SnapshotMemRegion **mr_cache, target_ulong addr) {
     for (int i = 0; i < SNAPSHOT_MEM_REG_CACHE; i++) {
         SnapshotMemRegion *mr = mr_cache[i];
-        if (check_addr_in_region(mr, addr) == 0) {
+        if (mr != NULL && check_addr_in_region(mr, addr) == 0) {
             return i;
         }
     }
@@ -477,6 +498,23 @@ static SnapshotMemRegion *mr_manager_get_cache(SnapshotMemRegion **mr_cache, int
 }
 
 static void mr_manager_update_region(SnapshotMemRegion *old_mr, SnapshotMemRegion *new_mr) {
+    if (new_mr->is_stack) {
+        // For stack, just update size
+        if (old_mr->base == 0) {
+            *old_mr = *new_mr;
+            old_mr->size += SNAPSHOT_STACK_LAZY_WINDOW;
+            trace_mem("[stack] [lazy init] [base %lx] [size %lx]\n", old_mr->base, old_mr->size);
+            return;
+        }
+        if (old_mr->base > new_mr->base) {
+            if (old_mr->size < (new_mr->base - old_mr->base + SNAPSHOT_STACK_LAZY_WINDOW)) {
+                old_mr->size = (new_mr->base - old_mr->base + SNAPSHOT_STACK_LAZY_WINDOW);
+                trace_mem("[stack] [lazy update] [base %lx] [size %lx]\n", old_mr->base, old_mr->size);
+            }
+        }
+        return;
+    }
+    
     if (old_mr->size == 0) {
         *old_mr = *new_mr;
         return;
@@ -551,15 +589,17 @@ void snapshot_trace_free(target_ulong base, target_ulong pc) {
 }
 
 static SnapshotMemRegion *mr_manager_stack_search(target_ulong addr) {
-    int query_result = mr_manager_search_cache(mr_manager.stack_cache, addr);
-    SnapshotMemRegion *mr = mr_manager_get_cache(mr_manager.stack_cache, query_result);
-    if (mr != NULL) {
-        return mr;
-    }
-    
+    // int query_result = mr_manager_search_cache(mr_manager.stack_cache, addr);
+    // SnapshotMemRegion *mr = mr_manager_get_cache(mr_manager.stack_cache, query_result);
+    // if (mr != NULL) {
+    //     return mr;
+    // }
+    trace_mem("[mr] [stack] [search] [addr %lx]\n", addr);
+    SnapshotMemRegion *mr = NULL;
     GArray *stack = mr_manager.stack_data;
     for (ssize_t i = stack->len - 1; i >= 0; i--) {
         SnapshotMemRegion* tmp = g_array_index(stack, SnapshotMemRegion *, i);
+        if (tmp == NULL) continue;
         if (check_addr_in_region(tmp, addr) == 0) {
             mr = tmp;
             break;
@@ -567,35 +607,53 @@ static SnapshotMemRegion *mr_manager_stack_search(target_ulong addr) {
     }
     if (mr != NULL) {
         // Update cache
-        int new_cache_index = mr_manager_new_cache_index(mr_manager.stack_cache_index);
-        mr_manager_update_cache(mr_manager.stack_cache, mr, new_cache_index);
-        mr_manager.stack_cache_index = new_cache_index;
+        // int new_cache_index = mr_manager_new_cache_index(mr_manager.stack_cache_index);
+        // mr_manager_update_cache(mr_manager.stack_cache, mr, new_cache_index);
+        // mr_manager.stack_cache_index = new_cache_index;
         return mr;
     }
     trace_mem("[mr] [stack] [error] failed to search region for [addr %lx]\n", addr);
     return NULL;
 }
 
-void snapshot_trace_stack_push(target_ulong sp, target_ulong frame_size,
-                         target_ulong pc) {
+void snapshot_trace_stack_push(target_ulong sp, target_ulong pc) {
+    /* Fix size of the previous frame lazily using the new stack top */
+    trace_mem("[stack] [ipush] [sp %lx] [pc %lx]\n", sp, pc);
+    if (mr_manager.stack_data->len > 0) {
+        SnapshotMemRegion *prev = g_array_index(mr_manager.stack_data, SnapshotMemRegion *, mr_manager.stack_data->len - 1);
+        if (prev == NULL) {
+            trace_mem("[stack] [push-error] previous frame is NULL!\n");
+            return;
+        }
+        if (sp >= prev->base) {
+            // Zero or negative size stack frame - should not happen
+            trace_mem("[stack] [push-error] [sp %lx] previous frame size update failed! [base %lx] [size %lx]\n",
+                      sp, prev->base, prev->size);
+            return;
+        }
+    }
+
     SnapshotMemRegion *mr = g_new(SnapshotMemRegion, 1);
     mr->is_heap = false;
     mr->is_stack = true;
     mr->base = sp;
-    mr->size = frame_size;
+    mr->size = 0;
     mr->pc = pc;
     g_array_append_val(mr_manager.stack_data, mr);
     mr_manager_update_region(&mr_manager.stack_region, mr);
-    trace_mem("[stack] [push] [sp %lx] [size %lx] [pc %lx] [depth %d]\n", sp, frame_size, pc, mr_manager.stack_data->len);
+    trace_mem("[stack] [push] [sp %lx] [size %lx] [pc %lx] [depth %d] [sr-base %lx] [sr-size %lx]\n", sp, mr->size, pc, mr_manager.stack_data->len, mr_manager.stack_region.base, mr_manager.stack_region.size);
 }
 
 void snapshot_trace_stack_pop(target_ulong sp) {
+    trace_mem("[stack] [ipop] [sp %lx]\n", sp);
     GArray *stack = mr_manager.stack_data;
     for (ssize_t i = stack->len - 1; i >= 0; i--) {
         SnapshotMemRegion *mr = g_array_index(stack, SnapshotMemRegion *, i);
-        if (mr->base == sp) {
+        if (mr == NULL) continue;
+        if (check_addr_in_region(mr, sp) == 0) {
             g_array_remove_index(stack, i);
-            trace_mem("[stack] [pop] [sp %lx] [pc %lx] [depth %d]\n", sp, mr->pc, stack->len);
+            trace_mem("[stack] [pop] [sp %lx] [base %lx] [pc %lx] [depth %d]\n",
+                      sp, mr->base, mr->pc, stack->len);
             return;
         }
     }
@@ -620,6 +678,7 @@ void snapshot_trace_global_add(target_ulong base, target_ulong size, target_ulon
 }
 
 static SnapshotMemRegion *mr_manager_global_search(target_ulong addr) {
+    trace_mem("[mr] [global] [search] [addr %lx]\n", addr);
 
     int query_result = mr_manager_search_cache(mr_manager.global_cache, addr);
     SnapshotMemRegion *mr = mr_manager_get_cache(mr_manager.global_cache, query_result);
@@ -662,10 +721,13 @@ static SnapshotMemRegion *mr_manager_global_search(target_ulong addr) {
 SnapshotMemRegion *snapshot_mem_region_search(target_ulong addr) {
     // Determine region by address
     if (check_addr_in_region(&mr_manager.stack_region, addr) == 0) {
+        trace_mem("[mr] [search] [stack] [addr %lx]\n", addr);
         return mr_manager_stack_search(addr);
     } else if (check_addr_in_region(&mr_manager.global_region, addr) == 0) {
+        trace_mem("[mr] [search] [global] [addr %lx]\n", addr);
         return mr_manager_global_search(addr);
     } else {
+        trace_mem("[mr] [search] [heap] [addr %lx]\n", addr);
         return mr_manager_heap_search(addr);
     }
 }
@@ -676,7 +738,9 @@ bool snapshot_is_taken(void) {
 }
 
 void snapshot_init(void) {
+    memset(&mr_manager, 0, sizeof(SnapshotMemRegionManager));
     init_mr_manager();
+    memset(&g_snapshot, 0, sizeof(SnapshotState));
     g_snapshot.pages = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, g_free);
     g_snapshot.is_snapshot_taken = false;
     // g_snapshot.cpu_state = malloc(sizeof(CPUArchState));

@@ -20,6 +20,7 @@
 #include "qemu.h"
 #include "signal-common.h"
 #include "linux-user/trace.h"
+#include "../snapshot.h"
 
 /* from the Linux kernel - /arch/x86/include/uapi/asm/sigcontext.h */
 
@@ -320,6 +321,8 @@ void setup_frame(int sig, struct target_sigaction *ka,
     frame_addr = get_sigframe(ka, env, sizeof(*frame));
     trace_user_setup_frame(env, frame_addr);
 
+    snapshot_trace_stack_push(frame_addr, env->eip);
+
     if (!lock_user_struct(VERIFY_WRITE, frame, frame_addr, 0))
         goto give_sigsegv;
 
@@ -382,6 +385,8 @@ void setup_rt_frame(int sig, struct target_sigaction *ka,
 
     frame_addr = get_sigframe(ka, env, sizeof(*frame));
     trace_user_setup_rt_frame(env, frame_addr);
+
+    snapshot_trace_stack_push(frame_addr, env->eip);
 
     if (!lock_user_struct(VERIFY_WRITE, frame, frame_addr, 0))
         goto give_sigsegv;
@@ -541,6 +546,7 @@ long do_sigreturn(CPUX86State *env)
     trace_user_do_sigreturn(env, frame_addr);
     if (!lock_user_struct(VERIFY_READ, frame, frame_addr, 1))
         goto badframe;
+    snapshot_trace_stack_pop(env->regs[R_ESP]);
     /* set blocked signals */
     __get_user(target_set.sig[0], &frame->sc.oldmask);
     for(i = 1; i < TARGET_NSIG_WORDS; i++) {
@@ -573,6 +579,7 @@ long do_rt_sigreturn(CPUX86State *env)
     trace_user_do_rt_sigreturn(env, frame_addr);
     if (!lock_user_struct(VERIFY_READ, frame, frame_addr, 1))
         goto badframe;
+    snapshot_trace_stack_pop(env->regs[R_ESP]);
     target_to_host_sigset(&set, &frame->uc.tuc_sigmask);
     set_sigmask(&set);
 

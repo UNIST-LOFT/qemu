@@ -2,7 +2,7 @@
 #define SYMBOLIC_INSTRUMENTATION_H
 
 #define SYMBOLIC_INSTRUMENTATION
-#define SYMBOLIC_CALLSTACK_INSTRUMENTATION 0
+#define SYMBOLIC_CALLSTACK_INSTRUMENTATION 1
 
 extern uint64_t  symbolic_start_code;
 extern uint64_t  symbolic_end_code;

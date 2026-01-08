@@ -54,6 +54,8 @@ typedef struct {
 typedef struct {
     bool         is_heap;
     bool         is_stack; // else: global
+    // For stack: base is the top of the stack frame
+    // For heap/global: base is the lowest address
     target_ulong base;
     target_ulong size;
     target_ulong pc;
@@ -119,7 +121,7 @@ void snapshot_trace_pending_allocs(target_ulong size, target_ulong pc);
 PendingAlloc snapshot_trace_get_pending_allocs(target_ulong pc);
 void snapshot_trace_alloc(target_ulong base, target_ulong size, target_ulong pc);
 void snapshot_trace_free(target_ulong base, target_ulong pc);
-void snapshot_trace_stack_push(target_ulong sp, target_ulong frame_size, target_ulong pc);
+void snapshot_trace_stack_push(target_ulong sp, target_ulong pc);
 void snapshot_trace_stack_pop(target_ulong sp);
 void snapshot_trace_global_add(target_ulong base, target_ulong size, target_ulong pc, const char *name);
 SnapshotMemRegion *snapshot_mem_region_search(target_ulong addr);
