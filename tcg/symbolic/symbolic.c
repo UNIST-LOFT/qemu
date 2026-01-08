@@ -2927,7 +2927,7 @@ static inline void qemu_load_helper(CPUArchState *env, uintptr_t orig_addr,
     for (int i = 0; i < CPU_NB_REGS; i++) {
         len += snprintf(buf + len, 4096 - len, "[r%d %lx] ", i, env->regs[i]);
     }
-    printf("[loadh] [addr %lx] [orig %lx] [offset %lx] [size %lx] %s\n", addr, orig_addr, offset, size, buf);
+    trace_mem("[loadh] [addr %lx] [orig %lx] [offset %lx] [size %lx] %s\n", addr, orig_addr, offset, size, buf);
     
 #if 0
     if (GET_QUERY_IDX(next_query) >= 116753 && GET_QUERY_IDX(next_query) <= 116773) {
@@ -3625,7 +3625,7 @@ static inline void qemu_store_helper(CPUArchState *env,
     for (int i = 0; i < CPU_NB_REGS; i++) {
         len += snprintf(buf + len, 4096 - len, "[r%d %lx] ", i, env->regs[i]);
     }
-    printf("[storeh] [addr %lx] [orig %lx] [offset %lx] [size %lx] %s\n", addr, orig_addr, offset, size, buf);
+    trace_mem("[storeh] [addr %lx] [orig %lx] [offset %lx] [size %lx] %s\n", addr, orig_addr, offset, size, buf);
     
     if (size <= 8) {
         SnapshotMemAccess mem_access = {

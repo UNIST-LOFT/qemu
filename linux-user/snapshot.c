@@ -29,7 +29,26 @@ unsigned char afl_fork_child;
 unsigned int  afl_forksrv_pid;
 
 static SnapshotState g_snapshot;
-static GTree *g_memtree = NULL;
+
+#define SNAPSHOT_MEM_REG_CACHE 4
+typedef struct {
+    // Determine region by address
+    SnapshotMemRegion stack_region;
+    SnapshotMemRegion global_region; // else: heap
+    // Cache
+    int stack_cache_index;
+    int heap_cache_index;
+    int global_cache_index;
+    SnapshotMemRegion* stack_cache[SNAPSHOT_MEM_REG_CACHE];
+    SnapshotMemRegion* heap_cache[SNAPSHOT_MEM_REG_CACHE];
+    SnapshotMemRegion* global_cache[SNAPSHOT_MEM_REG_CACHE];
+    // Data
+    GArray *stack_data;
+    GTree *heap_data;
+    GArray *global_data;
+} SnapshotMemRegionManager;
+
+static SnapshotMemRegionManager mr_manager;
 static GArray *pending_allocs = NULL;
 
 // TODO: add trace or coverage info
@@ -387,10 +406,7 @@ PendingAlloc snapshot_trace_get_pending_allocs(target_ulong pc) {
     return result;
 }
 
-gint compare_regions(gconstpointer a, gconstpointer b, gpointer user_data);
-gint search_region(gconstpointer key, gconstpointer user_data);
-
-gint compare_regions(gconstpointer a, gconstpointer b, gpointer user_data) {
+static gint compare_regions(gconstpointer a, gconstpointer b, gpointer user_data) {
     const SnapshotMemRegion *ra = (const SnapshotMemRegion *)a;
     const SnapshotMemRegion *rb = (const SnapshotMemRegion *)b;
     if (ra->base < rb->base) return -1;
@@ -398,24 +414,122 @@ gint compare_regions(gconstpointer a, gconstpointer b, gpointer user_data) {
     return 0;
 }
 
-gint search_region(gconstpointer key, gconstpointer user_data) {
-    const SnapshotMemRegion *region = (const SnapshotMemRegion *)key;
-    const target_ulong addr = *(const target_ulong *)user_data;
+static gint compare_regions_ptr(gconstpointer a, gconstpointer b) {
+    const SnapshotMemRegion *ra = *(const SnapshotMemRegion **)a;
+    const SnapshotMemRegion *rb = *(const SnapshotMemRegion **)b;
+    if (ra->base < rb->base) return -1;
+    if (ra->base > rb->base) return 1;
+    return 0;
+}
+
+static int check_addr_in_region(SnapshotMemRegion *mr, target_ulong addr) {
+    if (mr->base + mr->size < addr) return -1;
+    if (mr->base > addr) return 1;
+    return 0;
+}
+
+static void init_mr_manager(void) {
+    mr_manager.stack_data = g_array_new(FALSE, FALSE, sizeof(SnapshotMemRegion *));
+    mr_manager.heap_data = g_tree_new_full(
+        (GCompareDataFunc)compare_regions,
+        NULL,
+        g_free,
+        NULL
+    );
+    mr_manager.global_data = g_array_new(FALSE, FALSE, sizeof(SnapshotMemRegion *));
+}
+
+static int mr_manager_search_cache(SnapshotMemRegion **mr_cache, target_ulong addr) {
+    for (int i = 0; i < SNAPSHOT_MEM_REG_CACHE; i++) {
+        SnapshotMemRegion *mr = mr_cache[i];
+        if (check_addr_in_region(mr, addr) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static int mr_manager_new_cache_index(int prev) {
+    return (prev + 1) % SNAPSHOT_MEM_REG_CACHE;
+}
+
+static int mr_manager_search_cache_exact(SnapshotMemRegion **mr_cache, SnapshotMemRegion *query) {
+    for (int i = 0; i < SNAPSHOT_MEM_REG_CACHE; i++) {
+        SnapshotMemRegion *mr = mr_cache[i];
+        if (compare_regions(mr, query, NULL) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void mr_manager_update_cache(SnapshotMemRegion **mr_cache, SnapshotMemRegion *target, int index) {
+    if (index >= 0 && index < SNAPSHOT_MEM_REG_CACHE && mr_cache != NULL) {
+        mr_cache[index] = target;
+    }
+}
+
+static SnapshotMemRegion *mr_manager_get_cache(SnapshotMemRegion **mr_cache, int index) {
+    if (index >= 0 && index < SNAPSHOT_MEM_REG_CACHE && mr_cache != NULL) {
+        return mr_cache[index];
+    }
+    return NULL;
+}
+
+static void mr_manager_update_region(SnapshotMemRegion *old_mr, SnapshotMemRegion *new_mr) {
+    if (old_mr->size == 0) {
+        *old_mr = *new_mr;
+        return;
+    }
+    // Update base, size
+    if (old_mr->base > new_mr->base) {
+        old_mr->size += (old_mr->base - new_mr->base);
+        old_mr->base = new_mr->base;
+    } else if (old_mr->base + old_mr->size < new_mr->base + new_mr->size) {
+        old_mr->size = (new_mr->base + new_mr->size) - old_mr->base;
+    }
+}
+
+static void mr_manager_heap_insert(SnapshotMemRegion *mr) {
+    g_tree_insert(mr_manager.heap_data, mr, mr);
+}
+
+static void mr_manager_heap_remove(SnapshotMemRegion *query) {
+    // Remove from cache
+    int query_result = mr_manager_search_cache_exact(mr_manager.heap_cache, query);
+    mr_manager_update_cache(mr_manager.heap_cache, NULL, query_result);
+    // Remove from heap_data
+    if (!g_tree_remove(mr_manager.heap_data, query)) {
+        trace_mem("[free] [error] [base %lx] [pc %lx] not exist\n", query->base, query->pc);
+    } else {
+        trace_mem("[free] [done] [base %lx] [pc %lx]\n", query->base, query->pc);
+    }
+}
+
+static gint search_region(gconstpointer a, gconstpointer b) {
+    const SnapshotMemRegion *region = (const SnapshotMemRegion *)a;
+    const target_ulong addr = *(const target_ulong *)b;
     if (addr < region->base) return 1;
     if (addr >= region->base + region->size) return -1;
     return 0;
 }
 
-static GTree *get_memtree(void) {
-    if (g_memtree == NULL) {
-        g_memtree = g_tree_new_full(
-            (GCompareDataFunc)compare_regions,
-            NULL,
-            g_free,
-            NULL
-        );
+static SnapshotMemRegion *mr_manager_heap_search(target_ulong addr) {
+    int query_result = mr_manager_search_cache(mr_manager.heap_cache, addr);
+    SnapshotMemRegion *mr = mr_manager_get_cache(mr_manager.heap_cache, query_result);
+    // Cache miss
+    if (mr == NULL) {
+        mr = g_tree_search(mr_manager.heap_data, (GCompareFunc)search_region, &addr);
     }
-    return g_memtree;
+    if (mr == NULL) {
+        trace_mem("[mr] [heap] [error] failed to search region for [addr %lx]\n", addr);
+        return NULL;
+    }
+    // Update cache
+    int new_cache_index = mr_manager_new_cache_index(mr_manager.heap_cache_index);
+    mr_manager_update_cache(mr_manager.heap_cache, mr, new_cache_index);
+    mr_manager.heap_cache_index = new_cache_index;
+    return mr;
 }
 
 void snapshot_trace_alloc(target_ulong base, target_ulong size, target_ulong pc) {
@@ -425,18 +539,134 @@ void snapshot_trace_alloc(target_ulong base, target_ulong size, target_ulong pc)
     obj->base = base;
     obj->size = size;
     obj->pc = pc;
-    GTree *memtree = get_memtree();
-    g_tree_insert(memtree, obj, obj);
+    mr_manager_heap_insert(obj);
     trace_mem("[alloc] [done] [base %lx] [size %lx] [pc %lx]\n", base, size, pc);
 }
 
 void snapshot_trace_free(target_ulong base, target_ulong pc) {
-    GTree *memtree = get_memtree();
-    SnapshotMemRegion key = {base, 0, 0};
-    if (!g_tree_remove(memtree, &key)) {
-        trace_mem("[free] [error] [base %lx] [pc %lx] not exist\n", base, pc);
+    SnapshotMemRegion query;
+    query.base = base;
+    query.pc = pc;
+    mr_manager_heap_remove(&query);
+}
+
+static SnapshotMemRegion *mr_manager_stack_search(target_ulong addr) {
+    int query_result = mr_manager_search_cache(mr_manager.stack_cache, addr);
+    SnapshotMemRegion *mr = mr_manager_get_cache(mr_manager.stack_cache, query_result);
+    if (mr != NULL) {
+        return mr;
+    }
+    
+    GArray *stack = mr_manager.stack_data;
+    for (ssize_t i = stack->len - 1; i >= 0; i--) {
+        SnapshotMemRegion* tmp = g_array_index(stack, SnapshotMemRegion *, i);
+        if (check_addr_in_region(tmp, addr) == 0) {
+            mr = tmp;
+            break;
+        }
+    }
+    if (mr != NULL) {
+        // Update cache
+        int new_cache_index = mr_manager_new_cache_index(mr_manager.stack_cache_index);
+        mr_manager_update_cache(mr_manager.stack_cache, mr, new_cache_index);
+        mr_manager.stack_cache_index = new_cache_index;
+        return mr;
+    }
+    trace_mem("[mr] [stack] [error] failed to search region for [addr %lx]\n", addr);
+    return NULL;
+}
+
+void snapshot_trace_stack_push(target_ulong sp, target_ulong frame_size,
+                         target_ulong pc) {
+    SnapshotMemRegion *mr = g_new(SnapshotMemRegion, 1);
+    mr->is_heap = false;
+    mr->is_stack = true;
+    mr->base = sp;
+    mr->size = frame_size;
+    mr->pc = pc;
+    g_array_append_val(mr_manager.stack_data, mr);
+    mr_manager_update_region(&mr_manager.stack_region, mr);
+    trace_mem("[stack] [push] [sp %lx] [size %lx] [pc %lx] [depth %d]\n", sp, frame_size, pc, mr_manager.stack_data->len);
+}
+
+void snapshot_trace_stack_pop(target_ulong sp) {
+    GArray *stack = mr_manager.stack_data;
+    for (ssize_t i = stack->len - 1; i >= 0; i--) {
+        SnapshotMemRegion *mr = g_array_index(stack, SnapshotMemRegion *, i);
+        if (mr->base == sp) {
+            g_array_remove_index(stack, i);
+            trace_mem("[stack] [pop] [sp %lx] [pc %lx] [depth %d]\n", sp, mr->pc, stack->len);
+            return;
+        }
+    }
+    trace_mem("[stack] [pop] [sp %lx] [depth %d] not found!\n", sp, stack->len);
+}
+
+void snapshot_trace_global_add(target_ulong base, target_ulong size, target_ulong pc, const char *name) {
+    SnapshotMemRegion *mr = g_new(SnapshotMemRegion, 1);
+    mr->is_heap = false;
+    mr->is_stack = false;
+    mr->base = base;
+    mr->size = size;
+    mr->pc = pc;
+
+    g_array_append_val(mr_manager.global_data, mr);
+    
+    g_array_sort(mr_manager.global_data, (GCompareFunc)compare_regions_ptr);
+    
+    mr_manager_update_region(&mr_manager.global_region, mr);
+    trace_mem("[global] [add] [base %lx] [size %lx] [name %s] [pc %lx]\n", 
+              base, size, name ? name : "unknown", pc);
+}
+
+static SnapshotMemRegion *mr_manager_global_search(target_ulong addr) {
+
+    int query_result = mr_manager_search_cache(mr_manager.global_cache, addr);
+    SnapshotMemRegion *mr = mr_manager_get_cache(mr_manager.global_cache, query_result);
+    if (mr != NULL) {
+        return mr;
+    }
+
+    GArray *globals = mr_manager.global_data;
+    if (globals->len == 0) return NULL;
+
+    int low = 0;
+    int high = globals->len - 1;
+    SnapshotMemRegion *found = NULL;
+
+    // Binary search
+    while (low <= high) {
+        int mid = low + (high - low) / 2;
+        SnapshotMemRegion *mr = g_array_index(globals, SnapshotMemRegion *, mid);
+        
+        int res = check_addr_in_region(mr, addr);
+        if (res == 0) {
+            found = mr;
+            break;
+        } else if (res < 0) { // mr->base + size < addr
+            low = mid + 1;
+        } else { // mr->base > addr
+            high = mid - 1;
+        }
+    }
+
+    if (found) {
+        int next_cache_idx = mr_manager_new_cache_index(mr_manager.global_cache_index);
+        mr_manager_update_cache(mr_manager.global_cache, found, next_cache_idx);
+        mr_manager.global_cache_index = next_cache_idx;
+    }
+
+    return found;
+}
+
+SnapshotMemRegion *snapshot_mem_region_search(target_ulong addr) {
+    // Determine region by address
+    if (check_addr_in_region(&mr_manager.stack_region, addr) == 0) {
+        return mr_manager_stack_search(addr);
+    } else if (check_addr_in_region(&mr_manager.global_region, addr) == 0) {
+        return mr_manager_global_search(addr);
     } else {
-        trace_mem("[free] [done] [base %lx] [pc %lx]\n", base, pc);
+        return mr_manager_heap_search(addr);
     }
 }
 
@@ -446,7 +676,7 @@ bool snapshot_is_taken(void) {
 }
 
 void snapshot_init(void) {
-    memset(&g_snapshot, 0, sizeof(SnapshotState));
+    init_mr_manager();
     g_snapshot.pages = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, g_free);
     g_snapshot.is_snapshot_taken = false;
     // g_snapshot.cpu_state = malloc(sizeof(CPUArchState));
