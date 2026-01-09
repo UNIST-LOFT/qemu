@@ -426,23 +426,22 @@ static gint compare_regions_ptr(gconstpointer a, gconstpointer b) {
 
 static int check_addr_in_region(SnapshotMemRegion *mr, target_ulong addr) {
     if (mr->is_stack) {
-        // If frame size not known, accept addresses just below
-        // the current stack top as belonging to this frame.
+        /* Stack grows downward: region is [base - size, base]. */
         if (mr->size != 0) {
             if (addr > mr->base) {
                 return 1;
-            } else if (addr < mr->base && addr + mr->size > mr->base) {
+            }
+            if (addr + mr->size >= mr->base) {
                 return 0;
             }
             return -1;
         }
-        if (mr->base > addr) {
-            if (mr->base - addr < SNAPSHOT_STACK_LAZY_WINDOW) {
-                return 0;
-            }
-            return -1;
+
+        /* size unknown: accept a lazy window below (or at) base */
+        if (mr->base >= addr && mr->base - addr <= SNAPSHOT_STACK_LAZY_WINDOW) {
+            return 0;
         }
-        return 1;
+        return (addr > mr->base) ? 1 : -1;
     }
     if (mr->base + mr->size < addr) return -1;
     if (mr->base > addr) return 1;
@@ -491,7 +490,7 @@ static int mr_manager_new_cache_index(int prev) {
 static int mr_manager_search_cache_exact(SnapshotMemRegion **mr_cache, SnapshotMemRegion *query) {
     for (int i = 0; i < SNAPSHOT_MEM_REG_CACHE; i++) {
         SnapshotMemRegion *mr = mr_cache[i];
-        if (compare_regions(mr, query, NULL) == 0) {
+        if (mr != NULL && compare_regions(mr, query, NULL) == 0) {
             return i;
         }
     }
@@ -521,8 +520,8 @@ static void mr_manager_update_region(SnapshotMemRegion *old_mr, SnapshotMemRegio
             return;
         }
         if (old_mr->base > new_mr->base) {
-            if (old_mr->size < (new_mr->base - old_mr->base + SNAPSHOT_STACK_LAZY_WINDOW)) {
-                old_mr->size = (new_mr->base - old_mr->base + SNAPSHOT_STACK_LAZY_WINDOW);
+            if (old_mr->size < (old_mr->base - new_mr->base + SNAPSHOT_STACK_LAZY_WINDOW)) {
+                old_mr->size = (old_mr->base - new_mr->base + SNAPSHOT_STACK_LAZY_WINDOW);
                 trace_mem("[stack] [lazy update] [base %lx] [size %lx]\n", old_mr->base, old_mr->size);
             }
         }
@@ -548,8 +547,12 @@ static void mr_manager_heap_insert(SnapshotMemRegion *mr) {
 
 static void mr_manager_heap_remove(SnapshotMemRegion *query) {
     // Remove from cache
-    int query_result = mr_manager_search_cache_exact(mr_manager.heap_cache, query);
-    mr_manager_update_cache(mr_manager.heap_cache, NULL, query_result);
+    int query_result = SNAPSHOT_MEM_REG_CACHE;
+    while (query_result >= 0) {
+        query_result = mr_manager_search_cache_exact(mr_manager.heap_cache, query);
+        mr_manager_update_cache(mr_manager.heap_cache, NULL, query_result);
+    }
+    
     // Remove from heap_data
     if (!g_tree_remove(mr_manager.heap_data, query)) {
         trace_mem("[free] [error] [base %lx] [pc %lx] not exist\n", query->base, query->pc);
@@ -585,6 +588,7 @@ static SnapshotMemRegion *mr_manager_heap_search(target_ulong addr) {
 }
 
 void snapshot_trace_alloc(target_ulong base, target_ulong size, target_ulong pc) {
+    trace_mem("[alloc] [start] [base %lx] [size %lx] [pc %lx]\n", base, size, pc);
     SnapshotMemRegion *obj = g_new(SnapshotMemRegion, 1);
     obj->is_heap = true;
     obj->is_stack = false;
@@ -592,10 +596,10 @@ void snapshot_trace_alloc(target_ulong base, target_ulong size, target_ulong pc)
     obj->size = size;
     obj->pc = pc;
     mr_manager_heap_insert(obj);
-    trace_mem("[alloc] [done] [base %lx] [size %lx] [pc %lx]\n", base, size, pc);
 }
 
 void snapshot_trace_free(target_ulong base, target_ulong pc) {
+    trace_mem("[free] [start] [base %lx] [pc %lx]\n", base, pc);
     SnapshotMemRegion query;
     query.base = base;
     query.pc = pc;
@@ -631,6 +635,9 @@ static SnapshotMemRegion *mr_manager_stack_search(target_ulong addr) {
 }
 
 void snapshot_trace_stack_push(target_ulong sp, target_ulong pc) {
+    if (mr_manager.stack_data == NULL) {
+        init_mr_manager();
+    }
     /* Fix size of the previous frame lazily using the new stack top */
     trace_mem("[stack] [ipush] [sp %lx] [pc %lx]\n", sp, pc);
     if (mr_manager.stack_data->len > 0) {
@@ -639,11 +646,12 @@ void snapshot_trace_stack_push(target_ulong sp, target_ulong pc) {
             trace_mem("[stack] [push-error] previous frame is NULL!\n");
             return;
         }
-        if (sp >= prev->base) {
-            // Zero or negative size stack frame - should not happen
-            trace_mem("[stack] [push-error] [sp %lx] previous frame size update failed! [base %lx] [size %lx]\n",
-                      sp, prev->base, prev->size);
-            return;
+        if (sp < prev->base) {
+            target_ulong new_size = prev->base - sp;
+            if (new_size > prev->size) {
+                // prev->size = new_size;
+                mr_manager_update_region(&mr_manager.stack_region, prev);
+            }
         }
     }
 
@@ -659,8 +667,15 @@ void snapshot_trace_stack_push(target_ulong sp, target_ulong pc) {
 }
 
 void snapshot_trace_stack_pop(target_ulong sp) {
+    if (mr_manager.stack_data == NULL) {
+        init_mr_manager();
+    }
     trace_mem("[stack] [ipop] [sp %lx]\n", sp);
     GArray *stack = mr_manager.stack_data;
+    if (stack->len == 0) {
+        trace_mem("[stack] [pop-error] [sp %lx] [depth %d] empty stack!\n", sp, stack->len);
+        return;
+    }
     for (ssize_t i = stack->len - 1; i >= 0; i--) {
         SnapshotMemRegion *mr = g_array_index(stack, SnapshotMemRegion *, i);
         if (mr == NULL) continue;
@@ -668,6 +683,7 @@ void snapshot_trace_stack_pop(target_ulong sp) {
             g_array_remove_index(stack, i);
             trace_mem("[stack] [pop] [sp %lx] [base %lx] [pc %lx] [depth %d]\n",
                       sp, mr->base, mr->pc, stack->len);
+            g_free(mr);
             return;
         }
     }
@@ -1538,6 +1554,7 @@ static int analyze_collected_data(void) {
 
 void snapshot_forkserver(CPUState *cpu) {
     trace_mem("[snapshot] [forkserver] [called %d]\n", forkserver_installed);
+    fflush(stderr);
     if (forkserver_installed) return;
     forkserver_installed = true;
     snapshot_save();

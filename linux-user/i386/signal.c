@@ -321,6 +321,8 @@ void setup_frame(int sig, struct target_sigaction *ka,
     frame_addr = get_sigframe(ka, env, sizeof(*frame));
     trace_user_setup_frame(env, frame_addr);
 
+    trace_mem("[setup_frame] [sig %d] [frame_addr %lx] [handler %lx]\n",
+               sig, frame_addr, ka->_sa_handler);
     snapshot_trace_stack_push(frame_addr, env->eip);
 
     if (!lock_user_struct(VERIFY_WRITE, frame, frame_addr, 0))
@@ -386,6 +388,8 @@ void setup_rt_frame(int sig, struct target_sigaction *ka,
     frame_addr = get_sigframe(ka, env, sizeof(*frame));
     trace_user_setup_rt_frame(env, frame_addr);
 
+    trace_mem("[setup_rt_frame] [sig %d] [frame_addr %lx] [handler %lx]\n",
+               sig, frame_addr, ka->_sa_handler);
     snapshot_trace_stack_push(frame_addr, env->eip);
 
     if (!lock_user_struct(VERIFY_WRITE, frame, frame_addr, 0))
@@ -546,6 +550,7 @@ long do_sigreturn(CPUX86State *env)
     trace_user_do_sigreturn(env, frame_addr);
     if (!lock_user_struct(VERIFY_READ, frame, frame_addr, 1))
         goto badframe;
+    trace_mem("[sigreturn] [frame_addr %lx]\n", frame_addr);
     snapshot_trace_stack_pop(env->regs[R_ESP]);
     /* set blocked signals */
     __get_user(target_set.sig[0], &frame->sc.oldmask);
@@ -579,6 +584,7 @@ long do_rt_sigreturn(CPUX86State *env)
     trace_user_do_rt_sigreturn(env, frame_addr);
     if (!lock_user_struct(VERIFY_READ, frame, frame_addr, 1))
         goto badframe;
+    trace_mem("[rt_sigreturn] [frame_addr %lx]\n", frame_addr);
     snapshot_trace_stack_pop(env->regs[R_ESP]);
     target_to_host_sigset(&set, &frame->uc.tuc_sigmask);
     set_sigmask(&set);

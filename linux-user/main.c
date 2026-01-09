@@ -856,6 +856,7 @@ int main(int argc, char **argv, char **envp)
         }
         gdb_handlesig(cpu, 0);
     }
+    snapshot_trace_stack_push(info->start_stack, info->entry);
     cpu_loop(env);
     /* never exits */
     return 0;
