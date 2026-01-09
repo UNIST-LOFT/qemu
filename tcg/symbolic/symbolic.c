@@ -2949,9 +2949,9 @@ static inline void qemu_load_helper(CPUArchState *env, uintptr_t orig_addr,
         for (int i = 0; i < CPU_NB_REGS; i++) {
             len += snprintf(buf + len, 4096 - len, "[r%d %lx] ", i, env->regs[i]);
         }
-        trace_mem("[loadh] [addr %lx] [orig %lx] [offset %lx] [size %lx] %s\n", addr, orig_addr, offset, size, buf);
+        trace_mem("[loadh] [pc %lx] [addr %lx] [orig %lx] [offset %lx] [size %lx] %s\n", current_tb_pc, addr, orig_addr, offset, size, buf);
     } else {
-        trace_mem("[loadh-error] [addr %lx] [size %lx] failed to detect memory region\n", addr, size);
+        trace_mem("[loadh-error] [pc %lx] [addr %lx] [size %lx] failed to detect memory region\n", current_tb_pc, addr, size);
     }
     
 
@@ -3656,11 +3656,11 @@ static inline void qemu_store_helper(CPUArchState *env,
         for (int i = 0; i < CPU_NB_REGS; i++) {
             len += snprintf(buf + len, 4096 - len, "[r%d %lx] ", i, env->regs[i]);
         }
-        trace_mem("[storeh] [addr %lx] [orig %lx] [offset %lx] [size %lx] %s\n", addr, orig_addr, offset, size, buf);
+        trace_mem("[storeh] [pc %lx] [addr %lx] [orig %lx] [offset %lx] [size %lx] %s\n", current_tb_pc, addr, orig_addr, offset, size, buf);
     } else {
-        trace_mem("[storeh-error] [addr %lx] [size %lx] failed to detect memory region\n", addr, size);
+        trace_mem("[storeh-error] [pc %lx] [addr %lx] [size %lx] failed to detect memory region\n", current_tb_pc, addr, size);
     }
-    
+
     if (size <= 8) {
         SnapshotMemAccess mem_access = {
             .symbolic_addr = (addr_idx < TCG_MAX_TEMPS && s_temps[addr_idx] != NULL),

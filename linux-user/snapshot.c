@@ -450,14 +450,28 @@ static int check_addr_in_region(SnapshotMemRegion *mr, target_ulong addr) {
 }
 
 static void init_mr_manager(void) {
-    mr_manager.stack_data = g_array_new(FALSE, FALSE, sizeof(SnapshotMemRegion *));
-    mr_manager.heap_data = g_tree_new_full(
-        (GCompareDataFunc)compare_regions,
-        NULL,
-        g_free,
-        NULL
-    );
-    mr_manager.global_data = g_array_new(FALSE, FALSE, sizeof(SnapshotMemRegion *));
+    if (mr_manager.stack_data == NULL) {
+        mr_manager.stack_data = g_array_new(FALSE, FALSE, sizeof(SnapshotMemRegion *));
+    }
+    if (mr_manager.heap_data == NULL) {
+        mr_manager.heap_data = g_tree_new_full(
+            (GCompareDataFunc)compare_regions,
+            NULL,
+            g_free,
+            NULL
+        );
+        mr_manager.heap_cache_index = 0;
+        for (int i = 0; i < SNAPSHOT_MEM_REG_CACHE; i++) {
+            mr_manager.heap_cache[i] = NULL;
+        }
+    }
+    if (mr_manager.global_data == NULL) {
+        mr_manager.global_data = g_array_new(FALSE, FALSE, sizeof(SnapshotMemRegion *));
+        mr_manager.global_cache_index = 0;
+        for (int i = 0; i < SNAPSHOT_MEM_REG_CACHE; i++) {
+            mr_manager.global_cache[i] = NULL;
+        }
+    }
 }
 
 static int mr_manager_search_cache(SnapshotMemRegion **mr_cache, target_ulong addr) {
@@ -657,10 +671,13 @@ void snapshot_trace_stack_pop(target_ulong sp) {
             return;
         }
     }
-    trace_mem("[stack] [pop] [sp %lx] [depth %d] not found!\n", sp, stack->len);
+    trace_mem("[stack] [pop-error] [sp %lx] [depth %d] not found!\n", sp, stack->len);
 }
 
 void snapshot_trace_global_add(target_ulong base, target_ulong size, target_ulong pc, const char *name) {
+    if (mr_manager.global_data == NULL) {
+        init_mr_manager();
+    }
     SnapshotMemRegion *mr = g_new(SnapshotMemRegion, 1);
     mr->is_heap = false;
     mr->is_stack = false;
@@ -713,9 +730,11 @@ static SnapshotMemRegion *mr_manager_global_search(target_ulong addr) {
         int next_cache_idx = mr_manager_new_cache_index(mr_manager.global_cache_index);
         mr_manager_update_cache(mr_manager.global_cache, found, next_cache_idx);
         mr_manager.global_cache_index = next_cache_idx;
+        return found;
     }
 
-    return found;
+    trace_mem("[mr] [global] [error] failed to search region for [addr %lx]\n", addr);
+    return NULL;
 }
 
 SnapshotMemRegion *snapshot_mem_region_search(target_ulong addr) {

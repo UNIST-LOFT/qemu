@@ -627,6 +627,7 @@ int main(int argc, char **argv, char **envp)
     int i;
     int ret;
     int execfd;
+    snapshot_init();
 
     error_init(argv[0]);
     module_call_init(MODULE_INIT_TRACE);
@@ -855,7 +856,6 @@ int main(int argc, char **argv, char **envp)
         }
         gdb_handlesig(cpu, 0);
     }
-    snapshot_init();
     cpu_loop(env);
     /* never exits */
     return 0;

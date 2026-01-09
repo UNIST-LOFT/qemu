@@ -2851,6 +2851,20 @@ int load_elf_binary(struct linux_binprm *bprm, struct image_info *info)
         free(elf_interpreter);
     }
 
+    /* Register writable global regions (.data/.bss) for snapshot tracking */
+    if (info->end_data > info->start_data) {
+        snapshot_trace_global_add(info->start_data,
+                                  info->end_data - info->start_data,
+                                  info->entry,
+                                  ".data");
+    }
+    if (info->brk > info->end_data) {
+        snapshot_trace_global_add(info->end_data,
+                                  info->brk - info->end_data,
+                                  info->entry,
+                                  ".bss");
+    }
+
 #ifdef USE_ELF_CORE_DUMP
     bprm->core_dump = &elf_core_dump;
 #endif
