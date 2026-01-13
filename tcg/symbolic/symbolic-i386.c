@@ -593,7 +593,7 @@ static inline void qemu_memmove(CPUArchState *cpu_env, uintptr_t src, uintptr_t 
     for (int i = 0; i < CPU_NB_REGS; i++) {
         len += snprintf(buf + len, 4096 - len, "[r%d %lx] ", i, cpu_env->regs[i]);
     }
-    trace_mem("[memmoveh] [addr %lx] [size %lx] %s\n", src, size, buf);
+    trace_mem("[memmoveh] [src %lx] [dst %lx] [size %lx] %s\n", src, dst, size, buf);
     snapshot_read_access(&mem_access);
     // Add snapshot_write_access to dst if needed
 
