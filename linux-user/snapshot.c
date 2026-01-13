@@ -35,7 +35,6 @@ static SnapshotState g_snapshot;
 typedef struct {
     // Determine region by address
     SnapshotMemRegion stack_region;
-    SnapshotMemRegion global_region; // else: heap
     // Cache
     // Don't use stack cache for now
     // int stack_cache_index;
@@ -705,7 +704,6 @@ void snapshot_trace_global_add(target_ulong base, target_ulong size, target_ulon
     
     g_array_sort(mr_manager.global_data, (GCompareFunc)compare_regions_ptr);
     
-    mr_manager_update_region(&mr_manager.global_region, mr);
     trace_mem("[global] [add] [base %lx] [size %lx] [name %s] [pc %lx]\n", 
               base, size, name ? name : "unknown", pc);
 }
@@ -755,16 +753,27 @@ static SnapshotMemRegion *mr_manager_global_search(target_ulong addr) {
 
 SnapshotMemRegion *snapshot_mem_region_search(target_ulong addr) {
     // Determine region by address
+    SnapshotMemRegion *mr = NULL;
     if (check_addr_in_region(&mr_manager.stack_region, addr) == 0) {
         trace_mem("[mr] [search] [stack] [addr %lx]\n", addr);
-        return mr_manager_stack_search(addr);
-    } else if (check_addr_in_region(&mr_manager.global_region, addr) == 0) {
-        trace_mem("[mr] [search] [global] [addr %lx]\n", addr);
-        return mr_manager_global_search(addr);
-    } else {
-        trace_mem("[mr] [search] [heap] [addr %lx]\n", addr);
-        return mr_manager_heap_search(addr);
+        mr = mr_manager_stack_search(addr);
+    } 
+    if (mr != NULL) {
+        return mr;
     }
+    trace_mem("[mr] [search] [global] [addr %lx]\n", addr);
+    mr = mr_manager_global_search(addr);
+    if (mr != NULL) {
+        return mr;
+    }
+
+    trace_mem("[mr] [search] [heap] [addr %lx]\n", addr);
+    mr = mr_manager_heap_search(addr);
+    if (mr != NULL) {
+        return mr;
+    }
+    trace_mem("[mr] [search] [error] no region found for [addr %lx]\n", addr);
+    return NULL;
 }
 
 bool snapshot_is_taken(void) {
@@ -1654,15 +1663,12 @@ void snapshot_forkserver(CPUState *cpu) {
         /* Get and relay exit status to parent. */
     
         if (waitpid(child_pid, (int *)&status, 0) < 0) exit(6);
-        
-        // Send return code
-        if (write(FORKSRV_FD + 1, &status, 4) != 4) exit(7);
-        
+
         // Child process exit
         int should_halt = analyze_collected_data();
-    
-        // Send halt signal
-        if (write(FORKSRV_FD + 1, &should_halt, 4) != 4) exit(8);
+        int32_t combined_res[2] = {status, should_halt};
+        // Send return code and halt signal
+        if (write(FORKSRV_FD + 1, &combined_res, 8) != 8) exit(8);
   
     }
 

@@ -2864,6 +2864,18 @@ int load_elf_binary(struct linux_binprm *bprm, struct image_info *info)
                                   info->entry,
                                   ".bss");
     }
+    if (interp_info.end_data > interp_info.start_data) {
+        snapshot_trace_global_add(interp_info.start_data,
+                                  interp_info.end_data - interp_info.start_data,
+                                  info->entry,
+                                  "interp .data");
+    }
+    if (interp_info.brk > interp_info.end_data) {
+        snapshot_trace_global_add(interp_info.end_data,
+                                    interp_info.brk - interp_info.end_data,
+                                    info->entry,
+                                    "interp .bss");
+    }
 
 #ifdef USE_ELF_CORE_DUMP
     bprm->core_dump = &elf_core_dump;

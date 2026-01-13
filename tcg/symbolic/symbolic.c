@@ -2949,7 +2949,13 @@ static inline void qemu_load_helper(CPUArchState *env, uintptr_t orig_addr,
         for (int i = 0; i < CPU_NB_REGS; i++) {
             len += snprintf(buf + len, 4096 - len, "[r%d %lx] ", i, env->regs[i]);
         }
-        trace_mem("[loadh] [pc %lx] [addr %lx] [orig %lx] [offset %lx] [size %lx] %s\n", current_tb_pc, addr, orig_addr, offset, size, buf);
+        const char *reg_name = "global";
+        if (mr->is_stack) {
+            reg_name = "stack";
+        } else if (mr->is_heap) {
+            reg_name = "heap";
+        }
+        trace_mem("[loadh] [reg %s] [pc 0x%lx] [addr 0x%lx] [reg-base 0x%lx] [size 0x%lx] %s\n", reg_name, current_tb_pc, addr, mr->base, size, buf);
     } else {
         trace_mem("[loadh-error] [pc %lx] [addr %lx] [size %lx] failed to detect memory region\n", current_tb_pc, addr, size);
     }
@@ -3656,7 +3662,13 @@ static inline void qemu_store_helper(CPUArchState *env,
         for (int i = 0; i < CPU_NB_REGS; i++) {
             len += snprintf(buf + len, 4096 - len, "[r%d %lx] ", i, env->regs[i]);
         }
-        trace_mem("[storeh] [pc %lx] [addr %lx] [orig %lx] [offset %lx] [size %lx] %s\n", current_tb_pc, addr, orig_addr, offset, size, buf);
+        const char *reg_name = "global";
+        if (mr->is_stack) {
+            reg_name = "stack";
+        } else if (mr->is_heap) {
+            reg_name = "heap";
+        }
+        trace_mem("[storeh] [reg %s] [pc 0x%lx] [addr 0x%lx] [reg-base 0x%lx] [size 0x%lx] %s\n", reg_name, current_tb_pc, addr, mr->base, size, buf);
     } else {
         trace_mem("[storeh-error] [pc %lx] [addr %lx] [size %lx] failed to detect memory region\n", current_tb_pc, addr, size);
     }
