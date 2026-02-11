@@ -788,6 +788,23 @@ static inline uint64_t make_mem_op_offset(uint32_t op, uint32_t idx)
     return (((uint64_t)op) << 32) | idx;
 }
 
+#define DISP_VALID_MASK (1ULL << 63)
+
+static inline uint64_t pack_disp(int32_t disp, int valid)
+{
+    return ((uint64_t)(uint32_t)disp) | (valid ? DISP_VALID_MASK : 0);
+}
+
+static inline int32_t unpack_disp(uint64_t value)
+{
+    return (int32_t)(value & 0xFFFFFFFFu);
+}
+
+static inline int disp_is_valid(uint64_t value)
+{
+    return (value & DISP_VALID_MASK) != 0;
+}
+
 // see tcg_gen_callN in tgc.c
 static inline void add_void_call_0(void* f, TCGOp* op_in, TCGOp** op_out,
                                    TCGContext* tcg_ctx)
@@ -954,6 +971,73 @@ static inline void add_void_call_6(void* f, TCGTemp* arg0, TCGTemp* arg1,
     op->args[6]     = (uintptr_t)f;
     op->args[7]     = 0; // flags
     TCGOP_CALLI(op) = 6; // input args
+    TCGOP_CALLO(op) = 0; // ret args
+
+    if (op_out)
+        *op_out = op;
+}
+
+// see tcg_gen_callN in tgc.c
+static inline void add_void_call_7(void* f, TCGTemp* arg0, TCGTemp* arg1,
+                                   TCGTemp* arg2, TCGTemp* arg3, TCGTemp* arg4,
+                                   TCGTemp* arg5, TCGTemp* arg6, TCGOp* op_in,
+                                   TCGOp** op_out, TCGContext* tcg_ctx)
+{
+    assert(arg0->temp_allocated);
+    assert(arg1->temp_allocated);
+    assert(arg2->temp_allocated);
+    assert(arg3->temp_allocated);
+    assert(arg4->temp_allocated);
+    assert(arg5->temp_allocated);
+    assert(arg6->temp_allocated);
+
+    // FixMe: check 32 bit, check other archs
+    TCGOpcode opc   = INDEX_op_call;
+    TCGOp*    op    = tcg_op_insert_before(tcg_ctx, op_in, opc);
+    op->args[0]     = temp_arg(arg0);
+    op->args[1]     = temp_arg(arg1);
+    op->args[2]     = temp_arg(arg2);
+    op->args[3]     = temp_arg(arg3);
+    op->args[4]     = temp_arg(arg4);
+    op->args[5]     = temp_arg(arg5);
+    op->args[6]     = temp_arg(arg6);
+    op->args[7]     = (uintptr_t)f;
+    op->args[8]     = 0; // flags
+    TCGOP_CALLI(op) = 7; // input args
+    TCGOP_CALLO(op) = 0; // ret args
+
+    if (op_out)
+        *op_out = op;
+}
+
+// see tcg_gen_callN in tgc.c
+static inline void add_void_call_8(void* f, TCGTemp* arg0, TCGTemp* arg1,
+                                   TCGTemp* arg2, TCGTemp* arg3, TCGTemp* arg4,
+                                   TCGTemp* arg5, TCGTemp* arg6, TCGTemp* arg7, TCGOp* op_in,
+                                   TCGOp** op_out, TCGContext* tcg_ctx)
+{
+    assert(arg0->temp_allocated);
+    assert(arg1->temp_allocated);
+    assert(arg2->temp_allocated);
+    assert(arg3->temp_allocated);
+    assert(arg4->temp_allocated);
+    assert(arg5->temp_allocated);
+    assert(arg6->temp_allocated);
+    assert(arg7->temp_allocated);
+    // FixMe: check 32 bit, check other archs
+    TCGOpcode opc   = INDEX_op_call;
+    TCGOp*    op    = tcg_op_insert_before(tcg_ctx, op_in, opc);
+    op->args[0]     = temp_arg(arg0);
+    op->args[1]     = temp_arg(arg1);
+    op->args[2]     = temp_arg(arg2);
+    op->args[3]     = temp_arg(arg3);
+    op->args[4]     = temp_arg(arg4);
+    op->args[5]     = temp_arg(arg5);
+    op->args[6]     = temp_arg(arg6);
+    op->args[7]     = temp_arg(arg7);
+    op->args[8]     = (uintptr_t)f;
+    op->args[9]     = 0; // flags
+    TCGOP_CALLI(op) = 8; // input args
     TCGOP_CALLO(op) = 0; // ret args
 
     if (op_out)
@@ -2931,7 +3015,8 @@ static void add_consistency_check_load(Expr* e, uintptr_t addr, size_t size)
 
 static inline void qemu_load_helper(CPUArchState *env, uintptr_t orig_addr,
                                     uintptr_t mem_op_offset, uintptr_t addr_idx,
-                                    uintptr_t val_idx)
+                                    uintptr_t val_idx, uintptr_t base_val,
+                                    uintptr_t disp_pack)
 {
     TCGMemOp  mem_op = get_mem_op(mem_op_offset);
     uintptr_t offset = get_mem_offset(mem_op_offset);
@@ -2955,7 +3040,35 @@ static inline void qemu_load_helper(CPUArchState *env, uintptr_t orig_addr,
         } else if (mr->is_heap) {
             reg_name = "heap";
         }
-        trace_mem("[loadh] [reg %s] [pc 0x%lx] [addr 0x%lx] [reg-base 0x%lx] [size 0x%lx] %s\n", reg_name, current_tb_pc, addr, mr->base, size, buf);
+        if (disp_is_valid(disp_pack)) {
+            int32_t disp = unpack_disp(disp_pack);
+            trace_mem("[loadh] [val] [reg %s] [pc 0x%lx] [addr 0x%lx] [base 0x%lx] [disp %d] [reg-base 0x%lx] [size 0x%lx] %s\n",
+                      reg_name, current_tb_pc, addr, base_val, disp, mr->base,
+                      size, buf);
+        } else {
+            uintptr_t base_fallback = 0;
+            int32_t disp_fallback = 0;
+            int has_fallback = 0;
+            int64_t best_abs = (int64_t)0x1000;
+            for (int i = 0; i < CPU_NB_REGS; i++) {
+                int64_t disp = (int64_t)addr - (int64_t)env->regs[i];
+                int64_t abs_disp = disp < 0 ? -disp : disp;
+                if (abs_disp <= best_abs) {
+                    best_abs = abs_disp;
+                    base_fallback = env->regs[i];
+                    disp_fallback = (int32_t)disp;
+                    has_fallback = 1;
+                }
+            }
+            if (has_fallback) {
+                trace_mem("[loadh] [val-fallback] [reg %s] [pc 0x%lx] [addr 0x%lx] [base 0x%lx] [disp %d] [reg-base 0x%lx] [size 0x%lx] %s\n",
+                          reg_name, current_tb_pc, addr, base_fallback,
+                          disp_fallback, mr->base, size, buf);
+            } else {
+                trace_mem("[loadh] [inval] [reg %s] [pc 0x%lx] [addr 0x%lx] [reg-base 0x%lx] [size 0x%lx] %s\n",
+                          reg_name, current_tb_pc, addr, mr->base, size, buf);
+            }
+        }
     } else {
         trace_mem("[loadh-error] [pc %lx] [addr %lx] [size %lx] failed to detect memory region\n", current_tb_pc, addr, size);
     }
@@ -3646,7 +3759,9 @@ static inline void qemu_store_helper(CPUArchState *env,
                                      uintptr_t mem_op_offset,
                                      uintptr_t addr_idx, 
                                      uintptr_t val_idx, 
-                                     uintptr_t concrete_val)
+                                     uintptr_t concrete_val,
+                                     uintptr_t base_val,
+                                    uintptr_t disp_pack)
 {
     TCGMemOp  mem_op = get_mem_op(mem_op_offset);
     uintptr_t offset = get_mem_offset(mem_op_offset);
@@ -3667,6 +3782,30 @@ static inline void qemu_store_helper(CPUArchState *env,
             reg_name = "stack";
         } else if (mr->is_heap) {
             reg_name = "heap";
+        }
+        if (disp_is_valid(disp_pack)) {
+            int32_t disp = unpack_disp(disp_pack);
+            trace_mem("[storeh] [val] [reg %s] [pc 0x%lx] [addr 0x%lx] [base 0x%lx] [disp %d] [reg-base 0x%lx] [size 0x%lx] %s\n", reg_name, current_tb_pc, addr, base_val, disp, mr->base, size, buf);
+        } else {
+            uintptr_t base_fallback = 0;
+            int32_t disp_fallback = 0;
+            int has_fallback = 0;
+            int64_t best_abs = (int64_t)0x1000;
+            for (int i = 0; i < CPU_NB_REGS; i++) {
+                int64_t disp = (int64_t)addr - (int64_t)env->regs[i];
+                int64_t abs_disp = disp < 0 ? -disp : disp;
+                if (abs_disp <= best_abs) {
+                    best_abs = abs_disp;
+                    base_fallback = env->regs[i];
+                    disp_fallback = (int32_t)disp;
+                    has_fallback = 1;
+                }
+            }
+            if (has_fallback) {
+                trace_mem("[storeh] [val-fallback] [reg %s] [pc 0x%lx] [addr 0x%lx] [base 0x%lx] [disp %d] [reg-base 0x%lx] [size 0x%lx] %s\n", reg_name, current_tb_pc,  addr, base_fallback, disp_fallback, mr->base, size, buf);
+            } else {
+                trace_mem("[storeh] [inval] [reg %s] [pc 0x%lx] [addr 0x%lx] [reg-base 0x%lx] [size 0x%lx] %s\n", reg_name, current_tb_pc, addr, mr->base, size, buf);
+            }
         }
         trace_mem("[storeh] [reg %s] [pc 0x%lx] [addr 0x%lx] [reg-base 0x%lx] [size 0x%lx] %s\n", reg_name, current_tb_pc, addr, mr->base, size, buf);
     } else {
@@ -5770,6 +5909,13 @@ typedef struct {
     uintptr_t const_value;
 } TCGTempStaticState;
 
+typedef struct {
+    uint8_t  is_valid;
+    uint8_t  base_is_named;
+    int32_t  disp;
+    uintptr_t base_temp_idx;
+} TempAddrHint;
+
 static inline int detect_load_loop(TCGContext* tcg_ctx)
 {
     uintptr_t first_instr   = 0;
@@ -5988,6 +6134,7 @@ int        parse_translation_block(TranslationBlock* tb, uintptr_t tb_pc,
     JumpTableFinder jump_table_finder_prev_instr = {0};
 
     TCGTempStaticState temp_static_state[TCG_MAX_TEMPS] = {0};
+    TempAddrHint temp_addr_hint[TCG_MAX_TEMPS] = {0};
 
     if (instrument && 0) {
         detect_load_loop(tcg_ctx);
@@ -6161,6 +6308,7 @@ int        parse_translation_block(TranslationBlock* tb, uintptr_t tb_pc,
                     temp_static_state[temp_idx(t)].is_alive    = 1;
                     temp_static_state[temp_idx(t)].is_const    = 1;
                     temp_static_state[temp_idx(t)].const_value = op->args[1];
+                    temp_addr_hint[temp_idx(t)].is_valid = 0;
                 }
                 break;
 
@@ -6226,6 +6374,8 @@ int        parse_translation_block(TranslationBlock* tb, uintptr_t tb_pc,
                         assert(jump_table_finder_curr_instr.addr != to);
                         assert(jump_table_finder_curr_instr.addr != from);
                     }
+                    temp_addr_hint[temp_idx(to)] =
+                        temp_addr_hint[temp_idx(from)];
                 }
                 break;
 
@@ -6260,6 +6410,7 @@ int        parse_translation_block(TranslationBlock* tb, uintptr_t tb_pc,
                     TCGTemp* t_out      = arg_temp(op->args[0]);
                     TCGTemp* t_a        = arg_temp(op->args[1]);
                     TCGTemp* t_b        = arg_temp(op->args[2]);
+                    temp_addr_hint[temp_idx(t_out)].is_valid = 0;
 
                     size_t size;
                     if (t_a->type == TCG_TYPE_I32) {
@@ -6295,6 +6446,51 @@ int        parse_translation_block(TranslationBlock* tb, uintptr_t tb_pc,
                     tcg_temp_free_internal(t_opkind);
                     tcg_temp_free_internal(t_packed_idx);
 #endif
+                    if (op->opc == INDEX_op_add_i64 || op->opc == INDEX_op_add_i32 ||
+                        op->opc == INDEX_op_sub_i64 || op->opc == INDEX_op_sub_i32) {
+                        size_t out_idx = temp_idx(t_out);
+                        TempAddrHint hint = {0};
+                        size_t a_idx = temp_idx(t_a);
+                        size_t b_idx = temp_idx(t_b);
+                        int a_const = temp_static_state[a_idx].is_alive &&
+                                      temp_static_state[a_idx].is_const;
+                        int b_const = temp_static_state[b_idx].is_alive &&
+                                      temp_static_state[b_idx].is_const;
+
+                        if (a_const ^ b_const) {
+                            TCGTemp* t_base = a_const ? t_b : t_a;
+                            intptr_t disp = (intptr_t)(a_const
+                                ? temp_static_state[a_idx].const_value
+                                : temp_static_state[b_idx].const_value);
+
+                            if (op->opc == INDEX_op_sub_i64 ||
+                                op->opc == INDEX_op_sub_i32) {
+                                if (!a_const && b_const) {
+                                    disp = -disp;
+                                } else {
+                                    t_base = NULL;
+                                }
+                            }
+
+                            if (t_base) {
+                                size_t base_idx = temp_idx(t_base);
+                                TempAddrHint *base_hint =
+                                    &temp_addr_hint[base_idx];
+
+                                if (base_hint->is_valid) {
+                                    hint = *base_hint;
+                                    hint.disp = (int32_t)(hint.disp + disp);
+                                } else if (!temp_static_state[base_idx].is_const) {
+                                    hint.is_valid = 1;
+                                    hint.base_is_named = t_base->name != NULL;
+                                    hint.base_temp_idx = base_idx;
+                                    hint.disp = (int32_t)disp;
+                                }
+                            }
+                        }
+
+                        temp_addr_hint[out_idx] = hint;
+                    }
                     // jump table finder
                     if (op->opc == INDEX_op_shl_i64 &&
                         t_a->name && // native register
@@ -6332,6 +6528,7 @@ int        parse_translation_block(TranslationBlock* tb, uintptr_t tb_pc,
                                     tcg_ctx);
                     tcg_temp_free_internal(t_idx);
 #endif
+                    temp_addr_hint[temp_idx(t)].is_valid = 0;
                 }
                 break;
 
@@ -6394,16 +6591,37 @@ int        parse_translation_block(TranslationBlock* tb, uintptr_t tb_pc,
                             new_non_conflicting_temp(TCG_TYPE_PTR);
                         tcg_movi(t_val_idx, (uintptr_t)temp_idx(t_val), 0, op,
                                  NULL, tcg_ctx);
+                        TCGTemp* t_base_val =
+                            new_non_conflicting_temp(TCG_TYPE_PTR);
+                        tcg_movi(t_base_val, 0, 0, op, NULL, tcg_ctx);
+                        TCGTemp* t_disp_pack =
+                            new_non_conflicting_temp(TCG_TYPE_PTR);
+                        tcg_movi(t_disp_pack, 0, 0, op, NULL, tcg_ctx);
+                        TempAddrHint *addr_hint =
+                            &temp_addr_hint[temp_idx(t_ptr)];
+                        if (addr_hint->is_valid &&
+                            addr_hint->base_temp_idx < TCG_MAX_TEMPS) {
+                            TCGTemp* t_base =
+                                &tcg_ctx->temps[addr_hint->base_temp_idx];
+                            MARK_TEMP_AS_ALLOCATED(t_base);
+                            tcg_mov(t_base_val, t_base, 0, 0, op, NULL, tcg_ctx);
+                            MARK_TEMP_AS_NOT_ALLOCATED(t_base);
+                            tcg_movi(t_disp_pack,
+                                     pack_disp(addr_hint->disp, 1), 0, op, NULL,
+                                     tcg_ctx);
+                        }
                         TCGTemp *t_cpu_env = new_non_conflicting_temp(TCG_TYPE_PTR);
                         tcg_movi(t_cpu_env, (uintptr_t)cpu_env, 0, op, NULL, tcg_ctx);
                         MARK_TEMP_AS_ALLOCATED(t_ptr);
-                        add_void_call_5(qemu_load_helper, t_cpu_env, t_ptr, t_mem_op,
-                                        t_ptr_idx, t_val_idx, op, NULL,
-                                        tcg_ctx);
+                        add_void_call_7(qemu_load_helper, t_cpu_env, t_ptr, t_mem_op,
+                                        t_ptr_idx, t_val_idx, t_base_val,
+                                        t_disp_pack, op, NULL, tcg_ctx);
                         MARK_TEMP_AS_NOT_ALLOCATED(t_ptr);
                         tcg_temp_free_internal(t_mem_op);
                         tcg_temp_free_internal(t_ptr_idx);
                         tcg_temp_free_internal(t_val_idx);
+                        tcg_temp_free_internal(t_base_val);
+                        tcg_temp_free_internal(t_disp_pack);
                         tcg_temp_free_internal(t_cpu_env);
 #endif
                         // jump table finder
@@ -6491,18 +6709,39 @@ int        parse_translation_block(TranslationBlock* tb, uintptr_t tb_pc,
                             new_non_conflicting_temp(TCG_TYPE_PTR);
                         tcg_movi(t_val_idx, (uintptr_t)temp_idx(t_val), 0, op,
                                  NULL, tcg_ctx);
+                        TCGTemp* t_base_val =
+                                new_non_conflicting_temp(TCG_TYPE_PTR);
+                        tcg_movi(t_base_val, 0, 0, op, NULL, tcg_ctx);
+                        TCGTemp* t_disp_pack =
+                                new_non_conflicting_temp(TCG_TYPE_PTR);
+                        tcg_movi(t_disp_pack, 0, 0, op, NULL, tcg_ctx);
+                        TempAddrHint *addr_hint =
+                            &temp_addr_hint[temp_idx(t_ptr)];
+                        if (addr_hint->is_valid &&
+                            addr_hint->base_temp_idx < TCG_MAX_TEMPS) {
+                            TCGTemp* t_base =
+                                &tcg_ctx->temps[addr_hint->base_temp_idx];
+                            MARK_TEMP_AS_ALLOCATED(t_base);
+                            tcg_mov(t_base_val, t_base, 0, 0, op, NULL, tcg_ctx);
+                            MARK_TEMP_AS_NOT_ALLOCATED(t_base);
+                            tcg_movi(t_disp_pack,
+                                     pack_disp(addr_hint->disp, 1), 0, op, NULL,
+                                     tcg_ctx);
+                        }
                         TCGTemp *t_cpu_env = new_non_conflicting_temp(TCG_TYPE_PTR);
                         tcg_movi(t_cpu_env, (uintptr_t)cpu_env, 0, op, NULL, tcg_ctx);
                         MARK_TEMP_AS_ALLOCATED(t_ptr);
                         MARK_TEMP_AS_ALLOCATED(t_val);
-                        add_void_call_6(qemu_store_helper, t_cpu_env, t_ptr, t_mem_op,
-                                        t_ptr_idx, t_val_idx, t_val,
+                        add_void_call_8(qemu_store_helper, t_cpu_env, t_ptr, t_mem_op,
+                                        t_ptr_idx, t_val_idx, t_val, t_base_val, t_disp_pack,
                                         op, NULL, tcg_ctx);
                         MARK_TEMP_AS_NOT_ALLOCATED(t_val);
                         MARK_TEMP_AS_NOT_ALLOCATED(t_ptr);
                         tcg_temp_free_internal(t_mem_op);
                         tcg_temp_free_internal(t_ptr_idx);
                         tcg_temp_free_internal(t_val_idx);
+                        tcg_temp_free_internal(t_base_val);
+                        tcg_temp_free_internal(t_disp_pack);
                         tcg_temp_free_internal(t_cpu_env);
 #endif
                     }
@@ -6585,15 +6824,23 @@ int        parse_translation_block(TranslationBlock* tb, uintptr_t tb_pc,
                                 new_non_conflicting_temp(TCG_TYPE_PTR);
                             tcg_movi(t_val_idx, (uintptr_t)temp_idx(t_val), 0,
                                      op, NULL, tcg_ctx);
+                            TCGTemp* t_base_val =
+                                new_non_conflicting_temp(TCG_TYPE_PTR);
+                            tcg_movi(t_base_val, 0, 0, op, NULL, tcg_ctx);
+                            TCGTemp* t_disp_pack =
+                                new_non_conflicting_temp(TCG_TYPE_PTR);
+                            tcg_movi(t_disp_pack, 0, 0, op, NULL, tcg_ctx);
                             TCGTemp *t_cpu_env = new_non_conflicting_temp(TCG_TYPE_PTR);
                             tcg_movi(t_cpu_env, (uintptr_t)cpu_env, 0, op, NULL, tcg_ctx);
-                            add_void_call_5(qemu_load_helper, t_cpu_env, t_ptr, t_mem_op,
-                                            t_ptr_idx, t_val_idx, op, NULL,
-                                            tcg_ctx);
+                            add_void_call_7(qemu_load_helper, t_cpu_env, t_ptr, t_mem_op,
+                                            t_ptr_idx, t_val_idx, t_base_val,
+                                            t_disp_pack, op, NULL, tcg_ctx);
                             MARK_TEMP_AS_NOT_ALLOCATED(t_ptr);
                             tcg_temp_free_internal(t_mem_op);
                             tcg_temp_free_internal(t_ptr_idx);
                             tcg_temp_free_internal(t_val_idx);
+                            tcg_temp_free_internal(t_base_val);
+                            tcg_temp_free_internal(t_disp_pack);
                             tcg_temp_free_internal(t_cpu_env);
 
                         } else if (op->opc == INDEX_op_ld32s_i64) {
@@ -8179,6 +8426,8 @@ int        parse_translation_block(TranslationBlock* tb, uintptr_t tb_pc,
                     mark_temp_as_free(arg_temp(op->args[i]));
                     temp_static_state[temp_idx(arg_temp(op->args[i]))]
                         .is_alive = 0;
+                    temp_addr_hint[temp_idx(arg_temp(op->args[i]))]
+                        .is_valid = 0;
                 }
             }
         }
@@ -8252,6 +8501,8 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
             mode = 1;
         }  else if (model == CALLOC) {
             // printf("[0x%lx] calloc(%lu)\n", model_caller_addr, (uintptr_t)env->regs[R_EDI]);
+            // For array detection
+            trace_mem("[calloc] [size %lx] [pc %lx]\n]", env->regs[R_EDI], model_caller_addr);
             model_alloc(env, model_caller_addr, R_EDI);
             clear_call_args_temps();
             clear_xmm_regs(env);
