@@ -85,9 +85,11 @@ static uint8_t tb_is_symbolic                     = 0;
 #endif
 
 static uintptr_t current_tb_pc = 0;
+static uintptr_t last_tb_pc    = 0;
 
 GHashTable* coverage_log_bb_ht = NULL;
 GHashTable* coverage_log_edges_ht = NULL;
+extern GHashTable *coverage_log_edges_cnt;
 
 // path constraints
 Expr* path_constraints = NULL;
@@ -1549,10 +1551,25 @@ static inline void visitTB(uintptr_t cur_loc)
         virgin_bitmap[index]++;
     }
 
+    if (coverage_log_edges_cnt == NULL) {
+        coverage_log_edges_cnt = g_hash_table_new_full(coverage_edge_hash, coverage_edge_equal, g_free, g_free);
+    }
+    CoverageEdge key = { .from = last_tb_pc, .to = current_tb_pc };
+    gpointer v = g_hash_table_lookup(coverage_log_edges_cnt, &key);
+    if (v == NULL) {
+        uint64_t *cnt = g_new(uint64_t, 1);
+        *cnt = 1;
+        g_hash_table_insert(coverage_log_edges_cnt, coverage_edge_copy(&key), cnt);
+    } else {
+        uint64_t *cnt = (uint64_t *)v;
+        (*cnt)++;
+    }
+
 #if VISIT_LINEARIZATION
     tb_is_symbolic = 0;
 #endif
     prev_loc = cur_loc >> 1;
+    last_tb_pc = current_tb_pc;
 }
 
 static inline void print_something(char* str) { printf("%s\n", str); }

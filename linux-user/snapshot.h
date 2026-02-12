@@ -96,6 +96,15 @@ typedef struct {
     int max_size;
 } OrderedMap;
 
+typedef struct {
+    uint64_t from;
+    uint64_t to;
+} CoverageEdge;
+
+guint coverage_edge_hash(gconstpointer key);
+gboolean coverage_edge_equal(gconstpointer a, gconstpointer b);
+CoverageEdge* coverage_edge_copy(const CoverageEdge* edge);
+
 bool is_valid_address(target_ulong addr);
 
 OrderedMap *ordered_map_init(int max_size);

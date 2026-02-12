@@ -28,6 +28,7 @@ bool forkserver_installed = false;
 unsigned char afl_fork_child;
 unsigned int  afl_forksrv_pid;
 
+GHashTable *coverage_log_edges_cnt = NULL;
 static SnapshotState g_snapshot;
 
 #define SNAPSHOT_MEM_REG_CACHE 4
@@ -197,6 +198,27 @@ OrderedMapEntry* ordered_map_lookup(OrderedMap *map, uintptr_t key) {
     return entry;
 }
 
+guint coverage_edge_hash(gconstpointer key) {
+    const CoverageEdge* edge = (const CoverageEdge*)key;
+    guint h1 = g_int64_hash(&edge->from);
+    guint h2 = g_int64_hash(&edge->to);
+    return h1 ^ (h2 << 1);
+}
+
+gboolean coverage_edge_equal(gconstpointer a, gconstpointer b) {
+    const CoverageEdge* edge_a = (const CoverageEdge*)a;
+    const CoverageEdge* edge_b = (const CoverageEdge*)b;
+    return (edge_a->from == edge_b->from) && (edge_a->to == edge_b->to);
+}
+
+CoverageEdge* coverage_edge_copy(const CoverageEdge* edge) {
+    CoverageEdge *copy = g_new(CoverageEdge, 1);
+    copy->from = edge->from;
+    copy->to   = edge->to;
+    return copy;
+}
+
+
 static SnapshotExitInfo *snapshot_exit_info_ptr(void) {
     if (shared_trace_data == NULL) return NULL;
     return &shared_trace_data->exit_info;
@@ -230,6 +252,26 @@ static bool snapshot_exit_info_should_update(const SnapshotExitInfo *info, bool 
     return crashed;  // Prevent update for exit() after error handling
 }
 
+static void dump_coverage_edge_log(gboolean update) {
+    if (coverage_log_edges_cnt == NULL) return;
+    GHashTableIter iter;
+    gpointer key, value;
+    g_hash_table_iter_init(&iter, coverage_log_edges_cnt);
+    while (g_hash_table_iter_next(&iter, &key, &value)) {
+        CoverageEdge *edge = (CoverageEdge *)key;
+        uint64_t *cnt = (uint64_t *)value;
+        if (update) {
+            trace_mem("[cov] [update] [from %lx] [to %lx] [cnt %lu]\n", edge->from, edge->to, *cnt);
+        } else {
+            trace_mem("[cov] [base] [from %lx] [to %lx] [cnt %lu]\n", edge->from, edge->to, *cnt);
+        }
+    }
+    if (!update) {
+        g_hash_table_destroy(coverage_log_edges_cnt);
+        coverage_log_edges_cnt = NULL;
+    }
+}
+
 void snapshot_record_guest_normal_exit(CPUArchState *cpu_env, int exit_code, const char *reason) {
     SnapshotExitInfo *info = snapshot_exit_info_ptr();
     if (!snapshot_exit_info_should_update(info, false)) return;
@@ -238,6 +280,7 @@ void snapshot_record_guest_normal_exit(CPUArchState *cpu_env, int exit_code, con
     info->exit_code = exit_code;
     snapshot_exit_info_capture(info, cpu_env);
     snapshot_exit_info_set_reason(info, reason ? reason : "normal_exit");
+    dump_coverage_edge_log(true);
 }
 
 void snapshot_record_guest_crash(CPUArchState *cpu_env, int target_signal, int host_signal, int si_code, target_ulong fault_addr, uintptr_t host_fault_addr, const char *reason) {
@@ -261,6 +304,7 @@ void snapshot_record_guest_crash(CPUArchState *cpu_env, int target_signal, int h
         g_snprintf(buffer, sizeof(buffer), "%s (host=%d, target=%d)", base, host_signal, target_signal);
     }
     snapshot_exit_info_set_reason(info, buffer);
+    dump_coverage_edge_log(true);
 }
 
 static void remove_read_access_primitive(uintptr_t addr) {
@@ -837,6 +881,7 @@ void snapshot_save(void) {
     
     g_snapshot.is_snapshot_taken = true;
     trace_mem("[snapshot] [result] [brk %llx] [mmap %llx] [pages %d]\n", (long long int)target_brk, (long long int)mmap_next_start, g_hash_table_size(g_snapshot.pages));
+    dump_coverage_edge_log(false);
 }
 
 void snapshot_write_access(SnapshotMemAccess *mem_access) {
