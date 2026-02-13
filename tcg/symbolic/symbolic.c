@@ -3041,56 +3041,6 @@ static inline void qemu_load_helper(CPUArchState *env, uintptr_t orig_addr,
     // number of bytes to load
     size_t    size = get_mem_op_size(mem_op);
     uintptr_t addr = orig_addr + offset;
-
-    static char buf[4096];
-
-    SnapshotMemRegion *mr = snapshot_mem_region_search(addr);
-    
-    if (mr) {
-        size_t len = 0;
-        for (int i = 0; i < CPU_NB_REGS; i++) {
-            len += snprintf(buf + len, 4096 - len, "[r%d %lx] ", i, env->regs[i]);
-        }
-        const char *reg_name = "global";
-        if (mr->is_stack) {
-            reg_name = "stack";
-        } else if (mr->is_heap) {
-            reg_name = "heap";
-        }
-        if (disp_is_valid(disp_pack)) {
-            int32_t disp = unpack_disp(disp_pack);
-            trace_mem("[loadh] [val] [reg %s] [pc 0x%lx] [addr 0x%lx] [base 0x%lx] [disp %d] [reg-base 0x%lx] [size 0x%lx] %s\n",
-                      reg_name, current_tb_pc, addr, base_val, disp, mr->base,
-                      size, buf);
-        } else {
-            uintptr_t base_fallback = 0;
-            int32_t disp_fallback = 0;
-            int has_fallback = 0;
-            int64_t best_abs = (int64_t)0x1000;
-            for (int i = 0; i < CPU_NB_REGS; i++) {
-                int64_t disp = (int64_t)addr - (int64_t)env->regs[i];
-                int64_t abs_disp = disp < 0 ? -disp : disp;
-                if (abs_disp <= best_abs) {
-                    best_abs = abs_disp;
-                    base_fallback = env->regs[i];
-                    disp_fallback = (int32_t)disp;
-                    has_fallback = 1;
-                }
-            }
-            if (has_fallback) {
-                trace_mem("[loadh] [val-fallback] [reg %s] [pc 0x%lx] [addr 0x%lx] [base 0x%lx] [disp %d] [reg-base 0x%lx] [size 0x%lx] %s\n",
-                          reg_name, current_tb_pc, addr, base_fallback,
-                          disp_fallback, mr->base, size, buf);
-            } else {
-                trace_mem("[loadh] [inval] [reg %s] [pc 0x%lx] [addr 0x%lx] [reg-base 0x%lx] [size 0x%lx] %s\n",
-                          reg_name, current_tb_pc, addr, mr->base, size, buf);
-            }
-        }
-    } else {
-        trace_mem("[loadh-error] [pc %lx] [addr %lx] [size %lx] failed to detect memory region\n", current_tb_pc, addr, size);
-    }
-    
-
     
 #if 0
     if (GET_QUERY_IDX(next_query) >= 116753 && GET_QUERY_IDX(next_query) <= 116773) {
@@ -3353,7 +3303,8 @@ static inline void qemu_load_helper(CPUArchState *env, uintptr_t orig_addr,
     } else {
         early_exit = true;
     }
-    
+    target_ulong val = 0;
+    bool is_ptr = false;
     if (size <= 8) {
         SnapshotMemAccess mem_access = {
             .symbolic_addr = (addr_idx < TCG_MAX_TEMPS && s_temps[addr_idx] != NULL),
@@ -3364,13 +3315,65 @@ static inline void qemu_load_helper(CPUArchState *env, uintptr_t orig_addr,
             .ptr = NULL,
             .size = size
         };
-        if (is_valid_address(addr)) {
+        if (is_valid_address(addr, false)) {
             void *addr_h = g2h(addr);
             memcpy(mem_access.target, addr_h, size);
-            snapshot_read_access(&mem_access);
-        } else {
-            printf("Invalid addr %lx\n", addr);
         }
+        if (is_valid_address(addr, true)) {
+            snapshot_read_access(&mem_access);
+        }
+        if (size == sizeof(target_ulong)) {
+            memcpy(&val, mem_access.target, size);
+            is_ptr = is_valid_address(val, false);
+        }
+    }
+
+    static char buf[4096];
+
+    SnapshotMemRegion *mr = snapshot_mem_region_search(addr);
+    
+    if (mr) {
+        size_t len = 0;
+        for (int i = 0; i < CPU_NB_REGS; i++) {
+            len += snprintf(buf + len, 4096 - len, "[r%d %lx] ", i, env->regs[i]);
+        }
+        const char *reg_name = "global";
+        if (mr->is_stack) {
+            reg_name = "stack";
+        } else if (mr->is_heap) {
+            reg_name = "heap";
+        }
+        if (disp_is_valid(disp_pack)) {
+            int32_t disp = unpack_disp(disp_pack);
+            trace_mem("[loadh] [val] [reg %s] [pc 0x%lx] [addr 0x%lx] [base 0x%lx] [disp %d] [reg-base 0x%lx] [size 0x%lx] [val %lx] [is-ptr %d] %s\n",
+                      reg_name, current_tb_pc, addr, base_val, disp, mr->base,
+                      size, val, is_ptr, buf);
+        } else {
+            uintptr_t base_fallback = 0;
+            int32_t disp_fallback = 0;
+            int has_fallback = 0;
+            int64_t best_abs = (int64_t)0x1000;
+            for (int i = 0; i < CPU_NB_REGS; i++) {
+                int64_t disp = (int64_t)addr - (int64_t)env->regs[i];
+                int64_t abs_disp = disp < 0 ? -disp : disp;
+                if (abs_disp <= best_abs) {
+                    best_abs = abs_disp;
+                    base_fallback = env->regs[i];
+                    disp_fallback = (int32_t)disp;
+                    has_fallback = 1;
+                }
+            }
+            if (has_fallback) {
+                trace_mem("[loadh] [val-fallback] [reg %s] [pc 0x%lx] [addr 0x%lx] [base 0x%lx] [disp %d] [reg-base 0x%lx] [size 0x%lx] [val %lx] [is-ptr %d] %s\n",
+                          reg_name, current_tb_pc, addr, base_fallback,
+                          disp_fallback, mr->base, size, val, is_ptr, buf);
+            } else {
+                trace_mem("[loadh] [inval] [reg %s] [pc 0x%lx] [addr 0x%lx] [reg-base 0x%lx] [size 0x%lx] [val %lx] [is-ptr %d] %s\n",
+                          reg_name, current_tb_pc, addr, mr->base, size, val, is_ptr, buf);
+            }
+        }
+    } else {
+        trace_mem("[loadh-error] [pc %lx] [addr %lx] [size %lx] failed to detect memory region\n", current_tb_pc, addr, size);
     }
     
     
@@ -3787,6 +3790,26 @@ static inline void qemu_store_helper(CPUArchState *env,
     uintptr_t addr = orig_addr + offset;
     static char buf[4096];
 
+    bool is_ptr = false;
+    if (size <= 8) {
+        SnapshotMemAccess mem_access = {
+            .symbolic_addr = (addr_idx < TCG_MAX_TEMPS && s_temps[addr_idx] != NULL),
+            .symbolic_value = (addr_idx < TCG_MAX_TEMPS && s_temps[val_idx] != NULL),
+            .addr = addr,
+            .pc = current_tb_pc,
+            .target = {0},
+            .ptr = NULL,
+            .size = size
+        };
+        memcpy(mem_access.target, (void *)&concrete_val, size);
+        if (is_valid_address(addr, true)) {           
+            snapshot_write_access(&mem_access);
+        }
+        if (size == sizeof(target_ulong)) {
+            is_ptr = is_valid_address((target_ulong)concrete_val, false);
+        }
+    }
+
     SnapshotMemRegion *mr = snapshot_mem_region_search(addr);
     
     if (mr) {
@@ -3819,31 +3842,17 @@ static inline void qemu_store_helper(CPUArchState *env,
                 }
             }
             if (has_fallback) {
-                trace_mem("[storeh] [val-fallback] [reg %s] [pc 0x%lx] [addr 0x%lx] [base 0x%lx] [disp %d] [reg-base 0x%lx] [size 0x%lx] %s\n", reg_name, current_tb_pc,  addr, base_fallback, disp_fallback, mr->base, size, buf);
+                trace_mem("[storeh] [val-fallback] [reg %s] [pc 0x%lx] [addr 0x%lx] [base 0x%lx] [disp %d] [reg-base 0x%lx] [size 0x%lx] [val %lx] [is-ptr %d] %s\n", reg_name, current_tb_pc,  addr, base_fallback, disp_fallback, mr->base, size, concrete_val, is_ptr, buf);
             } else {
-                trace_mem("[storeh] [inval] [reg %s] [pc 0x%lx] [addr 0x%lx] [reg-base 0x%lx] [size 0x%lx] %s\n", reg_name, current_tb_pc, addr, mr->base, size, buf);
+                trace_mem("[storeh] [inval] [reg %s] [pc 0x%lx] [addr 0x%lx] [reg-base 0x%lx] [size 0x%lx] [val %lx] [is-ptr %d] %s\n", reg_name, current_tb_pc, addr, mr->base, size, concrete_val, is_ptr, buf);
             }
         }
-        trace_mem("[storeh] [reg %s] [pc 0x%lx] [addr 0x%lx] [reg-base 0x%lx] [size 0x%lx] %s\n", reg_name, current_tb_pc, addr, mr->base, size, buf);
+        // trace_mem("[storeh] [reg %s] [pc 0x%lx] [addr 0x%lx] [reg-base 0x%lx] [size 0x%lx] [val %lx] [is-ptr %d] %s\n", reg_name, current_tb_pc, addr, mr->base, size, concrete_val, is_ptr, buf);
     } else {
         trace_mem("[storeh-error] [pc %lx] [addr %lx] [size %lx] failed to detect memory region\n", current_tb_pc, addr, size);
     }
 
-    if (size <= 8) {
-        SnapshotMemAccess mem_access = {
-            .symbolic_addr = (addr_idx < TCG_MAX_TEMPS && s_temps[addr_idx] != NULL),
-            .symbolic_value = (addr_idx < TCG_MAX_TEMPS && s_temps[val_idx] != NULL),
-            .addr = addr,
-            .pc = current_tb_pc,
-            .target = {0},
-            .ptr = NULL,
-            .size = size
-        };
-        if (is_valid_address(addr)) {
-            memcpy(mem_access.target, (void *)&concrete_val, size);
-            snapshot_write_access(&mem_access);
-        }
-    }
+
 
 #if 0
     printf("Store %lu bytes at %lx\n", size, addr);

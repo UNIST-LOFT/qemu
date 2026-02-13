@@ -393,16 +393,26 @@ static void add_read_access_primitive(uintptr_t addr, int size, uintptr_t pc) {
     trace_mem("[rpi] [addr %lx] [size %d] [pc %lx] [index %d] [id %ld]\n", addr, size, pc, entry->shared_index, prim->access_id);
 }
 
-bool is_valid_address(target_ulong addr) {
+bool is_valid_address(target_ulong addr, bool for_snapshot) {
     if (g_snapshot.pages == NULL) {
         trace_mem("ERROR! No valid pages\n");
+        return false;
+    }
+    if (for_snapshot && g_hash_table_size(g_snapshot.pages) == 0) {
         return false;
     }
     target_ulong page = addr & SNAPSHOT_PAGE_MASK;
     SnapshotPageInfo *info = g_hash_table_lookup(g_snapshot.pages, &page);
     if (info != NULL) {
-        // Valid only if it has write permission
-        return (info->perms & PAGE_WRITE) != 0;
+        if (for_snapshot) {
+            // Valid only if it has write permission
+            return (info->perms & PAGE_WRITE) != 0;
+        } else {
+            return true;
+        }
+    }
+    if (!for_snapshot) {
+        return page_get_flags(addr) & PAGE_VALID;
     }
     return false;
 }
@@ -492,6 +502,7 @@ static int check_addr_in_region(SnapshotMemRegion *mr, target_ulong addr) {
 }
 
 static void init_mr_manager(void) {
+    mr_manager.stack_region.is_stack = true;
     if (mr_manager.stack_data == NULL) {
         mr_manager.stack_data = g_array_new(FALSE, FALSE, sizeof(SnapshotMemRegion *));
     }
@@ -655,7 +666,7 @@ static SnapshotMemRegion *mr_manager_stack_search(target_ulong addr) {
     // if (mr != NULL) {
     //     return mr;
     // }
-    trace_mem("[mr] [stack] [search] [addr %lx]\n", addr);
+    // trace_mem("[mr] [stack] [search] [addr %lx] [depth %d]\n", addr, mr_manager.stack_data->len);
     SnapshotMemRegion *mr = NULL;
     GArray *stack = mr_manager.stack_data;
     for (ssize_t i = stack->len - 1; i >= 0; i--) {
@@ -663,6 +674,8 @@ static SnapshotMemRegion *mr_manager_stack_search(target_ulong addr) {
         if (tmp == NULL) continue;
         if (check_addr_in_region(tmp, addr) == 0) {
             mr = tmp;
+            trace_mem("[mr] [stack] [found] [addr %lx] [base %lx] [size %lx] [pc %lx] [depth %d] [full-depth %d]\n",
+                      addr, mr->base, mr->size, mr->pc, i + 1, stack->len);
             break;
         }
     }
@@ -891,9 +904,6 @@ void snapshot_write_access(SnapshotMemAccess *mem_access) {
     if (size == sizeof(target_ulong)) {
         target_ulong target;
         memcpy(&target, mem_access->target, sizeof(target_ulong));
-        if (is_valid_address(target)) {
-            // Trace?
-        }
     }
     // target_ulong start = addr & SNAPSHOT_PAGE_MASK;
     // target_ulong end = (addr + size - 1) & SNAPSHOT_PAGE_MASK;
@@ -910,7 +920,7 @@ void snapshot_read_access(SnapshotMemAccess *mem_access) {
     if (size == sizeof(target_ulong)) {
         target_ulong target;
         memcpy(&target, mem_access->target, sizeof(target_ulong));
-        if (is_valid_address(target)) {
+        if (is_valid_address(target, true)) {
             // Add to pointer
             add_read_access_pointer(addr, target, mem_access->pc);
             is_value_pointer = true;

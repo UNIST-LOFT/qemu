@@ -583,9 +583,12 @@ static inline void qemu_memmove(CPUArchState *cpu_env, uintptr_t src, uintptr_t 
         .size = size
     };
     if (size <= 8) {
-        if (is_valid_address(src)) {
+        if (is_valid_address(src, false)) {
             void *addr_h = g2h(src);
             memcpy(mem_access.target, addr_h, size);
+        }
+        if (is_valid_address(src, true)) {
+            snapshot_read_access(&mem_access);
         }
     }
     static char buf[4096];
@@ -593,8 +596,13 @@ static inline void qemu_memmove(CPUArchState *cpu_env, uintptr_t src, uintptr_t 
     for (int i = 0; i < CPU_NB_REGS; i++) {
         len += snprintf(buf + len, 4096 - len, "[r%d %lx] ", i, cpu_env->regs[i]);
     }
-    trace_mem("[memmoveh] [src %lx] [dst %lx] [size %lx] %s\n", src, dst, size, buf);
-    snapshot_read_access(&mem_access);
+    target_ulong val = 0;
+    bool is_ptr = false;
+    if (size == sizeof(target_ulong)) {
+        memcpy(&val, mem_access.target, size);
+        is_ptr = is_valid_address(val, false);
+    }
+    trace_mem("[memmoveh] [src %lx] [dst %lx] [size %lx] [val %lx] [is-ptr %d] %s\n", src, dst, size, val, is_ptr, buf);
     // Add snapshot_write_access to dst if needed
 
     if (src_exprs == NULL && dst_exprs == NULL) {

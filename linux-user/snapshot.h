@@ -105,7 +105,7 @@ guint coverage_edge_hash(gconstpointer key);
 gboolean coverage_edge_equal(gconstpointer a, gconstpointer b);
 CoverageEdge* coverage_edge_copy(const CoverageEdge* edge);
 
-bool is_valid_address(target_ulong addr);
+bool is_valid_address(target_ulong addr, bool for_snapshot);
 
 OrderedMap *ordered_map_init(int max_size);
 OrderedMapEntry *ordered_map_insert(OrderedMap *map, uintptr_t key, void *data);
