@@ -3337,12 +3337,7 @@ static inline void qemu_load_helper(CPUArchState *env, uintptr_t orig_addr,
         for (int i = 0; i < CPU_NB_REGS; i++) {
             len += snprintf(buf + len, 4096 - len, "[r%d %lx] ", i, env->regs[i]);
         }
-        const char *reg_name = "global";
-        if (mr->is_stack) {
-            reg_name = "stack";
-        } else if (mr->is_heap) {
-            reg_name = "heap";
-        }
+        const char *reg_name = snapshot_mem_region_str(mr);
         if (disp_is_valid(disp_pack)) {
             int32_t disp = unpack_disp(disp_pack);
             trace_mem("[loadh] [val] [reg %s] [pc 0x%lx] [addr 0x%lx] [base 0x%lx] [disp %d] [reg-base 0x%lx] [size 0x%lx] [val %lx] [is-ptr %d] %s\n",
@@ -3817,12 +3812,7 @@ static inline void qemu_store_helper(CPUArchState *env,
         for (int i = 0; i < CPU_NB_REGS; i++) {
             len += snprintf(buf + len, 4096 - len, "[r%d %lx] ", i, env->regs[i]);
         }
-        const char *reg_name = "global";
-        if (mr->is_stack) {
-            reg_name = "stack";
-        } else if (mr->is_heap) {
-            reg_name = "heap";
-        }
+        const char *reg_name = snapshot_mem_region_str(mr);
         if (disp_is_valid(disp_pack)) {
             int32_t disp = unpack_disp(disp_pack);
             trace_mem("[storeh] [val] [reg %s] [pc 0x%lx] [addr 0x%lx] [base 0x%lx] [disp %d] [reg-base 0x%lx] [size 0x%lx] %s\n", reg_name, current_tb_pc, addr, base_val, disp, mr->base, size, buf);

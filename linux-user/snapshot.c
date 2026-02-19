@@ -155,6 +155,17 @@ void trace_mem(const char* fmt, ...) {
     va_end(ap);
 }
 
+const char *snapshot_mem_region_str(SnapshotMemRegion *mr) {
+    if (mr == NULL) return "NULL";
+    if (mr->is_stack) {
+        return "stack";
+    } else if (mr->is_heap) {
+        return "heap";
+    } else {
+        return "global";
+    }
+}
+
 OrderedMap *ordered_map_init(int max_size) {
     OrderedMap *map = g_new(OrderedMap, 1);
     map->max_size = max_size;

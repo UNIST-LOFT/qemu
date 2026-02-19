@@ -101,6 +101,8 @@ typedef struct {
     uint64_t to;
 } CoverageEdge;
 
+const char *snapshot_mem_region_str(SnapshotMemRegion *mr);
+
 guint coverage_edge_hash(gconstpointer key);
 gboolean coverage_edge_equal(gconstpointer a, gconstpointer b);
 CoverageEdge* coverage_edge_copy(const CoverageEdge* edge);
