@@ -3815,7 +3815,7 @@ static inline void qemu_store_helper(CPUArchState *env,
         const char *reg_name = snapshot_mem_region_str(mr);
         if (disp_is_valid(disp_pack)) {
             int32_t disp = unpack_disp(disp_pack);
-            trace_mem("[storeh] [val] [reg %s] [pc 0x%lx] [addr 0x%lx] [base 0x%lx] [disp %d] [reg-base 0x%lx] [size 0x%lx] %s\n", reg_name, current_tb_pc, addr, base_val, disp, mr->base, size, buf);
+            trace_mem("[storeh] [val] [reg %s] [pc 0x%lx] [addr 0x%lx] [base 0x%lx] [disp %d] [reg-base 0x%lx] [size 0x%lx] [val %lx] [is-ptr %d] %s\n", reg_name, current_tb_pc, addr, base_val, disp, mr->base, size, concrete_val, is_ptr, buf);
         } else {
             uintptr_t base_fallback = 0;
             int32_t disp_fallback = 0;
