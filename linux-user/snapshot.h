@@ -151,4 +151,6 @@ void snapshot_remove_mapping(target_ulong addr, target_ulong len);
 void snapshot_fork_setup(void);
 void snapshot_forkserver(CPUState *cpu);
 
+void snapshot_load_inferred_types(uint8_t *analyze_result);
+
 #endif /* BINRADAR_SNAPSHOT_H */
