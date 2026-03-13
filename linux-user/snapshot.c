@@ -123,20 +123,26 @@ static GHashTable *g_read_access_pointers_all = NULL;
 static ModificationManager *mod_manager = NULL;
 static SnapshotExitInfo original_exit_info;
 
-typedef enum {
-    OSPREY_TYPE_UNKNOWN = 0,
+typedef enum OspreyRoleKind {
+    OSPREY_ROLE_UNKNOWN = 0,
+    OSPREY_ROLE_SCALAR,
+    OSPREY_ROLE_FIELD,
+    OSPREY_ROLE_ARRAY_ELEM,
+    OSPREY_ROLE_STRUCT_BASE,
+    OSPREY_ROLE_ARRAY_START,
+} OspreyRoleKind;
+
+typedef enum OspreyTypeKind {
     OSPREY_TYPE_PRIMITIVE,
     OSPREY_TYPE_POINTER,
     OSPREY_TYPE_ARRAY,
-    OSPREY_TYPE_ARRAY_ELEM,
     OSPREY_TYPE_STRUCT,
-    OSPREY_TYPE_FIELD
 } OspreyTypeKind;
 
 typedef struct OspreyType OspreyType;
 
-typedef struct {
-    uint64_t offset;
+typedef struct OspreyStructField {
+    int64_t offset;
     uint64_t size;
     char *type_id;
     OspreyType *type;
@@ -145,52 +151,33 @@ typedef struct {
 struct OspreyType {
     OspreyTypeKind kind;
     char *id;
+    bool is_pointer;
+    uint64_t size;
+    // For pointer: the type it points to
+    // For array: the type of the element
+    OspreyType *target;
+    char *target_type_id; // For temp use before resolve
     union {
         struct {
-            uint64_t size;
-        } primitive;
-
-        struct {
-            char *target_type_id;
-            OspreyType *target_type;
-        } pointer;
-        
-        struct {
-            char *elem_type_id;
-            OspreyType *elem_type;
-            uint64_t count;
-            uint64_t elem_size;
-        } array;
-
-        struct {
-            char *elem_type_id;
-            OspreyType *elem_type;
-        } array_elem;
-        
+            char *target_role; // For temp use before resolve
+        } pointer_info;
         struct {
             GArray *fields; // OspreyStructField
-            uint64_t total_size;
-        } struct_type;
-
+        } struct_info;
         struct {
-            char *field_type_id;
-            OspreyType *field_type;
-            int64_t field_offset;
-            OspreyType *base_struct_type;
-        } field;
-
-    } data;
+            uint64_t count;
+        } array_info;
+    } meta;
 };
 
-typedef struct {
+typedef struct OspreyObject {
     uint64_t addr;
     uint64_t size;
 
-    OspreyTypeKind type_kind;
-    char *type_id;
+    OspreyRoleKind role;
     OspreyType *type;
-    
-    uint64_t target_addr;
+    // For field/array_elem: the struct/array it belongs to; For struct/array: NULL
+    struct OspreyObject *parent;
 } OspreyObject;
 
 
@@ -222,7 +209,7 @@ struct MemGraph {
     GHashTable *obj_nodes; // addr -> ObjNode
 };
 
-typedef struct {
+typedef struct OspreyTypeManager {
     GHashTable *type_table; // char* id -> OspreyType*
     GHashTable *obj_addr_to_type; // uint64_t addr -> OspreyObject* (scalar, pointer, array_elem, field)
     GHashTable *addr_to_type; // uint64_t addr -> OspreyObject* (array_start, struct)
@@ -230,26 +217,31 @@ typedef struct {
     MemGraph mem_graph;
 } OspreyTypeManager;
 
+static int osprey_type_size(OspreyType *type) {
+    if (type == NULL) {
+        return 0;
+    }
+    switch (type->kind) {
+        default:
+            return 0;
+    }
+}
+
 static void osprey_type_free(gpointer data) {
     OspreyType *t = (OspreyType *)data;
     g_free(t->id);
-    if (t->kind == OSPREY_TYPE_ARRAY) {
-        g_free(t->data.array.elem_type_id);
-    } else if (t->kind == OSPREY_TYPE_STRUCT) {
-        for (guint i = 0; i < t->data.struct_type.fields->len; i++) {
-            OspreyStructField *f = &g_array_index(t->data.struct_type.fields, OspreyStructField, i);
+    if (t->kind == OSPREY_TYPE_STRUCT) {
+        for (guint i = 0; i < t->meta.struct_info.fields->len; i++) {
+            OspreyStructField *f = &g_array_index(t->meta.struct_info.fields, OspreyStructField, i);
             g_free(f->type_id);
         }
-        g_array_free(t->data.struct_type.fields, TRUE);
-    } else if (t->kind == OSPREY_TYPE_POINTER) {
-        g_free(t->data.pointer.target_type_id);
+        g_array_free(t->meta.struct_info.fields, TRUE);
     }
     g_free(t);
 }
 
 static void osprey_object_free(gpointer data) {
     OspreyObject *inst = (OspreyObject *)data;
-    g_free(inst->type_id);
     g_free(inst);
 }
 
@@ -271,17 +263,17 @@ static OspreyTypeManager* osprey_type_manager_new(void) {
 //     g_free(manager);
 // }
 
-static PtrNode *osprey_ptr_node_get(OspreyTypeManager *manager, uint64_t addr, bool create) {
-    PtrNode *node = (PtrNode *)g_hash_table_lookup(
-        manager->mem_graph.ptr_nodes, GSIZE_TO_POINTER((gsize)addr));
-    if (node == NULL && create) {
-        node = g_new0(PtrNode, 1);
-        node->addr = addr;
-        g_hash_table_insert(manager->mem_graph.ptr_nodes,
-                            GSIZE_TO_POINTER((gsize)addr), node);
-    }
-    return node;
-}
+// static PtrNode *osprey_ptr_node_get(OspreyTypeManager *manager, uint64_t addr, bool create) {
+//     PtrNode *node = (PtrNode *)g_hash_table_lookup(
+//         manager->mem_graph.ptr_nodes, GSIZE_TO_POINTER((gsize)addr));
+//     if (node == NULL && create) {
+//         node = g_new0(PtrNode, 1);
+//         node->addr = addr;
+//         g_hash_table_insert(manager->mem_graph.ptr_nodes,
+//                             GSIZE_TO_POINTER((gsize)addr), node);
+//     }
+//     return node;
+// }
 
 static ObjNode *osprey_obj_node_get(OspreyTypeManager *manager, uint64_t addr, bool create) {
     ObjNode *node = (ObjNode *)g_hash_table_lookup(
@@ -296,15 +288,15 @@ static ObjNode *osprey_obj_node_get(OspreyTypeManager *manager, uint64_t addr, b
     return node;
 }
 
-static PtrEdge *osprey_ptr_edge_create(OspreyTypeManager *manager, PtrNode *src, PtrNode *dst) {
-    PtrEdge *edge = g_new0(PtrEdge, 1);
-    edge->src = src;
-    edge->dst = dst;
-    if (src->base) {
-        g_array_append_val(src->base->outgoing_ptr_edges, edge);
-    }
-    return edge;
-}
+// static PtrEdge *osprey_ptr_edge_create(OspreyTypeManager *manager, PtrNode *src, PtrNode *dst) {
+//     PtrEdge *edge = g_new0(PtrEdge, 1);
+//     edge->src = src;
+//     edge->dst = dst;
+//     if (src->base) {
+//         g_array_append_val(src->base->outgoing_ptr_edges, edge);
+//     }
+//     return edge;
+// }
 
 static OspreyObject *osprey_object_get(OspreyTypeManager *manager, uint64_t addr, bool create) {
     OspreyObject *obj = (OspreyObject *)g_hash_table_lookup(
@@ -318,10 +310,10 @@ static OspreyObject *osprey_object_get(OspreyTypeManager *manager, uint64_t addr
     return obj;
 }
 
-static OspreyObject *osprey_address_get(OspreyTypeManager *manager, uint64_t addr) {
+static OspreyObject *osprey_address_get(OspreyTypeManager *manager, uint64_t addr, bool create) {
     OspreyObject *obj = (OspreyObject *)g_hash_table_lookup(
         manager->addr_to_type, GSIZE_TO_POINTER((gsize)addr));
-    if (obj == NULL) {
+    if (obj == NULL && create) {
         obj = g_new0(OspreyObject, 1);
         obj->addr = addr;
         g_hash_table_insert(manager->addr_to_type,
@@ -331,6 +323,9 @@ static OspreyObject *osprey_address_get(OspreyTypeManager *manager, uint64_t add
 }
 
 static OspreyType *osprey_type_get(OspreyTypeManager *manager, const char *type_id) {
+    if (type_id == NULL) {
+        return NULL;
+    }
     OspreyType *type = (OspreyType *)g_hash_table_lookup(manager->type_table, type_id);
     return type;
 }
@@ -1447,6 +1442,145 @@ static void flip_bits(uint8_t *target, int size) {
     }
 }
 
+static void add_modification_primitive(GQueue *modifications, SingleModification *mod) {
+    // Set to 0, Set to 1, bitflip
+    // TODO: better modification methods
+    // TODO: multi loc modification
+    // TODO: remove partial pointer access (memcpy(target, ptr, 8))
+    // TODO: verifiy modification using solver
+    switch (mod->size) {
+        case 1: {
+            uint8_t val = mod->target[0];
+            if (val != 0) {
+                GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
+                mod->target[0] = 0;
+                g_array_append_val(arr, mod);
+                g_queue_push_tail(modifications, arr);
+            }
+            if (val != 1) {
+                GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
+                mod->target[0] = 1;
+                g_array_append_val(arr, mod);
+                g_queue_push_tail(modifications, arr);
+            }
+            GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
+            flip_bits(mod->target, mod->size);
+            g_array_append_val(arr, mod);
+            g_queue_push_tail(modifications, arr);
+            break;
+        }
+        case 2: {
+            uint16_t val;
+            memcpy(&val, mod->target, 2);
+            if (val != 0) {
+                GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
+                memset(mod->target, 0, 2);
+                g_array_append_val(arr, mod);
+                g_queue_push_tail(modifications, arr);
+            }
+            if (val != 1) {
+                GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
+                uint16_t one = 1;
+                memcpy(mod->target, &one, 2);
+                g_array_append_val(arr, mod);
+                g_queue_push_tail(modifications, arr);
+            }
+            GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
+            flip_bits(mod->target, mod->size);
+            g_array_append_val(arr, mod);
+            g_queue_push_tail(modifications, arr);
+            break;
+        }
+        case 4: {
+            uint32_t val;
+            memcpy(&val, mod->target, 4);
+            if (val != 0) {
+                GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
+                memset(mod->target, 0, 4);
+                g_array_append_val(arr, mod);
+                g_queue_push_tail(modifications, arr);
+            }
+            if (val != 1) {
+                GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
+                uint32_t one = 1;
+                memcpy(mod->target, &one, 4);
+                g_array_append_val(arr, mod);
+                g_queue_push_tail(modifications, arr);
+            }
+            GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
+            flip_bits(mod->target, mod->size);
+            g_array_append_val(arr, mod);
+            g_queue_push_tail(modifications, arr);
+            break;
+        }
+        case 8: {
+            uint64_t val;
+            memcpy(&val, mod->target, 8);
+            if (val != 0) {
+                GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
+                memset(mod->target, 0, 8);
+                g_array_append_val(arr, mod);
+                g_queue_push_tail(modifications, arr);
+            }
+            if (val != 1) {
+                GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
+                uint64_t one = 1;
+                memcpy(mod->target, &one, 8);
+                g_array_append_val(arr, mod);
+                g_queue_push_tail(modifications, arr);
+            }
+            GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
+            flip_bits(mod->target, mod->size);
+            g_array_append_val(arr, mod);
+            g_queue_push_tail(modifications, arr);
+            break;
+        }
+        default: {
+            // From real memcpy/memmove (if plt is given) or file write
+            if (mod->size < 8) {
+                flip_bits(mod->target, mod->size);
+                GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
+                g_array_append_val(arr, mod);
+                g_queue_push_tail(modifications, arr);
+            } else {
+                // TODO: fuzzing
+            }
+        }
+    }
+}
+
+static void add_modification_pointer(GQueue *modifications, SingleModification *mod) {
+    // For pointer, try null, valid
+    target_ulong original;
+    memcpy(&original, mod->target, sizeof(target_ulong));
+    OspreyObject *obj = NULL;
+    if (g_osprey_type_manager != NULL) {
+        obj = osprey_object_get(g_osprey_type_manager, mod->addr, false);
+    }
+    // Null pointer -> valid pointer
+    if (original == 0) {
+        // Check if any valid pointer is available for the address
+        if (obj != NULL) {
+            if (obj->type && obj->type->kind == OSPREY_TYPE_POINTER) {
+                OspreyType *pointee_type = obj->type->target;
+                int type_size = osprey_type_size(pointee_type);
+                // TODO: add to guest memory and get address
+                trace_mem("[inferred] [pointee] [pointee-type %s] [addr %lx] [size %d]\n", pointee_type->id, mod->addr, type_size);
+            }                
+        }
+    } else {
+        // Valid pointer -> null pointer
+        // TODO: Check if it can be null pointer
+        GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
+        memset(mod->target, 0, sizeof(target_ulong));
+        g_array_append_val(arr, mod);
+        g_queue_push_tail(modifications, arr);
+        // Valid pointer -> out-of-bounds pointer
+        // TODO: Check if it can be out-of-bounds pointer (if it's pointer to the element of array)
+        
+    }
+}
+
 // In parent process, called after child execution
 // Return: remaining modifications
 static int analyze_collected_data(void) {
@@ -1517,112 +1651,18 @@ static int analyze_collected_data(void) {
                 // Check if pointer
                 OspreyObject *obj = osprey_object_get(g_osprey_type_manager, prim->addr, false);
                 if (obj != NULL) {
-                    trace_mem("[inferred] [primitive] [type %s] [addr %lx]\n", obj->type_id, prim->addr);
+                    if (obj->type) {
+                        // Pointer type: try null, valid, out-of-bounds
+                        trace_mem("[inferred] [ptr] [type %s] [addr %lx]\n", obj->type->id, prim->addr);
+                    } else {
+                        // Non-pointer type: apply generic modifications
+                        add_modification_primitive(mod_manager->modifications, &mod);
+                    }
                 }
                 continue;
-            }
-            // Set to 0, Set to 1, bitflip
-            // TODO: better modification methods
-            // TODO: multi loc modification
-            // TODO: remove partial pointer access (memcpy(target, ptr, 8))
-            switch (mod.size) {
-                case 1: {
-                    uint8_t val = mod.target[0];
-                    if (val != 0) {
-                        GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
-                        mod.target[0] = 0;
-                        g_array_append_val(arr, mod);
-                        g_queue_push_tail(mod_manager->modifications, arr);
-                    }
-                    if (val != 1) {
-                        GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
-                        mod.target[0] = 1;
-                        g_array_append_val(arr, mod);
-                        g_queue_push_tail(mod_manager->modifications, arr);
-                    }
-                    GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
-                    flip_bits(mod.target, mod.size);
-                    g_array_append_val(arr, mod);
-                    g_queue_push_tail(mod_manager->modifications, arr);
-                    break;
-                }
-                case 2: {
-                    uint16_t val;
-                    memcpy(&val, mod.target, 2);
-                    if (val != 0) {
-                        GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
-                        memset(mod.target, 0, 2);
-                        g_array_append_val(arr, mod);
-                        g_queue_push_tail(mod_manager->modifications, arr);
-                    }
-                    if (val != 1) {
-                        GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
-                        uint16_t one = 1;
-                        memcpy(mod.target, &one, 2);
-                        g_array_append_val(arr, mod);
-                        g_queue_push_tail(mod_manager->modifications, arr);
-                    }
-                    GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
-                    flip_bits(mod.target, mod.size);
-                    g_array_append_val(arr, mod);
-                    g_queue_push_tail(mod_manager->modifications, arr);
-                    break;
-                }
-                case 4: {
-                    uint32_t val;
-                    memcpy(&val, mod.target, 4);
-                    if (val != 0) {
-                        GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
-                        memset(mod.target, 0, 4);
-                        g_array_append_val(arr, mod);
-                        g_queue_push_tail(mod_manager->modifications, arr);
-                    }
-                    if (val != 1) {
-                        GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
-                        uint32_t one = 1;
-                        memcpy(mod.target, &one, 4);
-                        g_array_append_val(arr, mod);
-                        g_queue_push_tail(mod_manager->modifications, arr);
-                    }
-                    GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
-                    flip_bits(mod.target, mod.size);
-                    g_array_append_val(arr, mod);
-                    g_queue_push_tail(mod_manager->modifications, arr);
-                    break;
-                }
-                case 8: {
-                    uint64_t val;
-                    memcpy(&val, mod.target, 8);
-                    if (val != 0) {
-                        GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
-                        memset(mod.target, 0, 8);
-                        g_array_append_val(arr, mod);
-                        g_queue_push_tail(mod_manager->modifications, arr);
-                    }
-                    if (val != 1) {
-                        GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
-                        uint64_t one = 1;
-                        memcpy(mod.target, &one, 8);
-                        g_array_append_val(arr, mod);
-                        g_queue_push_tail(mod_manager->modifications, arr);
-                    }
-                    GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
-                    flip_bits(mod.target, mod.size);
-                    g_array_append_val(arr, mod);
-                    g_queue_push_tail(mod_manager->modifications, arr);
-                    break;
-                }
-                default: {
-                    // From real memcpy/memmove (if plt is given) or file write
-                    if (mod.size < 8) {
-                        flip_bits(mod.target, mod.size);
-                        GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
-                        g_array_append_val(arr, mod);
-                        g_queue_push_tail(mod_manager->modifications, arr);
-                    } else {
-                        // TODO: fuzzing
-                    }
-                }
+            } else {
+                // No type inference: apply generic modifications
+                add_modification_primitive(mod_manager->modifications, &mod);
             }
         }
         for (int i = 0; i < shared_trace_data->ptr_idx; i++) {
@@ -1645,24 +1685,12 @@ static int analyze_collected_data(void) {
             if (g_osprey_type_manager != NULL) {
                 OspreyObject *obj = osprey_object_get(g_osprey_type_manager, ptr->addr, false);
                 if (obj != NULL) {
-                    trace_mem("[inferred] [pointer] [type %s] [addr %lx]\n", obj->type_id, ptr->addr);
-                    continue;
+                    trace_mem("[inferred] [pointer] [type %s] [addr %lx]\n", obj->type ? obj->type->id : "unknown", ptr->addr);
+                    add_modification_pointer(mod_manager->modifications, &mod);
                 }
                 continue;
             }
-            // Fix pointer
-            if (actual_value != 0) {
-                // Set to NULL
-                GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
-                target_ulong null_ptr = 0;
-                memcpy(mod.target, &null_ptr, sizeof(target_ulong));
-                g_array_append_val(arr, mod);
-                g_queue_push_tail(mod_manager->modifications, arr);
-            } else {
-                // Pointer to new object
-                // TODO: recognize null pointer
-                // TODO: allocate new page with mmap, cache it and reuse it
-            }
+            add_modification_pointer(mod_manager->modifications, &mod);
         }
         trace_mem("[analyze] [queue] [len %d]\n", g_queue_get_length(mod_manager->modifications));
     } else {
@@ -1694,108 +1722,17 @@ static int analyze_collected_data(void) {
                     void *ptr_h = g2h(prim->addr);
                     memcpy(mod.target, ptr_h, prim->size);
                 }
-                // Set to 0, Set to 1, bitflip
-                // TODO: better modification methods
-                // TODO: multi loc modification
-                // TODO: remove partial pointer access (memcpy(target, ptr, 8))
-                switch (mod.size) {
-                    case 1: {
-                        uint8_t val = mod.target[0];
-                        if (val != 0) {
-                            GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
-                            mod.target[0] = 0;
-                            g_array_append_val(arr, mod);
-                            g_queue_push_tail(mod_manager->modifications, arr);
-                        }
-                        if (val != 1) {
-                            GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
-                            mod.target[0] = 1;
-                            g_array_append_val(arr, mod);
-                            g_queue_push_tail(mod_manager->modifications, arr);
-                        }
-                        GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
-                        flip_bits(mod.target, mod.size);
-                        g_array_append_val(arr, mod);
-                        g_queue_push_tail(mod_manager->modifications, arr);
-                        break;
+                // If type inference is available, apply type-specific modifications (e.g., for pointers, try null, valid, out-of-bounds)
+                if (g_osprey_type_manager != NULL) {
+                    // Check if pointer
+                    OspreyObject *obj = osprey_object_get(g_osprey_type_manager,
+                                                            prim->addr, false);
+                    if (obj->type && obj->type->kind == OSPREY_TYPE_POINTER) {
+                        add_modification_pointer(mod_manager->modifications, &mod);
                     }
-                    case 2: {
-                        uint16_t val;
-                        memcpy(&val, mod.target, 2);
-                        if (val != 0) {
-                            GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
-                            memset(mod.target, 0, 2);
-                            g_array_append_val(arr, mod);
-                            g_queue_push_tail(mod_manager->modifications, arr);
-                        }
-                        if (val != 1) {
-                            GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
-                            uint16_t one = 1;
-                            memcpy(mod.target, &one, 2);
-                            g_array_append_val(arr, mod);
-                            g_queue_push_tail(mod_manager->modifications, arr);
-                        }
-                        GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
-                        flip_bits(mod.target, mod.size);
-                        g_array_append_val(arr, mod);
-                        g_queue_push_tail(mod_manager->modifications, arr);
-                        break;
-                    }
-                    case 4: {
-                        uint32_t val;
-                        memcpy(&val, mod.target, 4);
-                        if (val != 0) {
-                            GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
-                            memset(mod.target, 0, 4);
-                            g_array_append_val(arr, mod);
-                            g_queue_push_tail(mod_manager->modifications, arr);
-                        }
-                        if (val != 1) {
-                            GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
-                            uint32_t one = 1;
-                            memcpy(mod.target, &one, 4);
-                            g_array_append_val(arr, mod);
-                            g_queue_push_tail(mod_manager->modifications, arr);
-                        }
-                        GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
-                        flip_bits(mod.target, mod.size);
-                        g_array_append_val(arr, mod);
-                        g_queue_push_tail(mod_manager->modifications, arr);
-                        break;
-                    }
-                    case 8: {
-                        uint64_t val;
-                        memcpy(&val, mod.target, 8);
-                        if (val != 0) {
-                            GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
-                            memset(mod.target, 0, 8);
-                            g_array_append_val(arr, mod);
-                            g_queue_push_tail(mod_manager->modifications, arr);
-                        }
-                        if (val != 1) {
-                            GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
-                            uint64_t one = 1;
-                            memcpy(mod.target, &one, 8);
-                            g_array_append_val(arr, mod);
-                            g_queue_push_tail(mod_manager->modifications, arr);
-                        }
-                        GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
-                        flip_bits(mod.target, mod.size);
-                        g_array_append_val(arr, mod);
-                        g_queue_push_tail(mod_manager->modifications, arr);
-                        break;
-                    }
-                    default: {
-                        // From real memcpy/memmove (if plt is given) or file write
-                        if (mod.size < 8) {
-                            flip_bits(mod.target, mod.size);
-                            GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
-                            g_array_append_val(arr, mod);
-                            g_queue_push_tail(mod_manager->modifications, arr);
-                        } else {
-                            // TODO: fuzzing
-                        }
-                    }
+                } else {
+                    // No type inference: apply generic modifications
+                    add_modification_primitive(mod_manager->modifications, &mod);
                 }
             }
         }
@@ -1819,19 +1756,7 @@ static int analyze_collected_data(void) {
                 target_ulong actual_value;
                 memcpy(&actual_value, g2h(ptr->addr), sizeof(target_ulong));
                 memcpy(mod.target, &actual_value, sizeof(target_ulong));
-                // Fix pointer
-                if (actual_value != 0) {
-                    // Set to NULL
-                    GArray *arr = g_array_new(FALSE, FALSE, sizeof(SingleModification));
-                    target_ulong null_ptr = 0;
-                    memcpy(mod.target, &null_ptr, sizeof(target_ulong));
-                    g_array_append_val(arr, mod);
-                    g_queue_push_tail(mod_manager->modifications, arr);
-                } else {
-                    // Pointer to new object
-                    // TODO: recognize null pointer
-                    // TODO: allocate new page with mmap, cache it and reuse it
-                }
+                add_modification_pointer(mod_manager->modifications, &mod);
             }
         }
     }
@@ -2032,24 +1957,27 @@ static void osprey_type_manager_add_addr_to_type_id(OspreyTypeManager *manager, 
                         GSIZE_TO_POINTER((gsize)addr), g_strdup(type->id));
 }
 
-static void osprey_type_parse_field(OspreyType *type, const char *id, const char *field_str) {
+static void osprey_type_parse_field(OspreyType *type, int64_t base_offset, const char *id, const sbsv_value_list *field_list) {
     type->kind = OSPREY_TYPE_STRUCT;
     type->id = g_strdup(id);
-    type->data.struct_type.fields = g_array_new(false, false, sizeof(OspreyStructField));
-    gchar **tokens = g_strsplit(field_str, ",", -1);
-    for (int i = 0; tokens[i] != NULL; i++) {
+    type->meta.struct_info.fields = g_array_new(false, false, sizeof(OspreyStructField));
+    int64_t max_offset = 0;
+    for (int i = 0; i < field_list->count; i++) {
         char type_id[256];
         int64_t offset, size;
-        if (sscanf(tokens[i], "%lx(%lxB):%256[^,]", &offset, &size, type_id) == 3) {
+        if (sscanf(field_list->items[i].data.string_value, "%lx(%lxB):%256[^,]", &offset, &size, type_id) == 3) {
             OspreyStructField field = {
                 .offset = offset,
                 .size = size,
                 .type_id = g_strdup(type_id)
             };
-            g_array_append_val(type->data.struct_type.fields, field);
+            g_array_append_val(type->meta.struct_info.fields, field);
+            if (offset + size > max_offset) {
+                max_offset = offset + size;
+            }
         }
     }
-    g_strfreev(tokens);
+    // type->meta.struct_info.total_size = max_offset - base_offset;
 }
 
 void snapshot_load_inferred_types(uint8_t *analyze_result) {
@@ -2060,15 +1988,15 @@ void snapshot_load_inferred_types(uint8_t *analyze_result) {
     sbsv_parser_add_custom_type(parser, "hex", custom_hex, NULL);
     sbsv_parser_add_custom_type(parser, "region_type", custom_region_type, NULL);
     sbsv_parser_add_schema(parser, "[type-def] [primitive] [id: str] [size: int] [body: str]");
-    sbsv_parser_add_schema(parser, "[type-def] [array] [id: str] [RT: region_type] [RB: hex] [RI: hex] [lo: hex] [hi: hex] [elem: str] [count: int]");
-    sbsv_parser_add_schema(parser, "[type-def] [struct] [id: str] [RT: region_type] [RB: hex] [RI: hex] [base: hex] [fields: str]");
-    sbsv_parser_add_schema(parser, "[type-def] [pointer] [id: str] [to: str]");
-    sbsv_parser_add_schema(parser, "[struct] [base: hex] [offset: hex] [type: str]");
+    sbsv_parser_add_schema(parser, "[type-def] [array] [id: str] [RT: region_type] [RB: hex] [RI: hex] [lo: hex] [hi: hex] [elem-type: str] [count: int]");
+    sbsv_parser_add_schema(parser, "[type-def] [struct] [id: str] [RT: region_type] [RB: hex] [RI: hex] [base: hex] [fields: list[str]]");
+    sbsv_parser_add_schema(parser, "[type-def] [pointer] [id: str] [to-val: str] [to-role: str]");
+    sbsv_parser_add_schema(parser, "[struct-base] [base: hex] [offset: hex] [type: str]");
     sbsv_parser_add_schema(parser, "[field] [RT: region_type] [RB: hex] [RI: hex] [off: hex] [sz: hex] [base: hex] [type: str] [P: float]");
-    sbsv_parser_add_schema(parser, "[array] [RT: region_type] [RB: hex] [RI: hex] [lo: hex] [hi: hex] [elem: str] [P: float]");
-    sbsv_parser_add_schema(parser, "[array-elem] [RT: region_type] [RB: hex] [RI: hex] [off: hex] [sz: hex] [idx: int] [type: str] [P: float]");
-    sbsv_parser_add_schema(parser, "[scalar] [RT: region_type] [RB: hex] [RI: hex] [off: hex] [sz: hex] [P: float]");
-    sbsv_parser_add_schema(parser, "[pointer] [RT: region_type] [RB: hex] [RI: hex] [off: hex] [sz: hex] [target: hex] [type-id: str] [P: float]");
+    sbsv_parser_add_schema(parser, "[array-start] [RT: region_type] [RB: hex] [RI: hex] [type: str] [lo: hex] [hi: hex] [elem: str] [P: float]");
+    sbsv_parser_add_schema(parser, "[array-elem] [RT: region_type] [RB: hex] [RI: hex] [off: hex] [sz: hex] [type: str] [array-offset: hex] [array-id: str] [idx: int] [P: float]");
+    sbsv_parser_add_schema(parser, "[scalar] [RT: region_type] [RB: hex] [RI: hex] [off: hex] [sz: hex] [type: str] [P: float]");
+    sbsv_parser_add_schema(parser, "[pointer-var] [RT: region_type] [RB: hex] [RI: hex] [off: hex] [sz: hex] [type: str] [target: hex] [t-role: str] [t-val: str] [P: float]");
     // trace_mem("%s", (const char *)analyze_result);
     if (sbsv_parser_loads(parser, (const char *)analyze_result) != SBSV_OK) {
         trace_mem("Failed to load inferred types - %s\n", sbsv_parser_last_error(parser));
@@ -2087,10 +2015,11 @@ void snapshot_load_inferred_types(uint8_t *analyze_result) {
         const char *id = sbsv_row_get_string(r, "id");
         long long size = sbsv_row_get_int(r, "size", &valid);
         // const char *body = sbsv_row_get_string(r, "body");
-        OspreyType *type = g_new(OspreyType, 1);
+        OspreyType *type = g_new0(OspreyType, 1);
         type->kind = OSPREY_TYPE_PRIMITIVE;
         type->id = g_strdup(id);
-        type->data.primitive.size = size;
+        type->size = size;
+        type->is_pointer = false;
         osprey_type_manager_add_type(g_osprey_type_manager, type);
         g_array_append_val(primitive_types, type);
         // trace_mem("[inferred-type] [primitive] [id %s] [size %lld] [body %s]\n", id, size, body);
@@ -2104,15 +2033,15 @@ void snapshot_load_inferred_types(uint8_t *analyze_result) {
         // int region_type = sbsv_row_get_int(r, "RT", &valid);
         // uint64_t region_base = sbsv_row_get_int(r, "RB", &valid);
         // uint64_t region_size = sbsv_row_get_int(r, "RI", &valid);
-        int64_t lo = sbsv_row_get_int(r, "lo", &valid);
-        int64_t hi = sbsv_row_get_int(r, "hi", &valid);
-        const char *elem = sbsv_row_get_string(r, "elem");
+        // int64_t lo = sbsv_row_get_int(r, "lo", &valid);
+        // int64_t hi = sbsv_row_get_int(r, "hi", &valid);
+        const char *elem_type = sbsv_row_get_string(r, "elem-type");
         int64_t count = sbsv_row_get_int(r, "count", &valid);
-        OspreyType *type = g_new(OspreyType, 1);
+        OspreyType *type = g_new0(OspreyType, 1);
         type->kind = OSPREY_TYPE_ARRAY;
         type->id = g_strdup(id);
-        type->data.array.elem_type_id = g_strdup(elem);
-        type->data.array.elem_size = (hi - lo) / count;
+        type->target_type_id = g_strdup(elem_type);
+        type->meta.array_info.count = count;
         osprey_type_manager_add_type(g_osprey_type_manager, type);
     }
     sbsv_free_row_ref_array(rows);
@@ -2124,12 +2053,12 @@ void snapshot_load_inferred_types(uint8_t *analyze_result) {
         // int region_type = sbsv_row_get_int(r, "RT", &valid);
         int64_t region_base = sbsv_row_get_int(r, "RB", &valid);
         // int64_t region_size = sbsv_row_get_int(r, "RI", &valid);
-        int64_t base = sbsv_row_get_int(r, "base", &valid);
-        const char *fields = sbsv_row_get_string(r, "fields");
-        OspreyType *type = g_new(OspreyType, 1);
-        osprey_type_parse_field(type, id, fields);
+        int64_t base_offset = sbsv_row_get_int(r, "base", &valid);
+        const sbsv_value_list *fields = sbsv_row_get_list(r, "fields");
+        OspreyType *type = g_new0(OspreyType, 1);
+        osprey_type_parse_field(type, base_offset, id, fields);
         osprey_type_manager_add_type(g_osprey_type_manager, type);
-        osprey_type_manager_add_addr_to_type_id(g_osprey_type_manager, (uint64_t)(region_base + base), type);
+        osprey_type_manager_add_addr_to_type_id(g_osprey_type_manager, (uint64_t)(region_base + base_offset), type);
     }
     sbsv_free_row_ref_array(rows);
 
@@ -2137,43 +2066,53 @@ void snapshot_load_inferred_types(uint8_t *analyze_result) {
     for (size_t i = 0; i < num_rows; i++) {
         const sbsv_row *r = rows[i];
         const char *id = sbsv_row_get_string(r, "id");
-        const char *to = sbsv_row_get_string(r, "to");
-        OspreyType *type = g_new(OspreyType, 1);
+        const char *to = sbsv_row_get_string(r, "to-val");
+        const char *to_role = sbsv_row_get_string(r, "to-role");
+        OspreyType *type = g_new0(OspreyType, 1);
         type->kind = OSPREY_TYPE_POINTER;
         type->id = g_strdup(id);
-        type->data.pointer.target_type_id = g_strdup(to);
+        type->target_type_id = g_strdup(to);
+        type->meta.pointer_info.target_role = g_strdup(to_role);
         osprey_type_manager_add_type(g_osprey_type_manager, type);
     }
     sbsv_free_row_ref_array(rows);
 
     // 2. Match inferred types with actual addresses
     // 2.1: MemoryAddress -> Type ID (array_start, struct)
-    sbsv_parser_get_rows(parser, "[array]", &rows, &num_rows);
+    sbsv_parser_get_rows(parser, "[array-start]", &rows, &num_rows);
     for (size_t i = 0; i < num_rows; i++) {
         const sbsv_row *r = rows[i];
         // int region_type = sbsv_row_get_int(r, "RT", &valid);
         int64_t region_base = sbsv_row_get_int(r, "RB", &valid);
         // int64_t region_size = sbsv_row_get_int(r, "RI", &valid);
+        const char *type_id = sbsv_row_get_string(r, "type");
         int64_t lo = sbsv_row_get_int(r, "lo", &valid);
         int64_t hi = sbsv_row_get_int(r, "hi", &valid);
         // const char *elem = sbsv_row_get_string(r, "elem");
         // double p = sbsv_row_get_float(r, "P", &valid);
-        OspreyObject *obj = osprey_address_get(g_osprey_type_manager, region_base + lo);
-        obj->type_kind = OSPREY_TYPE_ARRAY;
+        OspreyObject *obj = osprey_address_get(g_osprey_type_manager, region_base + lo, true);
+        obj->role = OSPREY_ROLE_ARRAY_START;
         obj->size = hi - lo;
+        obj->type = osprey_type_get(g_osprey_type_manager, type_id);
+        if (obj->type == NULL) {
+            trace_mem("Failed to find type for array start: %s\n", type_id);
+        }
         ObjNode *obj_node = osprey_obj_node_get(g_osprey_type_manager, region_base + lo, true);
         obj_node->obj = obj;
     }
     sbsv_free_row_ref_array(rows);
 
-    sbsv_parser_get_rows(parser, "[struct]", &rows, &num_rows);
+    sbsv_parser_get_rows(parser, "[struct-base]", &rows, &num_rows);
     for (size_t i = 0; i < num_rows; i++) {
         const sbsv_row *r = rows[i];
         int64_t base = sbsv_row_get_int(r, "base", &valid);
         const char *type_id = sbsv_row_get_string(r, "type");
-        OspreyObject *obj = osprey_address_get(g_osprey_type_manager, base);
-        obj->type_kind = OSPREY_TYPE_STRUCT;
-        obj->type_id = g_strdup(type_id);
+        OspreyObject *obj = osprey_address_get(g_osprey_type_manager, base, true);
+        obj->role = OSPREY_ROLE_STRUCT_BASE;
+        obj->type = osprey_type_get(g_osprey_type_manager, type_id);
+        if (obj->type == NULL) {
+            trace_mem("Failed to find type for struct base: %s\n", type_id);
+        }
         ObjNode *obj_node = osprey_obj_node_get(g_osprey_type_manager, base, true);
         obj_node->obj = obj;
     }
@@ -2190,15 +2129,65 @@ void snapshot_load_inferred_types(uint8_t *analyze_result) {
         int64_t sz = sbsv_row_get_int(r, "sz", &valid);
         // double p = sbsv_row_get_float(r, "P", &valid);
         OspreyObject *obj = osprey_object_get(g_osprey_type_manager, region_base + off, true);
-        obj->type_kind = OSPREY_TYPE_PRIMITIVE;
+        obj->role = OSPREY_ROLE_SCALAR;
         // obj->type_id = g_strdup()
         for (size_t j = 0; j < primitive_types->len; j++) {
             OspreyType *type = g_array_index(primitive_types, OspreyType *, j);
-            if (type->data.primitive.size == sz) {
-                obj->type_id = g_strdup(type->id);
+            if (type->size == sz) {
+                obj->type = type;
                 break;
             }
         }
+    }
+    sbsv_free_row_ref_array(rows);
+
+    sbsv_parser_get_rows(parser, "[pointer-var]", &rows, &num_rows);
+    for (size_t i = 0; i < num_rows; i++) {
+        const sbsv_row *r = rows[i];
+        // int region_type = sbsv_row_get_int(r, "RT", &valid);
+        int64_t region_base = sbsv_row_get_int(r, "RB", &valid);
+        // int64_t region_size = sbsv_row_get_int(r, "RI", &valid);
+        int64_t off = sbsv_row_get_int(r, "off", &valid);
+        int64_t size = sbsv_row_get_int(r, "sz", &valid);
+        // int64_t target = sbsv_row_get_int(r, "target", &valid);
+        const char *type_id = sbsv_row_get_string(r, "type");
+        // const char *t_val = sbsv_row_get_string(r, "t-val");
+        // double p = sbsv_row_get_float(r, "P", &valid);
+        // trace_mem("[inferred-type] [pointer] [region-type %d] [region-base %lx] [region-size %lx] [off %lx] [size %lx] [target %lx] [type-id %s] [P %f]\n", region_type, region_base, region_size, off, size, target, type_id, p);
+        OspreyObject *obj = osprey_object_get(g_osprey_type_manager, region_base + off, true);
+        obj->role = OSPREY_ROLE_SCALAR;
+        obj->size = size;
+        obj->type = osprey_type_get(g_osprey_type_manager, type_id);
+        // PtrNode *ptr_node = osprey_ptr_node_get(g_osprey_type_manager, region_base + off, false);
+        // if (ptr_node == NULL) {
+        //     ptr_node = osprey_ptr_node_get(g_osprey_type_manager, region_base + off, true);
+        //     ptr_node->is_value_pointer = true;
+        //     ptr_node->points_to = osprey_ptr_node_get(g_osprey_type_manager, target, true);
+        //     osprey_ptr_edge_create(g_osprey_type_manager, ptr_node, ptr_node->points_to);
+        // }
+    }
+    sbsv_free_row_ref_array(rows);
+
+    sbsv_parser_get_rows(parser, "[array-elem]", &rows, &num_rows);
+    for (size_t i = 0; i < num_rows; i++) {
+        const sbsv_row *r = rows[i];
+        // int region_type = sbsv_row_get_int(r, "RT", &valid);
+        int64_t region_base = sbsv_row_get_int(r, "RB", &valid);
+        // int64_t region_size = sbsv_row_get_int(r, "RI", &valid);
+        int64_t off = sbsv_row_get_int(r, "off", &valid);
+        int64_t sz = sbsv_row_get_int(r, "sz", &valid);
+        int64_t array_start_offset = sbsv_row_get_int(r, "array-offset", &valid);
+        const char *type_id = sbsv_row_get_string(r, "type");
+        // double p = sbsv_row_get_float(r, "P", &valid);
+        OspreyObject *obj = osprey_object_get(g_osprey_type_manager, region_base + off, true);
+        obj->role = OSPREY_ROLE_ARRAY_ELEM;
+        obj->size = sz;
+        obj->type = osprey_type_get(g_osprey_type_manager, type_id);
+        int64_t array_start_addr = region_base + array_start_offset;
+        OspreyObject *array_start_obj = osprey_address_get(g_osprey_type_manager, array_start_addr, false);
+        obj->parent = array_start_obj;
+        ObjNode *obj_node = osprey_obj_node_get(g_osprey_type_manager, region_base + off, true);
+        obj_node->obj = obj;
     }
     sbsv_free_row_ref_array(rows);
 
@@ -2213,51 +2202,24 @@ void snapshot_load_inferred_types(uint8_t *analyze_result) {
         int64_t base = sbsv_row_get_int(r, "base", &valid);
         const char *type_id = sbsv_row_get_string(r, "type");
         // double p = sbsv_row_get_float(r, "P", &valid);
-        OspreyObject *obj = osprey_object_get(g_osprey_type_manager, region_base + base + off, true);
-        obj->type_kind = OSPREY_TYPE_FIELD;
+        OspreyObject *obj = osprey_object_get(g_osprey_type_manager, region_base + off, true);
+        obj->role = OSPREY_ROLE_FIELD;
         obj->size = sz;
-        obj->type_id = g_strdup(type_id);
-        if (strncmp(type_id, "T_PTR", 5) == 0) {
-            ObjNode *obj_node = osprey_obj_node_get(g_osprey_type_manager, region_base + base, true);
-            PtrNode *ptr_node = osprey_ptr_node_get(g_osprey_type_manager, region_base + base + off, true);
-            ptr_node->is_value_pointer = true;
-            if (obj_node->obj != NULL) {
-                ptr_node->points_to = osprey_ptr_node_get(
-                    g_osprey_type_manager, obj_node->obj->target_addr, true);
-            }
-            ptr_node->base = obj_node;
-            if (ptr_node->points_to != NULL) {
-                osprey_ptr_edge_create(g_osprey_type_manager, ptr_node,
-                                       ptr_node->points_to);
+        obj->type = osprey_type_get(g_osprey_type_manager, type_id);
+        OspreyObject *base_obj = osprey_address_get(g_osprey_type_manager, region_base + base, false);
+        if (base_obj != NULL) {
+            obj->parent = base_obj;
+        }
+        if (obj->type == NULL) {
+            // Primitive type
+            for (size_t j = 0; j < primitive_types->len; j++) {
+                OspreyType *type = g_array_index(primitive_types, OspreyType *, j);
+                if (type->size == sz) {
+                    obj->type = type;
+                    break;
+                }
             }
         }
-    }
-    sbsv_free_row_ref_array(rows);
-
-    sbsv_parser_get_rows(parser, "[pointer]", &rows, &num_rows);
-    for (size_t i = 0; i < num_rows; i++) {
-        const sbsv_row *r = rows[i];
-        // int region_type = sbsv_row_get_int(r, "RT", &valid);
-        int64_t region_base = sbsv_row_get_int(r, "RB", &valid);
-        // int64_t region_size = sbsv_row_get_int(r, "RI", &valid);
-        int64_t off = sbsv_row_get_int(r, "off", &valid);
-        int64_t size = sbsv_row_get_int(r, "sz", &valid);
-        int64_t target = sbsv_row_get_int(r, "target", &valid);
-        const char *type_id = sbsv_row_get_string(r, "type-id");
-        // double p = sbsv_row_get_float(r, "P", &valid);
-        // trace_mem("[inferred-type] [pointer] [region-type %d] [region-base %lx] [region-size %lx] [off %lx] [size %lx] [target %lx] [type-id %s] [P %f]\n", region_type, region_base, region_size, off, size, target, type_id, p);
-        OspreyObject *obj = osprey_object_get(g_osprey_type_manager, region_base + off, true);
-        obj->type_kind = OSPREY_TYPE_POINTER;
-        obj->size = size;
-        obj->target_addr = target;
-        obj->type_id = g_strdup(type_id);
-        // PtrNode *ptr_node = osprey_ptr_node_get(g_osprey_type_manager, region_base + off, false);
-        // if (ptr_node == NULL) {
-        //     ptr_node = osprey_ptr_node_get(g_osprey_type_manager, region_base + off, true);
-        //     ptr_node->is_value_pointer = true;
-        //     ptr_node->points_to = osprey_ptr_node_get(g_osprey_type_manager, target, true);
-        //     osprey_ptr_edge_create(g_osprey_type_manager, ptr_node, ptr_node->points_to);
-        // }
     }
     sbsv_free_row_ref_array(rows);
 
@@ -2270,33 +2232,42 @@ void snapshot_load_inferred_types(uint8_t *analyze_result) {
     g_hash_table_iter_init(&iter, g_osprey_type_manager->type_table);
     while (g_hash_table_iter_next(&iter, &key, &value)) {
         OspreyType *type = (OspreyType *)value;
-        if (type->kind == OSPREY_TYPE_ARRAY) {
-            type->data.array.elem_type = osprey_type_get(g_osprey_type_manager, type->data.array.elem_type_id);
-        } else if (type->kind == OSPREY_TYPE_POINTER) {
-            type->data.pointer.target_type = osprey_type_get(g_osprey_type_manager, type->data.pointer.target_type_id);
-        } else if (type->kind == OSPREY_TYPE_FIELD) {
-            // type->data.field.type = osprey_type_get(g_osprey_type_manager, type->data.field.type_id);
-        } else if (type->kind == OSPREY_TYPE_STRUCT) {
-            for (size_t i = 0; i < type->data.struct_type.fields->len; i++) {
-                OspreyStructField *field = &g_array_index(type->data.struct_type.fields, OspreyStructField, i);
-                field->type = osprey_type_get(g_osprey_type_manager, field->type_id);
-            }
+        switch (type->kind) {
+            case OSPREY_TYPE_PRIMITIVE:
+                type->is_pointer = false;
+                break;
+            case OSPREY_TYPE_POINTER:
+                type->is_pointer = true;
+                type->size = sizeof(target_ulong);
+                type->target = osprey_type_get(g_osprey_type_manager, type->target_type_id);
+                break;
+            case OSPREY_TYPE_ARRAY:
+                type->is_pointer = false;
+                type->target = osprey_type_get(g_osprey_type_manager, type->target_type_id);
+                break;
+            case OSPREY_TYPE_STRUCT:
+                type->is_pointer = false;
+                for (size_t i = 0; i < type->meta.struct_info.fields->len; i++) {
+                    OspreyStructField *field = &g_array_index(type->meta.struct_info.fields, OspreyStructField, i);
+                    field->type = osprey_type_get(g_osprey_type_manager, field->type_id);
+                }
+                break;
         }
     }
     g_hash_table_iter_init(&iter, g_osprey_type_manager->addr_to_type);
     while (g_hash_table_iter_next(&iter, &key, &value)) {
         // uint64_t addr = GPOINTER_TO_UINT(key);
         OspreyObject *obj = (OspreyObject *)value;
-        if (obj->type_id) {
-            obj->type = osprey_type_get(g_osprey_type_manager, obj->type_id);
+        if (obj->type == NULL) {
+            trace_mem("Failed to find type for address %lx, role %d\n", obj->addr, obj->role);
         }
     }
     g_hash_table_iter_init(&iter, g_osprey_type_manager->obj_addr_to_type);
     while (g_hash_table_iter_next(&iter, &key, &value)) {
         // uint64_t addr = GPOINTER_TO_UINT(key);
         OspreyObject *obj = (OspreyObject *)value;
-        if (obj->type_id) {
-            obj->type = osprey_type_get(g_osprey_type_manager, obj->type_id);
+        if (obj->type == NULL) {
+            trace_mem("Failed to find type for object address %lx, role %d\n", obj->addr, obj->role);
         }
     }
     trace_mem("[snapshot] [load-inferred-types] [finish]\n");
