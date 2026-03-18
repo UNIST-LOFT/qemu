@@ -263,17 +263,17 @@ static OspreyTypeManager* osprey_type_manager_new(void) {
 //     g_free(manager);
 // }
 
-// static PtrNode *osprey_ptr_node_get(OspreyTypeManager *manager, uint64_t addr, bool create) {
-//     PtrNode *node = (PtrNode *)g_hash_table_lookup(
-//         manager->mem_graph.ptr_nodes, GSIZE_TO_POINTER((gsize)addr));
-//     if (node == NULL && create) {
-//         node = g_new0(PtrNode, 1);
-//         node->addr = addr;
-//         g_hash_table_insert(manager->mem_graph.ptr_nodes,
-//                             GSIZE_TO_POINTER((gsize)addr), node);
-//     }
-//     return node;
-// }
+static PtrNode *osprey_ptr_node_get(OspreyTypeManager *manager, uint64_t addr, bool create) {
+    PtrNode *node = (PtrNode *)g_hash_table_lookup(
+        manager->mem_graph.ptr_nodes, GSIZE_TO_POINTER((gsize)addr));
+    if (node == NULL && create) {
+        node = g_new0(PtrNode, 1);
+        node->addr = addr;
+        g_hash_table_insert(manager->mem_graph.ptr_nodes,
+                            GSIZE_TO_POINTER((gsize)addr), node);
+    }
+    return node;
+}
 
 static ObjNode *osprey_obj_node_get(OspreyTypeManager *manager, uint64_t addr, bool create) {
     ObjNode *node = (ObjNode *)g_hash_table_lookup(
@@ -281,22 +281,22 @@ static ObjNode *osprey_obj_node_get(OspreyTypeManager *manager, uint64_t addr, b
     if (node == NULL && create) {
         node = g_new0(ObjNode, 1);
         node->addr = addr;
-        node->outgoing_ptr_edges = g_array_new(FALSE, FALSE, sizeof(PtrEdge));
+        node->outgoing_ptr_edges = g_array_new(FALSE, FALSE, sizeof(PtrEdge *));
         g_hash_table_insert(manager->mem_graph.obj_nodes,
                             GSIZE_TO_POINTER((gsize)addr), node);
     }
     return node;
 }
 
-// static PtrEdge *osprey_ptr_edge_create(OspreyTypeManager *manager, PtrNode *src, PtrNode *dst) {
-//     PtrEdge *edge = g_new0(PtrEdge, 1);
-//     edge->src = src;
-//     edge->dst = dst;
-//     if (src->base) {
-//         g_array_append_val(src->base->outgoing_ptr_edges, edge);
-//     }
-//     return edge;
-// }
+static PtrEdge *osprey_ptr_edge_create(OspreyTypeManager *manager, PtrNode *src, PtrNode *dst) {
+    PtrEdge *edge = g_new0(PtrEdge, 1);
+    edge->src = src;
+    edge->dst = dst;
+    if (src->base) {
+        g_array_append_val(src->base->outgoing_ptr_edges, edge);
+    }
+    return edge;
+}
 
 static OspreyObject *osprey_object_get(OspreyTypeManager *manager, uint64_t addr, bool create) {
     OspreyObject *obj = (OspreyObject *)g_hash_table_lookup(
@@ -1610,6 +1610,8 @@ static int analyze_collected_data(void) {
     // Sort by access_id
     qsort(shared_trace_data->primitives, shared_trace_data->prim_idx, sizeof(PrimitiveAccess), compare_prim_id_desc);
     qsort(shared_trace_data->pointers, shared_trace_data->ptr_idx, sizeof(PointerAccess), compare_ptr_id_desc);
+    GArray *mod_primitive_candidates = g_array_new(FALSE, FALSE, sizeof(SingleModification));
+    GArray *pointer_nodes = g_array_new(FALSE, FALSE, sizeof(PtrNode *));
     // First run: collect all data
     if (mod_manager == NULL) {
         mod_manager = g_new(ModificationManager, 1);
@@ -1652,8 +1654,27 @@ static int analyze_collected_data(void) {
                 OspreyObject *obj = osprey_object_get(g_osprey_type_manager, prim->addr, false);
                 if (obj != NULL) {
                     if (obj->type) {
-                        // Pointer type: try null, valid, out-of-bounds
-                        trace_mem("[inferred] [ptr] [type %s] [addr %lx]\n", obj->type->id, prim->addr);
+                        trace_mem("[memgraph] [prim] [type %s] [addr %lx]\n", obj->type->id, prim->addr);
+                        if (obj->type->kind == OSPREY_TYPE_PRIMITIVE) {
+                            // Primitive type: apply generic modifications
+                            g_array_append_val(mod_primitive_candidates, mod);
+                        } else if (obj->type->kind == OSPREY_TYPE_POINTER) {
+                            // Build MemGraph (null pointer)
+                            PtrNode *ptr_node = osprey_ptr_node_get(g_osprey_type_manager, prim->addr, false);
+                            uint64_t target_value;
+                            memcpy(&target_value, mod.target, sizeof(uint64_t));
+                            if (ptr_node == NULL) {
+                                ptr_node = osprey_ptr_node_get(g_osprey_type_manager, prim->addr, false);
+                                if (ptr_node) {
+                                    ptr_node->is_value_pointer = true;
+                                    ptr_node->points_to = osprey_ptr_node_get(g_osprey_type_manager, target_value, true);
+                                    osprey_ptr_edge_create(g_osprey_type_manager, ptr_node, ptr_node->points_to);
+                                    g_array_append_val(pointer_nodes, ptr_node);
+                                } else {
+                                    trace_mem("[memgraph] [pointer-error] [no-node] [addr %lx]\n", prim->addr);
+                                }
+                            }
+                        }
                     } else {
                         // Non-pointer type: apply generic modifications
                         add_modification_primitive(mod_manager->modifications, &mod);
@@ -1685,12 +1706,116 @@ static int analyze_collected_data(void) {
             if (g_osprey_type_manager != NULL) {
                 OspreyObject *obj = osprey_object_get(g_osprey_type_manager, ptr->addr, false);
                 if (obj != NULL) {
-                    trace_mem("[inferred] [pointer] [type %s] [addr %lx]\n", obj->type ? obj->type->id : "unknown", ptr->addr);
-                    add_modification_pointer(mod_manager->modifications, &mod);
+                    trace_mem("[memgraph] [pointer] [type %s] [addr %lx] [target %lx]\n", obj->type ? obj->type->id : "unknown", ptr->addr, ptr->target);
+                    // add_modification_pointer(mod_manager->modifications, &mod);
+                    PtrNode *ptr_node = osprey_ptr_node_get(g_osprey_type_manager, ptr->addr, false);
+                    if (ptr_node) {
+                        ptr_node->is_value_pointer = true;
+                        ptr_node->points_to = osprey_ptr_node_get(g_osprey_type_manager, ptr->target, true);
+                        osprey_ptr_edge_create(g_osprey_type_manager, ptr_node, ptr_node->points_to);
+                        g_array_append_val(pointer_nodes, ptr_node);
+                    } else {
+                        trace_mem("[memgraph] [pointer-error] [no-node] [addr %lx]\n", ptr->addr);
+                    }
                 }
                 continue;
             }
             add_modification_pointer(mod_manager->modifications, &mod);
+        }
+
+        // Use MemGraph to find candidate modifications
+        if (g_osprey_type_manager != NULL) {
+            GHashTable *visited_obj_nodes = g_hash_table_new(g_direct_hash,
+                                                             g_direct_equal);
+            GHashTable *terminal_obj_set = g_hash_table_new(g_direct_hash,
+                                                            g_direct_equal);
+            GHashTable *terminal_pointing_set = g_hash_table_new(g_direct_hash,
+                                                                  g_direct_equal);
+            GArray *terminal_nodes = g_array_new(FALSE, FALSE, sizeof(ObjNode *));
+            GArray *terminal_pointing_nodes = g_array_new(FALSE, FALSE,
+                                                          sizeof(PtrNode *));
+            GQueue *pending_obj_nodes = g_queue_new();
+
+            for (int i = pointer_nodes->len - 1; i >= 0; i--) {
+                PtrNode *ptr_node = g_array_index(pointer_nodes, PtrNode *, i);
+                if (ptr_node == NULL || ptr_node->base == NULL) {
+                    continue;
+                }
+                if (g_hash_table_contains(visited_obj_nodes, ptr_node->base)) {
+                    continue;
+                }
+
+                g_queue_push_tail(pending_obj_nodes, ptr_node->base);
+                while (!g_queue_is_empty(pending_obj_nodes)) {
+                    ObjNode *obj_node = (ObjNode *)g_queue_pop_head(
+                        pending_obj_nodes);
+                    if (obj_node == NULL) {
+                        continue;
+                    }
+                    if (g_hash_table_contains(visited_obj_nodes, obj_node)) {
+                        continue;
+                    }
+                    g_hash_table_add(visited_obj_nodes, obj_node);
+
+                    bool has_unvisited_pointer_edge = false;
+                    for (guint j = 0; j < obj_node->outgoing_ptr_edges->len; j++) {
+                        PtrEdge *edge = g_array_index(obj_node->outgoing_ptr_edges,
+                                                      PtrEdge *, j);
+                        if (edge == NULL || edge->dst == NULL) {
+                            continue;
+                        }
+                        if (!edge->dst->is_value_pointer || edge->dst->base == NULL) {
+                            continue;
+                        }
+                        if (!g_hash_table_contains(visited_obj_nodes,
+                                                   edge->dst->base)) {
+                            has_unvisited_pointer_edge = true;
+                            g_queue_push_tail(pending_obj_nodes,
+                                              edge->dst->base);
+                        }
+                    }
+
+                    if (!has_unvisited_pointer_edge) {
+                        if (!g_hash_table_contains(terminal_obj_set, obj_node)) {
+                            g_hash_table_add(terminal_obj_set, obj_node);
+                            g_array_append_val(terminal_nodes, obj_node);
+                        }
+                    }
+                }
+            }
+
+            for (int i = 0; i < pointer_nodes->len; i++) {
+                PtrNode *src_node = g_array_index(pointer_nodes, PtrNode *, i);
+                if (src_node == NULL || src_node->base == NULL) {
+                    continue;
+                }
+                ObjNode *base = src_node->base;
+                for (guint j = 0; j < base->outgoing_ptr_edges->len; j++) {
+                    PtrEdge *edge = g_array_index(base->outgoing_ptr_edges,
+                                                  PtrEdge *, j);
+                    if (edge == NULL || edge->dst == NULL || edge->dst->base == NULL) {
+                        continue;
+                    }
+                    if (!g_hash_table_contains(terminal_obj_set, edge->dst->base)) {
+                        continue;
+                    }
+                    if (!g_hash_table_contains(terminal_pointing_set, src_node)) {
+                        g_hash_table_add(terminal_pointing_set, src_node);
+                        g_array_append_val(terminal_pointing_nodes, src_node);
+                    }
+                }
+            }
+
+            trace_mem("[memgraph] [candidate] [terminal %d] [pointing %d]\n",
+                      terminal_nodes->len, terminal_pointing_nodes->len);
+            // TODO: generate modifications based on candidate nodes
+            
+            g_queue_free(pending_obj_nodes);
+            g_array_free(terminal_nodes, TRUE);
+            g_array_free(terminal_pointing_nodes, TRUE);
+            g_hash_table_destroy(visited_obj_nodes);
+            g_hash_table_destroy(terminal_obj_set);
+            g_hash_table_destroy(terminal_pointing_set);
         }
         trace_mem("[analyze] [queue] [len %d]\n", g_queue_get_length(mod_manager->modifications));
     } else {
@@ -1760,6 +1885,8 @@ static int analyze_collected_data(void) {
             }
         }
     }
+    g_array_free(pointer_nodes, true);
+    g_array_free(mod_primitive_candidates, true);
     // Select one modification
     g_array_append_val(mod_manager->done, mod_manager->current);
     mod_manager->current = g_queue_pop_head(mod_manager->modifications);
@@ -2158,13 +2285,8 @@ void snapshot_load_inferred_types(uint8_t *analyze_result) {
         obj->role = OSPREY_ROLE_SCALAR;
         obj->size = size;
         obj->type = osprey_type_get(g_osprey_type_manager, type_id);
-        // PtrNode *ptr_node = osprey_ptr_node_get(g_osprey_type_manager, region_base + off, false);
-        // if (ptr_node == NULL) {
-        //     ptr_node = osprey_ptr_node_get(g_osprey_type_manager, region_base + off, true);
-        //     ptr_node->is_value_pointer = true;
-        //     ptr_node->points_to = osprey_ptr_node_get(g_osprey_type_manager, target, true);
-        //     osprey_ptr_edge_create(g_osprey_type_manager, ptr_node, ptr_node->points_to);
-        // }
+        PtrNode *ptr_node = osprey_ptr_node_get(g_osprey_type_manager, region_base + off, true);
+        ptr_node->is_value_pointer = true;
     }
     sbsv_free_row_ref_array(rows);
 
@@ -2186,8 +2308,21 @@ void snapshot_load_inferred_types(uint8_t *analyze_result) {
         int64_t array_start_addr = region_base + array_start_offset;
         OspreyObject *array_start_obj = osprey_address_get(g_osprey_type_manager, array_start_addr, false);
         obj->parent = array_start_obj;
-        ObjNode *obj_node = osprey_obj_node_get(g_osprey_type_manager, region_base + off, true);
-        obj_node->obj = obj;
+        ObjNode *obj_node = osprey_obj_node_get(g_osprey_type_manager, region_base + off, false);
+        if (obj_node == NULL) {
+            obj_node = osprey_obj_node_get(g_osprey_type_manager, region_base + off, true);
+        }
+        if (obj_node != NULL && obj_node->obj == NULL) {
+            obj_node->obj = obj;
+        }
+        if (obj->type != NULL && obj->type->kind == OSPREY_TYPE_POINTER) {
+            PtrNode *ptr_node = osprey_ptr_node_get(g_osprey_type_manager, region_base + off, true);
+            ptr_node->is_value_pointer = true;
+            ptr_node->base = osprey_obj_node_get(g_osprey_type_manager, array_start_addr, false);
+        } else if (obj->type == NULL) {
+            trace_mem("[inferred-type] [array-elem] missing type [addr %lx] [type-id %s]\n",
+                      (uint64_t)(region_base + off), type_id ? type_id : "(null)");
+        }
     }
     sbsv_free_row_ref_array(rows);
 
@@ -2207,6 +2342,16 @@ void snapshot_load_inferred_types(uint8_t *analyze_result) {
         obj->size = sz;
         obj->type = osprey_type_get(g_osprey_type_manager, type_id);
         OspreyObject *base_obj = osprey_address_get(g_osprey_type_manager, region_base + base, false);
+        
+        if (obj->type != NULL && obj->type->kind == OSPREY_TYPE_POINTER) {
+            PtrNode *ptr_node = osprey_ptr_node_get(g_osprey_type_manager, region_base + off, true);
+            ptr_node->is_value_pointer = true;
+            ptr_node->base = osprey_obj_node_get(g_osprey_type_manager, region_base + base, false);
+        } else if (obj->type == NULL) {
+            trace_mem("[inferred-type] [field] missing type [addr %lx] [type-id %s]\n",
+                      (uint64_t)(region_base + off), type_id ? type_id : "(null)");
+        }
+        
         if (base_obj != NULL) {
             obj->parent = base_obj;
         }
