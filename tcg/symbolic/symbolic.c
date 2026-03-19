@@ -87,6 +87,159 @@ static uint8_t tb_is_symbolic                     = 0;
 static uintptr_t current_tb_pc = 0;
 static uintptr_t last_tb_pc    = 0;
 
+static inline Expr* new_expr(void);
+static void add_query(Expr* q, uintptr_t address, uintptr_t pc,
+                      const char* msg);
+
+typedef struct {
+    Expr*        size_expr;
+    target_ulong size;
+    target_ulong pc;
+} SymbolicPendingAlloc;
+
+typedef struct {
+    Expr*        size_expr;
+    target_ulong size;
+    target_ulong pc;
+} SymbolicHeapAlloc;
+
+static GArray*     symbolic_pending_allocs = NULL;
+static GHashTable* symbolic_heap_allocs    = NULL;
+
+static inline GArray* get_symbolic_pending_allocs(void)
+{
+    if (symbolic_pending_allocs == NULL) {
+        symbolic_pending_allocs = g_array_new(FALSE, FALSE,
+                                              sizeof(SymbolicPendingAlloc));
+    }
+    return symbolic_pending_allocs;
+}
+
+static inline GHashTable* get_symbolic_heap_allocs(void)
+{
+    if (symbolic_heap_allocs == NULL) {
+        symbolic_heap_allocs = g_hash_table_new_full(
+            g_direct_hash, g_direct_equal, NULL, g_free);
+    }
+    return symbolic_heap_allocs;
+}
+
+static inline void symbolic_trace_pending_alloc(Expr* size_expr,
+                                                target_ulong size,
+                                                target_ulong pc)
+{
+    GArray* stack = get_symbolic_pending_allocs();
+    SymbolicPendingAlloc alloc = {
+        .size_expr = size_expr,
+        .size = size,
+        .pc = pc,
+    };
+    g_array_append_val(stack, alloc);
+}
+
+static inline SymbolicPendingAlloc
+symbolic_trace_get_pending_alloc(target_ulong pc)
+{
+    GArray* stack = get_symbolic_pending_allocs();
+    SymbolicPendingAlloc result = {0};
+    if (stack->len == 0) {
+        return result;
+    }
+    result = g_array_index(stack, SymbolicPendingAlloc, stack->len - 1);
+    if (result.pc != pc) {
+        return (SymbolicPendingAlloc){0};
+    }
+    g_array_set_size(stack, stack->len - 1);
+    return result;
+}
+
+static inline void symbolic_trace_alloc(target_ulong base, Expr* size_expr,
+                                        target_ulong size, target_ulong pc)
+{
+    SymbolicHeapAlloc* alloc;
+    GHashTable* ht;
+
+    if (base == 0) {
+        return;
+    }
+
+    ht = get_symbolic_heap_allocs();
+    alloc = g_new(SymbolicHeapAlloc, 1);
+    alloc->size_expr = size_expr;
+    alloc->size = size;
+    alloc->pc = pc;
+    g_hash_table_insert(ht, (gpointer)(uintptr_t)base, alloc);
+}
+
+static inline void symbolic_trace_free(target_ulong base)
+{
+    if (symbolic_heap_allocs == NULL || base == 0) {
+        return;
+    }
+    g_hash_table_remove(symbolic_heap_allocs, (gpointer)(uintptr_t)base);
+}
+
+static inline SymbolicHeapAlloc* symbolic_lookup_alloc(target_ulong base)
+{
+    if (symbolic_heap_allocs == NULL || base == 0) {
+        return NULL;
+    }
+    return g_hash_table_lookup(symbolic_heap_allocs, (gpointer)(uintptr_t)base);
+}
+
+static inline void add_symbolic_heap_bounds_query(uintptr_t addr_idx,
+                                                   target_ulong base,
+                                                   uintptr_t offset,
+                                                   size_t access_size)
+{
+    Expr* addr_expr;
+    Expr* offset_expr;
+    SymbolicHeapAlloc* alloc;
+
+    if (access_size == 0 || addr_idx >= TCG_MAX_TEMPS) {
+        return;
+    }
+
+    addr_expr = s_temps[addr_idx];
+    if (addr_expr == NULL) {
+        return;
+    }
+
+    if (offset != 0) {
+        Expr* addr_with_offset = new_expr();
+        addr_with_offset->opkind = ADD;
+        addr_with_offset->op1 = addr_expr;
+        SET_EXPR_CONST_OP(addr_with_offset->op2,
+                          addr_with_offset->op2_is_const, offset);
+        addr_expr = addr_with_offset;
+    }
+
+    alloc = symbolic_lookup_alloc(base);
+    if (alloc == NULL || alloc->size_expr == NULL) {
+        return;
+    }
+
+    offset_expr = new_expr();
+    offset_expr->opkind = SUB;
+    offset_expr->op1 = addr_expr;
+    SET_EXPR_CONST_OP(offset_expr->op2, offset_expr->op2_is_const, base);
+
+    if (access_size > 1) {
+        Expr* last_byte_expr = new_expr();
+        last_byte_expr->opkind = ADD;
+        last_byte_expr->op1 = offset_expr;
+        SET_EXPR_CONST_OP(last_byte_expr->op2, last_byte_expr->op2_is_const,
+                          access_size - 1);
+        offset_expr = last_byte_expr;
+    }
+
+    Expr* q = new_expr();
+    q->opkind = LTU;
+    q->op1 = offset_expr;
+    q->op2 = alloc->size_expr;
+    add_query(q, 0, current_tb_pc, "heap_bounds");
+}
+
 GHashTable* coverage_log_bb_ht = NULL;
 GHashTable* coverage_log_edges_ht = NULL;
 extern GHashTable *coverage_log_edges_cnt;
@@ -3331,6 +3484,10 @@ static inline void qemu_load_helper(CPUArchState *env, uintptr_t orig_addr,
     static char buf[4096];
 
     SnapshotMemRegion *mr = snapshot_mem_region_search(addr);
+
+    if (mr && mr->is_heap) {
+        add_symbolic_heap_bounds_query(addr_idx, mr->base, offset, size);
+    }
     
     if (mr) {
         size_t len = 0;
@@ -3806,6 +3963,10 @@ static inline void qemu_store_helper(CPUArchState *env,
     }
 
     SnapshotMemRegion *mr = snapshot_mem_region_search(addr);
+
+    if (mr && mr->is_heap) {
+        add_symbolic_heap_bounds_query(addr_idx, mr->base, offset, size);
+    }
     
     if (mr) {
         size_t len = 0;
@@ -8504,6 +8665,7 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
             mode = 1;
         } else if (model == REALLOC) {
             // printf("[0x%lx] realloc(0x%lx, %lu)\n", model_caller_addr, (uintptr_t)env->regs[R_EDI], (uintptr_t)env->regs[R_ESI]);
+            symbolic_trace_free(env->regs[R_EDI]);
             snapshot_trace_free(env->regs[R_EDI], model_caller_addr);
             model_alloc(env, model_caller_addr, R_ESI);
             clear_call_args_temps();
@@ -8511,6 +8673,7 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
             mode = 1;
         } else if (model == FREE) {
             // printf("[0x%lx] free(0x%lx)\n", model_caller_addr, (uintptr_t)env->regs[R_EDI]);
+            symbolic_trace_free(env->regs[R_EDI]);
             snapshot_trace_free(env->regs[R_EDI], model_caller_addr);
             clear_call_args_temps();
             clear_xmm_regs(env);
@@ -8595,9 +8758,15 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
         }
         mode = 0;
         PendingAlloc alloc_info = snapshot_trace_get_pending_allocs(pc);
+        SymbolicPendingAlloc sym_alloc_info =
+            symbolic_trace_get_pending_alloc(pc);
         if (alloc_info.size != 0 && alloc_info.pc != 0) {
             target_ulong base = env->regs[R_EAX];
             snapshot_trace_alloc(base, alloc_info.size, alloc_info.pc);
+            if (sym_alloc_info.size_expr != NULL) {
+                symbolic_trace_alloc(base, sym_alloc_info.size_expr,
+                                    sym_alloc_info.size, sym_alloc_info.pc);
+            }
         }
         return r;
     }

@@ -327,6 +327,7 @@ static inline void model_alloc(CPUX86State* env, uintptr_t pc, uintptr_t reg_wit
     }
     
     size_t size = (size_t)(uintptr_t)env->regs[reg_with_size];
+    symbolic_trace_pending_alloc(size_expr, (target_ulong)size, pc);
     snapshot_trace_pending_allocs((target_ulong)size, pc);
     
     if (size_expr == NULL) {
