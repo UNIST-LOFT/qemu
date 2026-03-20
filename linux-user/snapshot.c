@@ -5,6 +5,7 @@
 
 #include <stdio.h>
 #include <stdint.h>
+#include <limits.h>
 
 #define SNAPSHOT_EXIT_DESC_LEN 256
 #define SNAPSHOT_BT_DEPTH 64
@@ -23,6 +24,17 @@
 extern target_ulong target_brk;
 bool restoring_to_snapshot;
 target_ulong binradar_entrypoint = (target_ulong)-1;
+
+extern Query *query_queue;
+extern Query *next_query;
+
+static uint64_t binradar_entrypoint_hit_count   = 0;
+static uint64_t binradar_forkserver_target_hit_count = 1;
+static int      binradar_forkserver_enable      = -1;
+static int      binradar_preserve_child_queries = -1;
+static FILE*    binradar_probe_file_fp     = NULL;
+static FILE*    binradar_query_window_fp = NULL;
+static uint8_t  binradar_query_window_dumped    = 0;
 
 bool forkserver_installed = false;
 unsigned char afl_fork_child;
@@ -122,6 +134,84 @@ static GHashTable *g_read_access_pointers_all = NULL;
 
 static ModificationManager *mod_manager = NULL;
 static SnapshotExitInfo original_exit_info;
+
+static void snapshot_load_binradar_env(void) {
+    if (binradar_forkserver_enable != -1) return;
+
+    binradar_forkserver_enable      = 1;
+    binradar_preserve_child_queries = 0;
+
+    const char* var = getenv("BINRADAR_FORKSERVER_ENABLE");
+    if (var) {
+        binradar_forkserver_enable = atoi(var) != 0;
+    }
+
+    var = getenv("BINRADAR_FORKSERVER_TARGET_HIT_COUNT");
+    if (var) {
+        uint64_t target = strtoull(var, NULL, 10);
+        if (target == ULLONG_MAX) {
+            target = 0;
+        }
+        binradar_forkserver_target_hit_count = target;
+    }
+
+    var = getenv("BINRADAR_PRESERVE_CHILD_QUERIES");
+    if (var) {
+        binradar_preserve_child_queries = atoi(var) != 0;
+    }
+
+    const char *probe_file = getenv("BINRADAR_PROBE_FILE");
+    if (probe_file && probe_file[0] && binradar_probe_file_fp == NULL) {
+        binradar_probe_file_fp = fopen(probe_file, "a");
+        if (!binradar_probe_file_fp) {
+            trace_mem("[snapshot] [error] failed to open BINRADAR_PROBE_FILE %s for write\n", probe_file);
+        } else {
+            trace_mem("[snapshot] [probe-file] [file %s]\n", probe_file);
+        }
+    }
+
+    const char *query_window_file = getenv("BINRADAR_QUERY_WINDOW_FILE");
+    if (query_window_file && query_window_file[0] && binradar_query_window_fp == NULL) {
+        binradar_query_window_fp = fopen(query_window_file, "w");
+        if (!binradar_query_window_fp) {
+            trace_mem("[snapshot] [error] failed to open BINRADAR_QUERY_WINDOW_FILE %s for write\n", query_window_file);
+        } else {
+            trace_mem("[snapshot] [query-window-file] [file %s]\n", query_window_file);
+        }
+    }
+}
+
+static void snapshot_dump_query_window(Query* q) {
+    snapshot_load_binradar_env();
+    if (binradar_query_window_dumped || binradar_query_window_fp == NULL) {
+        return;
+    }
+
+    uint64_t q_idx = GET_QUERY_IDX(q);
+
+    fprintf(binradar_query_window_fp, "[query-window] [pre-target %lu]\n", q_idx);
+    binradar_query_window_dumped = 1;
+}
+
+uint8_t snapshot_on_entrypoint_hit(target_ulong pc) {
+    snapshot_load_binradar_env();
+    binradar_entrypoint_hit_count += 1;
+
+    trace_mem("[snapshot] [entrypoint-hit] [pc %lx] [count %lu] [target %lu]\n",
+              pc, binradar_entrypoint_hit_count,
+              binradar_forkserver_target_hit_count);
+
+    if (!binradar_forkserver_enable) return 0;
+    if (binradar_forkserver_target_hit_count == 0) return 0;
+    return binradar_entrypoint_hit_count == binradar_forkserver_target_hit_count;
+}
+
+void snapshot_maybe_forkserver(CPUState *cpu, target_ulong pc) {
+    if (!snapshot_on_entrypoint_hit(pc)) {
+        return;
+    }
+    snapshot_forkserver(cpu);
+}
 
 typedef enum OspreyRoleKind {
     OSPREY_ROLE_UNKNOWN = 0,
@@ -500,10 +590,13 @@ void snapshot_record_guest_normal_exit(CPUArchState *cpu_env, int exit_code, con
     info->exit_code = exit_code;
     snapshot_exit_info_capture(info, cpu_env);
     snapshot_exit_info_set_reason(info, reason ? reason : "normal_exit");
+    trace_mem("[snapshot] [exit] [normal] [entrypoint-hit %lu]\n",
+              binradar_entrypoint_hit_count);
     dump_coverage_edge_log(true);
 }
 
 void snapshot_record_guest_crash(CPUArchState *cpu_env, int target_signal, int host_signal, int si_code, target_ulong fault_addr, uintptr_t host_fault_addr, const char *reason) {
+    snapshot_load_binradar_env();
     SnapshotExitInfo *info = snapshot_exit_info_ptr();
     if (!snapshot_exit_info_should_update(info, true)) return;
     info->valid = 1;
@@ -524,6 +617,13 @@ void snapshot_record_guest_crash(CPUArchState *cpu_env, int target_signal, int h
         g_snprintf(buffer, sizeof(buffer), "%s (host=%d, target=%d)", base, host_signal, target_signal);
     }
     snapshot_exit_info_set_reason(info, buffer);
+    trace_mem("[snapshot] [exit] [crash] [entrypoint-hit %lu]\n",
+              binradar_entrypoint_hit_count);
+    if (binradar_probe_file_fp) {
+        fprintf(binradar_probe_file_fp, "[snapshot] [crash] [hit-count %lu] [reason %s] [guest_pc %lx] [guest_cs_base %lx] [fault_addr %lx] [host_fault_addr %lx]\n",
+                binradar_entrypoint_hit_count, buffer, info->guest_pc, info->guest_cs_base, info->fault_addr, info->host_fault_addr);
+        fflush(binradar_probe_file_fp);
+    }
     dump_coverage_edge_log(true);
 }
 
@@ -1114,6 +1214,7 @@ void snapshot_save(void) {
     
     g_snapshot.is_snapshot_taken = true;
     trace_mem("[snapshot] [result] [brk %llx] [mmap %llx] [pages %d]\n", (long long int)target_brk, (long long int)mmap_next_start, g_hash_table_size(g_snapshot.pages));
+    snapshot_dump_query_window(next_query);
     dump_coverage_edge_log(false);
 }
 
@@ -1896,15 +1997,18 @@ static int analyze_collected_data(void) {
         return 0;
     }
     // Clean expr and query added during child execution
-    uint8_t *expr_base = (uint8_t *)next_free_expr;
-    uint8_t *expr_top  = (uint8_t *)exit_info->next_free_expr;
-    if (expr_top > expr_base) {
-        memset(next_free_expr, 0, expr_top - expr_base);
-    }
-    uint8_t *query_base = (uint8_t *)next_query;
-    uint8_t *query_top  = (uint8_t *)exit_info->next_query;
-    if (query_top > query_base) {
-        memset(next_query, 0, query_top - query_base);
+    snapshot_load_binradar_env();
+    if (!binradar_preserve_child_queries) {
+        uint8_t *expr_base = (uint8_t *)next_free_expr;
+        uint8_t *expr_top  = (uint8_t *)exit_info->next_free_expr;
+        if (expr_top > expr_base) {
+            memset(next_free_expr, 0, expr_top - expr_base);
+        }
+        uint8_t *query_base = (uint8_t *)next_query;
+        uint8_t *query_top  = (uint8_t *)exit_info->next_query;
+        if (query_top > query_base) {
+            memset(next_query, 0, query_top - query_base);
+        }
     }
     // Finished: reset shared_trace_data
     memset(shared_trace_data, 0, sizeof(SharedTraceData));

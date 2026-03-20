@@ -6394,9 +6394,12 @@ int        parse_translation_block(TranslationBlock* tb, uintptr_t tb_pc,
                     if (binradar_entrypoint == pc) {
                         printf("[snapshot] [instrument] [addr %lx]\n", pc);
                         TCGTemp *t_cpu_state = new_non_conflicting_temp(TCG_TYPE_PTR);
+                        TCGTemp *t_pc_entry = new_non_conflicting_temp(TCG_TYPE_PTR);
                         tcg_movi(t_cpu_state, (uintptr_t)env_cpu(cpu_env), 0, op, NULL, tcg_ctx);
-                        add_void_call_1(snapshot_forkserver, t_cpu_state, op, NULL, tcg_ctx);
+                        tcg_movi(t_pc_entry, (uintptr_t)pc, 0, op, NULL, tcg_ctx);
+                        add_void_call_2(snapshot_maybe_forkserver, t_cpu_state, t_pc_entry, op, NULL, tcg_ctx);
                         tcg_temp_free_internal(t_cpu_state);
+                        tcg_temp_free_internal(t_pc_entry);
                     }
                 }
 

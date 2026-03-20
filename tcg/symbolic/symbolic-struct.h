@@ -234,9 +234,6 @@ extern Expr* next_free_expr;
 #define GET_EXPR_IDX(e)  (((Expr*)e) - ((Expr*)pool))
 #define GET_QUERY_IDX(q) ((((Query*)q) - ((Query*)query_queue)) - 1)
 
-extern Query *query_queue;
-extern Query *next_query;
-
 extern uint64_t last_translation_block;
 
 static inline const char* opkind_to_str(uint8_t opkind)
