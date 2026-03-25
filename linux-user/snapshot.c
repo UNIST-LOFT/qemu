@@ -89,15 +89,9 @@ typedef struct SnapshotExitInfo {
     char description[SNAPSHOT_EXIT_DESC_LEN];
 } SnapshotExitInfo;
 
-typedef struct SingleModification {
-    uintptr_t addr;
-    uintptr_t size;
-    uint8_t target[8];
-} SingleModification;
-
 typedef struct Modification {
     uint32_t num_mods;
-    SingleModification *mods;
+    MutationCandidate *mods;
 } Modification;
 
 typedef struct ModificationManager {
@@ -188,7 +182,6 @@ static void snapshot_attach_mutation_channel(void) {
 }
 
 static void snapshot_load_binradar_env(void) {
-    trace_mem("[snapshot-load-binradar] [start] [forkserver %d]\n", binradar_forkserver_enable);
     if (binradar_forkserver_enable != -1) return;
 
     binradar_forkserver_enable      = 1;
@@ -240,6 +233,10 @@ static void snapshot_load_binradar_env(void) {
             trace_mem("[snapshot] [query-window-file] [file %s]\n", query_window_file);
         }
     }
+    trace_mem("[snapshot-load-binradar] [forkserver %d] [hit-count %lu] [probe-file %s] [query-window-file %s]\n",
+              binradar_forkserver_enable, binradar_forkserver_target_hit_count,
+              binradar_probe_file_fp ? probe_file : "null",
+              binradar_query_window_fp ? query_window_file : "null");
 }
 
 static void snapshot_dump_query_window(Query* q) {
@@ -1588,9 +1585,9 @@ static void snapshot_modify_memory(void) {
         exit(1);
     }
     for (int i = 0; i < mod->num_mods; i++) {
-        SingleModification single_mod = mod->mods[i];
+        MutationCandidate single_mod = mod->mods[i];
         void *target_addr_h = g2h(single_mod.addr);
-        memcpy(target_addr_h, single_mod.target, single_mod.size);
+        memcpy(target_addr_h, single_mod.value, single_mod.size);
         trace_mem("[mod] [addr %lx] [size %ld] [total %d]\n", single_mod.addr, single_mod.size, g_queue_get_length(mod_manager->modifications));
     }
 }
@@ -1643,11 +1640,11 @@ static void flip_bits(uint8_t *target, int size) {
     }
 }
 
-static Modification * add_single_modification(SingleModification *mod) {
+static Modification * add_single_modification(MutationCandidate *mod) {
     Modification *modification = g_new(Modification, 1);
-    modification->mods = g_new(SingleModification, 1);
+    modification->mods = g_new(MutationCandidate, 1);
     modification->num_mods = 1;
-    memcpy(&modification->mods[0], mod, sizeof(SingleModification));
+    memcpy(&modification->mods[0], mod, sizeof(MutationCandidate));
     return modification;
 }
 
@@ -1660,7 +1657,7 @@ static void modification_free(Modification *mod) {
     }
 }
 
-static void add_modification_primitive(GQueue *modifications, SingleModification *mod) {
+static void add_modification_primitive(GQueue *modifications, MutationCandidate *mod) {
     // Set to 0, Set to 1, bitflip
     // TODO: better modification methods
     // TODO: multi loc modification
@@ -1668,84 +1665,84 @@ static void add_modification_primitive(GQueue *modifications, SingleModification
     // TODO: verifiy modification using solver
     switch (mod->size) {
         case 1: {
-            uint8_t val = mod->target[0];
+            uint8_t val = mod->value[0];
             if (val != 0) {
-                mod->target[0] = 0;
+                mod->value[0] = 0;
                 Modification *modification = add_single_modification(mod);
                 g_queue_push_tail(modifications, modification);
             }
             if (val != 1) {
                 Modification *modification = add_single_modification(mod);
-                modification->mods[0].target[0] = 1;
+                modification->mods[0].value[0] = 1;
                 g_queue_push_tail(modifications, modification);
             }
-            flip_bits(mod->target, mod->size);
+            flip_bits(mod->value, mod->size);
             Modification *modification = add_single_modification(mod);
             g_queue_push_tail(modifications, modification);
             break;
         }
         case 2: {
             uint16_t val;
-            memcpy(&val, mod->target, 2);
+            memcpy(&val, mod->value, 2);
             if (val != 0) {
                 Modification *modification = add_single_modification(mod);
-                memset(modification->mods[0].target, 0, 2);
+                memset(modification->mods[0].value, 0, 2);
                 g_queue_push_tail(modifications, modification);
             }
             if (val != 1) {
                 Modification *modification = add_single_modification(mod);
-                modification->mods[0].target[0] = 1;
+                modification->mods[0].value[0] = 1;
                 uint16_t one = 1;
-                memcpy(mod->target, &one, 2);
+                memcpy(mod->value, &one, 2);
                 g_queue_push_tail(modifications, modification);
             }
             Modification *modification = add_single_modification(mod);
-            flip_bits(modification->mods[0].target, mod->size);
+            flip_bits(modification->mods[0].value, mod->size);
             g_queue_push_tail(modifications, modification);
             break;
         }
         case 4: {
             uint32_t val;
-            memcpy(&val, mod->target, 4);
+            memcpy(&val, mod->value, 4);
             if (val != 0) {
                 Modification *modification = add_single_modification(mod);
-                memset(modification->mods[0].target, 0, 4);
+                memset(modification->mods[0].value, 0, 4);
                 g_queue_push_tail(modifications, modification);
             }
             if (val != 1) {
                 Modification *modification = add_single_modification(mod);
                 uint32_t one = 1;
-                memcpy(modification->mods[0].target, &one, 4);
+                memcpy(modification->mods[0].value, &one, 4);
                 g_queue_push_tail(modifications, modification);
             }
             Modification *modification = add_single_modification(mod);
-            flip_bits(modification->mods[0].target, mod->size);
+            flip_bits(modification->mods[0].value, mod->size);
             g_queue_push_tail(modifications, modification);
             break;
         }
         case 8: {
             uint64_t val;
-            memcpy(&val, mod->target, 8);
+            memcpy(&val, mod->value, 8);
             if (val != 0) {
                 Modification *modification = add_single_modification(mod);
-                memset(modification->mods[0].target, 0, 8);
+                memset(modification->mods[0].value, 0, 8);
                 g_queue_push_tail(modifications, modification);
             }
             if (val != 1) {
                 Modification *modification = add_single_modification(mod);
                 uint64_t one = 1;
-                memcpy(modification->mods[0].target, &one, 8);
+                memcpy(modification->mods[0].value, &one, 8);
                 g_queue_push_tail(modifications, modification);
             }
             Modification *modification = add_single_modification(mod);
-            flip_bits(modification->mods[0].target, mod->size);
+            flip_bits(modification->mods[0].value, mod->size);
             g_queue_push_tail(modifications, modification);
             break;
         }
         default: {
             // From real memcpy/memmove (if plt is given) or file write
             if (mod->size < 8) {
-                flip_bits(mod->target, mod->size);
+                flip_bits(mod->value, mod->size);
                 Modification *modification = add_single_modification(mod);
                 g_queue_push_tail(modifications, modification);
             } else {
@@ -1755,10 +1752,10 @@ static void add_modification_primitive(GQueue *modifications, SingleModification
     }
 }
 
-static void add_modification_pointer(GQueue *modifications, SingleModification *mod) {
+static void add_modification_pointer(GQueue *modifications, MutationCandidate *mod) {
     // For pointer, try null, valid
     target_ulong original;
-    memcpy(&original, mod->target, sizeof(target_ulong));
+    memcpy(&original, mod->value, sizeof(target_ulong));
     OspreyObject *obj = NULL;
     if (g_osprey_type_manager != NULL) {
         obj = osprey_object_get(g_osprey_type_manager, mod->addr, false);
@@ -1777,7 +1774,7 @@ static void add_modification_pointer(GQueue *modifications, SingleModification *
     } else {
         // Valid pointer -> null pointer
         // TODO: Check if it can be null pointer
-        memset(mod->target, 0, sizeof(target_ulong));
+        memset(mod->value, 0, sizeof(target_ulong));
         Modification *modification = add_single_modification(mod);
         g_queue_push_tail(modifications, modification);
         // Valid pointer -> out-of-bounds pointer
@@ -1804,12 +1801,12 @@ static bool modification_equal(const Modification *lhs, const Modification *rhs)
         return false;
     }
     for (int i = 0; i < lhs->num_mods; i++) {
-        SingleModification *mod_lhs = &lhs->mods[i];
-        SingleModification *mod_rhs = &rhs->mods[i];
+        MutationCandidate *mod_lhs = &lhs->mods[i];
+        MutationCandidate *mod_rhs = &rhs->mods[i];
         if (mod_lhs->addr != mod_rhs->addr || mod_lhs->size != mod_rhs->size) {
             return false;
         }
-        if (memcmp(mod_lhs->target, mod_rhs->target, mod_lhs->size) != 0) {
+        if (memcmp(mod_lhs->value, mod_rhs->value, mod_lhs->size) != 0) {
             return false;
         }
     }
@@ -1834,35 +1831,13 @@ static bool modification_already_done(const ModificationManager *manager,
     return false;
 }
 
-static void modification_mark_done(ModificationManager *manager, Modification *mod) {
-    if (manager == NULL || mod == NULL || mod->num_mods == 0) {
-        return;
-    }
-
-    g_array_append_val(manager->done, mod);
-}
-
-static int snapshot_request_solver_modifications(void) {
-    snapshot_load_binradar_env();
+// Input: Array<MutationCandidate>
+static int snapshot_request_solver_modifications(GArray *primitive_candidates) {
     if (!binradar_solver_mutation_mode || mutation_req_shm == NULL || mutation_resp_shm == NULL) {
         return -1;
     }
     if (shared_trace_data == NULL) {
         return -1;
-    }
-
-    if (mod_manager == NULL) {
-        mod_manager_init();
-    }
-
-    if (mod_manager->current != NULL) {
-        modification_mark_done(mod_manager, mod_manager->current);
-        mod_manager->current = NULL;
-    }
-
-    if (!g_queue_is_empty(mod_manager->modifications)) {
-        mod_manager->current = g_queue_pop_head(mod_manager->modifications);
-        return g_queue_get_length(mod_manager->modifications);
     }
 
     if (mutation_req_shm->state != MUTATION_CH_EMPTY) {
@@ -1878,30 +1853,24 @@ static int snapshot_request_solver_modifications(void) {
     mutation_resp_shm->state = MUTATION_CH_EMPTY;
 
     uint32_t idx = 0;
-    for (uint32_t i = 0; i < shared_trace_data->prim_idx && idx < MUTATION_MAX_ITEMS; i++) {
-        PrimitiveAccess *prim = &shared_trace_data->primitives[i];
+    for (uint32_t i = 0; i < primitive_candidates->len && idx < MUTATION_MAX_ITEMS; i++) {
+        MutationCandidate *mod = &g_array_index(primitive_candidates, MutationCandidate, i);
         MutationCandidate *cand = &mutation_req_shm->items[idx];
-        memset(cand, 0, sizeof(*cand));
-        cand->addr = prim->addr;
-        cand->size = prim->size;
-        cand->kind = 0;
-        cand->expr = prim->expr;
-        if (prim->size > 0 && prim->size <= 8) {
-            memcpy(cand->value, g2h(prim->addr), prim->size);
-        }
+        memcpy(cand, mod, sizeof(MutationCandidate));
         idx++;
     }
-    for (uint32_t i = 0; i < shared_trace_data->ptr_idx && idx < MUTATION_MAX_ITEMS; i++) {
-        PointerAccess *ptr = &shared_trace_data->pointers[i];
-        MutationCandidate *cand = &mutation_req_shm->items[idx];
-        memset(cand, 0, sizeof(*cand));
-        cand->addr = ptr->addr;
-        cand->size = sizeof(target_ulong);
-        cand->kind = 1;
-        cand->expr = ptr->expr;
-        memcpy(cand->value, g2h(ptr->addr), sizeof(target_ulong));
-        idx++;
-    }
+    // TODO: handle pointer candidates?
+    // for (uint32_t i = 0; i < shared_trace_data->ptr_idx && idx < MUTATION_MAX_ITEMS; i++) {
+    //     PointerAccess *ptr = &shared_trace_data->pointers[i];
+    //     MutationCandidate *cand = &mutation_req_shm->items[idx];
+    //     memset(cand, 0, sizeof(*cand));
+    //     cand->addr = ptr->addr;
+    //     cand->size = sizeof(target_ulong);
+    //     cand->kind = 1;
+    //     cand->expr = ptr->expr;
+    //     memcpy(cand->value, g2h(ptr->addr), sizeof(target_ulong));
+    //     idx++;
+    // }
 
     mutation_req_shm->count = idx;
     MEM_BARRIER();
@@ -1930,16 +1899,10 @@ static int snapshot_request_solver_modifications(void) {
 
     for (uint32_t i = 0; i < response_count; i++) {
         MutationWritePlan *plan = &mutation_resp_shm->items[i];
-        if (plan->size == 0 || plan->size > sizeof(((SingleModification *)0)->target)) {
+        if (plan->size == 0 || plan->size > sizeof(((MutationCandidate *)0)->value)) {
             continue;
         }
-        SingleModification mod = {
-            .addr = plan->addr,
-            .size = plan->size,
-            .target = {0}
-        };
-        memcpy(mod.target, plan->value, plan->size);
-        Modification *modification = add_single_modification(&mod);
+        Modification *modification = add_single_modification(plan);
 
         if (modification_already_done(mod_manager, modification)) {
             modification_free(modification);
@@ -1948,10 +1911,10 @@ static int snapshot_request_solver_modifications(void) {
 
         g_queue_push_tail(mod_manager->modifications, modification);
         
-        GArray *existing_mods = g_hash_table_lookup(mod_manager->mod_maps, GUINT_TO_POINTER(mod.addr));
+        GArray *existing_mods = g_hash_table_lookup(mod_manager->mod_maps, GUINT_TO_POINTER(plan->addr));
         if (existing_mods == NULL) {
             existing_mods = g_array_new(FALSE, FALSE, sizeof(Modification *));
-            g_hash_table_insert(mod_manager->mod_maps, GUINT_TO_POINTER(mod.addr), existing_mods);
+            g_hash_table_insert(mod_manager->mod_maps, GUINT_TO_POINTER(plan->addr), existing_mods);
         }
         g_array_append_val(existing_mods, modification);
     }
@@ -1959,10 +1922,6 @@ static int snapshot_request_solver_modifications(void) {
     mutation_resp_shm->state = MUTATION_CH_EMPTY;
     MEM_BARRIER();
 
-    mod_manager->current = g_queue_pop_head(mod_manager->modifications);
-    if (mod_manager->current == NULL) {
-        return 0;
-    }
     return g_queue_get_length(mod_manager->modifications);
 }
 
@@ -1992,50 +1951,11 @@ static int analyze_collected_data(void) {
         trace_mem("[analyze] [normal] [exit %d] [guest-pc %lx] [guest-cs %lx] [reason %s] [last %lx]\n", exit_info->exit_code, exit_info->guest_pc, exit_info->guest_cs_base, exit_info->description, exit_info->guest_last_translation_block);
     }
 
-    int solver_remaining = snapshot_request_solver_modifications();
-    if (solver_remaining >= 0) {
-        snapshot_load_binradar_env();
-        if (!binradar_preserve_child_queries) {
-            uint8_t *expr_base = (uint8_t *)next_free_expr;
-            uint8_t *expr_top  = (uint8_t *)exit_info->next_free_expr;
-            if (expr_top > expr_base) {
-                memset(next_free_expr, 0, expr_top - expr_base);
-            }
-            uint8_t *query_base = (uint8_t *)next_query;
-            uint8_t *query_top  = (uint8_t *)exit_info->next_query;
-            if (query_top > query_base) {
-                memset(next_query, 0, query_top - query_base);
-            }
-        }
-        memset(shared_trace_data, 0, sizeof(SharedTraceData));
-        return solver_remaining;
-    }
-
-    // if (mod_manager != NULL &&
-    //     (g_read_access_tainted_primitives_original == NULL ||
-    //      g_read_access_pointers_original == NULL ||
-    //      g_read_access_tainted_primitives_all == NULL ||
-    //      g_read_access_pointers_all == NULL)) {
-    //     if (mod_manager->modifications != NULL) {
-    //         clear_modification_queue(mod_manager->modifications);
-    //         g_queue_free(mod_manager->modifications);
-    //     }
-    //     if (mod_manager->done != NULL) {
-    //         for (int i = 0; i < mod_manager->done->len; i++) {
-    //             Modification *mod = &g_array_index(mod_manager->done, Modification, i);
-    //             modification_free(mod);
-    //         }
-    //         g_array_free(mod_manager->done, TRUE);
-    //     }
-    //     g_free(mod_manager);
-    //     mod_manager = NULL;
-    // }
-
     // Analyze shared_trace_data
     // Sort by access_id
     qsort(shared_trace_data->primitives, shared_trace_data->prim_idx, sizeof(PrimitiveAccess), compare_prim_id_desc);
     qsort(shared_trace_data->pointers, shared_trace_data->ptr_idx, sizeof(PointerAccess), compare_ptr_id_desc);
-    GArray *mod_primitive_candidates = g_array_new(FALSE, FALSE, sizeof(SingleModification));
+    GArray *mod_primitive_candidates = g_array_new(FALSE, FALSE, sizeof(MutationCandidate));
     GArray *pointer_nodes = g_array_new(FALSE, FALSE, sizeof(PtrNode *));
     // First run: collect all data
     if (mod_manager == NULL) {
@@ -2060,15 +1980,17 @@ static int analyze_collected_data(void) {
             g_hash_table_insert(g_read_access_tainted_primitives_original, GUINT_TO_POINTER(prim_data->addr), prim_data);
             g_hash_table_insert(g_read_access_tainted_primitives_all, GUINT_TO_POINTER(prim_data->addr), prim_data);
             trace_mem("[analyze] [primitive] [index %d] [addr %lx] [size %d] [id %ld]\n", i, prim->addr, prim->size, prim->access_id);
-            SingleModification mod = {
+            MutationCandidate mod = {
                 .addr = prim->addr,
                 .size = prim->size,
-                .target = {0}
+                .kind = 0,
+                .expr = prim->expr,
+                .value = {0}
             };
             // Get actual value
             if (prim->size <= 8) {
                 void *ptr_h = g2h(prim->addr);
-                memcpy(mod.target, ptr_h, prim->size);
+                memcpy(mod.value, ptr_h, prim->size);
             }
             // If type inference is available, apply type-specific modifications (e.g., for pointers, try null, valid, out-of-bounds)
             if (g_osprey_type_manager != NULL) {
@@ -2084,7 +2006,7 @@ static int analyze_collected_data(void) {
                             // Build MemGraph (null pointer)
                             PtrNode *ptr_node = osprey_ptr_node_get(g_osprey_type_manager, prim->addr, false);
                             uint64_t target_value;
-                            memcpy(&target_value, mod.target, sizeof(uint64_t));
+                            memcpy(&target_value, mod.value, sizeof(uint64_t));
                             if (ptr_node == NULL) {
                                 ptr_node = osprey_ptr_node_get(g_osprey_type_manager, prim->addr, false);
                                 if (ptr_node) {
@@ -2099,7 +2021,7 @@ static int analyze_collected_data(void) {
                         }
                     } else {
                         // Non-pointer type: apply generic modifications
-                        add_modification_primitive(mod_manager->modifications, &mod);
+                        g_array_append_val(mod_primitive_candidates, mod);
                     }
                 }
                 continue;
@@ -2115,15 +2037,17 @@ static int analyze_collected_data(void) {
             g_hash_table_insert(g_read_access_pointers_original, GUINT_TO_POINTER(ptr_data->addr), ptr_data);
             g_hash_table_insert(g_read_access_pointers_all, GUINT_TO_POINTER(ptr_data->addr), ptr_data);
             trace_mem("[analyze] [pointer] [index %d] [addr %lx] [target %lx] [id %ld]\n", i, ptr->addr, ptr->target, ptr->access_id);
-            SingleModification mod = {
+            MutationCandidate mod = {
                 .addr = ptr->addr,
                 .size = sizeof(target_ulong),
-                .target = {0}
+                .kind = 1,
+                .expr = ptr->expr,
+                .value = {0}
             };
             // Get actual value
             target_ulong actual_value;
             memcpy(&actual_value, g2h(ptr->addr), sizeof(target_ulong));
-            memcpy(mod.target, &actual_value, sizeof(target_ulong));
+            memcpy(mod.value, &actual_value, sizeof(target_ulong));
             // Check type inference
             if (g_osprey_type_manager != NULL) {
                 OspreyObject *obj = osprey_object_get(g_osprey_type_manager, ptr->addr, false);
@@ -2141,8 +2065,9 @@ static int analyze_collected_data(void) {
                     }
                 }
                 continue;
+            } else {
+                add_modification_pointer(mod_manager->modifications, &mod);
             }
-            add_modification_pointer(mod_manager->modifications, &mod);
         }
 
         // Use MemGraph to find candidate modifications
@@ -2230,8 +2155,9 @@ static int analyze_collected_data(void) {
 
             trace_mem("[memgraph] [candidate] [terminal %d] [pointing %d]\n",
                       terminal_nodes->len, terminal_pointing_nodes->len);
-            // TODO: generate modifications based on candidate nodes
-            
+            // Generate modifications using solver
+            snapshot_request_solver_modifications(mod_primitive_candidates);
+
             g_queue_free(pending_obj_nodes);
             g_array_free(terminal_nodes, TRUE);
             g_array_free(terminal_pointing_nodes, TRUE);
@@ -2260,15 +2186,15 @@ static int analyze_collected_data(void) {
         //         memcpy(prim_data, prim, sizeof(PrimitiveAccess));
         //         g_hash_table_insert(g_read_access_tainted_primitives_all, GUINT_TO_POINTER(prim_data->addr), prim_data);
         //         trace_mem("[analyze] [new-primitive] [index %d] [addr %lx] [size %d] [id %ld]\n", i, prim->addr, prim->size, prim->access_id);
-        //         SingleModification mod = {
+        //         MutationCandidate mod = {
         //             .addr = prim->addr,
         //             .size = prim->size,
-        //             .target = {0}
+        //             .value = {0}
         //         };
         //         // Get actual value
         //         if (prim->size <= 8) {
         //             void *ptr_h = g2h(prim->addr);
-        //             memcpy(mod.target, ptr_h, prim->size);
+        //             memcpy(mod.value, ptr_h, prim->size);
         //         }
         //         // If type inference is available, apply type-specific modifications (e.g., for pointers, try null, valid, out-of-bounds)
         //         if (g_osprey_type_manager != NULL) {
@@ -2295,15 +2221,15 @@ static int analyze_collected_data(void) {
         //         memcpy(ptr_data, ptr, sizeof(PointerAccess));
         //         g_hash_table_insert(g_read_access_pointers_all, GUINT_TO_POINTER(ptr_data->addr), ptr_data);
         //         trace_mem("[analyze] [new-pointer] [index %d] [addr %lx] [target %lx] [id %ld]\n", i, ptr->addr, ptr->target, ptr->access_id);
-        //         SingleModification mod = {
+        //         MutationCandidate mod = {
         //             .addr = ptr->addr,
         //             .size = sizeof(target_ulong),
-        //             .target = {0}
+        //             .value = {0}
         //         };
         //         // Get actual value
         //         target_ulong actual_value;
         //         memcpy(&actual_value, g2h(ptr->addr), sizeof(target_ulong));
-        //         memcpy(mod.target, &actual_value, sizeof(target_ulong));
+        //         memcpy(mod.value, &actual_value, sizeof(target_ulong));
         //         add_modification_pointer(mod_manager->modifications, &mod);
         //     }
         // }
@@ -2319,7 +2245,6 @@ static int analyze_collected_data(void) {
         return 0;
     }
     // Clean expr and query added during child execution
-    snapshot_load_binradar_env();
     if (!binradar_preserve_child_queries) {
         uint8_t *expr_base = (uint8_t *)next_free_expr;
         uint8_t *expr_top  = (uint8_t *)exit_info->next_free_expr;
