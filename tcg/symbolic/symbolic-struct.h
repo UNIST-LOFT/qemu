@@ -16,10 +16,17 @@
 #define EXPR_POOL_CAPACITY  (1024 * 1024 * 8)
 #define EXPR_QUERY_CAPACITY (1024 * 1024)
 #define EXPR_POOL_ADDR      ((const void*)0x7f05c8cc7000)
+#define MUTATION_MAX_ITEMS  4096
 #define FINAL_QUERY         ((void*)0xDEAD)
 #define SHM_READY           (0xDEADBEEF)
 #define SHM_DONE            ((void*)0xABCDABCD)
 #define MEM_BARRIER()       asm volatile("" ::: "memory")
+
+typedef enum MutationChannelState {
+    MUTATION_CH_EMPTY = 0,
+    MUTATION_CH_READY = 1,
+    MUTATION_CH_BUSY = 2,
+} MutationChannelState;
 
 #define PACK_0(p, v) (p | (((uint64_t)v) & 0xFFFF))
 #define PACK_1(p, v) (p | ((((uint64_t)v) & 0xFFFF) << 16))
@@ -228,6 +235,27 @@ typedef struct Query {
         } args16;
     };
 } Query;
+
+typedef struct MutationCandidate {
+    uintptr_t addr;
+    uint32_t  size;
+    uint32_t  kind;
+    Expr*     expr;
+    uint8_t   value[8];
+} MutationCandidate;
+
+typedef MutationCandidate MutationWritePlan;
+
+typedef struct MutationRequestShm {
+    uint32_t          version;
+    uint32_t          state;
+    uint64_t          seq;
+    uint32_t          count;
+    uint32_t          reserved;
+    MutationCandidate items[MUTATION_MAX_ITEMS];
+} MutationRequestShm;
+
+#define MUTATION_IPC_VERSION 1
 
 extern Expr* pool;
 extern Expr* next_free_expr;

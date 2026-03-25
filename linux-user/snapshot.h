@@ -11,6 +11,8 @@
 #include <stdbool.h>
 #include <stdarg.h>
 
+typedef struct Expr Expr;
+
 void trace_mem(const char* fmt, ...);
 
 extern bool restoring_to_snapshot;
@@ -127,6 +129,7 @@ void snapshot_save(void);
 
 void snapshot_write_access(SnapshotMemAccess *mem_access);
 void snapshot_read_access(SnapshotMemAccess *mem_access);
+void snapshot_bind_read_expr(uintptr_t addr, uintptr_t size, Expr *expr);
 
 void snapshot_trace_pending_allocs(target_ulong size, target_ulong pc);
 PendingAlloc snapshot_trace_get_pending_allocs(target_ulong pc);

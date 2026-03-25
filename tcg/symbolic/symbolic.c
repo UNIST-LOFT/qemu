@@ -3684,6 +3684,10 @@ static inline void qemu_load_helper(CPUArchState *env, uintptr_t orig_addr,
         }
     }
 
+    if (size <= 8 && e != NULL && is_valid_address(addr, true)) {
+        snapshot_bind_read_expr(addr, size, e);
+    }
+
     s_temps[val_idx] = e;
 }
 
