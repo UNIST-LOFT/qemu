@@ -617,6 +617,7 @@ static inline void qemu_memmove(CPUArchState *cpu_env, uintptr_t src, uintptr_t 
         }
         return;
     }
+    trace_mem("[tmplog] memmove symbolic copy from=%lx to=%lx size=%lu\n", src, dst, size);
 
     if (dst_exprs == NULL) {
         size_t overflow_n_bytes;

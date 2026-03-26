@@ -3687,6 +3687,9 @@ static inline void qemu_load_helper(CPUArchState *env, uintptr_t orig_addr,
     if (size <= 8 && e != NULL && is_valid_address(addr, true)) {
         snapshot_bind_read_expr(addr, size, e);
     }
+    if (e != NULL) {
+        trace_mem("[tmplog] load symbolic [pc 0x%lx] [addr 0x%lx] [size 0x%lx] %p\n", current_tb_pc, addr, size, e);
+    }
 
     s_temps[val_idx] = e;
 }
@@ -4188,6 +4191,7 @@ static inline void qemu_store_helper(CPUArchState *env,
             e->op1     = expr_a;
             e->op2     = (Expr*)idx;
             l3_page->entries[l3_page_idx + i] = e;
+            trace_mem("[tmplog] store symbolic [pc 0x%lx] [addr 0x%lx] [size 0x%lx] %p\n", current_tb_pc, addr, size, e);
             // printf("Storing byte at index %lu\n", i);
 #if 0
             if (addr + i >= 0x8b1ba0 && addr + i < 0x8b1ba0 + 1) {
@@ -5198,6 +5202,127 @@ static Expr** get_expr_addr(uintptr_t addr, size_t size, uint8_t allocate,
     }
 
     return &l3_page->entries[l3_page_idx];
+}
+
+Expr* symbolic_rebuild_load_expr(uintptr_t addr, uint32_t size,
+                                 const uint8_t *concrete_bytes,
+                                 uint8_t sign_extend)
+{
+    Expr* exprs[8] = {NULL};
+    uint8_t expr_is_not_null = 0;
+
+    if (size == 0 || size > 8) {
+        return NULL;
+    }
+
+    size_t overflow_n_bytes = 0;
+    Expr** addr_exprs = get_expr_addr(addr, size, 0, &overflow_n_bytes);
+    if (overflow_n_bytes > 0 || addr_exprs == NULL) {
+        trace_mem("[tmplog] symbolic_rebuild_load_expr: overflow_n_bytes=%lu, addr_exprs=%p\n", overflow_n_bytes, (void*)addr_exprs);
+        return NULL;
+    }
+
+    for (size_t i = 0; i < size; i++) {
+        exprs[i] = addr_exprs[i];
+        expr_is_not_null = expr_is_not_null | (exprs[i] != NULL);
+    }
+
+    if (expr_is_not_null == 0) {
+        trace_mem("[tmplog] symbolic_rebuild_load_expr: no symbolic expressions found\n");
+        return NULL;
+    }
+
+    Expr* e = NULL;
+    if (size == 8) {
+        for (size_t i = 0; i < size; i++) {
+            if (exprs[i] != NULL && exprs[i]->opkind == EXTRACT8 &&
+                CONST(exprs[i]->op2) == i) {
+                if (e && e != exprs[i]->op1) {
+                    e = NULL;
+                    break;
+                }
+                e = exprs[i]->op1;
+            } else {
+                e = NULL;
+                break;
+            }
+        }
+
+        if (e != NULL) {
+            size_t overflow_tail = 0;
+            Expr** tail_exprs = get_expr_addr(addr + size, 1, 0,
+                                              &overflow_tail);
+            if (overflow_tail == 0 && tail_exprs != NULL &&
+                tail_exprs[0] != NULL &&
+                tail_exprs[0]->opkind == EXTRACT8 &&
+                tail_exprs[0]->op1 == e) {
+                e = NULL;
+            }
+        }
+    }
+
+    if (e == NULL) {
+        for (ssize_t i = size - 1; i >= 0; i--) {
+            if (i == size - 1) {
+                if (exprs[i] == NULL) {
+                    Expr* c = new_expr();
+                    c->opkind = IS_CONST;
+                    if (concrete_bytes != NULL) {
+                        c->op1 = (Expr*)((uintptr_t)concrete_bytes[i]);
+                    } else {
+                        uint8_t byte = 0;
+                        void *addr_h = g2h(addr + i);
+                        memcpy(&byte, addr_h, 1);
+                        c->op1 = (Expr*)((uintptr_t)byte);
+                    }
+                    e = c;
+                } else {
+                    e = exprs[i];
+                }
+            } else {
+                Expr* n_expr = new_expr();
+                n_expr->opkind = CONCAT8R;
+                n_expr->op1 = e;
+
+                if (exprs[i] == NULL) {
+                    uint8_t byte = 0;
+                    if (concrete_bytes != NULL) {
+                        byte = concrete_bytes[i];
+                    } else {
+                        void *addr_h = g2h(addr + i);
+                        memcpy(&byte, addr_h, 1);
+                    }
+                    n_expr->op2 = (Expr*)((uintptr_t)byte);
+                    n_expr->op2_is_const = 1;
+                } else {
+                    n_expr->op2 = exprs[i];
+                }
+
+                e = n_expr;
+            }
+        }
+    }
+
+    if (size < 8 && e != NULL) {
+        uintptr_t opkind = sign_extend ? SEXT : ZEXT;
+
+        if (e->opkind == ZEXT && opkind == SEXT &&
+            CONST(e->op2) == (8 * size)) {
+            e = e->op1;
+        }
+
+        if (!(opkind == SEXT && e->opkind == ZEXT &&
+              CONST(e->op2) < (8 * size)) &&
+            !(opkind == e->opkind && CONST(e->op2) <= (8 * size))) {
+            Expr* n_expr = new_expr();
+            n_expr->opkind = opkind;
+            n_expr->op1 = e;
+            n_expr->op2 = (Expr*)(uintptr_t)(8 * size);
+            e = n_expr;
+        }
+    }
+
+    return e;
 }
 
 static inline void clear_mem(uintptr_t addr, uintptr_t size)

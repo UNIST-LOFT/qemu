@@ -1831,6 +1831,15 @@ static bool modification_already_done(const ModificationManager *manager,
     return false;
 }
 
+static Expr* mutation_candidate_to_expr(const MutationCandidate *candidate) {
+    if (candidate == NULL) {
+        return NULL;
+    }
+
+    return symbolic_rebuild_load_expr(candidate->addr, candidate->size,
+                                      candidate->value, 0);
+}
+
 // Input: Array<MutationCandidate>
 static int snapshot_request_solver_modifications(GArray *primitive_candidates) {
     if (!binradar_solver_mutation_mode || mutation_req_shm == NULL || mutation_resp_shm == NULL) {
@@ -1852,11 +1861,18 @@ static int snapshot_request_solver_modifications(GArray *primitive_candidates) {
     mutation_req_shm->count = 0;
     mutation_resp_shm->state = MUTATION_CH_EMPTY;
 
+    // TODO: Backup and restore expr index
+    // Expr *original_next_free_expr = next_free_expr;
+
     uint32_t idx = 0;
     for (uint32_t i = 0; i < primitive_candidates->len && idx < MUTATION_MAX_ITEMS; i++) {
         MutationCandidate *mod = &g_array_index(primitive_candidates, MutationCandidate, i);
+        // TODO: read symbols
+        mod->expr = mutation_candidate_to_expr(mod);
         MutationCandidate *cand = &mutation_req_shm->items[idx];
         memcpy(cand, mod, sizeof(MutationCandidate));
+
+        trace_mem("[mutation-req] [prim] [addr %lx] [size %ld] [expr %lx]\n", mod->addr, mod->size, mod->expr);
         idx++;
     }
     // TODO: handle pointer candidates?
@@ -2023,6 +2039,9 @@ static int analyze_collected_data(void) {
                         // Non-pointer type: apply generic modifications
                         g_array_append_val(mod_primitive_candidates, mod);
                     }
+                } else {
+                    // No type information: assume as primitive type
+                    g_array_append_val(mod_primitive_candidates, mod);
                 }
                 continue;
             } else {
