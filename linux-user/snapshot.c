@@ -266,13 +266,6 @@ uint8_t snapshot_on_entrypoint_hit(target_ulong pc) {
     return binradar_entrypoint_hit_count == binradar_forkserver_target_hit_count;
 }
 
-void snapshot_maybe_forkserver(CPUState *cpu, target_ulong pc) {
-    if (!snapshot_on_entrypoint_hit(pc)) {
-        return;
-    }
-    snapshot_forkserver(cpu);
-}
-
 typedef enum OspreyRoleKind {
     OSPREY_ROLE_UNKNOWN = 0,
     OSPREY_ROLE_SCALAR,
@@ -1572,8 +1565,9 @@ static void mod_manager_init(void) {
     }
 }
 
+
 // Called after fork to keep clean initial state
-static void snapshot_modify_memory(void) {
+static void snapshot_modify_memory(CPUArchState *cpu_env) {
     if (mod_manager == NULL) {
         // Initial run: no modification
         return;
@@ -1586,6 +1580,17 @@ static void snapshot_modify_memory(void) {
     }
     for (int i = 0; i < mod->num_mods; i++) {
         MutationCandidate single_mod = mod->mods[i];
+        if (single_mod.addr < SNAPSHOT_PAGE_SIZE) {
+            // Modify register
+            target_ulong reg_value;
+            memcpy(&reg_value, single_mod.value, sizeof(target_ulong));
+            cpu_env->regs[(size_t)single_mod.addr] = reg_value;
+            trace_mem("[mod-reg] [register %ld] [size %ld] [total %d]\n",
+                      single_mod.addr,
+                      single_mod.size,
+                      g_queue_get_length(mod_manager->modifications));
+            continue;
+        }
         void *target_addr_h = g2h(single_mod.addr);
         memcpy(target_addr_h, single_mod.value, single_mod.size);
         trace_mem("[mod] [addr %lx] [size %ld] [total %d]\n", single_mod.addr, single_mod.size, g_queue_get_length(mod_manager->modifications));
@@ -1757,7 +1762,7 @@ static void add_modification_pointer(GQueue *modifications, MutationCandidate *m
     target_ulong original;
     memcpy(&original, mod->value, sizeof(target_ulong));
     OspreyObject *obj = NULL;
-    if (g_osprey_type_manager != NULL) {
+    if (g_osprey_type_manager != NULL && mod->addr >= SNAPSHOT_PAGE_SIZE) {
         obj = osprey_object_get(g_osprey_type_manager, mod->addr, false);
     }
     // Null pointer -> valid pointer
@@ -1836,6 +1841,14 @@ static Expr* mutation_candidate_to_expr(const MutationCandidate *candidate) {
         return NULL;
     }
 
+    if (candidate->expr != NULL) {
+        return candidate->expr;
+    }
+
+    if (candidate->addr < SNAPSHOT_PAGE_SIZE) {
+        return candidate->expr;
+    }
+
     return symbolic_rebuild_load_expr(candidate->addr, candidate->size,
                                       candidate->value, 0);
 }
@@ -1867,8 +1880,12 @@ static int snapshot_request_solver_modifications(GArray *primitive_candidates) {
     uint32_t idx = 0;
     for (uint32_t i = 0; i < primitive_candidates->len && idx < MUTATION_MAX_ITEMS; i++) {
         MutationCandidate *mod = &g_array_index(primitive_candidates, MutationCandidate, i);
-        // TODO: read symbols
         mod->expr = mutation_candidate_to_expr(mod);
+        if (mod->expr == NULL) {
+            trace_mem("[mutation-req] [skip] [missing-expr] [addr %lx] [size %ld]\n",
+                      mod->addr, mod->size);
+            continue;
+        }
         MutationCandidate *cand = &mutation_req_shm->items[idx];
         memcpy(cand, mod, sizeof(MutationCandidate));
 
@@ -1943,7 +1960,7 @@ static int snapshot_request_solver_modifications(GArray *primitive_candidates) {
 
 // In parent process, called after child execution
 // Return: remaining modifications
-static int analyze_collected_data(void) {
+static int analyze_collected_data(const ArgumentInfo *arg_info, size_t num_arg_regs) {
     if (shared_trace_data == NULL) {
         trace_mem("Snapshot init error: shared_trace_data is null\n");
         exit(1);
@@ -1986,6 +2003,27 @@ static int analyze_collected_data(void) {
         Query *query_top = exit_info->next_query;
         for (Query *q = next_query; q < query_top; q++) {
             trace_mem("[analyze] [query] [op %s] [addr %lx]\n", opkind_to_str(q->query->opkind), q->address);
+        }
+        // TODO: Add function argument (register) access
+        for (size_t i = 0; i < num_arg_regs; i++) {
+            if (arg_info[i].expr) {
+                if (is_valid_address(arg_info[i].value, false)) {
+                    // Treat as pointer access
+                    trace_mem("[analyze] [sym-arg] [ptr] [reg %zu] [expr %lx]\n", i, arg_info[i].expr);
+                } else {
+                    // Treat as primitive access
+                    MutationCandidate mc = {
+                        .addr = (uintptr_t)arg_info[i].reg,
+                        .size = sizeof(target_ulong),
+                        .kind = 0,
+                        .expr = arg_info[i].expr,
+                        .value = {0}
+                    };
+                    memcpy(mc.value, &arg_info[i].value, sizeof(target_ulong));
+                    g_array_append_val(mod_primitive_candidates, mc);
+                    trace_mem("[analyze] [sym-arg] [prim] [reg %zu] [expr %lx]\n", i, arg_info[i].expr);
+                }
+            }
         }
         
         // Create modification list
@@ -2281,7 +2319,7 @@ static int analyze_collected_data(void) {
     return g_queue_get_length(mod_manager->modifications);
 }
 
-void snapshot_forkserver(CPUState *cpu) {
+void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env, const ArgumentInfo *arg_info, size_t num_arg_regs) {
     trace_mem("[snapshot] [forkserver] [called %d]\n", forkserver_installed);
     fflush(stderr);
     if (forkserver_installed) return;
@@ -2354,7 +2392,7 @@ void snapshot_forkserver(CPUState *cpu) {
             snapshot_install_crash_handler();
 #endif
             /* Child process. Close descriptors and run free. */
-            snapshot_modify_memory();
+            snapshot_modify_memory(cpu_env);
             afl_fork_child = 1;
             close(FORKSRV_FD);
             close(FORKSRV_FD + 1);
@@ -2410,7 +2448,7 @@ void snapshot_forkserver(CPUState *cpu) {
             snapshot_load_inferred_types(analyze_result);
         }
 
-        int remaining = analyze_collected_data();
+        int remaining = analyze_collected_data(arg_info, num_arg_regs);
         
         // Send remaining count
         if (write(FORKSRV_FD + 1, &remaining, 4) != 4) exit(10);

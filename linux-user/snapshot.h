@@ -103,6 +103,13 @@ typedef struct {
     uint64_t to;
 } CoverageEdge;
 
+typedef struct ArgumentInfo {
+    uint8_t reg;
+    const char *reg_name;
+    target_ulong value;
+    Expr *expr;
+} ArgumentInfo;
+
 const char *snapshot_mem_region_str(SnapshotMemRegion *mr);
 
 guint coverage_edge_hash(gconstpointer key);
@@ -152,9 +159,10 @@ void snapshot_add_mapping(target_ulong addr, target_ulong len);
 void snapshot_remove_mapping(target_ulong addr, target_ulong len);
 
 void snapshot_fork_setup(void);
-void snapshot_forkserver(CPUState *cpu);
+void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env, const ArgumentInfo *arg_info, size_t num_arg_regs);
+void snapshot_maybe_forkserver(CPUState *cpu, CPUArchState *cpu_env, target_ulong pc);
+
 uint8_t snapshot_on_entrypoint_hit(target_ulong pc);
-void snapshot_maybe_forkserver(CPUState *cpu, target_ulong pc);
 
 void snapshot_load_inferred_types(uint8_t *analyze_result);
 

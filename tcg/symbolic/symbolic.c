@@ -1728,6 +1728,54 @@ static inline void visitTB(uintptr_t cur_loc)
 static inline void print_something(char* str) { printf("%s\n", str); }
 DEF_HELPER_INFO(print_something);
 
+void snapshot_maybe_forkserver(CPUState *cpu, CPUArchState *env, target_ulong pc) {
+    if (!snapshot_on_entrypoint_hit(pc)) {
+        return;
+    }
+#ifdef TARGET_X86_64
+    #define NUM_ARG_REGS 6
+    static const uint8_t arg_regs[NUM_ARG_REGS] = {
+        R_EDI,
+        R_ESI,
+        R_EDX,
+        R_ECX,
+        R_R8,
+        R_R9,
+    };
+    static const char* arg_names[NUM_ARG_REGS] = {
+        "rdi",
+        "rsi",
+        "rdx",
+        "rcx",
+        "r8",
+        "r9",
+    };
+    ArgumentInfo arg_info[NUM_ARG_REGS];
+#else // Not implemented
+    #define NUM_ARG_REGS 0
+    static const uint8_t* arg_regs = NULL;
+    static const char** arg_names = NULL;
+    ArgumentInfo *arg_info = NULL;
+#endif
+    printf("[snapshot] [args] [pc %lx] [num %d]", pc, NUM_ARG_REGS);
+    for (size_t i = 0; i < NUM_ARG_REGS; i++) {
+        Expr* e = s_temps[temp_idx(tcg_find_temp_arch_reg(tcg_ctx, arg_names[i]))];
+        arg_info[i].reg = arg_regs[i];
+        arg_info[i].reg_name = arg_names[i];
+        arg_info[i].expr = e;
+        arg_info[i].value = env->regs[arg_regs[i]];
+
+        printf(" [%s %s", arg_names[i], e ? "sym" : "con");
+        if (e) {
+            printf("[idx %lu][op %u]", GET_EXPR_IDX(e), e->opkind);
+        }
+        printf("]");
+    }
+    printf("\n");
+
+    snapshot_forkserver(cpu, env, arg_info, NUM_ARG_REGS);
+}
+
 // the string has to be statically allocated, otherwise it will crash!
 static inline void tcg_print_const_str(const char* str, TCGOp* op_in,
                                        TCGOp** op, TCGContext* tcg_ctx)
@@ -6523,11 +6571,14 @@ int        parse_translation_block(TranslationBlock* tb, uintptr_t tb_pc,
                     if (binradar_entrypoint == pc) {
                         printf("[snapshot] [instrument] [addr %lx]\n", pc);
                         TCGTemp *t_cpu_state = new_non_conflicting_temp(TCG_TYPE_PTR);
+                        TCGTemp *t_cpu_env = new_non_conflicting_temp(TCG_TYPE_PTR);
                         TCGTemp *t_pc_entry = new_non_conflicting_temp(TCG_TYPE_PTR);
                         tcg_movi(t_cpu_state, (uintptr_t)env_cpu(cpu_env), 0, op, NULL, tcg_ctx);
+                        tcg_movi(t_cpu_env, (uintptr_t)cpu_env, 0, op, NULL, tcg_ctx);
                         tcg_movi(t_pc_entry, (uintptr_t)pc, 0, op, NULL, tcg_ctx);
-                        add_void_call_2(snapshot_maybe_forkserver, t_cpu_state, t_pc_entry, op, NULL, tcg_ctx);
+                        add_void_call_3(snapshot_maybe_forkserver, t_cpu_state, t_cpu_env, t_pc_entry, op, NULL, tcg_ctx);
                         tcg_temp_free_internal(t_cpu_state);
+                        tcg_temp_free_internal(t_cpu_env);
                         tcg_temp_free_internal(t_pc_entry);
                     }
                 }
