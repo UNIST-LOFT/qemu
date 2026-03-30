@@ -163,3 +163,4 @@ build/
 
 .github/
 .vscode/
+*.diff
