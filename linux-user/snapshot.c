@@ -140,46 +140,6 @@ static GHashTable *g_read_access_pointers_all = NULL;
 
 static ModificationManager *mod_manager = NULL;
 static SnapshotExitInfo original_exit_info;
-static int mutation_req_shm_id = -1;
-static MutationRequestShm *mutation_req_shm = NULL;
-static MutationRequestShm *mutation_resp_shm = NULL;
-static uint64_t mutation_req_seq = 0;
-
-static void snapshot_attach_mutation_channel(void) {
-    if (!binradar_solver_mutation_mode) {
-        return;
-    }
-    if (mutation_req_shm && mutation_resp_shm) {
-        return;
-    }
-
-    const char *req_key_s = getenv("MUTATION_REQ_SHM_KEY");
-    if (!req_key_s || !req_key_s[0]) {
-        trace_mem("[snapshot] [mutation-ipc] missing shm keys\n");
-        binradar_solver_mutation_mode = 0;
-        return;
-    }
-
-    key_t req_key = (key_t)strtoull(req_key_s, NULL, 16);
-    mutation_req_shm_id = shmget(req_key, sizeof(MutationRequestShm) * 2, 0666);
-    if (mutation_req_shm_id < 0) {
-        trace_mem("[snapshot] [mutation-ipc] shmget failed [req-id %d]\n",
-                  mutation_req_shm_id);
-        binradar_solver_mutation_mode = 0;
-        return;
-    }
-
-    mutation_req_shm = shmat(mutation_req_shm_id, NULL, 0);
-    if (mutation_req_shm == (void*)-1) {
-        trace_mem("[snapshot] [mutation-ipc] shmat failed\n");
-        mutation_req_shm = NULL;
-        binradar_solver_mutation_mode = 0;
-        return;
-    }
-    mutation_resp_shm = mutation_req_shm + 1;
-
-    trace_mem("[snapshot] [mutation-ipc] attached [req %d]\n", mutation_req_shm_id);
-}
 
 static void snapshot_load_binradar_env(void) {
     if (binradar_forkserver_enable != -1) return;
@@ -206,13 +166,6 @@ static void snapshot_load_binradar_env(void) {
     if (var) {
         binradar_preserve_child_queries = atoi(var) != 0;
     }
-
-    var = getenv("BINRADAR_SOLVER_MUTATION_MODE");
-    if (var) {
-        binradar_solver_mutation_mode = atoi(var) != 0;
-    }
-
-    snapshot_attach_mutation_channel();
 
     const char *probe_file = getenv("BINRADAR_PROBE_FILE");
     if (probe_file && probe_file[0] && binradar_probe_file_fp == NULL) {
@@ -1653,14 +1606,14 @@ static Modification * add_single_modification(MutationCandidate *mod) {
     return modification;
 }
 
-static void modification_free(Modification *mod) {
-    if (mod) {
-        if (mod->mods) {
-            g_free(mod->mods);
-        }
-        g_free(mod);
-    }
-}
+// static void modification_free(Modification *mod) {
+//     if (mod) {
+//         if (mod->mods) {
+//             g_free(mod->mods);
+//         }
+//         g_free(mod);
+//     }
+// }
 
 static void add_modification_primitive(GQueue *modifications, MutationCandidate *mod) {
     // Set to 0, Set to 1, bitflip
@@ -1798,163 +1751,69 @@ static void add_modification_pointer(GQueue *modifications, MutationCandidate *m
 //     }
 // }
 
-static bool modification_equal(const Modification *lhs, const Modification *rhs) {
-    if (lhs == NULL || rhs == NULL) {
-        return false;
-    }
-    if (lhs->num_mods != rhs->num_mods) {
-        return false;
-    }
-    for (int i = 0; i < lhs->num_mods; i++) {
-        MutationCandidate *mod_lhs = &lhs->mods[i];
-        MutationCandidate *mod_rhs = &rhs->mods[i];
-        if (mod_lhs->addr != mod_rhs->addr || mod_lhs->size != mod_rhs->size) {
-            return false;
-        }
-        if (memcmp(mod_lhs->value, mod_rhs->value, mod_lhs->size) != 0) {
-            return false;
-        }
-    }
-    return true;
-}
+// static bool modification_equal(const Modification *lhs, const Modification *rhs) {
+//     if (lhs == NULL || rhs == NULL) {
+//         return false;
+//     }
+//     if (lhs->num_mods != rhs->num_mods) {
+//         return false;
+//     }
+//     for (int i = 0; i < lhs->num_mods; i++) {
+//         MutationCandidate *mod_lhs = &lhs->mods[i];
+//         MutationCandidate *mod_rhs = &rhs->mods[i];
+//         if (mod_lhs->addr != mod_rhs->addr || mod_lhs->size != mod_rhs->size) {
+//             return false;
+//         }
+//         if (memcmp(mod_lhs->value, mod_rhs->value, mod_lhs->size) != 0) {
+//             return false;
+//         }
+//     }
+//     return true;
+// }
 
-static bool modification_already_done(const ModificationManager *manager,
-                                      const Modification *candidate) {
-    if (manager == NULL || manager->done == NULL || manager->mod_maps == NULL || candidate == NULL || candidate->num_mods == 0) {
-        return false;
-    }
+// static bool modification_already_done(const ModificationManager *manager,
+//                                       const Modification *candidate) {
+//     if (manager == NULL || manager->done == NULL || manager->mod_maps == NULL || candidate == NULL || candidate->num_mods == 0) {
+//         return false;
+//     }
 
-    GArray *existing_mods = g_hash_table_lookup(manager->mod_maps, GUINT_TO_POINTER(candidate->mods[0].addr));
-    if (existing_mods != NULL) {
-        for (int i = 0; i < existing_mods->len; i++) {
-            Modification *existing_mod = g_array_index(existing_mods, Modification *, i);
-            if (modification_equal(candidate, existing_mod)) {
-                return true;
-            }
-        }
-    }
-    return false;
-}
+//     GArray *existing_mods = g_hash_table_lookup(manager->mod_maps, GUINT_TO_POINTER(candidate->mods[0].addr));
+//     if (existing_mods != NULL) {
+//         for (int i = 0; i < existing_mods->len; i++) {
+//             Modification *existing_mod = g_array_index(existing_mods, Modification *, i);
+//             if (modification_equal(candidate, existing_mod)) {
+//                 return true;
+//             }
+//         }
+//     }
+//     return false;
+// }
 
-static Expr* mutation_candidate_to_expr(const MutationCandidate *candidate) {
-    if (candidate == NULL) {
-        return NULL;
-    }
+// static Expr* mutation_candidate_to_expr(const MutationCandidate *candidate) {
+//     if (candidate == NULL) {
+//         return NULL;
+//     }
 
-    if (candidate->expr != NULL) {
-        return candidate->expr;
-    }
+//     if (candidate->expr != NULL) {
+//         return candidate->expr;
+//     }
 
-    if (candidate->addr < SNAPSHOT_PAGE_SIZE) {
-        return candidate->expr;
-    }
+//     if (candidate->addr < SNAPSHOT_PAGE_SIZE) {
+//         return candidate->expr;
+//     }
 
-    return symbolic_rebuild_load_expr(candidate->addr, candidate->size,
-                                      candidate->value, 0);
-}
+//     return symbolic_rebuild_load_expr(candidate->addr, candidate->size,
+//                                       candidate->value, 0);
+// }
 
-// Input: Array<MutationCandidate>
+// TODO: call solver
 static int snapshot_request_solver_modifications(GArray *primitive_candidates) {
-    if (!binradar_solver_mutation_mode || mutation_req_shm == NULL || mutation_resp_shm == NULL) {
+    if (!binradar_solver_mutation_mode) {
         return -1;
     }
     if (shared_trace_data == NULL) {
         return -1;
     }
-
-    if (mutation_req_shm->state != MUTATION_CH_EMPTY) {
-        return -1;
-    }
-
-    // clear_modification_queue(mod_manager->modifications);
-
-    mutation_req_seq += 1;
-    mutation_req_shm->version = MUTATION_IPC_VERSION;
-    mutation_req_shm->seq = mutation_req_seq;
-    mutation_req_shm->count = 0;
-    mutation_resp_shm->state = MUTATION_CH_EMPTY;
-
-    // TODO: Backup and restore expr index
-    // Expr *original_next_free_expr = next_free_expr;
-
-    uint32_t idx = 0;
-    for (uint32_t i = 0; i < primitive_candidates->len && idx < MUTATION_MAX_ITEMS; i++) {
-        MutationCandidate *mod = &g_array_index(primitive_candidates, MutationCandidate, i);
-        mod->expr = mutation_candidate_to_expr(mod);
-        if (mod->expr == NULL) {
-            trace_mem("[mutation-req] [skip] [missing-expr] [addr %lx] [size %ld]\n",
-                      mod->addr, mod->size);
-            continue;
-        }
-        MutationCandidate *cand = &mutation_req_shm->items[idx];
-        memcpy(cand, mod, sizeof(MutationCandidate));
-
-        trace_mem("[mutation-req] [prim] [addr %lx] [size %ld] [expr %lx]\n", mod->addr, mod->size, mod->expr);
-        idx++;
-    }
-    // TODO: handle pointer candidates?
-    // for (uint32_t i = 0; i < shared_trace_data->ptr_idx && idx < MUTATION_MAX_ITEMS; i++) {
-    //     PointerAccess *ptr = &shared_trace_data->pointers[i];
-    //     MutationCandidate *cand = &mutation_req_shm->items[idx];
-    //     memset(cand, 0, sizeof(*cand));
-    //     cand->addr = ptr->addr;
-    //     cand->size = sizeof(target_ulong);
-    //     cand->kind = 1;
-    //     cand->expr = ptr->expr;
-    //     memcpy(cand->value, g2h(ptr->addr), sizeof(target_ulong));
-    //     idx++;
-    // }
-
-    mutation_req_shm->count = idx;
-    MEM_BARRIER();
-    mutation_req_shm->state = MUTATION_CH_READY;
-    MEM_BARRIER();
-
-    uint32_t wait_ms = 0;
-    while (wait_ms < 5000) {
-        if (mutation_resp_shm->state == MUTATION_CH_READY &&
-            mutation_resp_shm->seq == mutation_req_seq) {
-            break;
-        }
-        usleep(1000);
-        wait_ms += 1;
-    }
-
-    if (mutation_resp_shm->state != MUTATION_CH_READY || mutation_resp_shm->seq != mutation_req_seq) {
-        trace_mem("[snapshot] [mutation-ipc] timeout [seq %lu]\n", mutation_req_seq);
-        return -1;
-    }
-
-    uint32_t response_count = mutation_resp_shm->count;
-    if (response_count > MUTATION_MAX_ITEMS) {
-        response_count = MUTATION_MAX_ITEMS;
-    }
-
-    for (uint32_t i = 0; i < response_count; i++) {
-        MutationWritePlan *plan = &mutation_resp_shm->items[i];
-        if (plan->size == 0 || plan->size > sizeof(((MutationCandidate *)0)->value)) {
-            continue;
-        }
-        Modification *modification = add_single_modification(plan);
-
-        if (modification_already_done(mod_manager, modification)) {
-            modification_free(modification);
-            continue;
-        }
-
-        g_queue_push_tail(mod_manager->modifications, modification);
-        
-        GArray *existing_mods = g_hash_table_lookup(mod_manager->mod_maps, GUINT_TO_POINTER(plan->addr));
-        if (existing_mods == NULL) {
-            existing_mods = g_array_new(FALSE, FALSE, sizeof(Modification *));
-            g_hash_table_insert(mod_manager->mod_maps, GUINT_TO_POINTER(plan->addr), existing_mods);
-        }
-        g_array_append_val(existing_mods, modification);
-    }
-
-    mutation_resp_shm->state = MUTATION_CH_EMPTY;
-    MEM_BARRIER();
-
     return g_queue_get_length(mod_manager->modifications);
 }
 
