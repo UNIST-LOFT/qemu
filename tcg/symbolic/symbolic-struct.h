@@ -181,6 +181,7 @@ typedef enum OPKIND {
     MOV,
     //
     MODEL,
+    BINRADAR_CONCRETIZATION,
 } OPKIND;
 
 typedef enum EXTENDKIND {
@@ -261,6 +262,8 @@ extern Expr* pool;
 extern Expr* next_free_expr;
 #define GET_EXPR_IDX(e)  (((Expr*)e) - ((Expr*)pool))
 #define GET_QUERY_IDX(q) ((((Query*)q) - ((Query*)query_queue)) - 1)
+
+void add_query(Expr *q, uintptr_t address, uintptr_t pc, const char *msg);
 
 Expr* symbolic_rebuild_load_expr(uintptr_t addr, uint32_t size,
                                  const uint8_t *concrete_bytes,
@@ -484,6 +487,9 @@ static inline const char* opkind_to_str(uint8_t opkind)
 
         case MODEL:
             return "MODEL";
+        
+        case BINRADAR_CONCRETIZATION:
+            return "BINRADAR_CONCRETIZATION";
 
         default:
             printf("\nstr(opkind=%u) is unknown\n", opkind);

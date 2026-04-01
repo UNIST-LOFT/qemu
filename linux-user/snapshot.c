@@ -36,8 +36,8 @@ static uint64_t binradar_forkserver_target_hit_count = 1;
 static int      binradar_forkserver_enable      = -1;
 static int      binradar_preserve_child_queries = -1;
 static int      binradar_solver_mutation_mode   = -1;
-static FILE*    binradar_probe_file_fp     = NULL;
-static FILE*    binradar_query_window_fp = NULL;
+static char*    binradar_probe_file     = NULL;
+static char*    binradar_query_window_file = NULL;
 static uint8_t  binradar_query_window_dumped    = 0;
 
 bool forkserver_installed = false;
@@ -167,42 +167,41 @@ static void snapshot_load_binradar_env(void) {
         binradar_preserve_child_queries = atoi(var) != 0;
     }
 
-    const char *probe_file = getenv("BINRADAR_PROBE_FILE");
-    if (probe_file && probe_file[0] && binradar_probe_file_fp == NULL) {
-        binradar_probe_file_fp = fopen(probe_file, "a");
-        if (!binradar_probe_file_fp) {
-            trace_mem("[snapshot] [error] failed to open BINRADAR_PROBE_FILE %s for write\n", probe_file);
-        } else {
-            trace_mem("[snapshot] [probe-file] [file %s]\n", probe_file);
-        }
+    binradar_probe_file = getenv("BINRADAR_PROBE_FILE");
+    if (binradar_probe_file && binradar_probe_file[0] == '\0') {
+        binradar_probe_file = NULL;
     }
 
-    const char *query_window_file = getenv("BINRADAR_QUERY_WINDOW_FILE");
-    if (query_window_file && query_window_file[0] && binradar_query_window_fp == NULL) {
-        binradar_query_window_fp = fopen(query_window_file, "w");
-        if (!binradar_query_window_fp) {
-            trace_mem("[snapshot] [error] failed to open BINRADAR_QUERY_WINDOW_FILE %s for write\n", query_window_file);
-        } else {
-            trace_mem("[snapshot] [query-window-file] [file %s]\n", query_window_file);
-        }
+    binradar_query_window_file = getenv("BINRADAR_QUERY_WINDOW_FILE");
+    if (binradar_query_window_file && binradar_query_window_file[0] == '\0') {
+        binradar_query_window_file = NULL;
     }
     trace_mem("[snapshot-load-binradar] [forkserver %d] [hit-count %lu] [probe-file %s] [query-window-file %s]\n",
               binradar_forkserver_enable, binradar_forkserver_target_hit_count,
-              binradar_probe_file_fp ? probe_file : "null",
-              binradar_query_window_fp ? query_window_file : "null");
+              binradar_probe_file ? binradar_probe_file : "null",
+              binradar_query_window_file ? binradar_query_window_file : "null");
 }
 
-static void snapshot_dump_query_window(Query* q) {
+static void snapshot_dump_query_window(Query* q, Expr *e) {
     snapshot_load_binradar_env();
-    if (binradar_query_window_dumped || binradar_query_window_fp == NULL) {
+    if (binradar_query_window_dumped || binradar_query_window_file == NULL) {
         return;
     }
 
-    uint64_t q_idx = GET_QUERY_IDX(q);
+    int64_t start_index = GET_QUERY_IDX(next_query);
+    int64_t end_index = GET_QUERY_IDX(q);
+    // Preserve query window for first run
+    next_query = q;
+    next_free_expr = e;
 
-    fprintf(binradar_query_window_fp, "[query-window] [pre-target %lu]\n", q_idx);
-    fflush(binradar_query_window_fp);
-    fsync(fileno(binradar_query_window_fp));
+    FILE *fp = fopen(binradar_query_window_file, "a");
+    if (fp == NULL) {
+        fprintf(stderr, "Failed to open binradar query window file: %s\n", binradar_query_window_file);
+        return;
+    }
+
+    fprintf(fp, "[query-window] [start %ld] [end %ld]\n", start_index, end_index - 1);
+    fclose(fp);
     binradar_query_window_dumped = 1;
 }
 
@@ -626,10 +625,15 @@ void snapshot_record_guest_crash(CPUArchState *cpu_env, int target_signal, int h
     snapshot_exit_info_set_reason(info, buffer);
     trace_mem("[snapshot] [exit] [crash] [entrypoint-hit %lu]\n",
               binradar_entrypoint_hit_count);
-    if (binradar_probe_file_fp) {
+    if (binradar_probe_file) {
+        FILE *binradar_probe_file_fp = fopen(binradar_probe_file, "a");
+        if (binradar_probe_file_fp == NULL) {
+            fprintf(stderr, "Failed to open binradar probe file: %s\n", binradar_probe_file);
+            return;
+        }
         fprintf(binradar_probe_file_fp, "[snapshot] [crash] [hit-count %lu] [reason %s] [guest_pc %lx] [guest_cs_base %lx] [fault_addr %lx] [host_fault_addr %lx]\n",
                 binradar_entrypoint_hit_count, buffer, info->guest_pc, info->guest_cs_base, info->fault_addr, info->host_fault_addr);
-        fflush(binradar_probe_file_fp);
+        fclose(binradar_probe_file_fp);
     }
     dump_coverage_edge_log(true);
 }
@@ -1247,7 +1251,6 @@ void snapshot_save(void) {
     
     g_snapshot.is_snapshot_taken = true;
     trace_mem("[snapshot] [result] [brk %llx] [mmap %llx] [pages %d]\n", (long long int)target_brk, (long long int)mmap_next_start, g_hash_table_size(g_snapshot.pages));
-    snapshot_dump_query_window(next_query);
     dump_coverage_edge_log(false);
 }
 
@@ -1508,13 +1511,14 @@ void snapshot_fork_setup(void) {
 }
 
 // Modify guest program's state base on mod_manager (check analyze_collected_data)
-static void mod_manager_init(void) {
+static void mod_manager_init(SnapshotExitInfo *exit_info) {
     if (mod_manager == NULL) {
         mod_manager = g_new0(ModificationManager, 1);
         mod_manager->modifications = g_queue_new();
         mod_manager->done = g_array_new(FALSE, FALSE, sizeof(Modification *));
         mod_manager->mod_maps = g_hash_table_new(g_direct_hash, g_direct_equal);
         mod_manager->current = NULL;
+        snapshot_dump_query_window(exit_info->next_query, exit_info->next_free_expr);
     }
 }
 
@@ -1814,6 +1818,7 @@ static int snapshot_request_solver_modifications(GArray *primitive_candidates) {
     if (shared_trace_data == NULL) {
         return -1;
     }
+
     return g_queue_get_length(mod_manager->modifications);
 }
 
@@ -1851,7 +1856,7 @@ static int analyze_collected_data(const ArgumentInfo *arg_info, size_t num_arg_r
     GArray *pointer_nodes = g_array_new(FALSE, FALSE, sizeof(PtrNode *));
     // First run: collect all data
     if (mod_manager == NULL) {
-        mod_manager_init();
+        mod_manager_init(exit_info);
         
         memcpy(&original_exit_info, exit_info, sizeof(SnapshotExitInfo));
         g_read_access_tainted_primitives_original = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, NULL);

@@ -88,8 +88,6 @@ static uintptr_t current_tb_pc = 0;
 static uintptr_t last_tb_pc    = 0;
 
 static inline Expr* new_expr(void);
-static void add_query(Expr* q, uintptr_t address, uintptr_t pc,
-                      const char* msg);
 
 typedef struct {
     Expr*        size_expr;
@@ -493,7 +491,7 @@ static void print_query_loc(Query *query, uint64_t pc, const char *msg) {
     }
 }
 
-static void add_query(Expr *q, uintptr_t address, uintptr_t pc, const char *msg) {
+void add_query(Expr *q, uintptr_t address, uintptr_t pc, const char *msg) {
     next_query->query = q;
     next_query->address = address;
     print_query_loc(next_query, pc, msg);
@@ -3733,7 +3731,17 @@ static inline void qemu_load_helper(CPUArchState *env, uintptr_t orig_addr,
     }
 
     if (size <= 8 && e != NULL && is_valid_address(addr, true)) {
-        snapshot_bind_read_expr(addr, size, e);
+        // snapshot_bind_read_expr(addr, size, e);
+        // Add query BINRADAR_CONCRETIZATION
+        Expr *binradar_e = new_expr();
+        binradar_e->opkind = BINRADAR_CONCRETIZATION;
+        binradar_e->op1 = e;
+        binradar_e->op2 = NULL;
+        uint8_t* concrete_bytes = (uint8_t*)&binradar_e->op2;
+        memcpy(concrete_bytes, (void*)g2h(addr), size);
+        binradar_e->op2_is_const = 1;
+        SET_EXPR_CONST_OP(binradar_e->op3, binradar_e->op3_is_const, size);
+        add_query(binradar_e, addr, current_tb_pc, "BINRADAR_CONCRETIZATION");
     }
     if (e != NULL) {
         trace_mem("[tmplog] load symbolic [pc 0x%lx] [addr 0x%lx] [size 0x%lx] %p\n", current_tb_pc, addr, size, e);
