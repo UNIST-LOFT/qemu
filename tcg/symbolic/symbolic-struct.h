@@ -182,6 +182,7 @@ typedef enum OPKIND {
     //
     MODEL,
     BINRADAR_CONCRETIZATION,
+    BINRADAR_HEAP_BOUND_CHECK,
 } OPKIND;
 
 typedef enum EXTENDKIND {
@@ -490,6 +491,8 @@ static inline const char* opkind_to_str(uint8_t opkind)
         
         case BINRADAR_CONCRETIZATION:
             return "BINRADAR_CONCRETIZATION";
+        case BINRADAR_HEAP_BOUND_CHECK:
+            return "BINRADAR_HEAP_BOUND_CHECK";
 
         default:
             printf("\nstr(opkind=%u) is unknown\n", opkind);

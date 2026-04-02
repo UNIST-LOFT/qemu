@@ -203,6 +203,11 @@ static inline void add_symbolic_heap_bounds_query(uintptr_t addr_idx,
         return;
     }
 
+    alloc = symbolic_lookup_alloc(base);
+    if (alloc == NULL || alloc->size_expr == NULL) {
+        return;
+    }
+
     if (offset != 0) {
         Expr* addr_with_offset = new_expr();
         addr_with_offset->opkind = ADD;
@@ -210,11 +215,6 @@ static inline void add_symbolic_heap_bounds_query(uintptr_t addr_idx,
         SET_EXPR_CONST_OP(addr_with_offset->op2,
                           addr_with_offset->op2_is_const, offset);
         addr_expr = addr_with_offset;
-    }
-
-    alloc = symbolic_lookup_alloc(base);
-    if (alloc == NULL || alloc->size_expr == NULL) {
-        return;
     }
 
     offset_expr = new_expr();
@@ -232,7 +232,7 @@ static inline void add_symbolic_heap_bounds_query(uintptr_t addr_idx,
     }
 
     Expr* q = new_expr();
-    q->opkind = LTU;
+    q->opkind = BINRADAR_HEAP_BOUND_CHECK;
     q->op1 = offset_expr;
     q->op2 = alloc->size_expr;
     add_query(q, 0, current_tb_pc, "heap_bounds");
