@@ -479,12 +479,12 @@ OrderedMap *ordered_map_init(int max_size) {
 }
 
 OrderedMapEntry *ordered_map_insert(OrderedMap *map, uintptr_t key, void *data) {
-    OrderedMapEntry *existing = g_hash_table_lookup(map->table, GUINT_TO_POINTER(key));
+    OrderedMapEntry *existing = g_hash_table_lookup(map->table, GSIZE_TO_POINTER(key));
     int old_index = -1;
     if (existing != NULL) {
         old_index = existing->shared_index;
         g_queue_delete_link(map->queue, existing->node);
-        g_hash_table_remove(map->table, GUINT_TO_POINTER(key));
+        g_hash_table_remove(map->table, GSIZE_TO_POINTER(key));
     }
 
     if (map->max_size > 0 && g_queue_get_length(map->queue) >= map->max_size) {
@@ -492,7 +492,7 @@ OrderedMapEntry *ordered_map_insert(OrderedMap *map, uintptr_t key, void *data) 
         if (oldest_entry != NULL) {
             old_index = oldest_entry->shared_index;
             uintptr_t old_key = oldest_entry->key;
-            g_hash_table_remove(map->table, GUINT_TO_POINTER(old_key));
+            g_hash_table_remove(map->table, GSIZE_TO_POINTER(old_key));
         }
     }
 
@@ -504,12 +504,12 @@ OrderedMapEntry *ordered_map_insert(OrderedMap *map, uintptr_t key, void *data) 
 
     g_queue_push_tail(map->queue, entry);
     entry->node = map->queue->tail;
-    g_hash_table_insert(map->table, GUINT_TO_POINTER(key), entry);
+    g_hash_table_insert(map->table, GSIZE_TO_POINTER(key), entry);
     return entry;
 }
 
 OrderedMapEntry* ordered_map_lookup(OrderedMap *map, uintptr_t key) {
-    OrderedMapEntry *entry = (OrderedMapEntry *)g_hash_table_lookup(map->table, GUINT_TO_POINTER(key));
+    OrderedMapEntry *entry = (OrderedMapEntry *)g_hash_table_lookup(map->table, GSIZE_TO_POINTER(key));
     return entry;
 }
 
@@ -661,7 +661,7 @@ static void remove_read_access_primitive(uintptr_t addr) {
     } else {
         trace_mem("[rpi] ERROR! remove primtive failed! idx %d > last %d\n", idx_to_remove, last_idx);
     }
-    g_hash_table_remove(g_read_access_tainted_primitives->table, GUINT_TO_POINTER(addr));
+    g_hash_table_remove(g_read_access_tainted_primitives->table, GSIZE_TO_POINTER(addr));
 }
 
 static void add_read_access_pointer(uintptr_t addr, uintptr_t target, uintptr_t pc) {
@@ -759,7 +759,7 @@ bool is_valid_address(target_ulong addr, bool for_snapshot) {
         return false;
     }
     target_ulong page = addr & SNAPSHOT_PAGE_MASK;
-    SnapshotPageInfo *info = g_hash_table_lookup(g_snapshot.pages, &page);
+    SnapshotPageInfo *info = g_hash_table_lookup(g_snapshot.pages, GSIZE_TO_POINTER(page));
     if (info != NULL) {
         if (for_snapshot) {
             // Valid only if it has write permission
@@ -1199,7 +1199,7 @@ void snapshot_init(void) {
     memset(&mr_manager, 0, sizeof(SnapshotMemRegionManager));
     init_mr_manager();
     memset(&g_snapshot, 0, sizeof(SnapshotState));
-    g_snapshot.pages = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, g_free);
+    g_snapshot.pages = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, NULL);
     g_snapshot.is_snapshot_taken = false;
     // g_snapshot.cpu_state = malloc(sizeof(CPUArchState));
     // memset(g_snapshot.cpu_state, 0, sizeof(CPUArchState));
@@ -1221,13 +1221,12 @@ static int walk_memory_cb(void *priv, target_ulong start, target_ulong end,
             info->addr = addr;
             info->perms = flags;
             info->data = g_malloc(SNAPSHOT_PAGE_SIZE);
+            uint64_t key = addr & SNAPSHOT_PAGE_MASK;
             
             void *host_addr = g2h(addr);
             // memcpy(info->data, host_addr, SNAPSHOT_PAGE_SIZE);
 
-            target_ulong *key = g_malloc(sizeof(target_ulong));
-            *key = addr;
-            g_hash_table_insert(g_snapshot.pages, key, info);
+            g_hash_table_insert(g_snapshot.pages, GSIZE_TO_POINTER(key), info);
             trace_mem("[snapshot] [memwalk] [addr %lx] [perms %ld] [host %lx]\n", (uint64_t)addr, flags, (uint64_t)host_addr);
         }
     }
@@ -1281,6 +1280,9 @@ void snapshot_read_access(SnapshotMemAccess *mem_access) {
             // Add to pointer
             add_read_access_pointer(addr, target, mem_access->pc);
             is_value_pointer = true;
+            trace_mem("[snapshot] [raccess] [pointer] [addr %lx] [target %lx] [pc %lx]\n", addr, target, mem_access->pc);
+        } else {
+            trace_mem("[snapshot] [raccess] [primitive] [addr %lx] [value %lx] [pc %lx]\n", addr, target, mem_access->pc);
         }
     }
     if (!is_value_pointer) {
@@ -1480,7 +1482,7 @@ int snapshot_is_unmap_allowed(target_ulong addr, target_ulong len) {
     return 1;
     target_ulong end = addr + len;
     for (target_ulong p = addr; p < end; p += SNAPSHOT_PAGE_SIZE) {
-        if (g_hash_table_contains(g_snapshot.pages, &p)) {
+        if (g_hash_table_contains(g_snapshot.pages, GSIZE_TO_POINTER(p & SNAPSHOT_PAGE_MASK))) {
             return 0; // False
         }
     }
@@ -1510,6 +1512,23 @@ void snapshot_fork_setup(void) {
     trace_mem("[forkserver] [setup]\n");
 }
 
+static abi_ulong snapshot_alloc_pointer_page(void)
+{
+    abi_long mapped = target_mmap(0, SNAPSHOT_PAGE_SIZE,
+                                  PROT_READ | PROT_WRITE,
+                                  MAP_PRIVATE | MAP_ANONYMOUS,
+                                  -1, 0);
+    if (mapped == -1) {
+        trace_mem("[mod-pointer] [alloc-error] target_mmap failed\n");
+        return (abi_ulong)-1;
+    }
+
+    memset(g2h((target_ulong)mapped), 0, SNAPSHOT_PAGE_SIZE);
+    trace_mem("[mod-pointer] [alloc] [addr %lx] [size %x]\n",
+              (target_ulong)mapped, SNAPSHOT_PAGE_SIZE);
+    return (abi_ulong)mapped;
+}
+
 // Modify guest program's state base on mod_manager (check analyze_collected_data)
 static void mod_manager_init(SnapshotExitInfo *exit_info) {
     if (mod_manager == NULL) {
@@ -1535,8 +1554,35 @@ static void snapshot_modify_memory(CPUArchState *cpu_env) {
         trace_mem("ERROR: empty modification\n");
         exit(1);
     }
+    bool pointer_mod = false;
+    for (int i = 0; i < mod->num_mods; i++) {
+        if (mod->mods[i].kind == 1) {
+            pointer_mod = true;
+            break;
+        }
+    }
+    abi_ulong pointer_page = (abi_ulong)-1;
+    if (pointer_mod) {
+        trace_mem("[mod-pointer] [start]\n");
+        pointer_page = snapshot_alloc_pointer_page();
+        if (pointer_page == (abi_ulong)-1) {
+            exit(1);
+        }
+    }
     for (int i = 0; i < mod->num_mods; i++) {
         MutationCandidate single_mod = mod->mods[i];
+        if (single_mod.kind == 1) {
+            target_ulong ptr_value = (target_ulong)pointer_page;
+            memcpy(single_mod.value, &ptr_value, sizeof(target_ulong));
+            if (single_mod.value_obj != NULL) {
+                size_t obj_size = single_mod.size;
+                if (obj_size > SNAPSHOT_PAGE_SIZE) {
+                    obj_size = SNAPSHOT_PAGE_SIZE;
+                }
+                memcpy(g2h((target_ulong)pointer_page),
+                       single_mod.value_obj, obj_size);
+            }
+        }
         if (single_mod.addr < SNAPSHOT_PAGE_SIZE) {
             // Modify register
             target_ulong reg_value;
@@ -1781,7 +1827,7 @@ static void add_modification_pointer(GQueue *modifications, MutationCandidate *m
 //         return false;
 //     }
 
-//     GArray *existing_mods = g_hash_table_lookup(manager->mod_maps, GUINT_TO_POINTER(candidate->mods[0].addr));
+//     GArray *existing_mods = g_hash_table_lookup(manager->mod_maps, GSIZE_TO_POINTER(candidate->mods[0].addr));
 //     if (existing_mods != NULL) {
 //         for (int i = 0; i < existing_mods->len; i++) {
 //             Modification *existing_mod = g_array_index(existing_mods, Modification *, i);
@@ -1895,8 +1941,8 @@ static int analyze_collected_data(const ArgumentInfo *arg_info, size_t num_arg_r
             PrimitiveAccess *prim = &shared_trace_data->primitives[i];
             PrimitiveAccess *prim_data = g_new(PrimitiveAccess, 1);
             memcpy(prim_data, prim, sizeof(PrimitiveAccess));
-            g_hash_table_insert(g_read_access_tainted_primitives_original, GUINT_TO_POINTER(prim_data->addr), prim_data);
-            g_hash_table_insert(g_read_access_tainted_primitives_all, GUINT_TO_POINTER(prim_data->addr), prim_data);
+            g_hash_table_insert(g_read_access_tainted_primitives_original, GSIZE_TO_POINTER(prim_data->addr), prim_data);
+            g_hash_table_insert(g_read_access_tainted_primitives_all, GSIZE_TO_POINTER(prim_data->addr), prim_data);
             trace_mem("[analyze] [primitive] [index %d] [addr %lx] [size %d] [id %ld]\n", i, prim->addr, prim->size, prim->access_id);
             MutationCandidate mod = {
                 .addr = prim->addr,
@@ -1925,6 +1971,7 @@ static int analyze_collected_data(const ArgumentInfo *arg_info, size_t num_arg_r
                             PtrNode *ptr_node = osprey_ptr_node_get(g_osprey_type_manager, prim->addr, false);
                             uint64_t target_value;
                             memcpy(&target_value, mod.value, sizeof(uint64_t));
+                            trace_mem("[inferred] [pointer] [addr %lx] [target %lx] [type %s]\n", prim->addr, target_value, obj->type->id);
                             if (ptr_node == NULL) {
                                 ptr_node = osprey_ptr_node_get(g_osprey_type_manager, prim->addr, false);
                                 if (ptr_node) {
@@ -1955,8 +2002,8 @@ static int analyze_collected_data(const ArgumentInfo *arg_info, size_t num_arg_r
             PointerAccess *ptr = &shared_trace_data->pointers[i];
             PointerAccess *ptr_data = g_new(PointerAccess, 1);
             memcpy(ptr_data, ptr, sizeof(PointerAccess));
-            g_hash_table_insert(g_read_access_pointers_original, GUINT_TO_POINTER(ptr_data->addr), ptr_data);
-            g_hash_table_insert(g_read_access_pointers_all, GUINT_TO_POINTER(ptr_data->addr), ptr_data);
+            g_hash_table_insert(g_read_access_pointers_original, GSIZE_TO_POINTER(ptr_data->addr), ptr_data);
+            g_hash_table_insert(g_read_access_pointers_all, GSIZE_TO_POINTER(ptr_data->addr), ptr_data);
             trace_mem("[analyze] [pointer] [index %d] [addr %lx] [target %lx] [id %ld]\n", i, ptr->addr, ptr->target, ptr->access_id);
             MutationCandidate mod = {
                 .addr = ptr->addr,
@@ -2098,14 +2145,14 @@ static int analyze_collected_data(const ArgumentInfo *arg_info, size_t num_arg_r
         // // Append modification list
         // for (int i = 0; i < shared_trace_data->prim_idx; i++) {
         //     PrimitiveAccess *prim = &shared_trace_data->primitives[i];
-        //     if (!g_hash_table_lookup(g_read_access_tainted_primitives_original, GUINT_TO_POINTER(prim->addr))) {
+        //     if (!g_hash_table_lookup(g_read_access_tainted_primitives_original, GSIZE_TO_POINTER(prim->addr))) {
         //         // TODO: New value
         //     }
-        //     if (!g_hash_table_lookup(g_read_access_tainted_primitives_all, GUINT_TO_POINTER(prim->addr))) {
+        //     if (!g_hash_table_lookup(g_read_access_tainted_primitives_all, GSIZE_TO_POINTER(prim->addr))) {
         //         // Found new read
         //         PrimitiveAccess *prim_data = g_new(PrimitiveAccess, 1);
         //         memcpy(prim_data, prim, sizeof(PrimitiveAccess));
-        //         g_hash_table_insert(g_read_access_tainted_primitives_all, GUINT_TO_POINTER(prim_data->addr), prim_data);
+        //         g_hash_table_insert(g_read_access_tainted_primitives_all, GSIZE_TO_POINTER(prim_data->addr), prim_data);
         //         trace_mem("[analyze] [new-primitive] [index %d] [addr %lx] [size %d] [id %ld]\n", i, prim->addr, prim->size, prim->access_id);
         //         MutationCandidate mod = {
         //             .addr = prim->addr,
@@ -2133,14 +2180,14 @@ static int analyze_collected_data(const ArgumentInfo *arg_info, size_t num_arg_r
         // }
         // for (int i = 0; i < shared_trace_data->ptr_idx; i++) {
         //     PointerAccess *ptr = &shared_trace_data->pointers[i];
-        //     if (!g_hash_table_lookup(g_read_access_pointers_original, GUINT_TO_POINTER(ptr->addr))) {
+        //     if (!g_hash_table_lookup(g_read_access_pointers_original, GSIZE_TO_POINTER(ptr->addr))) {
         //         // New pointer read
         //     }
-        //     if (!g_hash_table_lookup(g_read_access_pointers_all, GUINT_TO_POINTER(ptr->addr))) {
+        //     if (!g_hash_table_lookup(g_read_access_pointers_all, GSIZE_TO_POINTER(ptr->addr))) {
         //         // Found new read
         //         PointerAccess *ptr_data = g_new(PointerAccess, 1);
         //         memcpy(ptr_data, ptr, sizeof(PointerAccess));
-        //         g_hash_table_insert(g_read_access_pointers_all, GUINT_TO_POINTER(ptr_data->addr), ptr_data);
+        //         g_hash_table_insert(g_read_access_pointers_all, GSIZE_TO_POINTER(ptr_data->addr), ptr_data);
         //         trace_mem("[analyze] [new-pointer] [index %d] [addr %lx] [target %lx] [id %ld]\n", i, ptr->addr, ptr->target, ptr->access_id);
         //         MutationCandidate mod = {
         //             .addr = ptr->addr,

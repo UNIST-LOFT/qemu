@@ -244,6 +244,9 @@ typedef struct MutationCandidate {
     uint32_t  kind;
     Expr*     expr;
     uint8_t   value[8];
+    // Only for kind == 1 (pointer)
+    uintptr_t value_addr;
+    uint8_t *value_obj;
 } MutationCandidate;
 
 typedef MutationCandidate MutationWritePlan;
