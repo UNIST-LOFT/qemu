@@ -1281,6 +1281,11 @@ void snapshot_read_access(SnapshotMemAccess *mem_access) {
             add_read_access_pointer(addr, target, mem_access->pc);
             is_value_pointer = true;
             trace_mem("[snapshot] [raccess] [pointer] [addr %lx] [target %lx] [pc %lx]\n", addr, target, mem_access->pc);
+        } else if (target == 0) {
+            // It may be a null pointer
+            add_read_access_primitive(addr, size, mem_access->pc);
+            trace_mem("[snapshot] [raccess] [null-pointer] [addr %lx] [pc %lx]\n", addr, mem_access->pc);
+            is_value_pointer = true; // Do not add it twice
         } else {
             trace_mem("[snapshot] [raccess] [primitive] [addr %lx] [value %lx] [pc %lx]\n", addr, target, mem_access->pc);
         }
@@ -1556,7 +1561,7 @@ static void snapshot_modify_memory(CPUArchState *cpu_env) {
     }
     bool pointer_mod = false;
     for (int i = 0; i < mod->num_mods; i++) {
-        if (mod->mods[i].kind == 1) {
+        if (mod->mods[i].kind == 1 && mod->mods[i].value_addr == 1) {
             pointer_mod = true;
             break;
         }
@@ -1571,7 +1576,7 @@ static void snapshot_modify_memory(CPUArchState *cpu_env) {
     }
     for (int i = 0; i < mod->num_mods; i++) {
         MutationCandidate single_mod = mod->mods[i];
-        if (single_mod.kind == 1) {
+        if (single_mod.kind == 1 && single_mod.value_addr == 1) {
             target_ulong ptr_value = (target_ulong)pointer_page;
             memcpy(single_mod.value, &ptr_value, sizeof(target_ulong));
             if (single_mod.value_obj != NULL) {
@@ -2123,6 +2128,34 @@ static int analyze_collected_data(const ArgumentInfo *arg_info, size_t num_arg_r
 
             trace_mem("[memgraph] [candidate] [terminal %d] [pointing %d]\n",
                       terminal_nodes->len, terminal_pointing_nodes->len);
+            for (int i = 0; i < terminal_pointing_nodes->len; i++) {
+                PtrNode *ptr_node = g_array_index(terminal_pointing_nodes, PtrNode *, i);
+                // Add to modification candidates
+                uint32_t size = sizeof(target_ulong);
+                if (ptr_node->points_to && ptr_node->points_to->base && ptr_node->points_to->base->obj) {
+                    size = ptr_node->points_to->base->obj->size;
+                }
+                MutationCandidate mod = {
+                    .addr = ptr_node->addr,
+                    .size = size,
+                    .kind = 1,
+                    .expr = NULL,
+                    .value = {0},
+                    .value_addr = 0,
+                    .value_obj = NULL,
+                };
+                // If the pointer is null, try allocate new obj
+                target_ulong actual_value;
+                memcpy(&actual_value, g2h(ptr_node->addr), sizeof(target_ulong));
+                if (actual_value == 0) {
+                    trace_mem("[candidate] [pointer] [null] [addr %lx] [size %d]\n", mod.addr, mod.size);
+                    mod.value_addr = 1; // dummy non-null value
+                    mod.value_obj = g_malloc0(size);
+                }
+                trace_mem("[candidate] [pointer] [addr %lx] [size %d] [actual_value %lx]\n", mod.addr, mod.size, actual_value);
+                Modification *modification = add_single_modification(&mod);
+                g_queue_push_tail(mod_manager->modifications, modification);
+            }
             // Generate modifications using solver
             snapshot_request_solver_modifications(mod_primitive_candidates);
 
@@ -2227,7 +2260,7 @@ static int analyze_collected_data(const ArgumentInfo *arg_info, size_t num_arg_r
     }
     // Finished: reset shared_trace_data
     memset(shared_trace_data, 0, sizeof(SharedTraceData));
-    return g_queue_get_length(mod_manager->modifications);
+    return g_queue_get_length(mod_manager->modifications) + 1;
 }
 
 void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env, const ArgumentInfo *arg_info, size_t num_arg_regs) {
