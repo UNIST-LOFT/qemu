@@ -3536,16 +3536,16 @@ static inline void qemu_load_helper(CPUArchState *env, uintptr_t orig_addr,
     }
     
     if (mr) {
-        size_t len = 0;
-        for (int i = 0; i < CPU_NB_REGS; i++) {
-            len += snprintf(buf + len, 4096 - len, "[r%d %lx] ", i, env->regs[i]);
-        }
+        // size_t len = 0;
+        // for (int i = 0; i < CPU_NB_REGS; i++) {
+        //     len += snprintf(buf + len, 4096 - len, "[r%d %lx] ", i, env->regs[i]);
+        // }
         const char *reg_name = snapshot_mem_region_str(mr);
         if (disp_is_valid(disp_pack)) {
             int32_t disp = unpack_disp(disp_pack);
-            trace_mem("[loadh] [val] [reg %s] [pc 0x%lx] [addr 0x%lx] [base 0x%lx] [disp %d] [reg-base 0x%lx] [size 0x%lx] [val %lx] [is-ptr %d] %s\n",
+            trace_mem("[loadh] [val] [reg %s] [pc 0x%lx] [addr 0x%lx] [base 0x%lx] [disp %d] [reg-base 0x%lx] [size 0x%lx] [val %lx] [is-ptr %d]\n",
                       reg_name, current_tb_pc, addr, base_val, disp, mr->base,
-                      size, val, is_ptr, buf);
+                      size, val, is_ptr);
         } else {
             uintptr_t base_fallback = 0;
             int32_t disp_fallback = 0;
@@ -4032,14 +4032,14 @@ static inline void qemu_store_helper(CPUArchState *env,
     }
     
     if (mr) {
-        size_t len = 0;
-        for (int i = 0; i < CPU_NB_REGS; i++) {
-            len += snprintf(buf + len, 4096 - len, "[r%d %lx] ", i, env->regs[i]);
-        }
+        // size_t len = 0;
+        // for (int i = 0; i < CPU_NB_REGS; i++) {
+        //     len += snprintf(buf + len, 4096 - len, "[r%d %lx] ", i, env->regs[i]);
+        // }
         const char *reg_name = snapshot_mem_region_str(mr);
         if (disp_is_valid(disp_pack)) {
             int32_t disp = unpack_disp(disp_pack);
-            trace_mem("[storeh] [val] [reg %s] [pc 0x%lx] [addr 0x%lx] [base 0x%lx] [disp %d] [reg-base 0x%lx] [size 0x%lx] [val %lx] [is-ptr %d] %s\n", reg_name, current_tb_pc, addr, base_val, disp, mr->base, size, concrete_val, is_ptr, buf);
+            trace_mem("[storeh] [val] [reg %s] [pc 0x%lx] [addr 0x%lx] [base 0x%lx] [disp %d] [reg-base 0x%lx] [size 0x%lx] [val %lx] [is-ptr %d]\n", reg_name, current_tb_pc, addr, base_val, disp, mr->base, size, concrete_val, is_ptr);
         } else {
             uintptr_t base_fallback = 0;
             int32_t disp_fallback = 0;

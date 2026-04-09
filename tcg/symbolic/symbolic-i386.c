@@ -591,11 +591,11 @@ static inline void qemu_memmove(CPUArchState *cpu_env, uintptr_t src, uintptr_t 
             snapshot_read_access(&mem_access);
         }
     }
-    static char buf[4096];
-    size_t len = 0;
-    for (int i = 0; i < CPU_NB_REGS; i++) {
-        len += snprintf(buf + len, 4096 - len, "[r%d %lx] ", i, cpu_env->regs[i]);
-    }
+    // static char buf[4096];
+    // size_t len = 0;
+    // for (int i = 0; i < CPU_NB_REGS; i++) {
+    //     len += snprintf(buf + len, 4096 - len, "[r%d %lx] ", i, cpu_env->regs[i]);
+    // }
     target_ulong val = 0;
     bool is_ptr = false;
     if (size == sizeof(target_ulong)) {
@@ -604,7 +604,7 @@ static inline void qemu_memmove(CPUArchState *cpu_env, uintptr_t src, uintptr_t 
     }
     SnapshotMemRegion *mr_src = snapshot_mem_region_search(src);
     SnapshotMemRegion *mr_dst = snapshot_mem_region_search(dst);
-    trace_mem("[memmoveh] [src %lx] [dst %lx] [size %lx] [val %lx] [is-ptr %d] [src-r %s] [src-rb %lx] [dst-r %s] [dst-rb %lx] %s\n", src, dst, size, val, is_ptr, snapshot_mem_region_str(mr_src), mr_src ? mr_src->base : 0, snapshot_mem_region_str(mr_dst), mr_dst ? mr_dst->base : 0, buf);
+    trace_mem("[memmoveh] [src %lx] [dst %lx] [size %lx] [val %lx] [is-ptr %d] [src-r %s] [src-rb %lx] [dst-r %s] [dst-rb %lx]\n", src, dst, size, val, is_ptr, snapshot_mem_region_str(mr_src), mr_src ? mr_src->base : 0, snapshot_mem_region_str(mr_dst), mr_dst ? mr_dst->base : 0);
     // Add snapshot_write_access to dst if needed
 
     if (src_exprs == NULL && dst_exprs == NULL) {
