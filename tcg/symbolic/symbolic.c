@@ -3527,8 +3527,6 @@ static inline void qemu_load_helper(CPUArchState *env, uintptr_t orig_addr,
         }
     }
 
-    static char buf[4096];
-
     SnapshotMemRegion *mr = snapshot_mem_region_search(addr);
 
     if (mr && mr->is_heap) {
@@ -3562,12 +3560,12 @@ static inline void qemu_load_helper(CPUArchState *env, uintptr_t orig_addr,
                 }
             }
             if (has_fallback) {
-                trace_mem("[loadh] [val-fallback] [reg %s] [pc 0x%lx] [addr 0x%lx] [base 0x%lx] [disp %d] [reg-base 0x%lx] [size 0x%lx] [val %lx] [is-ptr %d] %s\n",
+                trace_mem("[loadh] [val-fallback] [reg %s] [pc 0x%lx] [addr 0x%lx] [base 0x%lx] [disp %d] [reg-base 0x%lx] [size 0x%lx] [val %lx] [is-ptr %d]\n",
                           reg_name, current_tb_pc, addr, base_fallback,
-                          disp_fallback, mr->base, size, val, is_ptr, buf);
+                          disp_fallback, mr->base, size, val, is_ptr);
             } else {
-                trace_mem("[loadh] [inval] [reg %s] [pc 0x%lx] [addr 0x%lx] [reg-base 0x%lx] [size 0x%lx] [val %lx] [is-ptr %d] %s\n",
-                          reg_name, current_tb_pc, addr, mr->base, size, val, is_ptr, buf);
+                trace_mem("[loadh] [inval] [reg %s] [pc 0x%lx] [addr 0x%lx] [reg-base 0x%lx] [size 0x%lx] [val %lx] [is-ptr %d]\n",
+                          reg_name, current_tb_pc, addr, mr->base, size, val, is_ptr);
             }
         }
     } else {
@@ -4003,7 +4001,6 @@ static inline void qemu_store_helper(CPUArchState *env,
 
     size_t    size = get_mem_op_size(mem_op);
     uintptr_t addr = orig_addr + offset;
-    static char buf[4096];
 
     bool is_ptr = false;
     if (size <= 8) {
@@ -4056,12 +4053,12 @@ static inline void qemu_store_helper(CPUArchState *env,
                 }
             }
             if (has_fallback) {
-                trace_mem("[storeh] [val-fallback] [reg %s] [pc 0x%lx] [addr 0x%lx] [base 0x%lx] [disp %d] [reg-base 0x%lx] [size 0x%lx] [val %lx] [is-ptr %d] %s\n", reg_name, current_tb_pc,  addr, base_fallback, disp_fallback, mr->base, size, concrete_val, is_ptr, buf);
+                trace_mem("[storeh] [val-fallback] [reg %s] [pc 0x%lx] [addr 0x%lx] [base 0x%lx] [disp %d] [reg-base 0x%lx] [size 0x%lx] [val %lx] [is-ptr %d]\n", reg_name, current_tb_pc,  addr, base_fallback, disp_fallback, mr->base, size, concrete_val, is_ptr);
             } else {
-                trace_mem("[storeh] [inval] [reg %s] [pc 0x%lx] [addr 0x%lx] [reg-base 0x%lx] [size 0x%lx] [val %lx] [is-ptr %d] %s\n", reg_name, current_tb_pc, addr, mr->base, size, concrete_val, is_ptr, buf);
+                trace_mem("[storeh] [inval] [reg %s] [pc 0x%lx] [addr 0x%lx] [reg-base 0x%lx] [size 0x%lx] [val %lx] [is-ptr %d]\n", reg_name, current_tb_pc, addr, mr->base, size, concrete_val, is_ptr);
             }
         }
-        // trace_mem("[storeh] [reg %s] [pc 0x%lx] [addr 0x%lx] [reg-base 0x%lx] [size 0x%lx] [val %lx] [is-ptr %d] %s\n", reg_name, current_tb_pc, addr, mr->base, size, concrete_val, is_ptr, buf);
+        // trace_mem("[storeh] [reg %s] [pc 0x%lx] [addr 0x%lx] [reg-base 0x%lx] [size 0x%lx] [val %lx] [is-ptr %d]\n", reg_name, current_tb_pc, addr, mr->base, size, concrete_val, is_ptr);
     } else {
         trace_mem("[storeh-error] [pc %lx] [addr %lx] [size %lx] failed to detect memory region\n", current_tb_pc, addr, size);
     }
