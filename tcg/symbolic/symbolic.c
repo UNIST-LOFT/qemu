@@ -384,6 +384,13 @@ typedef enum {
     STRCPY,
     STRNCPY,
     FPUTC,
+    ATOI,
+    ATOL,
+    ATOLL,
+    STRTOL,
+    STRTOLL,
+    STRTOUL,
+    STRTOULL,
 } LIB_MODEL;
 
 typedef struct {
@@ -458,6 +465,20 @@ inline static void parse_plt_info(char* path)
             plt->model = FPRINTF;
         } else if (strcmp(token, "fputc") == 0) {
             plt->model = FPUTC;
+        } else if (strcmp(token, "atoi") == 0) {
+            plt->model = ATOI;
+        } else if (strcmp(token, "atol") == 0) {
+            plt->model = ATOL;
+        } else if (strcmp(token, "atoll") == 0) {
+            plt->model = ATOLL;
+        } else if (strcmp(token, "strtol") == 0) {
+            plt->model = STRTOL;
+        } else if (strcmp(token, "strtoll") == 0) {
+            plt->model = STRTOLL;
+        } else if (strcmp(token, "strtoul") == 0) {
+            plt->model = STRTOUL;
+        } else if (strcmp(token, "strtoull") == 0) {
+            plt->model = STRTOULL;
         }
         token = strtok(NULL, ",");
         if (!token || plt->model == 0) {
@@ -8929,6 +8950,34 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
             mode = 2;
             clear_call_args_temps();
             clear_xmm_regs(env);
+        } else if (model == ATOI) {
+            mode = model_atoi_like(env, model_caller_addr, MODEL_ATOI);
+            clear_call_args_temps();
+            clear_xmm_regs(env);
+        } else if (model == ATOL) {
+            mode = model_atoi_like(env, model_caller_addr, MODEL_ATOL);
+            clear_call_args_temps();
+            clear_xmm_regs(env);
+        } else if (model == ATOLL) {
+            mode = model_atoi_like(env, model_caller_addr, MODEL_ATOLL);
+            clear_call_args_temps();
+            clear_xmm_regs(env);
+        } else if (model == STRTOL) {
+            mode = model_strtol_like(env, model_caller_addr, MODEL_STRTOL);
+            clear_call_args_temps();
+            clear_xmm_regs(env);
+        } else if (model == STRTOLL) {
+            mode = model_strtol_like(env, model_caller_addr, MODEL_STRTOLL);
+            clear_call_args_temps();
+            clear_xmm_regs(env);
+        } else if (model == STRTOUL) {
+            mode = model_strtol_like(env, model_caller_addr, MODEL_STRTOUL);
+            clear_call_args_temps();
+            clear_xmm_regs(env);
+        } else if (model == STRTOULL) {
+            mode = model_strtol_like(env, model_caller_addr, MODEL_STRTOULL);
+            clear_call_args_temps();
+            clear_xmm_regs(env);
         } 
         // printf("Return address is %lx [%lx]\n", model_caller_addr, rsp);
         if (mode == 2) {
@@ -8939,6 +8988,11 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
     }
     if (mode > 0 && pc == model_caller_addr) {
         // printf("Switch mode back\n");
+        Expr* ret_expr = take_pending_model_return_expr();
+        if (ret_expr != NULL) {
+            s_temps[temp_idx(tcg_find_temp_arch_reg(tcg_ctx, "rax"))] =
+                ret_expr;
+        }
         model_caller_addr = 0;
         int r = 0;
         if (mode == 2) {

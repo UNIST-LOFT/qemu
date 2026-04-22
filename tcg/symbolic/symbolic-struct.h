@@ -220,6 +220,13 @@ typedef enum {
     MODEL_MALLOC,
     MODEL_CALLOC,
     MODEL_REALLOC,
+    MODEL_ATOI,
+    MODEL_ATOL,
+    MODEL_ATOLL,
+    MODEL_STRTOL,
+    MODEL_STRTOLL,
+    MODEL_STRTOUL,
+    MODEL_STRTOULL,
 } MODEL_T;
 
 typedef struct Query {
@@ -520,6 +527,20 @@ static inline const char* model_to_str(uint8_t opkind)
             return "MODEL_CALLOC";
         case MODEL_REALLOC:
             return "MODEL_REALLOC";
+        case MODEL_ATOI:
+            return "MODEL_ATOI";
+        case MODEL_ATOL:
+            return "MODEL_ATOL";
+        case MODEL_ATOLL:
+            return "MODEL_ATOLL";
+        case MODEL_STRTOL:
+            return "MODEL_STRTOL";
+        case MODEL_STRTOLL:
+            return "MODEL_STRTOLL";
+        case MODEL_STRTOUL:
+            return "MODEL_STRTOUL";
+        case MODEL_STRTOULL:
+            return "MODEL_STRTOULL";
 
         default:
             printf("\nstr(model=%u) is unknown\n", opkind);

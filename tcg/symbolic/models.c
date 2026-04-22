@@ -1,5 +1,22 @@
 #include "symbolic-struct.h"
 #include "../../linux-user/snapshot.h"
+
+#define MODEL_PARSE_MAX_INPUT 64
+
+static Expr* pending_model_return_expr = NULL;
+
+static inline void set_pending_model_return_expr(Expr* expr)
+{
+    pending_model_return_expr = expr;
+}
+
+static inline Expr* take_pending_model_return_expr(void)
+{
+    Expr* expr = pending_model_return_expr;
+    pending_model_return_expr = NULL;
+    return expr;
+}
+
 static inline void clear_call_args_temps(void)
 {
     s_temps[temp_idx(tcg_find_temp_arch_reg(tcg_ctx, "rax"))] = 0;
@@ -73,6 +90,97 @@ static inline Expr* build_expr(Expr** exprs, void* addr, size_t size)
 
     // print_expr(dst_expr);
     return dst_expr;
+}
+
+static inline int model_is_space(char c)
+{
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r' ||
+           c == '\f' || c == '\v';
+}
+
+static inline int model_digit_for_base(char c, int base)
+{
+    int digit = -1;
+    if (c >= '0' && c <= '9') {
+        digit = c - '0';
+    } else if (c >= 'a' && c <= 'z') {
+        digit = 10 + (c - 'a');
+    } else if (c >= 'A' && c <= 'Z') {
+        digit = 10 + (c - 'A');
+    }
+
+    if (digit < 0 || digit >= base) {
+        return -1;
+    }
+    return digit;
+}
+
+static inline size_t model_numeric_span(const char* s, int base,
+                                        int* used_base_out)
+{
+    size_t i = 0;
+    int used_base = base;
+
+    while (s[i] && model_is_space(s[i]) && i < MODEL_PARSE_MAX_INPUT) {
+        i++;
+    }
+
+    if (s[i] == '+' || s[i] == '-') {
+        i++;
+    }
+
+    if (used_base == 0) {
+        used_base = 10;
+        if (s[i] == '0') {
+            used_base = 8;
+            if ((s[i + 1] == 'x' || s[i + 1] == 'X')) {
+                used_base = 16;
+            }
+        }
+    }
+
+    if (used_base == 16 && s[i] == '0' &&
+        (s[i + 1] == 'x' || s[i + 1] == 'X')) {
+        i += 2;
+    }
+
+    while (s[i] && i < MODEL_PARSE_MAX_INPUT) {
+        if (model_digit_for_base(s[i], used_base) < 0) {
+            break;
+        }
+        i++;
+    }
+
+    if (used_base_out != NULL) {
+        *used_base_out = used_base;
+    }
+    return i;
+}
+
+static inline int model_has_symbolic_bytes(Expr** exprs, size_t len)
+{
+    if (exprs == NULL) {
+        return 0;
+    }
+    for (size_t i = 0; i < len; i++) {
+        if (exprs[i] != NULL) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static inline Expr* model_build_return_expr(Expr* input_expr,
+                                            uintptr_t concrete_value,
+                                            uintptr_t meta)
+{
+    Expr* ret_expr = new_expr();
+    ret_expr->opkind = MODEL;
+    ret_expr->op1 = input_expr;
+    SET_EXPR_CONST_OP(ret_expr->op2, ret_expr->op2_is_const,
+                      concrete_value);
+    SET_EXPR_CONST_OP(ret_expr->op3, ret_expr->op3_is_const, meta);
+    return ret_expr;
 }
 
 static inline int model_strcmp(CPUX86State* env, uintptr_t pc, uintptr_t n)
@@ -344,4 +452,101 @@ static inline void model_alloc(CPUX86State* env, uintptr_t pc, uintptr_t reg_wit
     // next_query[0].address = pc;
     // next_query[0].model   = MODEL_MALLOC;
     // next_query++;
+}
+
+static inline int model_atoi_like(CPUX86State* env, uintptr_t pc,
+                                  MODEL_T model_kind)
+{
+    int mode = 2;
+    const char* s = (const char*)(uintptr_t)env->regs[R_EDI];
+    long long result = 0;
+    int used_base = 10;
+
+    if (s == NULL) {
+        return mode;
+    }
+
+    if (model_kind == MODEL_ATOI) {
+        result = (long long)atoi(s);
+    } else if (model_kind == MODEL_ATOL) {
+        result = (long long)atol(s);
+    } else {
+        result = atoll(s);
+    }
+
+    size_t span = model_numeric_span(s, 10, &used_base);
+    if (span == 0) {
+        span = 1;
+    }
+
+    Expr** exprs = get_expr_addr((uintptr_t)s, span, 0, NULL);
+    if (!model_has_symbolic_bytes(exprs, span)) {
+        return mode;
+    }
+
+    Expr* input_expr = build_expr(exprs, (void*)s, span);
+    uint64_t meta = 0;
+    meta = PACK_0(meta, span);
+    meta = PACK_1(meta, used_base);
+
+    Expr* q = model_build_return_expr(input_expr, (uintptr_t)result, meta);
+    add_query_with_model(q, pc, model_kind, "model_atoi_like");
+    set_pending_model_return_expr(q);
+    return mode;
+}
+
+static inline int model_strtol_like(CPUX86State* env, uintptr_t pc,
+                                    MODEL_T model_kind)
+{
+    int mode = 2;
+    const char* nptr = (const char*)(uintptr_t)env->regs[R_EDI];
+    char** endptr = (char**)(uintptr_t)env->regs[R_ESI];
+    int base = (int)(uintptr_t)env->regs[R_EDX];
+    char* end_local = NULL;
+    uintptr_t concrete_value = 0;
+    int used_base = base;
+
+    if (nptr == NULL) {
+        return mode;
+    }
+
+    if (model_kind == MODEL_STRTOUL) {
+        concrete_value = (uintptr_t)strtoul(nptr, &end_local, base);
+    } else if (model_kind == MODEL_STRTOULL) {
+        concrete_value = (uintptr_t)strtoull(nptr, &end_local, base);
+    } else if (model_kind == MODEL_STRTOLL) {
+        concrete_value = (uintptr_t)strtoll(nptr, &end_local, base);
+    } else {
+        concrete_value = (uintptr_t)strtol(nptr, &end_local, base);
+    }
+
+    if (endptr != NULL) {
+        *endptr = end_local;
+        clear_mem((uintptr_t)endptr, sizeof(char*));
+    }
+
+    size_t span = model_numeric_span(nptr, base, &used_base);
+    if (span == 0) {
+        span = 1;
+    }
+
+    Expr** exprs = get_expr_addr((uintptr_t)nptr, span, 0, NULL);
+    if (!model_has_symbolic_bytes(exprs, span)) {
+        return mode;
+    }
+
+    Expr* input_expr = build_expr(exprs, (void*)nptr, span);
+    uint64_t meta = 0;
+    uintptr_t end_off = 0;
+    if (end_local != NULL) {
+        end_off = (uintptr_t)(end_local - nptr);
+    }
+    meta = PACK_0(meta, span);
+    meta = PACK_1(meta, used_base);
+    meta = PACK_2(meta, end_off);
+
+    Expr* q = model_build_return_expr(input_expr, concrete_value, meta);
+    add_query_with_model(q, pc, model_kind, "model_strtol_like");
+    set_pending_model_return_expr(q);
+    return mode;
 }
