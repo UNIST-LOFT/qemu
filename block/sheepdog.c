@@ -1443,7 +1443,7 @@ static int reload_inode(BDRVSheepdogState *s, uint32_t snapid, const char *tag)
         return -EIO;
     }
 
-    inode = g_malloc(SD_INODE_HEADER_SIZE);
+    inode = g_malloc(sizeof(*inode));
 
     ret = find_vdi_name(s, s->name, snapid, tag, &vid, false, &local_err);
     if (ret) {
@@ -2922,7 +2922,7 @@ static int sd_snapshot_list(BlockDriverState *bs, QEMUSnapshotInfo **psn_tab)
     uint32_t vid;
 
     vdi_inuse = g_malloc(max);
-    inode = g_malloc(SD_INODE_HEADER_SIZE);
+    inode = g_malloc(sizeof(*inode));
 
     fd = connect_to_sdog(s, &local_err);
     if (fd < 0) {
