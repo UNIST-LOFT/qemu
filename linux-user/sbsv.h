@@ -9,7 +9,7 @@ extern "C" {
 #endif
 
 #define SBSV_VERSION_MAJOR 0
-#define SBSV_VERSION_MINOR 1
+#define SBSV_VERSION_MINOR 2
 #define SBSV_VERSION_PATCH 0
 
 typedef enum {
@@ -60,8 +60,12 @@ struct sbsv_value {
     sbsv_custom_free_fn custom_free;
 };
 
+typedef struct sbsv_schema sbsv_schema;
+typedef struct sbsv_schema_field sbsv_schema_field;
+
 typedef struct {
-    char* key;
+    const char* name_with_tag;
+    const char* name;
     sbsv_value value;
 } sbsv_field;
 
@@ -78,6 +82,7 @@ typedef struct {
 } sbsv_index_range;
 
 typedef struct sbsv_parser sbsv_parser;
+typedef struct sbsv_body_parser sbsv_body_parser;
 
 typedef sbsv_status (*sbsv_custom_type_fn)(
     const char* input,
@@ -98,6 +103,27 @@ void sbsv_value_init(sbsv_value* value);
 void sbsv_value_clear(sbsv_value* value);
 sbsv_status sbsv_value_set_string(sbsv_value* value, const char* string_value);
 sbsv_status sbsv_value_set_custom_ptr(sbsv_value* value, void* custom_ptr, sbsv_custom_free_fn custom_free);
+void sbsv_row_free(sbsv_row* row);
+const char* sbsv_field_name(const sbsv_field* field);
+const char* sbsv_field_name_with_tag(const sbsv_field* field);
+const char* sbsv_row_schema_name(const sbsv_row* row);
+size_t sbsv_row_field_count(const sbsv_row* row);
+
+sbsv_body_parser* sbsv_body_parser_new(void);
+void sbsv_body_parser_free(sbsv_body_parser* parser);
+const char* sbsv_body_parser_last_error(const sbsv_body_parser* parser);
+sbsv_status sbsv_body_parser_add_custom_type(
+    sbsv_body_parser* parser,
+    const char* type_name,
+    sbsv_custom_type_fn converter,
+    void* user_data
+);
+sbsv_status sbsv_body_parser_set_schema(sbsv_body_parser* parser, const char* schema_body);
+sbsv_status sbsv_body_parser_parse(
+    sbsv_body_parser* parser,
+    const char* body,
+    sbsv_row** out_row
+);
 
 sbsv_parser* sbsv_parser_new(sbsv_parser_flags flags);
 void sbsv_parser_free(sbsv_parser* parser);
@@ -110,6 +136,11 @@ sbsv_status sbsv_parser_add_custom_type(
     sbsv_custom_type_fn converter,
     void* user_data
 );
+sbsv_status sbsv_parser_ignore_prefix(
+    sbsv_parser* parser,
+    const char* prefix,
+    int save_ignored
+);
 sbsv_status sbsv_parser_add_group(
     sbsv_parser* parser,
     const char* group_name,
@@ -121,8 +152,15 @@ sbsv_status sbsv_parser_parse_line(
     const char* line,
     size_t line_number
 );
+sbsv_status sbsv_parser_parse_line_detached(
+    sbsv_parser* parser,
+    const char* line,
+    size_t line_number,
+    sbsv_row** out_row
+);
 sbsv_status sbsv_parser_loads(sbsv_parser* parser, const char* content);
 sbsv_status sbsv_parser_load_file(sbsv_parser* parser, FILE* fp);
+sbsv_status sbsv_parser_finish(sbsv_parser* parser);
 
 size_t sbsv_parser_row_count(const sbsv_parser* parser);
 const sbsv_row* sbsv_parser_row_at(const sbsv_parser* parser, size_t index);

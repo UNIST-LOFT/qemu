@@ -4,18 +4,19 @@
 #include <errno.h>
 #include <stdarg.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-typedef struct {
+struct sbsv_schema_field {
     char* name_with_tag;
     char* name;
     char* type_name;
     int nullable;
-} sbsv_schema_field;
+};
 
-typedef struct {
+struct sbsv_schema {
     char* name;
     sbsv_schema_field* fields;
     size_t field_count;
@@ -23,7 +24,7 @@ typedef struct {
     sbsv_row** rows;
     size_t row_count;
     size_t row_capacity;
-} sbsv_schema;
+};
 
 typedef struct {
     char* name;
@@ -41,6 +42,12 @@ typedef struct {
     long long start_index;
 } sbsv_group;
 
+typedef struct {
+    char* literal;
+    sbsv_schema_field capture;
+    int is_capture;
+} sbsv_ignore_prefix_token;
+
 struct sbsv_parser {
     int ignore_unknown;
     char* last_error;
@@ -57,9 +64,23 @@ struct sbsv_parser {
     size_t group_count;
     size_t group_capacity;
 
+    sbsv_ignore_prefix_token* ignored_prefix;
+    size_t ignored_prefix_count;
+    size_t ignored_prefix_capacity;
+    int save_ignored_prefix;
+
     sbsv_row** rows;
     size_t row_count;
     size_t row_capacity;
+};
+
+struct sbsv_body_parser {
+    char* last_error;
+    sbsv_schema schema;
+    int has_schema;
+    sbsv_custom_type* custom_types;
+    size_t custom_type_count;
+    size_t custom_type_capacity;
 };
 
 typedef struct {
@@ -67,9 +88,53 @@ typedef struct {
     char** data_tokens;
     size_t data_count;
     size_t data_capacity;
+    sbsv_field* ignored_fields;
+    size_t ignored_field_count;
+    size_t ignored_field_capacity;
 } sbsv_preprocessed_line;
 
+static sbsv_status sbsv_parse_row_for_schema(
+    sbsv_parser* parser,
+    sbsv_schema* schema,
+    char** tokens,
+    size_t token_count,
+    sbsv_row** out_row
+);
+
 static void sbsv_parser_set_error(sbsv_parser* parser, const char* format, ...) {
+    va_list args;
+    va_list copy;
+    int needed;
+    char* message;
+
+    if (parser == NULL || format == NULL) {
+        return;
+    }
+
+    free(parser->last_error);
+    parser->last_error = NULL;
+
+    va_start(args, format);
+    va_copy(copy, args);
+    needed = vsnprintf(NULL, 0, format, args);
+    va_end(args);
+    if (needed < 0) {
+        va_end(copy);
+        return;
+    }
+
+    message = (char*)malloc((size_t)needed + 1);
+    if (message == NULL) {
+        va_end(copy);
+        return;
+    }
+
+    vsnprintf(message, (size_t)needed + 1, format, copy);
+    va_end(copy);
+    parser->last_error = message;
+}
+
+static void sbsv_body_parser_set_error(sbsv_body_parser* parser, const char* format, ...) {
     va_list args;
     va_list copy;
     int needed;
@@ -124,6 +189,53 @@ static bool sbsv_is_space_char(char ch) {
     return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' || ch == '\f' || ch == '\v';
 }
 
+static int sbsv_validate_name_range(const char* name, size_t len) {
+    size_t i;
+
+    if (name == NULL || len == 0) {
+        return 0;
+    }
+    for (i = 0; i < len; ++i) {
+        unsigned char ch = (unsigned char)name[i];
+        if (!(isalnum(ch) || ch == '_' || ch == '-')) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int sbsv_validate_name(const char* name) {
+    if (name == NULL) {
+        return 0;
+    }
+    return sbsv_validate_name_range(name, strlen(name));
+}
+
+static int sbsv_validate_tagged_field_name(const char* name) {
+    const char* start;
+    const char* cursor;
+
+    if (name == NULL || name[0] == '\0') {
+        return 0;
+    }
+
+    start = name;
+    cursor = name;
+    while (1) {
+        if (*cursor == '$' || *cursor == '\0') {
+            size_t len = (size_t)(cursor - start);
+            if (!sbsv_validate_name_range(start, len)) {
+                return 0;
+            }
+            if (*cursor == '\0') {
+                return 1;
+            }
+            start = cursor + 1;
+        }
+        cursor += 1;
+    }
+}
+
 static void sbsv_trim_inplace(char* value) {
     size_t len;
     size_t start = 0;
@@ -163,7 +275,14 @@ static sbsv_status sbsv_grow_array(void** ptr, size_t elem_size, size_t* capacit
 
     new_capacity = (*capacity == 0) ? 4 : (*capacity * 2);
     while (new_capacity < needed) {
+        if (new_capacity > SIZE_MAX / 2) {
+            return SBSV_ERR_ALLOC;
+        }
         new_capacity *= 2;
+    }
+
+    if (elem_size != 0 && new_capacity > SIZE_MAX / elem_size) {
+        return SBSV_ERR_ALLOC;
     }
 
     new_ptr = realloc(*ptr, elem_size * new_capacity);
@@ -250,7 +369,7 @@ static void sbsv_schema_field_free(sbsv_schema_field* field) {
     free(field->type_name);
 }
 
-static void sbsv_row_free(sbsv_row* row) {
+void sbsv_row_free(sbsv_row* row) {
     size_t i;
 
     if (row == NULL) {
@@ -258,7 +377,6 @@ static void sbsv_row_free(sbsv_row* row) {
     }
 
     for (i = 0; i < row->field_count; ++i) {
-        free(row->fields[i].key);
         sbsv_value_clear(&row->fields[i].value);
     }
     free(row->fields);
@@ -287,6 +405,17 @@ static void sbsv_group_free(sbsv_group* group) {
 
     free(group->name);
     free(group->ranges);
+}
+
+static void sbsv_ignore_prefix_token_free(sbsv_ignore_prefix_token* token) {
+    if (token == NULL) {
+        return;
+    }
+    free(token->literal);
+    if (token->is_capture) {
+        sbsv_schema_field_free(&token->capture);
+    }
+    memset(token, 0, sizeof(*token));
 }
 
 sbsv_parser* sbsv_parser_new(sbsv_parser_flags flags) {
@@ -320,6 +449,11 @@ void sbsv_parser_free(sbsv_parser* parser) {
         sbsv_group_free(&parser->groups[i]);
     }
     free(parser->groups);
+
+    for (i = 0; i < parser->ignored_prefix_count; ++i) {
+        sbsv_ignore_prefix_token_free(&parser->ignored_prefix[i]);
+    }
+    free(parser->ignored_prefix);
 
     for (i = 0; i < parser->row_count; ++i) {
         sbsv_row_free(parser->rows[i]);
@@ -367,6 +501,68 @@ static sbsv_custom_type* sbsv_find_custom_type(sbsv_parser* parser, const char* 
     return NULL;
 }
 
+static sbsv_custom_type* sbsv_find_custom_type_in_array(sbsv_custom_type* custom_types, size_t custom_type_count, const char* type_name) {
+    size_t i;
+    for (i = 0; i < custom_type_count; ++i) {
+        if (strcmp(custom_types[i].name, type_name) == 0) {
+            return &custom_types[i];
+        }
+    }
+    return NULL;
+}
+
+static int sbsv_type_is_supported(sbsv_custom_type* custom_types, size_t custom_type_count, const char* type_name) {
+    size_t len;
+    char* subtype;
+    int supported;
+
+    if (type_name == NULL || type_name[0] == '\0') {
+        return 0;
+    }
+    if (strcmp(type_name, "int") == 0 || strcmp(type_name, "float") == 0 ||
+        strcmp(type_name, "str") == 0 || strcmp(type_name, "bool") == 0 ||
+        strcmp(type_name, "null") == 0) {
+        return 1;
+    }
+    len = strlen(type_name);
+    if (strncmp(type_name, "list", 4) == 0) {
+        if (len < 7 || strncmp(type_name, "list[", 5) != 0 || type_name[len - 1] != ']') {
+            return 0;
+        }
+        subtype = (char*)malloc(len - 5);
+        if (subtype == NULL) {
+            return 0;
+        }
+        memcpy(subtype, type_name + 5, len - 6);
+        subtype[len - 6] = '\0';
+        supported = sbsv_type_is_supported(custom_types, custom_type_count, subtype);
+        free(subtype);
+        return supported;
+    }
+    return sbsv_find_custom_type_in_array(custom_types, custom_type_count, type_name) != NULL;
+}
+
+static int sbsv_schema_names_conflict(const char* left, const char* right) {
+    const char* l = left;
+    const char* r = right;
+
+    while (1) {
+        const char* lend = strchr(l, '$');
+        const char* rend = strchr(r, '$');
+        size_t llen = (lend == NULL) ? strlen(l) : (size_t)(lend - l);
+        size_t rlen = (rend == NULL) ? strlen(r) : (size_t)(rend - r);
+
+        if (llen != rlen || strncmp(l, r, llen) != 0) {
+            return 0;
+        }
+        if (lend == NULL || rend == NULL) {
+            return 1;
+        }
+        l = lend + 1;
+        r = rend + 1;
+    }
+}
+
 static void sbsv_split_token_default(const char* token, char** out_key, char** out_value) {
     const char* cursor;
     size_t key_len;
@@ -391,6 +587,16 @@ static void sbsv_split_token_default(const char* token, char** out_key, char** o
     memcpy(*out_key, token, key_len);
     (*out_key)[key_len] = '\0';
     sbsv_trim_inplace(*out_key);
+    {
+        char* unescaped_key = NULL;
+        if (sbsv_unescape_str(*out_key, &unescaped_key) != SBSV_OK) {
+            free(*out_key);
+            *out_key = NULL;
+            return;
+        }
+        free(*out_key);
+        *out_key = unescaped_key;
+    }
 
     while (*cursor != '\0' && sbsv_is_space_char(*cursor)) {
         cursor += 1;
@@ -422,6 +628,16 @@ static void sbsv_split_token_schema(const char* token, char** out_key, char** ou
         *out_value = sbsv_strdup_local("");
         if (*out_key != NULL) {
             sbsv_trim_inplace(*out_key);
+            {
+                char* unescaped_key = NULL;
+                if (sbsv_unescape_str(*out_key, &unescaped_key) != SBSV_OK) {
+                    free(*out_key);
+                    *out_key = NULL;
+                } else {
+                    free(*out_key);
+                    *out_key = unescaped_key;
+                }
+            }
         }
         if (*out_value != NULL) {
             sbsv_trim_inplace(*out_value);
@@ -437,6 +653,16 @@ static void sbsv_split_token_schema(const char* token, char** out_key, char** ou
     memcpy(*out_key, token, key_len);
     (*out_key)[key_len] = '\0';
     sbsv_trim_inplace(*out_key);
+    {
+        char* unescaped_key = NULL;
+        if (sbsv_unescape_str(*out_key, &unescaped_key) != SBSV_OK) {
+            free(*out_key);
+            *out_key = NULL;
+            return;
+        }
+        free(*out_key);
+        *out_key = unescaped_key;
+    }
 
     *out_value = sbsv_strdup_local(delimiter + 1);
     if (*out_value == NULL) {
@@ -503,6 +729,7 @@ sbsv_status sbsv_parser_add_schema(sbsv_parser* parser, const char* schema_expr)
     sbsv_schema parsed;
     size_t i;
     sbsv_status status;
+    int body_started = 0;
 
     if (parser == NULL || schema_expr == NULL) {
         return SBSV_ERR_INVALID_ARG;
@@ -527,6 +754,12 @@ sbsv_status sbsv_parser_add_schema(sbsv_parser* parser, const char* schema_expr)
     if (parsed.name == NULL) {
         sbsv_free_token_list(&tokens);
         return SBSV_ERR_ALLOC;
+    }
+    if (!sbsv_validate_name(parsed.name)) {
+        sbsv_parser_set_error(parser, "Invalid schema name '%s': use only [A-Za-z0-9_-]", parsed.name);
+        sbsv_schema_free(&parsed);
+        sbsv_free_token_list(&tokens);
+        return SBSV_ERR_INVALID_ARG;
     }
 
     for (i = 1; i < tokens.count; ++i) {
@@ -553,7 +786,23 @@ sbsv_status sbsv_parser_add_schema(sbsv_parser* parser, const char* schema_expr)
             return SBSV_ERR_INVALID_ARG;
         }
 
-        if (strlen(value) == 0) {
+        if (strchr(tokens.items[i], ':') == NULL) {
+            if (body_started || strlen(value) != 0) {
+                sbsv_parser_set_error(parser, "Invalid schema token [%s]: missing type annotation", tokens.items[i]);
+                free(key);
+                free(value);
+                sbsv_schema_free(&parsed);
+                sbsv_free_token_list(&tokens);
+                return SBSV_ERR_INVALID_ARG;
+            }
+            if (!sbsv_validate_name(key)) {
+                sbsv_parser_set_error(parser, "Invalid sub-schema name '%s': use only [A-Za-z0-9_-]", key);
+                free(key);
+                free(value);
+                sbsv_schema_free(&parsed);
+                sbsv_free_token_list(&tokens);
+                return SBSV_ERR_INVALID_ARG;
+            }
             status = sbsv_parser_add_schema_name_suffix(&parsed.name, key);
             free(key);
             free(value);
@@ -564,6 +813,7 @@ sbsv_status sbsv_parser_add_schema(sbsv_parser* parser, const char* schema_expr)
             }
             continue;
         }
+        body_started = 1;
 
         free(key);
         free(value);
@@ -581,6 +831,30 @@ sbsv_status sbsv_parser_add_schema(sbsv_parser* parser, const char* schema_expr)
         if (strlen(key) > 0 && key[strlen(key) - 1] == '?') {
             key[strlen(key) - 1] = '\0';
             field.nullable = 1;
+        }
+        if (!sbsv_validate_tagged_field_name(key)) {
+            sbsv_parser_set_error(parser, "Invalid schema field name '%s': use only [A-Za-z0-9_-] and optional $ tags", key);
+            free(key);
+            free(value);
+            sbsv_schema_free(&parsed);
+            sbsv_free_token_list(&tokens);
+            return SBSV_ERR_INVALID_ARG;
+        }
+        if (!sbsv_type_is_supported(parser->custom_types, parser->custom_type_count, value)) {
+            sbsv_parser_set_error(parser, "Unsupported type: %s", value);
+            free(key);
+            free(value);
+            sbsv_schema_free(&parsed);
+            sbsv_free_token_list(&tokens);
+            return SBSV_ERR_INVALID_ARG;
+        }
+        if (parsed.field_count == 0 && field.nullable) {
+            sbsv_parser_set_error(parser, "Invalid schema %s: first body field '%s' cannot be nullable", schema_expr, key);
+            free(key);
+            free(value);
+            sbsv_schema_free(&parsed);
+            sbsv_free_token_list(&tokens);
+            return SBSV_ERR_INVALID_ARG;
         }
 
         field.name_with_tag = sbsv_strdup_local(key);
@@ -634,6 +908,15 @@ sbsv_status sbsv_parser_add_schema(sbsv_parser* parser, const char* schema_expr)
         }
     }
 
+    for (i = 0; i < parser->schema_count; ++i) {
+        if (sbsv_schema_names_conflict(parsed.name, parser->schemas[i].name)) {
+            sbsv_parser_set_error(parser, "Schema '%s' conflicts with existing schema '%s'", parsed.name, parser->schemas[i].name);
+            sbsv_schema_free(&parsed);
+            sbsv_free_token_list(&tokens);
+            return SBSV_ERR_INVALID_ARG;
+        }
+    }
+
     status = sbsv_grow_array((void**)&parser->schemas, sizeof(sbsv_schema), &parser->schema_capacity, parser->schema_count + 1);
     if (status != SBSV_OK) {
         sbsv_schema_free(&parsed);
@@ -641,16 +924,8 @@ sbsv_status sbsv_parser_add_schema(sbsv_parser* parser, const char* schema_expr)
         return status;
     }
 
-    {
-        sbsv_schema* existing = sbsv_find_schema(parser, parsed.name);
-        if (existing != NULL) {
-            sbsv_schema_free(existing);
-            *existing = parsed;
-        } else {
-            parser->schemas[parser->schema_count] = parsed;
-            parser->schema_count += 1;
-        }
-    }
+    parser->schemas[parser->schema_count] = parsed;
+    parser->schema_count += 1;
 
     sbsv_free_token_list(&tokens);
     return SBSV_OK;
@@ -666,6 +941,14 @@ sbsv_status sbsv_parser_add_custom_type(
     sbsv_status status;
 
     if (parser == NULL || type_name == NULL || converter == NULL) {
+        return SBSV_ERR_INVALID_ARG;
+    }
+    if (parser->schema_count > 0) {
+        sbsv_parser_set_error(parser, "add_custom_type() must be called before add_schema()");
+        return SBSV_ERR_INVALID_ARG;
+    }
+    if (!sbsv_validate_name(type_name)) {
+        sbsv_parser_set_error(parser, "Invalid custom type name '%s': use only [A-Za-z0-9_-]", type_name);
         return SBSV_ERR_INVALID_ARG;
     }
 
@@ -688,6 +971,370 @@ sbsv_status sbsv_parser_add_custom_type(
     parser->custom_types[parser->custom_type_count].converter = converter;
     parser->custom_types[parser->custom_type_count].user_data = user_data;
     parser->custom_type_count += 1;
+    return SBSV_OK;
+}
+
+sbsv_status sbsv_parser_ignore_prefix(
+    sbsv_parser* parser,
+    const char* prefix,
+    int save_ignored
+) {
+    sbsv_token_list tokens;
+    sbsv_ignore_prefix_token* parsed_tokens = NULL;
+    size_t parsed_count = 0;
+    size_t parsed_capacity = 0;
+    size_t i;
+    sbsv_status status;
+
+    if (parser == NULL || prefix == NULL) {
+        return SBSV_ERR_INVALID_ARG;
+    }
+    if (parser->schema_count > 0) {
+        sbsv_parser_set_error(parser, "ignore_prefix() must be called before add_schema()");
+        return SBSV_ERR_INVALID_ARG;
+    }
+
+    memset(&tokens, 0, sizeof(tokens));
+    status = sbsv_tokenize_line(prefix, &tokens);
+    if (status != SBSV_OK || tokens.count == 0) {
+        sbsv_parser_set_error(parser, "Invalid ignore prefix %s: too short", prefix);
+        sbsv_free_token_list(&tokens);
+        return status == SBSV_OK ? SBSV_ERR_INVALID_ARG : status;
+    }
+
+    for (i = 0; i < tokens.count; ++i) {
+        char* key = NULL;
+        char* value = NULL;
+        sbsv_ignore_prefix_token token;
+
+        memset(&token, 0, sizeof(token));
+        sbsv_split_token_schema(tokens.items[i], &key, &value);
+        if (key == NULL || value == NULL) {
+            free(key);
+            free(value);
+            status = SBSV_ERR_ALLOC;
+            goto fail;
+        }
+        if (key[0] == '\0') {
+            sbsv_parser_set_error(parser, "Invalid ignore prefix token [%s]: empty name", tokens.items[i]);
+            free(key);
+            free(value);
+            status = SBSV_ERR_INVALID_ARG;
+            goto fail;
+        }
+
+        if (key[0] != '$') {
+            token.literal = sbsv_strdup_local(tokens.items[i]);
+            free(key);
+            free(value);
+            if (token.literal == NULL) {
+                status = SBSV_ERR_ALLOC;
+                goto fail;
+            }
+        } else {
+            const char* capture_name = key + 1;
+            if (!sbsv_validate_name(capture_name)) {
+                sbsv_parser_set_error(parser, "Invalid ignored prefix name '%s': use only [A-Za-z0-9_-]", capture_name);
+                free(key);
+                free(value);
+                status = SBSV_ERR_INVALID_ARG;
+                goto fail;
+            }
+            if (value[0] == '\0') {
+                free(value);
+                value = sbsv_strdup_local("str");
+                if (value == NULL) {
+                    free(key);
+                    status = SBSV_ERR_ALLOC;
+                    goto fail;
+                }
+            }
+            if (!sbsv_type_is_supported(parser->custom_types, parser->custom_type_count, value)) {
+                sbsv_parser_set_error(parser, "Unsupported type: %s", value);
+                free(key);
+                free(value);
+                status = SBSV_ERR_INVALID_ARG;
+                goto fail;
+            }
+
+            token.is_capture = 1;
+            token.capture.name_with_tag = sbsv_strdup_local(key);
+            token.capture.name = sbsv_strdup_local(key);
+            token.capture.type_name = sbsv_strdup_local(value);
+            token.capture.nullable = 0;
+            free(key);
+            free(value);
+            if (token.capture.name_with_tag == NULL || token.capture.name == NULL || token.capture.type_name == NULL) {
+                sbsv_ignore_prefix_token_free(&token);
+                status = SBSV_ERR_ALLOC;
+                goto fail;
+            }
+        }
+
+        status = sbsv_grow_array((void**)&parsed_tokens, sizeof(sbsv_ignore_prefix_token), &parsed_capacity, parsed_count + 1);
+        if (status != SBSV_OK) {
+            sbsv_ignore_prefix_token_free(&token);
+            goto fail;
+        }
+        parsed_tokens[parsed_count] = token;
+        parsed_count += 1;
+    }
+
+    for (i = 0; i < parser->ignored_prefix_count; ++i) {
+        sbsv_ignore_prefix_token_free(&parser->ignored_prefix[i]);
+    }
+    free(parser->ignored_prefix);
+    parser->ignored_prefix = parsed_tokens;
+    parser->ignored_prefix_count = parsed_count;
+    parser->ignored_prefix_capacity = parsed_capacity;
+    parser->save_ignored_prefix = save_ignored ? 1 : 0;
+    sbsv_free_token_list(&tokens);
+    return SBSV_OK;
+
+fail:
+    for (i = 0; i < parsed_count; ++i) {
+        sbsv_ignore_prefix_token_free(&parsed_tokens[i]);
+    }
+    free(parsed_tokens);
+    sbsv_free_token_list(&tokens);
+    return status;
+}
+
+sbsv_body_parser* sbsv_body_parser_new(void) {
+    return (sbsv_body_parser*)calloc(1, sizeof(sbsv_body_parser));
+}
+
+void sbsv_body_parser_free(sbsv_body_parser* parser) {
+    size_t i;
+
+    if (parser == NULL) {
+        return;
+    }
+
+    sbsv_schema_free(&parser->schema);
+    for (i = 0; i < parser->custom_type_count; ++i) {
+        free(parser->custom_types[i].name);
+    }
+    free(parser->custom_types);
+    free(parser->last_error);
+    free(parser);
+}
+
+const char* sbsv_body_parser_last_error(const sbsv_body_parser* parser) {
+    if (parser == NULL) {
+        return "invalid parser";
+    }
+    return parser->last_error;
+}
+
+sbsv_status sbsv_body_parser_add_custom_type(
+    sbsv_body_parser* parser,
+    const char* type_name,
+    sbsv_custom_type_fn converter,
+    void* user_data
+) {
+    sbsv_custom_type* existing;
+    sbsv_status status;
+
+    if (parser == NULL || type_name == NULL || converter == NULL) {
+        return SBSV_ERR_INVALID_ARG;
+    }
+    if (parser->has_schema) {
+        sbsv_body_parser_set_error(parser, "add_custom_type() must be called before set_schema()");
+        return SBSV_ERR_INVALID_ARG;
+    }
+    if (!sbsv_validate_name(type_name)) {
+        sbsv_body_parser_set_error(parser, "Invalid custom type name '%s': use only [A-Za-z0-9_-]", type_name);
+        return SBSV_ERR_INVALID_ARG;
+    }
+
+    existing = sbsv_find_custom_type_in_array(parser->custom_types, parser->custom_type_count, type_name);
+    if (existing != NULL) {
+        existing->converter = converter;
+        existing->user_data = user_data;
+        return SBSV_OK;
+    }
+
+    status = sbsv_grow_array((void**)&parser->custom_types, sizeof(sbsv_custom_type), &parser->custom_type_capacity, parser->custom_type_count + 1);
+    if (status != SBSV_OK) {
+        return status;
+    }
+
+    parser->custom_types[parser->custom_type_count].name = sbsv_strdup_local(type_name);
+    if (parser->custom_types[parser->custom_type_count].name == NULL) {
+        return SBSV_ERR_ALLOC;
+    }
+    parser->custom_types[parser->custom_type_count].converter = converter;
+    parser->custom_types[parser->custom_type_count].user_data = user_data;
+    parser->custom_type_count += 1;
+    return SBSV_OK;
+}
+
+sbsv_status sbsv_body_parser_set_schema(sbsv_body_parser* parser, const char* schema_body) {
+    sbsv_token_list tokens;
+    sbsv_schema parsed;
+    size_t i;
+    sbsv_status status;
+
+    if (parser == NULL || schema_body == NULL) {
+        return SBSV_ERR_INVALID_ARG;
+    }
+
+    memset(&tokens, 0, sizeof(tokens));
+    memset(&parsed, 0, sizeof(parsed));
+    parsed.name = sbsv_strdup_local("");
+    if (parsed.name == NULL) {
+        return SBSV_ERR_ALLOC;
+    }
+
+    status = sbsv_tokenize_line(schema_body, &tokens);
+    if (status != SBSV_OK) {
+        sbsv_schema_free(&parsed);
+        sbsv_body_parser_set_error(parser, "Invalid schema body: failed to tokenize");
+        return status;
+    }
+
+    for (i = 0; i < tokens.count; ++i) {
+        char* key = NULL;
+        char* value = NULL;
+        sbsv_schema_field field;
+
+        memset(&field, 0, sizeof(field));
+        if (strchr(tokens.items[i], ':') == NULL) {
+            sbsv_body_parser_set_error(parser, "Invalid schema token [%s]: missing type annotation", tokens.items[i]);
+            sbsv_schema_free(&parsed);
+            sbsv_free_token_list(&tokens);
+            return SBSV_ERR_INVALID_ARG;
+        }
+
+        sbsv_split_token_schema(tokens.items[i], &key, &value);
+        if (key == NULL || value == NULL) {
+            free(key);
+            free(value);
+            sbsv_schema_free(&parsed);
+            sbsv_free_token_list(&tokens);
+            return SBSV_ERR_ALLOC;
+        }
+        if (strlen(key) > 0 && key[strlen(key) - 1] == '?') {
+            key[strlen(key) - 1] = '\0';
+            field.nullable = 1;
+        }
+        if (!sbsv_validate_tagged_field_name(key)) {
+            sbsv_body_parser_set_error(parser, "Invalid schema field name '%s': use only [A-Za-z0-9_-] and optional $ tags", key);
+            free(key);
+            free(value);
+            sbsv_schema_free(&parsed);
+            sbsv_free_token_list(&tokens);
+            return SBSV_ERR_INVALID_ARG;
+        }
+        if (!sbsv_type_is_supported(parser->custom_types, parser->custom_type_count, value)) {
+            sbsv_body_parser_set_error(parser, "Unsupported type: %s", value);
+            free(key);
+            free(value);
+            sbsv_schema_free(&parsed);
+            sbsv_free_token_list(&tokens);
+            return SBSV_ERR_INVALID_ARG;
+        }
+
+        field.name_with_tag = sbsv_strdup_local(key);
+        field.type_name = sbsv_strdup_local(value);
+        if (field.name_with_tag == NULL || field.type_name == NULL) {
+            free(key);
+            free(value);
+            sbsv_schema_field_free(&field);
+            sbsv_schema_free(&parsed);
+            sbsv_free_token_list(&tokens);
+            return SBSV_ERR_ALLOC;
+        }
+        {
+            const char* dollar = strchr(field.name_with_tag, '$');
+            if (dollar != NULL) {
+                size_t base_len = (size_t)(dollar - field.name_with_tag);
+                field.name = (char*)malloc(base_len + 1);
+                if (field.name == NULL) {
+                    free(key);
+                    free(value);
+                    sbsv_schema_field_free(&field);
+                    sbsv_schema_free(&parsed);
+                    sbsv_free_token_list(&tokens);
+                    return SBSV_ERR_ALLOC;
+                }
+                memcpy(field.name, field.name_with_tag, base_len);
+                field.name[base_len] = '\0';
+            } else {
+                field.name = sbsv_strdup_local(field.name_with_tag);
+                if (field.name == NULL) {
+                    free(key);
+                    free(value);
+                    sbsv_schema_field_free(&field);
+                    sbsv_schema_free(&parsed);
+                    sbsv_free_token_list(&tokens);
+                    return SBSV_ERR_ALLOC;
+                }
+            }
+        }
+        free(key);
+        free(value);
+
+        status = sbsv_schema_add_field(&parsed, field);
+        if (status != SBSV_OK) {
+            sbsv_schema_field_free(&field);
+            sbsv_schema_free(&parsed);
+            sbsv_free_token_list(&tokens);
+            return status;
+        }
+    }
+
+    sbsv_schema_free(&parser->schema);
+    parser->schema = parsed;
+    parser->has_schema = 1;
+    sbsv_free_token_list(&tokens);
+    return SBSV_OK;
+}
+
+sbsv_status sbsv_body_parser_parse(
+    sbsv_body_parser* parser,
+    const char* body,
+    sbsv_row** out_row
+) {
+    sbsv_token_list tokens;
+    sbsv_parser fake_parser;
+    sbsv_row* row = NULL;
+    sbsv_status status;
+
+    if (parser == NULL || body == NULL || out_row == NULL) {
+        return SBSV_ERR_INVALID_ARG;
+    }
+    *out_row = NULL;
+    if (!parser->has_schema) {
+        sbsv_body_parser_set_error(parser, "schema body is not set");
+        return SBSV_ERR_INVALID_ARG;
+    }
+
+    memset(&tokens, 0, sizeof(tokens));
+    status = sbsv_tokenize_line(body, &tokens);
+    if (status != SBSV_OK) {
+        sbsv_body_parser_set_error(parser, "Invalid body: failed to tokenize");
+        return status;
+    }
+
+    memset(&fake_parser, 0, sizeof(fake_parser));
+    fake_parser.ignore_unknown = 1;
+    fake_parser.custom_types = parser->custom_types;
+    fake_parser.custom_type_count = parser->custom_type_count;
+    status = sbsv_parse_row_for_schema(&fake_parser, &parser->schema, tokens.items, tokens.count, &row);
+    if (status != SBSV_OK) {
+        const char* detail = fake_parser.last_error ? fake_parser.last_error : "parse error";
+        sbsv_body_parser_set_error(parser, "%s", detail);
+        free(fake_parser.last_error);
+        sbsv_free_token_list(&tokens);
+        return status;
+    }
+    free(fake_parser.last_error);
+    sbsv_free_token_list(&tokens);
+    row->id = (size_t)-1;
+    row->schema_name = parser->schema.name;
+    *out_row = row;
     return SBSV_OK;
 }
 
@@ -909,6 +1556,7 @@ static sbsv_status sbsv_parse_list_value(
         if (status != SBSV_OK) {
             free(subtype);
             sbsv_free_token_list(&list_tokens);
+            sbsv_value_clear(out_value);
             return status;
         }
     }
@@ -926,63 +1574,107 @@ static sbsv_status sbsv_parse_value(
 ) {
     char* end_ptr;
     sbsv_custom_type* custom;
+    char* decoded = NULL;
+    const char* value = raw;
+
+    if (strncmp(type_name, "list[", 5) == 0) {
+        return sbsv_parse_list_value(parser, type_name, raw, out_value);
+    }
+
+    if (sbsv_unescape_str(raw, &decoded) != SBSV_OK) {
+        sbsv_parser_set_error(parser, "Invalid string value: %s", raw);
+        return SBSV_ERR_INVALID_ARG;
+    }
+    value = decoded;
 
     if (strcmp(type_name, "int") == 0) {
         long long parsed;
         errno = 0;
-        parsed = strtoll(raw, &end_ptr, 10);
+        parsed = strtoll(value, &end_ptr, 10);
         if (errno != 0 || *end_ptr != '\0') {
-            sbsv_parser_set_error(parser, "Invalid int value: %s", raw);
+            sbsv_parser_set_error(parser, "Invalid int value: %s", value);
+            free(decoded);
             return SBSV_ERR_INVALID_ARG;
         }
         out_value->type = SBSV_VALUE_INT;
         out_value->data.int_value = parsed;
+        free(decoded);
         return SBSV_OK;
     }
 
     if (strcmp(type_name, "float") == 0) {
         double parsed;
         errno = 0;
-        parsed = strtod(raw, &end_ptr);
+        parsed = strtod(value, &end_ptr);
         if (errno != 0 || *end_ptr != '\0') {
-            sbsv_parser_set_error(parser, "Invalid float value: %s", raw);
+            sbsv_parser_set_error(parser, "Invalid float value: %s", value);
+            free(decoded);
             return SBSV_ERR_INVALID_ARG;
         }
         out_value->type = SBSV_VALUE_FLOAT;
         out_value->data.float_value = parsed;
+        free(decoded);
         return SBSV_OK;
     }
 
     if (strcmp(type_name, "str") == 0) {
-        return sbsv_value_set_string(out_value, raw);
+        sbsv_status status = sbsv_value_set_string(out_value, value);
+        free(decoded);
+        return status;
     }
 
     if (strcmp(type_name, "bool") == 0) {
         int bool_value;
-        if (!sbsv_parse_bool(raw, &bool_value)) {
-            sbsv_parser_set_error(parser, "Invalid boolean value: %s", raw);
+        if (!sbsv_parse_bool(value, &bool_value)) {
+            sbsv_parser_set_error(parser, "Invalid boolean value: %s", value);
+            free(decoded);
             return SBSV_ERR_INVALID_ARG;
         }
         out_value->type = SBSV_VALUE_BOOL;
         out_value->data.bool_value = bool_value;
+        free(decoded);
         return SBSV_OK;
     }
 
-    if (strncmp(type_name, "list[", 5) == 0) {
-        return sbsv_parse_list_value(parser, type_name, raw, out_value);
+    if (strcmp(type_name, "null") == 0) {
+        char lowered[8];
+        size_t len = strlen(value);
+        size_t i;
+        if (len >= sizeof(lowered)) {
+            sbsv_parser_set_error(parser, "Invalid null value: %s", value);
+            free(decoded);
+            return SBSV_ERR_INVALID_ARG;
+        }
+        for (i = 0; i < len; ++i) {
+            lowered[i] = (char)tolower((unsigned char)value[i]);
+        }
+        lowered[len] = '\0';
+        if (strcmp(lowered, "null") != 0) {
+            sbsv_parser_set_error(parser, "Invalid null value: %s", value);
+            free(decoded);
+            return SBSV_ERR_INVALID_ARG;
+        }
+        out_value->type = SBSV_VALUE_NULL;
+        free(decoded);
+        return SBSV_OK;
     }
 
     custom = sbsv_find_custom_type(parser, type_name);
     if (custom != NULL) {
-        return custom->converter(raw, out_value, custom->user_data);
+        sbsv_status status = custom->converter(value, out_value, custom->user_data);
+        free(decoded);
+        return status;
     }
 
-    return sbsv_value_set_string(out_value, raw);
+    sbsv_parser_set_error(parser, "Unsupported type: %s", type_name);
+    free(decoded);
+    return SBSV_ERR_INVALID_ARG;
 }
 
-static sbsv_status sbsv_preprocess_line(const char* line, sbsv_preprocessed_line* out_line) {
+static sbsv_status sbsv_preprocess_line(sbsv_parser* parser, const char* line, sbsv_preprocessed_line* out_line) {
     sbsv_token_list tokens;
     size_t i;
+    size_t start_index = 0;
     int may_have_sub_schema = 1;
     sbsv_status status;
 
@@ -994,7 +1686,50 @@ static sbsv_status sbsv_preprocess_line(const char* line, sbsv_preprocessed_line
         return status;
     }
 
-    for (i = 0; i < tokens.count; ++i) {
+    if (parser != NULL && parser->ignored_prefix_count > 0) {
+        if (tokens.count < parser->ignored_prefix_count) {
+            sbsv_parser_set_error(parser, "Invalid data: expected at least %zu ignored prefix fields, got %zu", parser->ignored_prefix_count, tokens.count);
+            sbsv_free_token_list(&tokens);
+            return SBSV_ERR_INVALID_ARG;
+        }
+
+        for (i = 0; i < parser->ignored_prefix_count; ++i) {
+            sbsv_ignore_prefix_token* prefix_token = &parser->ignored_prefix[i];
+            if (!prefix_token->is_capture) {
+                if (strcmp(tokens.items[i], prefix_token->literal) != 0) {
+                    sbsv_parser_set_error(parser, "Invalid ignored prefix token [%s]: expected [%s]", tokens.items[i], prefix_token->literal);
+                    sbsv_free_token_list(&tokens);
+                    return SBSV_ERR_INVALID_ARG;
+                }
+                continue;
+            }
+
+            if (parser->save_ignored_prefix) {
+                sbsv_field saved;
+                memset(&saved, 0, sizeof(saved));
+                saved.name_with_tag = prefix_token->capture.name_with_tag;
+                saved.name = prefix_token->capture.name;
+                sbsv_value_init(&saved.value);
+                status = sbsv_parse_value(parser, prefix_token->capture.type_name, tokens.items[i], &saved.value);
+                if (status != SBSV_OK) {
+                    sbsv_value_clear(&saved.value);
+                    sbsv_free_token_list(&tokens);
+                    return status;
+                }
+                status = sbsv_grow_array((void**)&out_line->ignored_fields, sizeof(sbsv_field), &out_line->ignored_field_capacity, out_line->ignored_field_count + 1);
+                if (status != SBSV_OK) {
+                    sbsv_value_clear(&saved.value);
+                    sbsv_free_token_list(&tokens);
+                    return status;
+                }
+                out_line->ignored_fields[out_line->ignored_field_count] = saved;
+                out_line->ignored_field_count += 1;
+            }
+        }
+        start_index = parser->ignored_prefix_count;
+    }
+
+    for (i = start_index; i < tokens.count; ++i) {
         char* key = NULL;
         char* value = NULL;
 
@@ -1066,6 +1801,10 @@ static void sbsv_preprocessed_line_free(sbsv_preprocessed_line* pre) {
         free(pre->data_tokens[i]);
     }
     free(pre->data_tokens);
+    for (i = 0; i < pre->ignored_field_count; ++i) {
+        sbsv_value_clear(&pre->ignored_fields[i].value);
+    }
+    free(pre->ignored_fields);
     memset(pre, 0, sizeof(*pre));
 }
 
@@ -1091,8 +1830,6 @@ static sbsv_status sbsv_parser_append_row(sbsv_parser* parser, sbsv_schema* sche
     schema_index = (size_t)(schema - parser->schemas);
 
     row->id = current_id;
-    row->schema_name = schema->name;
-
     status = sbsv_schema_push_row(schema, row);
     if (status != SBSV_OK) {
         return status;
@@ -1149,7 +1886,7 @@ static sbsv_status sbsv_parse_row_for_schema(
     size_t queue_index = 0;
 
     if (token_count < schema->field_count) {
-        sbsv_parser_set_error(parser, "Invalid data: too short");
+        sbsv_parser_set_error(parser, "Invalid data: expected at least %zu fields, got %zu", schema->field_count, token_count);
         return SBSV_ERR_INVALID_ARG;
     }
 
@@ -1157,6 +1894,7 @@ static sbsv_status sbsv_parse_row_for_schema(
     if (row == NULL) {
         return SBSV_ERR_ALLOC;
     }
+    row->schema_name = schema->name;
     row->field_count = schema->field_count;
     row->fields = (sbsv_field*)calloc(schema->field_count, sizeof(sbsv_field));
     if (row->fields == NULL) {
@@ -1168,11 +1906,8 @@ static sbsv_status sbsv_parse_row_for_schema(
         sbsv_schema_field* field = &schema->fields[field_index];
         int matched = 0;
 
-        row->fields[field_index].key = sbsv_strdup_local(field->name_with_tag);
-        if (row->fields[field_index].key == NULL) {
-            sbsv_row_free(row);
-            return SBSV_ERR_ALLOC;
-        }
+        row->fields[field_index].name_with_tag = field->name_with_tag;
+        row->fields[field_index].name = field->name;
         sbsv_value_init(&row->fields[field_index].value);
 
         while (queue_index < token_count) {
@@ -1214,24 +1949,39 @@ static sbsv_status sbsv_parse_row_for_schema(
             if (strlen(value) == 0 && !field->nullable) {
                 free(key);
                 free(value);
-                sbsv_parser_set_error(parser, "Invalid data %s: empty value", tokens[queue_index - 1]);
+                sbsv_parser_set_error(parser, "Invalid data token [%s]: empty value for non-nullable key '%s'", tokens[queue_index - 1], field->name);
                 sbsv_row_free(row);
                 return SBSV_ERR_INVALID_ARG;
             }
 
             convert_status = sbsv_parse_value(parser, field->type_name, value, &row->fields[field_index].value);
-            free(key);
-            free(value);
             if (convert_status != SBSV_OK) {
+                const char* detail = parser->last_error ? parser->last_error : "conversion failed";
+                char* detail_copy = sbsv_strdup_local(detail);
+                if (detail_copy != NULL) {
+                    sbsv_parser_set_error(
+                        parser,
+                        "Invalid value for key '%s' as type '%s': '%s' (%s)",
+                        field->name,
+                        field->type_name,
+                        value,
+                        detail_copy
+                    );
+                    free(detail_copy);
+                }
+                free(key);
+                free(value);
                 sbsv_row_free(row);
                 return convert_status;
             }
+            free(key);
+            free(value);
             matched = 1;
             break;
         }
 
         if (!matched) {
-            sbsv_parser_set_error(parser, "Invalid data: missing key");
+            sbsv_parser_set_error(parser, "Invalid data: missing key '%s'", field->name);
             sbsv_row_free(row);
             return SBSV_ERR_INVALID_ARG;
         }
@@ -1241,12 +1991,40 @@ static sbsv_status sbsv_parse_row_for_schema(
     return SBSV_OK;
 }
 
-sbsv_status sbsv_parser_parse_line(sbsv_parser* parser, const char* line, size_t line_number) {
+static sbsv_status sbsv_row_prepend_fields(sbsv_row* row, sbsv_preprocessed_line* pre) {
+    sbsv_field* merged;
+
+    if (row == NULL || pre == NULL || pre->ignored_field_count == 0) {
+        return SBSV_OK;
+    }
+
+    merged = (sbsv_field*)calloc(row->field_count + pre->ignored_field_count, sizeof(sbsv_field));
+    if (merged == NULL) {
+        return SBSV_ERR_ALLOC;
+    }
+
+    memcpy(merged, pre->ignored_fields, sizeof(sbsv_field) * pre->ignored_field_count);
+    memcpy(merged + pre->ignored_field_count, row->fields, sizeof(sbsv_field) * row->field_count);
+    free(row->fields);
+    row->fields = merged;
+    row->field_count += pre->ignored_field_count;
+    free(pre->ignored_fields);
+    pre->ignored_fields = NULL;
+    pre->ignored_field_count = 0;
+    pre->ignored_field_capacity = 0;
+    return SBSV_OK;
+}
+
+static sbsv_status sbsv_parser_parse_line_internal(sbsv_parser* parser, const char* line, size_t line_number, int append, sbsv_row** out_row) {
     char* stripped;
     sbsv_preprocessed_line pre;
     sbsv_schema* schema;
     sbsv_row* row = NULL;
     sbsv_status status;
+
+    if (out_row != NULL) {
+        *out_row = NULL;
+    }
 
     if (parser == NULL || line == NULL) {
         return SBSV_ERR_INVALID_ARG;
@@ -1263,19 +2041,28 @@ sbsv_status sbsv_parser_parse_line(sbsv_parser* parser, const char* line, size_t
         return SBSV_OK;
     }
 
-    status = sbsv_preprocess_line(stripped, &pre);
-    free(stripped);
+    status = sbsv_preprocess_line(parser, stripped, &pre);
     if (status != SBSV_OK) {
+        const char* detail = parser->last_error ? parser->last_error : "parse error";
+        char* detail_copy = sbsv_strdup_local(detail);
+        if (detail_copy != NULL) {
+            sbsv_parser_set_error(parser, "Parse error (line=%zu, input='%s'): %s", line_number, stripped, detail_copy);
+            free(detail_copy);
+        }
+        sbsv_preprocessed_line_free(&pre);
+        free(stripped);
         return status;
     }
 
     if (pre.schema_name == NULL) {
         if (parser->ignore_unknown) {
             sbsv_preprocessed_line_free(&pre);
+            free(stripped);
             return SBSV_OK;
         }
-        sbsv_parser_set_error(parser, "Parse error (line=%zu, schema=<none>): Invalid schema <none> at line %zu", line_number, line_number);
+        sbsv_parser_set_error(parser, "Parse error (line=%zu, schema=<missing>, input='%s'): Unknown schema '<missing>'", line_number, stripped);
         sbsv_preprocessed_line_free(&pre);
+        free(stripped);
         return SBSV_ERR_INVALID_ARG;
     }
 
@@ -1283,10 +2070,12 @@ sbsv_status sbsv_parser_parse_line(sbsv_parser* parser, const char* line, size_t
     if (schema == NULL) {
         if (parser->ignore_unknown) {
             sbsv_preprocessed_line_free(&pre);
+            free(stripped);
             return SBSV_OK;
         }
-        sbsv_parser_set_error(parser, "Parse error (line=%zu, schema=%s): Invalid schema %s at line %zu", line_number, pre.schema_name, pre.schema_name, line_number);
+        sbsv_parser_set_error(parser, "Parse error (line=%zu, schema=%s, input='%s'): Unknown schema '%s'", line_number, pre.schema_name, stripped, pre.schema_name);
         sbsv_preprocessed_line_free(&pre);
+        free(stripped);
         return SBSV_ERR_INVALID_ARG;
     }
 
@@ -1295,22 +2084,78 @@ sbsv_status sbsv_parser_parse_line(sbsv_parser* parser, const char* line, size_t
         const char* detail = parser->last_error ? parser->last_error : "parse error";
         char* detail_copy = sbsv_strdup_local(detail);
         if (detail_copy != NULL) {
-            sbsv_parser_set_error(parser, "Parse error (line=%zu, schema=%s): %s", line_number, schema->name, detail_copy);
+            sbsv_parser_set_error(parser, "Parse error (line=%zu, schema=%s, input='%s'): %s", line_number, schema->name, stripped, detail_copy);
             free(detail_copy);
         } else {
-            sbsv_parser_set_error(parser, "Parse error (line=%zu, schema=%s): parse error", line_number, schema->name);
+            sbsv_parser_set_error(parser, "Parse error (line=%zu, schema=%s, input='%s'): parse error", line_number, schema->name, stripped);
         }
         sbsv_preprocessed_line_free(&pre);
+        free(stripped);
         return status;
     }
 
-    status = sbsv_parser_append_row(parser, schema, row);
+    status = sbsv_row_prepend_fields(row, &pre);
     if (status != SBSV_OK) {
         sbsv_row_free(row);
+        sbsv_preprocessed_line_free(&pre);
+        free(stripped);
+        return status;
+    }
+
+    if (append) {
+        status = sbsv_parser_append_row(parser, schema, row);
+        if (status != SBSV_OK) {
+            sbsv_row_free(row);
+        }
+    } else {
+        row->id = (size_t)-1;
+        row->schema_name = schema->name;
+        if (out_row != NULL) {
+            *out_row = row;
+        }
     }
 
     sbsv_preprocessed_line_free(&pre);
+    free(stripped);
     return status;
+}
+
+sbsv_status sbsv_parser_parse_line(sbsv_parser* parser, const char* line, size_t line_number) {
+    return sbsv_parser_parse_line_internal(parser, line, line_number, 1, NULL);
+}
+
+sbsv_status sbsv_parser_parse_line_detached(
+    sbsv_parser* parser,
+    const char* line,
+    size_t line_number,
+    sbsv_row** out_row
+) {
+    if (out_row == NULL) {
+        return SBSV_ERR_INVALID_ARG;
+    }
+    return sbsv_parser_parse_line_internal(parser, line, line_number, 0, out_row);
+}
+
+sbsv_status sbsv_parser_finish(sbsv_parser* parser) {
+    size_t i;
+
+    if (parser == NULL) {
+        return SBSV_ERR_INVALID_ARG;
+    }
+
+    for (i = 0; i < parser->group_count; ++i) {
+        sbsv_group* group = &parser->groups[i];
+        if (group->start_index >= 0 && parser->row_count > 0) {
+            sbsv_index_range range;
+            range.start = (size_t)group->start_index;
+            range.end = parser->row_count - 1;
+            if (sbsv_group_add_range(group, range) != SBSV_OK) {
+                return SBSV_ERR_ALLOC;
+            }
+            group->start_index = -1;
+        }
+    }
+    return SBSV_OK;
 }
 
 sbsv_status sbsv_parser_loads(sbsv_parser* parser, const char* content) {
@@ -1363,23 +2208,7 @@ sbsv_status sbsv_parser_loads(sbsv_parser* parser, const char* content) {
         free(line_buffer);
     }
 
-    {
-        size_t i;
-        for (i = 0; i < parser->group_count; ++i) {
-            sbsv_group* group = &parser->groups[i];
-            if (group->start_index >= 0 && parser->row_count > 0) {
-                sbsv_index_range range;
-                range.start = (size_t)group->start_index;
-                range.end = parser->row_count - 1;
-                if (sbsv_group_add_range(group, range) != SBSV_OK) {
-                    return SBSV_ERR_ALLOC;
-                }
-                group->start_index = -1;
-            }
-        }
-    }
-
-    return SBSV_OK;
+    return sbsv_parser_finish(parser);
 }
 
 sbsv_status sbsv_parser_load_file(sbsv_parser* parser, FILE* fp) {
@@ -1452,25 +2281,8 @@ sbsv_status sbsv_parser_load_file(sbsv_parser* parser, FILE* fp) {
         }
     }
 
-    {
-        size_t i;
-        for (i = 0; i < parser->group_count; ++i) {
-            sbsv_group* group = &parser->groups[i];
-            if (group->start_index >= 0 && parser->row_count > 0) {
-                sbsv_index_range range;
-                range.start = (size_t)group->start_index;
-                range.end = parser->row_count - 1;
-                if (sbsv_group_add_range(group, range) != SBSV_OK) {
-                    free(line_buf);
-                    return SBSV_ERR_ALLOC;
-                }
-                group->start_index = -1;
-            }
-        }
-    }
-
     free(line_buf);
-    return SBSV_OK;
+    return sbsv_parser_finish(parser);
 }
 
 size_t sbsv_parser_row_count(const sbsv_parser* parser) {
@@ -1715,11 +2527,40 @@ const sbsv_value* sbsv_row_get(const sbsv_row* row, const char* key) {
         return NULL;
     }
     for (i = 0; i < row->field_count; ++i) {
-        if (strcmp(row->fields[i].key, key) == 0) {
+        if ((row->fields[i].name_with_tag != NULL && strcmp(row->fields[i].name_with_tag, key) == 0) ||
+            (row->fields[i].name != NULL && strcmp(row->fields[i].name, key) == 0)) {
             return &row->fields[i].value;
         }
     }
     return NULL;
+}
+
+const char* sbsv_field_name(const sbsv_field* field) {
+    if (field == NULL) {
+        return NULL;
+    }
+    return field->name;
+}
+
+const char* sbsv_field_name_with_tag(const sbsv_field* field) {
+    if (field == NULL) {
+        return NULL;
+    }
+    return field->name_with_tag;
+}
+
+const char* sbsv_row_schema_name(const sbsv_row* row) {
+    if (row == NULL) {
+        return NULL;
+    }
+    return row->schema_name;
+}
+
+size_t sbsv_row_field_count(const sbsv_row* row) {
+    if (row == NULL) {
+        return 0;
+    }
+    return row->field_count;
 }
 
 const char* sbsv_row_get_string(const sbsv_row* row, const char* key) {
