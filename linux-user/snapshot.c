@@ -1054,7 +1054,7 @@ static SnapshotMemRegion *mr_manager_heap_search(target_ulong addr) {
         mr = g_tree_search(mr_manager.heap_data, (GCompareFunc)search_region, &addr);
     }
     if (mr == NULL) {
-        trace_mem("[mr] [heap] [error] failed to search region for [addr %lx]\n", addr);
+        // trace_mem("[mr] [heap] [error] failed to search region for [addr %lx]\n", addr);
         return NULL;
     }
     // Update cache
@@ -1097,8 +1097,8 @@ static SnapshotMemRegion *mr_manager_stack_search(target_ulong addr) {
         if (tmp == NULL) continue;
         if (check_addr_in_region(tmp, addr) == 0) {
             mr = tmp;
-            trace_mem("[mr] [stack] [found] [addr %lx] [base %lx] [size %lx] [pc %lx] [depth %d] [full-depth %d]\n",
-                      addr, mr->base, mr->size, mr->pc, i + 1, stack->len);
+            // trace_mem("[mr] [stack] [found] [addr %lx] [base %lx] [size %lx] [pc %lx] [depth %d] [full-depth %d]\n",
+            //           addr, mr->base, mr->size, mr->pc, i + 1, stack->len);
             break;
         }
     }
@@ -1109,7 +1109,7 @@ static SnapshotMemRegion *mr_manager_stack_search(target_ulong addr) {
         // mr_manager.stack_cache_index = new_cache_index;
         return mr;
     }
-    trace_mem("[mr] [stack] [error] failed to search region for [addr %lx]\n", addr);
+    // trace_mem("[mr] [stack] [error] failed to search region for [addr %lx]\n", addr);
     return NULL;
 }
 
@@ -1189,7 +1189,7 @@ void snapshot_trace_global_add(target_ulong base, target_ulong size, target_ulon
 }
 
 static SnapshotMemRegion *mr_manager_global_search(target_ulong addr) {
-    trace_mem("[mr] [global] [search] [addr %lx]\n", addr);
+    // trace_mem("[mr] [global] [search] [addr %lx]\n", addr);
 
     int query_result = mr_manager_search_cache(mr_manager.global_cache, addr);
     SnapshotMemRegion *mr = mr_manager_get_cache(mr_manager.global_cache, query_result);
@@ -1227,7 +1227,7 @@ static SnapshotMemRegion *mr_manager_global_search(target_ulong addr) {
         return found;
     }
 
-    trace_mem("[mr] [global] [error] failed to search region for [addr %lx]\n", addr);
+    // trace_mem("[mr] [global] [error] failed to search region for [addr %lx]\n", addr);
     return NULL;
 }
 
@@ -1235,24 +1235,24 @@ SnapshotMemRegion *snapshot_mem_region_search(target_ulong addr) {
     // Determine region by address
     SnapshotMemRegion *mr = NULL;
     if (check_addr_in_region(&mr_manager.stack_region, addr) == 0) {
-        trace_mem("[mr] [search] [stack] [addr %lx]\n", addr);
+        // trace_mem("[mr] [search] [stack] [addr %lx]\n", addr);
         mr = mr_manager_stack_search(addr);
     } 
     if (mr != NULL) {
         return mr;
     }
-    trace_mem("[mr] [search] [global] [addr %lx]\n", addr);
+    // trace_mem("[mr] [search] [global] [addr %lx]\n", addr);
     mr = mr_manager_global_search(addr);
     if (mr != NULL) {
         return mr;
     }
 
-    trace_mem("[mr] [search] [heap] [addr %lx]\n", addr);
+    // trace_mem("[mr] [search] [heap] [addr %lx]\n", addr);
     mr = mr_manager_heap_search(addr);
     if (mr != NULL) {
         return mr;
     }
-    trace_mem("[mr] [search] [error] no region found for [addr %lx]\n", addr);
+    // trace_mem("[mr] [search] [error] no region found for [addr %lx]\n", addr);
     return NULL;
 }
 
@@ -2645,6 +2645,9 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env, const ArgumentInf
             if (wait_child_and_drain_patch(child_pid, status) < 0) exit(6);
 
             // Child process exit
+            if (trace_file_fp != NULL) {
+                fflush(trace_file_fp);
+            }
             if (write(FORKSRV_FD + 1, status, sizeof(status)) != sizeof(status)) exit(7);
 
             // Get type inference result

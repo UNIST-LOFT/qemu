@@ -3778,9 +3778,9 @@ static inline void qemu_load_helper(CPUArchState *env, uintptr_t orig_addr,
         SET_EXPR_CONST_OP(binradar_e->op3, binradar_e->op3_is_const, size);
         add_query(binradar_e, addr, current_tb_pc, "BINRADAR_CONCRETIZATION");
     }
-    if (e != NULL) {
-        trace_mem("[tmplog] load symbolic [pc 0x%lx] [addr 0x%lx] [size 0x%lx] %p\n", current_tb_pc, addr, size, e);
-    }
+    // if (e != NULL) {
+    //     trace_mem("[tmplog] load symbolic [pc 0x%lx] [addr 0x%lx] [size 0x%lx] %p\n", current_tb_pc, addr, size, e);
+    // }
 
     s_temps[val_idx] = e;
 }
@@ -4281,7 +4281,7 @@ static inline void qemu_store_helper(CPUArchState *env,
             e->op1     = expr_a;
             e->op2     = (Expr*)idx;
             l3_page->entries[l3_page_idx + i] = e;
-            trace_mem("[tmplog] store symbolic [pc 0x%lx] [addr 0x%lx] [size 0x%lx] %p\n", current_tb_pc, addr, size, e);
+            // trace_mem("[tmplog] store symbolic [pc 0x%lx] [addr 0x%lx] [size 0x%lx] %p\n", current_tb_pc, addr, size, e);
             // printf("Storing byte at index %lu\n", i);
 #if 0
             if (addr + i >= 0x8b1ba0 && addr + i < 0x8b1ba0 + 1) {
@@ -5308,7 +5308,7 @@ Expr* symbolic_rebuild_load_expr(uintptr_t addr, uint32_t size,
     size_t overflow_n_bytes = 0;
     Expr** addr_exprs = get_expr_addr(addr, size, 0, &overflow_n_bytes);
     if (overflow_n_bytes > 0 || addr_exprs == NULL) {
-        trace_mem("[tmplog] symbolic_rebuild_load_expr: overflow_n_bytes=%lu, addr_exprs=%p\n", overflow_n_bytes, (void*)addr_exprs);
+        // trace_mem("[tmplog] symbolic_rebuild_load_expr: overflow_n_bytes=%lu, addr_exprs=%p\n", overflow_n_bytes, (void*)addr_exprs);
         return NULL;
     }
 
@@ -5318,7 +5318,7 @@ Expr* symbolic_rebuild_load_expr(uintptr_t addr, uint32_t size,
     }
 
     if (expr_is_not_null == 0) {
-        trace_mem("[tmplog] symbolic_rebuild_load_expr: no symbolic expressions found\n");
+        // trace_mem("[tmplog] symbolic_rebuild_load_expr: no symbolic expressions found\n");
         return NULL;
     }
 

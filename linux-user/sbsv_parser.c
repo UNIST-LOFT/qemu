@@ -93,6 +93,11 @@ typedef struct {
     size_t ignored_field_capacity;
 } sbsv_preprocessed_line;
 
+typedef struct {
+    char* schema_name;
+    int ambiguous_sub_schema;
+} sbsv_schema_prefix_scan;
+
 static sbsv_status sbsv_parse_row_for_schema(
     sbsv_parser* parser,
     sbsv_schema* schema,
@@ -479,6 +484,241 @@ static sbsv_schema* sbsv_find_schema(sbsv_parser* parser, const char* schema_nam
         }
     }
     return NULL;
+}
+
+static int sbsv_token_view_has_value(const char* start, size_t len) {
+    size_t i = 0;
+    size_t end = len;
+
+    if (start == NULL) {
+        return 0;
+    }
+    while (i < end && sbsv_is_space_char(start[i])) {
+        i += 1;
+    }
+    while (end > i && sbsv_is_space_char(start[end - 1])) {
+        end -= 1;
+    }
+    while (i < end && !sbsv_is_space_char(start[i])) {
+        i += 1;
+    }
+    while (i < end && sbsv_is_space_char(start[i])) {
+        i += 1;
+    }
+    return i < end;
+}
+
+static int sbsv_token_view_is_empty(const char* start, size_t len) {
+    size_t i;
+
+    if (start == NULL) {
+        return 1;
+    }
+    for (i = 0; i < len; ++i) {
+        if (!sbsv_is_space_char(start[i])) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static bool sbsv_scan_can_start_quote(const char* current, size_t current_len) {
+    size_t start = 0;
+    size_t end = current_len;
+    size_t words = 0;
+    bool in_word = false;
+
+    if (current == NULL) {
+        return true;
+    }
+    while (start < end && sbsv_is_space_char(current[start])) {
+        start += 1;
+    }
+    while (end > start && sbsv_is_space_char(current[end - 1])) {
+        end -= 1;
+    }
+    if (start == end) {
+        return true;
+    }
+    if (current_len == 0 || !sbsv_is_space_char(current[current_len - 1])) {
+        return false;
+    }
+    while (start < end) {
+        if (sbsv_is_space_char(current[start])) {
+            in_word = false;
+        } else if (!in_word) {
+            words += 1;
+            in_word = true;
+        }
+        start += 1;
+    }
+    return words == 1;
+}
+
+static sbsv_status sbsv_append_schema_name_suffix_range(char** name, const char* start, size_t len) {
+    const char* trimmed_start = start;
+    size_t trimmed_len = len;
+    size_t old_len;
+    size_t new_len;
+    char* next;
+
+    while (trimmed_len > 0 && sbsv_is_space_char(*trimmed_start)) {
+        trimmed_start += 1;
+        trimmed_len -= 1;
+    }
+    while (trimmed_len > 0 && sbsv_is_space_char(trimmed_start[trimmed_len - 1])) {
+        trimmed_len -= 1;
+    }
+    if (trimmed_len == 0) {
+        return SBSV_OK;
+    }
+    if (*name == NULL) {
+        next = (char*)malloc(trimmed_len + 1);
+        if (next == NULL) {
+            return SBSV_ERR_ALLOC;
+        }
+        memcpy(next, trimmed_start, trimmed_len);
+        next[trimmed_len] = '\0';
+        *name = next;
+        return SBSV_OK;
+    }
+
+    old_len = strlen(*name);
+    new_len = old_len + 1 + trimmed_len;
+    next = (char*)malloc(new_len + 1);
+    if (next == NULL) {
+        return SBSV_ERR_ALLOC;
+    }
+    memcpy(next, *name, old_len);
+    next[old_len] = '$';
+    memcpy(next + old_len + 1, trimmed_start, trimmed_len);
+    next[new_len] = '\0';
+    free(*name);
+    *name = next;
+    return SBSV_OK;
+}
+
+static void sbsv_schema_prefix_scan_free(sbsv_schema_prefix_scan* scan) {
+    if (scan == NULL) {
+        return;
+    }
+    free(scan->schema_name);
+    scan->schema_name = NULL;
+    scan->ambiguous_sub_schema = 0;
+}
+
+static int sbsv_schema_name_may_match(sbsv_parser* parser, const char* schema_name, int ambiguous_sub_schema) {
+    size_t i;
+    size_t schema_name_len;
+
+    if (parser == NULL || schema_name == NULL) {
+        return 0;
+    }
+    if (sbsv_find_schema(parser, schema_name) != NULL) {
+        return 1;
+    }
+    if (!ambiguous_sub_schema) {
+        return 0;
+    }
+
+    schema_name_len = strlen(schema_name);
+    for (i = 0; i < parser->schema_count; ++i) {
+        const char* existing = parser->schemas[i].name;
+        if (
+            strncmp(existing, schema_name, schema_name_len) == 0
+            && existing[schema_name_len] == '$'
+        ) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static sbsv_status sbsv_scan_schema_name_prefix(sbsv_parser* parser, const char* line, sbsv_schema_prefix_scan* out_scan) {
+    size_t ignored_prefix_count;
+    size_t token_index = 0;
+    int level = 0;
+    bool escape = false;
+    bool quote = false;
+    const char* token_start = NULL;
+    size_t current_len = 0;
+    size_t i;
+    size_t length;
+
+    if (line == NULL || out_scan == NULL) {
+        return SBSV_ERR_INVALID_ARG;
+    }
+
+    memset(out_scan, 0, sizeof(*out_scan));
+    ignored_prefix_count = parser == NULL ? 0 : parser->ignored_prefix_count;
+    length = strlen(line);
+
+    for (i = 0; i < length; ++i) {
+        char ch = line[i];
+
+        if (escape) {
+            escape = false;
+            if (level > 0) {
+                current_len += 2;
+            }
+            continue;
+        }
+
+        if (ch == '\\' && level > 0) {
+            escape = true;
+            continue;
+        }
+
+        if (ch == '"' && level > 0 && (quote || sbsv_scan_can_start_quote(token_start, current_len))) {
+            quote = !quote;
+            current_len += 1;
+            continue;
+        }
+
+        if (ch == '[' && !quote) {
+            level += 1;
+            if (level == 1) {
+                token_start = line + i + 1;
+                current_len = 0;
+                continue;
+            }
+        } else if (ch == ']' && !quote) {
+            level -= 1;
+            if (level == 0) {
+                if (!sbsv_token_view_is_empty(token_start, current_len)) {
+                    if (token_index >= ignored_prefix_count) {
+                        if (sbsv_token_view_has_value(token_start, current_len)) {
+                            return SBSV_OK;
+                        }
+                        sbsv_status status = sbsv_append_schema_name_suffix_range(&out_scan->schema_name, token_start, current_len);
+                        if (status != SBSV_OK) {
+                            sbsv_schema_prefix_scan_free(out_scan);
+                            return status;
+                        }
+                    }
+                    token_index += 1;
+                }
+                token_start = NULL;
+                current_len = 0;
+                continue;
+            }
+            if (level < 0) {
+                level = 0;
+                return SBSV_OK;
+            }
+        }
+
+        if (level > 0) {
+            current_len += 1;
+        }
+    }
+
+    if (level > 0 || quote) {
+        out_scan->ambiguous_sub_schema =
+            sbsv_token_view_is_empty(token_start, current_len)
+            || !sbsv_token_view_has_value(token_start, current_len);
+    }
+    return SBSV_OK;
 }
 
 static const sbsv_schema* sbsv_find_schema_const(const sbsv_parser* parser, const char* schema_name) {
@@ -2043,6 +2283,21 @@ static sbsv_status sbsv_parser_parse_line_internal(sbsv_parser* parser, const ch
 
     status = sbsv_preprocess_line(parser, stripped, &pre);
     if (status != SBSV_OK) {
+        if (parser->ignore_unknown) {
+            sbsv_schema_prefix_scan scan;
+            sbsv_status scan_status = sbsv_scan_schema_name_prefix(parser, stripped, &scan);
+            if (scan_status != SBSV_OK) {
+                free(stripped);
+                return scan_status;
+            }
+            if (!sbsv_schema_name_may_match(parser, scan.schema_name, scan.ambiguous_sub_schema)) {
+                sbsv_schema_prefix_scan_free(&scan);
+                sbsv_preprocessed_line_free(&pre);
+                free(stripped);
+                return SBSV_OK;
+            }
+            sbsv_schema_prefix_scan_free(&scan);
+        }
         const char* detail = parser->last_error ? parser->last_error : "parse error";
         char* detail_copy = sbsv_strdup_local(detail);
         if (detail_copy != NULL) {
