@@ -110,6 +110,7 @@ typedef struct ArgumentInfo {
     Expr *expr;
 } ArgumentInfo;
 
+void snapshot_set_binradar_patch_shm(uint32_t *shm);
 const char *snapshot_mem_region_str(SnapshotMemRegion *mr);
 
 guint coverage_edge_hash(gconstpointer key);
