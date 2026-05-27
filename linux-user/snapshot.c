@@ -24,8 +24,6 @@
 #include <sys/shm.h>
 #include <unistd.h>
 
-#define FORKSRV_FD 198
-
 extern target_ulong target_brk;
 bool restoring_to_snapshot;
 target_ulong binradar_entrypoint = (target_ulong)-1;
@@ -38,6 +36,8 @@ static uint64_t binradar_forkserver_target_hit_count = 1;
 static int      binradar_forkserver_enable      = -1;
 static int      binradar_preserve_child_queries = -1;
 static int      binradar_solver_mutation_mode   = -1;
+static int      binradar_forkserver_ctrl_r = -1;
+static int      binradar_forkserver_stat_w = -1;
 static char*    binradar_probe_file     = NULL;
 static char*    binradar_query_window_file = NULL;
 static uint8_t  binradar_query_window_dumped    = 0;
@@ -215,6 +215,15 @@ static void snapshot_load_binradar_env(void) {
     const char* var = getenv("BINRADAR_FORKSERVER_ENABLE");
     if (var) {
         binradar_forkserver_enable = atoi(var) != 0;
+    }
+
+    var = getenv("BINRADAR_FORKSERVER_CTRL_R");
+    if (var) {
+        binradar_forkserver_ctrl_r = atoi(var);
+    }
+    var = getenv("BINRADAR_FORKSERVER_STAT_W");
+    if (var) {
+        binradar_forkserver_stat_w = atoi(var);
     }
 
     var = getenv("BINRADAR_FORKSERVER_TARGET_HIT_COUNT");
@@ -491,36 +500,49 @@ static OspreyType *osprey_type_get(OspreyTypeManager *manager, const char *type_
 
 OspreyTypeManager *g_osprey_type_manager = NULL;
 
-static int   use_trace = -1;
-static FILE* trace_file_fp;
+static int use_trace = -1;
+static int trace_fd = -1;
 
-void trace_mem(const char* fmt, ...) {
-    if (use_trace == -1 && trace_file_fp == NULL) {
-        char* trace_file = getenv("BINRADAR_TRACE_FILE");
-        if (trace_file == NULL) {
-            use_trace = 1;
-        } else if (strcmp(trace_file, "none") == 0) {
-            use_trace = 0;
-        } else {
-            use_trace = 1;
-            trace_file_fp = fopen(trace_file, "a");
-            if (trace_file_fp == NULL) {
-                fprintf( stderr, "ERROR: cannot open trace file %s\n",
-                        trace_file);
-                exit(1);
-            }
+static void trace_mem_init(void) {
+    if (use_trace != -1) return;
+    char* trace_file = getenv("BINRADAR_TRACE_FILE");
+    if (trace_file == NULL) {
+        use_trace = 1;
+        trace_fd = STDERR_FILENO;
+    } else if (strcmp(trace_file, "none") == 0) {
+        use_trace = 0;
+    } else {
+        use_trace = 1;
+        trace_fd = open(trace_file, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (trace_fd < 0) {
+            fprintf( stderr, "ERROR: cannot open trace file %s\n",
+                    trace_file);
+            exit(1);
         }
     }
+}
+
+void trace_mem(const char* fmt, ...) {
+    trace_mem_init();
     if (!use_trace)
         return;
     va_list ap;
+    char buf[4096];
     va_start(ap, fmt);
-    if (trace_file_fp) {
-        vfprintf(trace_file_fp, fmt, ap);
-    } else {
-        vfprintf( stderr, fmt, ap);
-    }
+    int n = vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
+    ssize_t wr;
+    if (n < 0) {
+        return;
+    }
+    if (n >= sizeof(buf)) {
+        // This should not happen
+        wr = write(trace_fd, buf, sizeof(buf) - 1);
+        wr = write(trace_fd, "\n[ERROR] [TRUNCATED]\n", 21);
+    } else {
+        wr = write(trace_fd, buf, n);
+    }
+    (void)wr;
 }
 
 const char *snapshot_mem_region_str(SnapshotMemRegion *mr) {
@@ -2220,6 +2242,10 @@ static int analyze_collected_data(const ArgumentInfo *arg_info, size_t num_arg_r
             g_hash_table_destroy(terminal_obj_set);
             g_hash_table_destroy(terminal_pointing_set);
         }
+        for (int i = 0; i < mod_primitive_candidates->len; i++) {
+            MutationCandidate mod = g_array_index(mod_primitive_candidates, MutationCandidate, i);
+            add_modification_primitive(mod_manager->modifications, &mod);
+        }
         trace_mem("[analyze] [queue] [len %d]\n", g_queue_get_length(mod_manager->modifications));
         g_array_free(pointer_nodes, true);
         g_array_free(mod_primitive_candidates, true);
@@ -2458,7 +2484,6 @@ static void binradar_manager_drain_patch_fd_once(BinradarManager *manager) {
         if (errno == EINTR) {
             continue;
         }
-        perror("read(binradar_patch_fd_r)");
         break;
     }
 }
@@ -2493,7 +2518,7 @@ static int wait_child_and_drain_patch(pid_t child_pid, uint32_t *status_out) {
             child_exited = true;
             break;
         } else if (r < 0) {
-            perror("waitpid(WNOHANG)");
+            trace_mem("waitpid(WNOHANG)\n");
             return -1;
         }
 
@@ -2502,7 +2527,7 @@ static int wait_child_and_drain_patch(pid_t child_pid, uint32_t *status_out) {
             if (errno == EINTR) {
                 continue;
             }
-            perror("poll");
+            trace_mem("poll\n");
             return -1;
         }
 
@@ -2515,7 +2540,7 @@ static int wait_child_and_drain_patch(pid_t child_pid, uint32_t *status_out) {
         }
 
         if (pfd.revents & POLLERR) {
-            fprintf(stderr, "[forkserver] patch pipe POLLERR\n");
+            trace_mem("patch pipe POLLERR\n");
             binradar_manager_drain_patch_fd_once(binradar_manager);
         }
     }
@@ -2529,11 +2554,14 @@ static int wait_child_and_drain_patch(pid_t child_pid, uint32_t *status_out) {
 
 void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env, const ArgumentInfo *arg_info, size_t num_arg_regs) {
     trace_mem("[snapshot] [forkserver] [called %d]\n", forkserver_installed);
-    fflush(stderr);
     if (forkserver_installed) return;
     forkserver_installed = true;
     rcu_disable_atfork();
     snapshot_save();
+    if (binradar_forkserver_ctrl_r == -1 || binradar_forkserver_stat_w == -1) {
+        trace_mem("[snapshot] [forkserver] [error] invalid binradar control fds\n");
+        _exit(1);
+    }
     pid_t child_pid;
     // int   t_fd[2];
     int patch_cnt = 0;
@@ -2557,15 +2585,15 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env, const ArgumentInf
     /* Tell the parent that we're alive. If the parent doesn't want
        to talk, assume that we're not running in forkserver mode. */
   
-    if (write(FORKSRV_FD + 1, msg, 4) != 4) {
-        trace_mem("[snapshot] [forkserver] [error] failed to write to %d %d\n", FORKSRV_FD + 1, status);
+    if (write(binradar_forkserver_stat_w, msg, 4) != 4) {
+        trace_mem("[snapshot] [forkserver] [error] failed to write to %d %d\n", binradar_forkserver_stat_w, status);
         _exit(1);
     }
   
     afl_forksrv_pid = getpid();
   
-    if (read(FORKSRV_FD, reply, 4) != 4) {
-        trace_mem("[snapshot] [forkserver] [error] fuzzolic not responding to %d\n", FORKSRV_FD); 
+    if (read(binradar_forkserver_ctrl_r, reply, 4) != 4) {
+        trace_mem("[snapshot] [forkserver] [error] fuzzolic not responding to %d\n", binradar_forkserver_ctrl_r);
         _exit(1);
     }
     if (tmp != reply_value) {
@@ -2574,8 +2602,8 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env, const ArgumentInf
     }
 
     // send welcome message as final message
-    if (write(FORKSRV_FD + 1, msg, 4) != 4) { 
-        trace_mem("[snapshot] [forkserver] [error] failed to send final handshake to %d %d\n", FORKSRV_FD + 1, status);
+    if (write(binradar_forkserver_stat_w, msg, 4) != 4) { 
+        trace_mem("[snapshot] [forkserver] [error] failed to send final handshake to %d %d\n", binradar_forkserver_stat_w, status);
         _exit(1);
     }
   
@@ -2589,7 +2617,7 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env, const ArgumentInf
   
         /* Whoops, parent dead? */
     
-        if (read(FORKSRV_FD, &was_killed, 4) != 4) {
+        if (read(binradar_forkserver_ctrl_r, &was_killed, 4) != 4) {
             trace_mem("[forkserver] [exit] parent (fuzzolic) dead or exit\n");
             exit(2);
         }
@@ -2612,6 +2640,7 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env, const ArgumentInf
                 }
                 trace_mem("[binradar] [shm] [patch-id %d] [iter %d]\n", *binradar_manager->cur_patch_id, *binradar_manager->cur_iter);
             }
+            fflush(NULL);
             child_pid = fork();
             if (child_pid < 0) exit(4);
 
@@ -2622,8 +2651,8 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env, const ArgumentInf
                 /* Child process. Close descriptors and run free. */
                 snapshot_modify_memory(cpu_env);
                 afl_fork_child = 1;
-                close(FORKSRV_FD);
-                close(FORKSRV_FD + 1);
+                close(binradar_forkserver_ctrl_r);
+                close(binradar_forkserver_stat_w);
                 // close(t_fd[0]);
                 return;
 
@@ -2645,14 +2674,14 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env, const ArgumentInf
             if (wait_child_and_drain_patch(child_pid, status) < 0) exit(6);
 
             // Child process exit
-            if (trace_file_fp != NULL) {
-                fflush(trace_file_fp);
+            if (trace_fd != -1) {
+                fsync(trace_fd);
             }
-            if (write(FORKSRV_FD + 1, status, sizeof(status)) != sizeof(status)) exit(7);
+            if (write(binradar_forkserver_stat_w, status, sizeof(status)) != sizeof(status)) exit(7);
 
             // Get type inference result
-            if (read(FORKSRV_FD, &analyze_result_len, 4) != 4) {
-                trace_mem("[forkserver] [error] failed to read analyze_result_len from %d\n", FORKSRV_FD);
+            if (read(binradar_forkserver_ctrl_r, &analyze_result_len, 4) != 4) {
+                trace_mem("[forkserver] [error] failed to read analyze_result_len from %d\n", binradar_forkserver_ctrl_r);
                 exit(8);
             }
             trace_mem("[forkserver] [analyze-result] [len %lu]\n", analyze_result_len);
@@ -2665,9 +2694,9 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env, const ArgumentInf
                 }
                 size_t total_read = 0;
                 while (total_read < analyze_result_len) {
-                    ssize_t bytes_read = read(FORKSRV_FD, analyze_result + total_read, analyze_result_len - total_read);
+                    ssize_t bytes_read = read(binradar_forkserver_ctrl_r, analyze_result + total_read, analyze_result_len - total_read);
                     if (bytes_read <= 0) {
-                        trace_mem("[forkserver] [error] failed to read analyze_result from %d\n", FORKSRV_FD);
+                        trace_mem("[forkserver] [error] failed to read analyze_result from %d\n", binradar_forkserver_ctrl_r);
                         exit(9);
                     }
                     total_read += bytes_read;
@@ -2679,12 +2708,12 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env, const ArgumentInf
 
             if (binradar_mode && binradar_iter == 1) {
                 remaining_mods = analyze_collected_data(arg_info, num_arg_regs);
-                if (write(FORKSRV_FD + 1, &remaining_mods, 4) != 4) exit(10);
+                if (write(binradar_forkserver_stat_w, &remaining_mods, 4) != 4) exit(10);
                 break; // We don't have to run other patches for original input
             }
             
             // Send remaining count
-            if (write(FORKSRV_FD + 1, &remaining_mods, 4) != 4) exit(10);
+            if (write(binradar_forkserver_stat_w, &remaining_mods, 4) != 4) exit(10);
 
         }
   
