@@ -2494,12 +2494,12 @@ static void binradar_manager_handle_patch_line(BinradarManager *manager, const c
             int br = sbsv_row_get_bool(row, "br", NULL);
             long long iter = sbsv_row_get_int(row, "v", NULL);
             if (iter != cur_iter) {
-                // This happens if there were patch hit before patch function entry
+                trace_mem("[binradar] [iter-mismatch] [v %lld] [iter %d] [id %lld] [br %d]\n", iter, cur_iter, patch_id, br);
                 sbsv_row_free(row);
                 return;
             }
             if (patch_id < 0 || patch_id > UINT32_MAX) {
-                trace_mem("[binradar] [patch-res] [invalid-patch-id %lld]\n", patch_id);
+                trace_mem("[binradar] [invalid-patch-id] [id %lld]\n", patch_id);
                 sbsv_row_free(row);
                 return;
             }
@@ -2690,9 +2690,14 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env, const ArgumentInf
             trace_mem("[forkserver] [exit] parent (fuzzolic) dead or exit\n");
             exit_with_status(2);
         }
-        binradar_commit(binradar_manager);
+        binradar_commit(binradar_manager); // Commit collected patch results from previous iteration
         binradar_iter++;
         binradar_manager_cur_iter(binradar_manager, binradar_iter);
+        if (binradar_iter > 1) {
+            // Select one modification to apply for next iteration
+            // Pop from modification queue and set as current
+            remaining_mods = analyze_collected_data(arg_info, num_arg_regs);
+        }
     
         /* Establish a channel with child to grab translation commands. We'll
         read from t_fd[0], child will write to TSL_FD. */
@@ -2704,9 +2709,6 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env, const ArgumentInf
                 status[1] = i; // patch id
                 status[2] = binradar_iter; // iter
                 binradar_manager_cur_patch_id(binradar_manager, i);
-                if (binradar_iter != 1) {
-                    remaining_mods = analyze_collected_data(arg_info, num_arg_regs);
-                }
                 trace_mem("[binradar] [shm] [patch-id %d] [iter %d]\n", *binradar_manager->cur_patch_id, *binradar_manager->cur_iter);
             }
             fflush(NULL);
