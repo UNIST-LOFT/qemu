@@ -4057,6 +4057,7 @@ static inline abi_ulong do_shmat(CPUArchState *cpu_env,
         return get_errno((long)host_raddr);
     }
     raddr=h2g((unsigned long)host_raddr);
+    snapshot_protect_mapping(raddr, shm_info.shm_segsz);
 
     page_set_flags(raddr, raddr + shm_info.shm_segsz,
                    PAGE_VALID | PAGE_READ |

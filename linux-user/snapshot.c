@@ -155,6 +155,7 @@ typedef struct BinradarManager {
 } BinradarManager;
 
 static SharedTraceData *shared_trace_data = NULL;
+static GList *binradar_protected_mappings = NULL;
 
 static OrderedMap *g_read_access_tainted_primitives = NULL;
 static OrderedMap *g_read_access_pointers = NULL;
@@ -178,6 +179,36 @@ static BinradarResult *binradar_manager_alloc_one_iter(BinradarManager *manager)
     return result;
 }
 
+static void trace_mem_flush(void);
+
+void snapshot_protect_mapping(target_ulong addr, target_ulong len) {
+    if (addr == (target_ulong)-1 || len == 0) {
+        return;
+    }
+    SnapshotMapping *map = g_new(SnapshotMapping, 1);
+    map->start = addr;
+    map->len = len;
+    binradar_protected_mappings = g_list_prepend(binradar_protected_mappings, map);
+}
+
+bool snapshot_addr_is_protected(target_ulong addr) {
+    for (GList *node = binradar_protected_mappings; node != NULL; node = node->next) {
+        SnapshotMapping *map = (SnapshotMapping *)node->data;
+        if (map == NULL) {
+            continue;
+        }
+        if (addr >= map->start && addr < map->start + map->len) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void exit_with_status(int status) {
+    trace_mem_flush();
+    exit(status);
+}
+
 void snapshot_set_binradar_patch_shm(uint32_t *shm) {
     binradar_manager = g_new0(BinradarManager, 1);
     binradar_manager->patch_cnt = 1;
@@ -191,15 +222,15 @@ void snapshot_set_binradar_patch_shm(uint32_t *shm) {
     if (var != NULL) {
         binradar_manager->patch_fd_r = atoi(var);
     } else {
-        perror("BINRADAR_PATCH_FD_R not set");
-        exit(1);
+        trace_mem("BINRADAR_PATCH_FD_R not set");
+        exit_with_status(1);
     }
     var = getenv("BINRADAR_PATCH_CNT");
     if (var != NULL) {
         binradar_manager->patch_cnt = atoi(var);
     } else {
-        perror("BINRADAR_PATCH_CNT not set");
-        exit(1);
+        trace_mem("BINRADAR_PATCH_CNT not set");
+        exit_with_status(1);
     }
     binradar_manager->patch_result_parser = sbsv_parser_new(SBSV_PARSER_DEFAULT);
     sbsv_parser_add_schema(binradar_manager->patch_result_parser, "[patch] [id: int] [br: bool] [v: int]");
@@ -517,7 +548,7 @@ static void trace_mem_init(void) {
         if (trace_fd < 0) {
             fprintf( stderr, "ERROR: cannot open trace file %s\n",
                     trace_file);
-            exit(1);
+            exit_with_status(1);
         }
     }
 }
@@ -543,6 +574,12 @@ void trace_mem(const char* fmt, ...) {
         wr = write(trace_fd, buf, n);
     }
     (void)wr;
+}
+
+void trace_mem_flush(void) {
+    if (!use_trace) return;
+    if (trace_fd > 2)
+        fsync(trace_fd);
 }
 
 const char *snapshot_mem_region_str(SnapshotMemRegion *mr) {
@@ -768,7 +805,7 @@ static void add_read_access_pointer(uintptr_t addr, uintptr_t target, uintptr_t 
     }
     if (ptr == NULL) {
         trace_mem("[rpo] ptr shared_index error!!! %d\n", entry->shared_index);
-        exit(1);
+        exit_with_status(1);
     }
     ptr->addr = addr;
     ptr->target = target;
@@ -803,7 +840,7 @@ static void add_read_access_primitive(uintptr_t addr, int size, uintptr_t pc) {
     }
     if (prim == NULL) {
         trace_mem("[rpo] prim shared_index error!!! %d\n", entry->shared_index);
-        exit(1);
+        exit_with_status(1);
     }
     prim->addr = addr;
     prim->size = size;
@@ -1294,8 +1331,8 @@ void snapshot_init(void) {
     size_t shm_size = sizeof(SharedTraceData);
     shared_trace_data = mmap(NULL, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
     if (shared_trace_data == MAP_FAILED) {
-        perror("mmap shared memory failed");
-        exit(1);
+        trace_mem("mmap shared memory failed");
+        exit_with_status(1);
     }
     memset(shared_trace_data, 0, shm_size);
 }
@@ -1645,7 +1682,7 @@ static void snapshot_modify_memory(CPUArchState *cpu_env) {
     Modification *mod = mod_manager->current;
     if (mod == NULL) {
         trace_mem("ERROR: empty modification\n");
-        exit(1);
+        exit_with_status(1);
     }
     bool pointer_mod = false;
     for (int i = 0; i < mod->num_mods; i++) {
@@ -1659,7 +1696,8 @@ static void snapshot_modify_memory(CPUArchState *cpu_env) {
         trace_mem("[mod-pointer] [start]\n");
         pointer_page = snapshot_alloc_pointer_page();
         if (pointer_page == (abi_ulong)-1) {
-            exit(1);
+            trace_mem("[mod-pointer] [error] failed to allocate pointer page\n");
+            exit_with_status(1);
         }
     }
     for (int i = 0; i < mod->num_mods; i++) {
@@ -1702,7 +1740,7 @@ static void snapshot_sig_handler(int sig, siginfo_t *si, void *ctx) {
     int n = backtrace(frames, SNAPSHOT_BT_DEPTH);
     dprintf(STDERR_FILENO, "[forkserver-child] fata signal %d (%s) addr=%p\n", sig, strsignal(sig), si ? si->si_addr : NULL);
     backtrace_symbols_fd(frames, n, STDERR_FILENO);
-    _exit(128 + sig);
+    exit_with_status(128 + sig);
 }
 
 static void snapshot_install_crash_handler(void) {
@@ -1949,12 +1987,20 @@ static void add_modification_pointer(GQueue *modifications, MutationCandidate *m
 //                                       candidate->value, 0);
 // }
 
+static bool binradar_manager_check_addr(target_ulong addr) {
+    if (snapshot_addr_is_protected(addr)) {
+        trace_mem("[binradar] [check-addr] [addr %lx] [hit]\n", addr);
+        return true;
+    }
+    return false;
+}
+
 // In parent process, called after child execution
 // Return: remaining modifications
 static int analyze_collected_data(const ArgumentInfo *arg_info, size_t num_arg_regs) {
     if (shared_trace_data == NULL) {
         trace_mem("Snapshot init error: shared_trace_data is null\n");
-        exit(1);
+        exit_with_status(1);
     }
     // Analyze exit reason
     SnapshotExitInfo *exit_info = snapshot_exit_info_ptr();
@@ -1968,7 +2014,7 @@ static int analyze_collected_data(const ArgumentInfo *arg_info, size_t num_arg_r
                     (exit_info->host_signal > 0) ? strsignal(exit_info->host_signal) : NULL;
         if (exit_info->target_signal == 0) {
             trace_mem("[analyze] [host-crash] [exit %d] [addr %lx] [reason %s] [name %s] [last %lx] Host crashed!!!\n", exit_info->host_signal, exit_info->host_fault_addr, exit_info->description, host_name ? host_name : "unknown", exit_info->guest_last_translation_block);
-            exit(1);
+            exit_with_status(1);
         }
         trace_mem("[analyze] [crash] [exit %d] [target %d] [host %d] [name %s] [fault-addr %lx] [guest-pc %lx] [guest-cs %lx] [si-code %d] [last %lx]\n", exit_info->exit_code, exit_info->target_signal, exit_info->host_signal, host_name ? host_name : "unknown", exit_info->fault_addr, exit_info->guest_pc, exit_info->guest_cs_base, exit_info->si_code, exit_info->guest_last_translation_block);
     } else {
@@ -2244,6 +2290,10 @@ static int analyze_collected_data(const ArgumentInfo *arg_info, size_t num_arg_r
         }
         for (int i = 0; i < mod_primitive_candidates->len; i++) {
             MutationCandidate mod = g_array_index(mod_primitive_candidates, MutationCandidate, i);
+            if (binradar_manager_check_addr(mod.addr)) {
+                trace_mem("[binradar] [skip-mod] [addr %lx]\n", mod.addr);
+                continue;
+            }
             add_modification_primitive(mod_manager->modifications, &mod);
         }
         trace_mem("[analyze] [queue] [len %d]\n", g_queue_get_length(mod_manager->modifications));
@@ -2382,6 +2432,11 @@ static void binradar_commit(BinradarManager *manager) {
     memset(br_buf, 0, sizeof(br_buf));
     for (uint32_t i = 0; i < manager->patch_cnt + 1; i++) {
         PatchedResult res = manager->current->patch_results[i];
+        if (res.br_taken == NULL) {
+            trace_mem("[binradar] [commit] [iter %d] [patch %d] [br null]\n", cur_iter, i);
+            clone->patch_results[i] = res;
+            continue;
+        }
         for (size_t j = 0; j < res.br_taken->len; j++) {
             bool taken = g_array_index(res.br_taken, bool, j);
             br_buf[j] = taken ? '1' : '0';
@@ -2395,26 +2450,35 @@ static void binradar_commit(BinradarManager *manager) {
             break;
         }
     }
-    memset(manager->current, 0, sizeof(BinradarResult) * (manager->patch_cnt + 1));
+    memset(manager->current->patch_results, 0, sizeof(PatchedResult) * (manager->patch_cnt + 1));
     g_ptr_array_add(manager->results, clone);
 }
 
 static void set_nonblock(int fd) {
     int flags = fcntl(fd, F_GETFL);
     if (flags < 0) {
-        perror("fcntl(F_GETFL)");
-        exit(1);
+        trace_mem("fcntl(F_GETFL)");
+        exit_with_status(1);
     }
     if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
-        perror("fcntl(F_SETFL)");
-        exit(1);
+        trace_mem("fcntl(F_SETFL)");
+        exit_with_status(1);
     }
 }
 
 static PatchedResult *get_patched_result_tmp(BinradarManager *manager, uint32_t patch_id) {
-    if (manager == NULL) exit(1);
-    if (manager->current == NULL) exit(1);
-    if (manager->patch_cnt < patch_id) exit(1);
+    if (manager == NULL) {
+        trace_mem("Manager not initialized");
+        exit_with_status(1);
+    }
+    if (manager->current == NULL) {
+        trace_mem("Current result not initialized");
+        exit_with_status(1);
+    }
+    if (patch_id > manager->patch_cnt) {
+        trace_mem("Invalid patch ID: %u", patch_id);
+        exit_with_status(1);
+    }
     return &manager->current->patch_results[patch_id];
 }
 
@@ -2431,6 +2495,11 @@ static void binradar_manager_handle_patch_line(BinradarManager *manager, const c
             long long iter = sbsv_row_get_int(row, "v", NULL);
             if (iter != cur_iter) {
                 // This happens if there were patch hit before patch function entry
+                sbsv_row_free(row);
+                return;
+            }
+            if (patch_id < 0 || patch_id > UINT32_MAX) {
+                trace_mem("[binradar] [patch-res] [invalid-patch-id %lld]\n", patch_id);
                 sbsv_row_free(row);
                 return;
             }
@@ -2560,7 +2629,7 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env, const ArgumentInf
     snapshot_save();
     if (binradar_forkserver_ctrl_r == -1 || binradar_forkserver_stat_w == -1) {
         trace_mem("[snapshot] [forkserver] [error] invalid binradar control fds\n");
-        _exit(1);
+        exit_with_status(1);
     }
     pid_t child_pid;
     // int   t_fd[2];
@@ -2587,24 +2656,24 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env, const ArgumentInf
   
     if (write(binradar_forkserver_stat_w, msg, 4) != 4) {
         trace_mem("[snapshot] [forkserver] [error] failed to write to %d %d\n", binradar_forkserver_stat_w, status);
-        _exit(1);
+        exit_with_status(1);
     }
   
     afl_forksrv_pid = getpid();
   
     if (read(binradar_forkserver_ctrl_r, reply, 4) != 4) {
         trace_mem("[snapshot] [forkserver] [error] fuzzolic not responding to %d\n", binradar_forkserver_ctrl_r);
-        _exit(1);
+        exit_with_status(1);
     }
     if (tmp != reply_value) {
         trace_mem("wrong forkserver message from fuzzolic.py");
-        _exit(1);
+        exit_with_status(1);
     }
 
     // send welcome message as final message
     if (write(binradar_forkserver_stat_w, msg, 4) != 4) { 
         trace_mem("[snapshot] [forkserver] [error] failed to send final handshake to %d %d\n", binradar_forkserver_stat_w, status);
-        _exit(1);
+        exit_with_status(1);
     }
   
   
@@ -2619,7 +2688,7 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env, const ArgumentInf
     
         if (read(binradar_forkserver_ctrl_r, &was_killed, 4) != 4) {
             trace_mem("[forkserver] [exit] parent (fuzzolic) dead or exit\n");
-            exit(2);
+            exit_with_status(2);
         }
         binradar_commit(binradar_manager);
         binradar_iter++;
@@ -2642,7 +2711,7 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env, const ArgumentInf
             }
             fflush(NULL);
             child_pid = fork();
-            if (child_pid < 0) exit(4);
+            if (child_pid < 0) exit_with_status(4);
 
             if (!child_pid) {
 #ifdef SNAPSHOT_DEBUG
@@ -2671,18 +2740,16 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env, const ArgumentInf
         
             /* Get and relay exit status to parent. */
         
-            if (wait_child_and_drain_patch(child_pid, status) < 0) exit(6);
+            if (wait_child_and_drain_patch(child_pid, status) < 0) exit_with_status(6);
 
             // Child process exit
-            if (trace_fd != -1) {
-                fsync(trace_fd);
-            }
-            if (write(binradar_forkserver_stat_w, status, sizeof(status)) != sizeof(status)) exit(7);
+            trace_mem_flush();
+            if (write(binradar_forkserver_stat_w, status, sizeof(status)) != sizeof(status)) exit_with_status(7);
 
             // Get type inference result
             if (read(binradar_forkserver_ctrl_r, &analyze_result_len, 4) != 4) {
                 trace_mem("[forkserver] [error] failed to read analyze_result_len from %d\n", binradar_forkserver_ctrl_r);
-                exit(8);
+                exit_with_status(8);
             }
             trace_mem("[forkserver] [analyze-result] [len %lu]\n", analyze_result_len);
 
@@ -2697,7 +2764,7 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env, const ArgumentInf
                     ssize_t bytes_read = read(binradar_forkserver_ctrl_r, analyze_result + total_read, analyze_result_len - total_read);
                     if (bytes_read <= 0) {
                         trace_mem("[forkserver] [error] failed to read analyze_result from %d\n", binradar_forkserver_ctrl_r);
-                        exit(9);
+                        exit_with_status(9);
                     }
                     total_read += bytes_read;
                 }
@@ -2708,12 +2775,12 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env, const ArgumentInf
 
             if (binradar_mode && binradar_iter == 1) {
                 remaining_mods = analyze_collected_data(arg_info, num_arg_regs);
-                if (write(binradar_forkserver_stat_w, &remaining_mods, 4) != 4) exit(10);
+                if (write(binradar_forkserver_stat_w, &remaining_mods, 4) != 4) exit_with_status(10);
                 break; // We don't have to run other patches for original input
             }
             
             // Send remaining count
-            if (write(binradar_forkserver_stat_w, &remaining_mods, 4) != 4) exit(10);
+            if (write(binradar_forkserver_stat_w, &remaining_mods, 4) != 4) exit_with_status(10);
 
         }
   

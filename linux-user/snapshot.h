@@ -147,6 +147,8 @@ void snapshot_trace_stack_push(target_ulong sp, target_ulong pc);
 void snapshot_trace_stack_pop(target_ulong sp);
 void snapshot_trace_global_add(target_ulong base, target_ulong size, target_ulong pc, const char *name);
 SnapshotMemRegion *snapshot_mem_region_search(target_ulong addr);
+void snapshot_protect_mapping(target_ulong addr, target_ulong len);
+bool snapshot_addr_is_protected(target_ulong addr);
 
 void snapshot_syscall(uintptr_t syscall_no, uintptr_t syscall_arg0,
                       uintptr_t syscall_arg1, uintptr_t syscall_arg2,
