@@ -240,14 +240,14 @@ void snapshot_set_binradar_patch_shm(uint32_t *shm) {
     if (var != NULL) {
         binradar_manager->patch_fd_r = atoi(var);
     } else {
-        trace_mem("BINRADAR_PATCH_FD_R not set");
+        log_msg("BINRADAR_PATCH_FD_R not set");
         exit_with_status(1);
     }
     var = getenv("BINRADAR_PATCH_CNT");
     if (var != NULL) {
         binradar_manager->patch_cnt = atoi(var);
     } else {
-        trace_mem("BINRADAR_PATCH_CNT not set");
+        log_msg("BINRADAR_PATCH_CNT not set");
         exit_with_status(1);
     }
     binradar_manager->patch_result_parser = sbsv_parser_new(SBSV_PARSER_DEFAULT);
@@ -298,7 +298,7 @@ static void snapshot_load_binradar_env(void) {
     if (binradar_query_window_file && binradar_query_window_file[0] == '\0') {
         binradar_query_window_file = NULL;
     }
-    trace_mem("[snapshot-load-binradar] [forkserver %d] [hit-count %lu] [probe-file %s] [query-window-file %s]\n",
+    log_msg("[snapshot-load-binradar] [forkserver %d] [hit-count %lu] [probe-file %s] [query-window-file %s]\n",
               binradar_forkserver_enable, binradar_forkserver_target_hit_count,
               binradar_probe_file ? binradar_probe_file : "null",
               binradar_query_window_file ? binradar_query_window_file : "null");
@@ -331,7 +331,7 @@ uint8_t snapshot_on_entrypoint_hit(target_ulong pc) {
     snapshot_load_binradar_env();
     binradar_entrypoint_hit_count += 1;
 
-    trace_mem("[snapshot] [entrypoint-hit] [pc %lx] [count %lu] [target %lu]\n",
+    log_msg("[snapshot] [entrypoint-hit] [pc %lx] [count %lu] [target %lu]\n",
               pc, binradar_entrypoint_hit_count,
               binradar_forkserver_target_hit_count);
 
@@ -571,7 +571,7 @@ static target_ulong dyn_frame_legacy_id(const DynStackFrame *frame) {
 
 static uint64_t osprey_stack_type_key(uint64_t region_id, int64_t offset) {
     if (offset < OSPREY_STACK_KEY_OFF_MIN || offset > OSPREY_STACK_KEY_OFF_MAX) {
-        trace_mem("[osprey-key] [stack-offset-overflow] [ri %lx] [off %ld]\n",
+        log_msg("[osprey-key] [stack-offset-overflow] [ri %lx] [off %ld]\n",
                   (unsigned long)region_id, (long)offset);
     }
     return OSPREY_STACK_KEY_TAG |
@@ -624,6 +624,8 @@ OspreyTypeManager *g_osprey_type_manager = NULL;
 
 static int use_trace = -1;
 static int trace_fd = -1;
+static int use_log = -1;
+static int log_fd = -1;
 
 static void trace_mem_init(void) {
     if (use_trace != -1) return;
@@ -644,10 +646,33 @@ static void trace_mem_init(void) {
     }
 }
 
+static void log_msg_init(void) {
+    if (use_log != -1) return;
+    char* log_file = getenv("BINRADAR_TRACER_LOG_FILE");
+    if (log_file == NULL) {
+        use_log = 1;
+        log_fd = STDERR_FILENO;
+    } else if (strcmp(log_file, "none") == 0) {
+        use_log = 0;
+    } else {
+        use_log = 1;
+        log_fd = open(log_file, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (log_fd < 0) {
+            fprintf( stderr, "ERROR: cannot open log file %s\n",
+                    log_file);
+            exit_with_status(1);
+        }
+    }
+}
+
 void trace_mem(const char* fmt, ...) {
     trace_mem_init();
     if (!use_trace)
         return;
+    if (mod_manager != NULL) {
+        // Don't write after type analysis is done
+        return;
+    }
     va_list ap;
     char buf[4096];
     va_start(ap, fmt);
@@ -667,10 +692,39 @@ void trace_mem(const char* fmt, ...) {
     (void)wr;
 }
 
+void log_msg(const char* fmt, ...) {
+    log_msg_init();
+    if (!use_log)
+        return;
+    va_list ap;
+    char buf[4096];
+    va_start(ap, fmt);
+    int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    ssize_t wr;
+    if (n < 0) {
+        return;
+    }
+    if (n >= sizeof(buf)) {
+        // This should not happen
+        wr = write(log_fd, buf, sizeof(buf) - 1);
+        wr = write(log_fd, "\n[ERROR] [TRUNCATED]\n", 21);
+    } else {
+        wr = write(log_fd, buf, n);
+    }
+    (void)wr;
+}
+
 void trace_mem_flush(void) {
     if (!use_trace) return;
     if (trace_fd > 2)
         fsync(trace_fd);
+}
+
+static void log_msg_flush(void) {
+    if (!use_log) return;
+    if (log_fd > 2)
+        fsync(log_fd);
 }
 
 const char *snapshot_mem_region_str(SnapshotMemRegion *mr) {
@@ -810,7 +864,7 @@ void snapshot_record_guest_normal_exit(CPUArchState *cpu_env, int exit_code, con
     info->exit_code = exit_code;
     snapshot_exit_info_capture(info, cpu_env);
     snapshot_exit_info_set_reason(info, reason ? reason : "normal_exit");
-    trace_mem("[snapshot] [exit] [normal] [entrypoint-hit %lu]\n",
+    log_msg("[snapshot] [exit] [normal] [entrypoint-hit %lu]\n",
               binradar_entrypoint_hit_count);
     dump_coverage_edge_log(true);
 }
@@ -837,9 +891,9 @@ void snapshot_record_guest_crash(CPUArchState *cpu_env, int target_signal, int h
         g_snprintf(buffer, sizeof(buffer), "%s (host=%d, target=%d)", base, host_signal, target_signal);
     }
     snapshot_exit_info_set_reason(info, buffer);
-    trace_mem("[snapshot] [exit] [crash] [entrypoint-hit %lu]\n",
+    log_msg("[snapshot] [exit] [crash] [entrypoint-hit %lu]\n",
               binradar_entrypoint_hit_count);
-    trace_mem("[snapshot] [crash] [hit-count %lu] [reason %s] [guest_pc %lx] [guest_cs_base %lx] [fault_addr %lx] [host_fault_addr %lx]\n",
+    log_msg("[snapshot] [crash] [hit-count %lu] [reason %s] [guest_pc %lx] [guest_cs_base %lx] [fault_addr %lx] [host_fault_addr %lx]\n",
                 binradar_entrypoint_hit_count, buffer, info->guest_pc, info->guest_cs_base, info->fault_addr, info->host_fault_addr);
     if (binradar_probe_file) {
         FILE *binradar_probe_file_fp = fopen(binradar_probe_file, "a");
@@ -1621,7 +1675,7 @@ void snapshot_init(void) {
     size_t shm_size = sizeof(SharedTraceData);
     shared_trace_data = mmap(NULL, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
     if (shared_trace_data == MAP_FAILED) {
-        trace_mem("mmap shared memory failed");
+        log_msg("mmap shared memory failed");
         exit_with_status(1);
     }
     memset(shared_trace_data, 0, shm_size);
@@ -1651,7 +1705,7 @@ static int walk_memory_cb(void *priv, target_ulong start, target_ulong end,
 void snapshot_save(void) {
     if (g_snapshot.pages == NULL) snapshot_init();
     if (g_snapshot.is_snapshot_taken) return;
-    trace_mem("[snapshot] [mem] [start]\n");
+    log_msg("[snapshot] [mem] [start]\n");
     // CPU state
     // if (g_snapshot.cpu_state) {
     //     trace_mem("[snapshot] [cpu] [at %lx] [size %ld]\n", (uintptr_t)cpu, sizeof(CPUArchState));
@@ -1664,7 +1718,7 @@ void snapshot_save(void) {
     g_snapshot.start_mmap = mmap_next_start;
     
     g_snapshot.is_snapshot_taken = true;
-    trace_mem("[snapshot] [result] [brk %llx] [mmap %llx] [pages %d]\n", (long long int)target_brk, (long long int)mmap_next_start, g_hash_table_size(g_snapshot.pages));
+    log_msg("[snapshot] [result] [brk %llx] [mmap %llx] [pages %d]\n", (long long int)target_brk, (long long int)mmap_next_start, g_hash_table_size(g_snapshot.pages));
     dump_coverage_edge_log(false);
 }
 
@@ -1929,7 +1983,7 @@ void snapshot_remove_mapping(target_ulong addr, target_ulong len) {
 }
 
 void snapshot_fork_setup(void) {
-    trace_mem("[forkserver] [setup]\n");
+    log_msg("[forkserver] [setup]\n");
 }
 
 static abi_ulong snapshot_alloc_pointer_page(void)
@@ -1939,12 +1993,12 @@ static abi_ulong snapshot_alloc_pointer_page(void)
                                   MAP_PRIVATE | MAP_ANONYMOUS,
                                   -1, 0);
     if (mapped == -1) {
-        trace_mem("[mod-pointer] [alloc-error] target_mmap failed\n");
+        log_msg("[mod-pointer] [alloc-error] target_mmap failed\n");
         return (abi_ulong)-1;
     }
 
     memset(g2h((target_ulong)mapped), 0, SNAPSHOT_PAGE_SIZE);
-    trace_mem("[mod-pointer] [alloc] [addr %lx] [size %x]\n",
+    log_msg("[mod-pointer] [alloc] [addr %lx] [size %x]\n",
               (target_ulong)mapped, SNAPSHOT_PAGE_SIZE);
     return (abi_ulong)mapped;
 }
@@ -1971,7 +2025,7 @@ static void snapshot_modify_memory(CPUArchState *cpu_env) {
     // Select one from modifications
     Modification *mod = mod_manager->current;
     if (mod == NULL) {
-        trace_mem("ERROR: empty modification\n");
+        log_msg("ERROR: empty modification\n");
         exit_with_status(1);
     }
     bool pointer_mod = false;
@@ -1983,10 +2037,10 @@ static void snapshot_modify_memory(CPUArchState *cpu_env) {
     }
     abi_ulong pointer_page = (abi_ulong)-1;
     if (pointer_mod) {
-        trace_mem("[mod-pointer] [start]\n");
+        log_msg("[mod-pointer] [start]\n");
         pointer_page = snapshot_alloc_pointer_page();
         if (pointer_page == (abi_ulong)-1) {
-            trace_mem("[mod-pointer] [error] failed to allocate pointer page\n");
+            log_msg("[mod-pointer] [error] failed to allocate pointer page\n");
             exit_with_status(1);
         }
     }
@@ -2009,7 +2063,7 @@ static void snapshot_modify_memory(CPUArchState *cpu_env) {
             target_ulong reg_value;
             memcpy(&reg_value, single_mod.value, sizeof(target_ulong));
             cpu_env->regs[(size_t)single_mod.addr] = reg_value;
-            trace_mem("[mod-reg] [register %ld] [size %ld] [total %d]\n",
+            log_msg("[mod-reg] [register %ld] [size %ld] [total %d]\n",
                       single_mod.addr,
                       single_mod.size,
                       g_queue_get_length(mod_manager->modifications));
@@ -2017,7 +2071,7 @@ static void snapshot_modify_memory(CPUArchState *cpu_env) {
         }
         void *target_addr_h = g2h(single_mod.addr);
         memcpy(target_addr_h, single_mod.value, single_mod.size);
-        trace_mem("[mod] [addr %lx] [size %ld] [total %d]\n", single_mod.addr, single_mod.size, g_queue_get_length(mod_manager->modifications));
+        log_msg("[mod] [addr %lx] [size %ld] [total %d]\n", single_mod.addr, single_mod.size, g_queue_get_length(mod_manager->modifications));
     }
 }
 
@@ -2197,7 +2251,7 @@ static void add_modification_pointer(GQueue *modifications, MutationCandidate *m
                 OspreyType *pointee_type = obj->type->target;
                 int type_size = osprey_type_size(pointee_type);
                 // TODO: add to guest memory and get address
-                trace_mem("[inferred] [pointee] [pointee-type %s] [addr %lx] [size %d]\n", pointee_type->id, mod->addr, type_size);
+                log_msg("[inferred] [pointee] [pointee-type %s] [addr %lx] [size %d]\n", pointee_type->id, mod->addr, type_size);
             }                
         }
     } else {
@@ -2279,7 +2333,7 @@ static void add_modification_pointer(GQueue *modifications, MutationCandidate *m
 
 static bool binradar_manager_check_addr(target_ulong addr) {
     if (snapshot_addr_is_protected(addr)) {
-        trace_mem("[binradar] [check-addr] [addr %lx] [hit]\n", addr);
+        log_msg("[binradar] [check-addr] [addr %lx] [hit]\n", addr);
         return true;
     }
     return false;
@@ -2289,13 +2343,13 @@ static bool binradar_manager_check_addr(target_ulong addr) {
 // Return: remaining modifications
 static int analyze_collected_data(const ArgumentInfo *arg_info, size_t num_arg_regs) {
     if (shared_trace_data == NULL) {
-        trace_mem("Snapshot init error: shared_trace_data is null\n");
+        log_msg("Snapshot init error: shared_trace_data is null\n");
         exit_with_status(1);
     }
     // Analyze exit reason
     SnapshotExitInfo *exit_info = snapshot_exit_info_ptr();
     if (!exit_info || !exit_info->valid) {
-        trace_mem("[analyze] [exit-error] no exit info!!!\n");
+        log_msg("[analyze] [exit-error] no exit info!!!\n");
         return 0;
     }
     bool is_crash = exit_info->crashed;
@@ -2303,12 +2357,12 @@ static int analyze_collected_data(const ArgumentInfo *arg_info, size_t num_arg_r
         const char *host_name =
                     (exit_info->host_signal > 0) ? strsignal(exit_info->host_signal) : NULL;
         if (exit_info->target_signal == 0) {
-            trace_mem("[analyze] [host-crash] [exit %d] [addr %lx] [reason %s] [name %s] [last %lx] Host crashed!!!\n", exit_info->host_signal, exit_info->host_fault_addr, exit_info->description, host_name ? host_name : "unknown", exit_info->guest_last_translation_block);
+            log_msg("[analyze] [host-crash] [exit %d] [addr %lx] [reason %s] [name %s] [last %lx] Host crashed!!!\n", exit_info->host_signal, exit_info->host_fault_addr, exit_info->description, host_name ? host_name : "unknown", exit_info->guest_last_translation_block);
             exit_with_status(1);
         }
-        trace_mem("[analyze] [crash] [exit %d] [target %d] [host %d] [name %s] [fault-addr %lx] [guest-pc %lx] [guest-cs %lx] [si-code %d] [last %lx]\n", exit_info->exit_code, exit_info->target_signal, exit_info->host_signal, host_name ? host_name : "unknown", exit_info->fault_addr, exit_info->guest_pc, exit_info->guest_cs_base, exit_info->si_code, exit_info->guest_last_translation_block);
+        log_msg("[analyze] [crash] [exit %d] [target %d] [host %d] [name %s] [fault-addr %lx] [guest-pc %lx] [guest-cs %lx] [si-code %d] [last %lx]\n", exit_info->exit_code, exit_info->target_signal, exit_info->host_signal, host_name ? host_name : "unknown", exit_info->fault_addr, exit_info->guest_pc, exit_info->guest_cs_base, exit_info->si_code, exit_info->guest_last_translation_block);
     } else {
-        trace_mem("[analyze] [normal] [exit %d] [guest-pc %lx] [guest-cs %lx] [reason %s] [last %lx]\n", exit_info->exit_code, exit_info->guest_pc, exit_info->guest_cs_base, exit_info->description, exit_info->guest_last_translation_block);
+        log_msg("[analyze] [normal] [exit %d] [guest-pc %lx] [guest-cs %lx] [reason %s] [last %lx]\n", exit_info->exit_code, exit_info->guest_pc, exit_info->guest_cs_base, exit_info->description, exit_info->guest_last_translation_block);
     }
 
     // Analyze shared_trace_data
@@ -2329,14 +2383,14 @@ static int analyze_collected_data(const ArgumentInfo *arg_info, size_t num_arg_r
         // TODO: analyze added queries
         Query *query_top = exit_info->next_query;
         for (Query *q = next_query; q < query_top; q++) {
-            trace_mem("[analyze] [query] [op %s] [addr %lx]\n", opkind_to_str(q->query->opkind), q->address);
+            log_msg("[analyze] [query] [op %s] [addr %lx]\n", opkind_to_str(q->query->opkind), q->address);
         }
         // TODO: Add function argument (register) access
         for (size_t i = 0; i < num_arg_regs; i++) {
             if (arg_info[i].expr) {
                 if (is_valid_address(arg_info[i].value, false)) {
                     // Treat as pointer access
-                    trace_mem("[analyze] [sym-arg] [ptr] [reg %zu] [expr %lx]\n", i, arg_info[i].expr);
+                    log_msg("[analyze] [sym-arg] [ptr] [reg %zu] [expr %lx]\n", i, arg_info[i].expr);
                 } else {
                     // Treat as primitive access
                     MutationCandidate mc = {
@@ -2348,7 +2402,7 @@ static int analyze_collected_data(const ArgumentInfo *arg_info, size_t num_arg_r
                     };
                     memcpy(mc.value, &arg_info[i].value, sizeof(target_ulong));
                     g_array_append_val(mod_primitive_candidates, mc);
-                    trace_mem("[analyze] [sym-arg] [prim] [reg %zu] [expr %lx]\n", i, arg_info[i].expr);
+                    log_msg("[analyze] [sym-arg] [prim] [reg %zu] [expr %lx]\n", i, arg_info[i].expr);
                 }
             }
         }
@@ -2360,7 +2414,7 @@ static int analyze_collected_data(const ArgumentInfo *arg_info, size_t num_arg_r
             memcpy(prim_data, prim, sizeof(PrimitiveAccess));
             g_hash_table_insert(g_read_access_tainted_primitives_original, GSIZE_TO_POINTER(prim_data->addr), prim_data);
             g_hash_table_insert(g_read_access_tainted_primitives_all, GSIZE_TO_POINTER(prim_data->addr), prim_data);
-            trace_mem("[analyze] [primitive] [index %d] [addr %lx] [size %d] [id %ld]\n", i, prim->addr, prim->size, prim->access_id);
+            log_msg("[analyze] [primitive] [index %d] [addr %lx] [size %d] [id %ld]\n", i, prim->addr, prim->size, prim->access_id);
             MutationCandidate mod = {
                 .addr = prim->addr,
                 .size = prim->size,
@@ -2380,7 +2434,7 @@ static int analyze_collected_data(const ArgumentInfo *arg_info, size_t num_arg_r
                 OspreyObject *obj = osprey_object_get(g_osprey_type_manager, prim_key, false);
                 if (obj != NULL) {
                     if (obj->type) {
-                        trace_mem("[memgraph] [prim] [type %s] [addr %lx]\n", obj->type->id, prim->addr);
+                        log_msg("[memgraph] [prim] [type %s] [addr %lx]\n", obj->type->id, prim->addr);
                         if (obj->type->kind == OSPREY_TYPE_PRIMITIVE) {
                             // Primitive type: apply generic modifications
                             g_array_append_val(mod_primitive_candidates, mod);
@@ -2389,7 +2443,7 @@ static int analyze_collected_data(const ArgumentInfo *arg_info, size_t num_arg_r
                             PtrNode *ptr_node = osprey_ptr_node_get(g_osprey_type_manager, prim_key, false);
                             uint64_t target_value;
                             memcpy(&target_value, mod.value, sizeof(uint64_t));
-                            trace_mem("[inferred] [pointer] [addr %lx] [target %lx] [type %s]\n", prim->addr, target_value, obj->type->id);
+                            log_msg("[inferred] [pointer] [addr %lx] [target %lx] [type %s]\n", prim->addr, target_value, obj->type->id);
                             if (ptr_node == NULL) {
                                 ptr_node = osprey_ptr_node_get(g_osprey_type_manager, prim_key, false);
                                 if (ptr_node) {
@@ -2399,7 +2453,7 @@ static int analyze_collected_data(const ArgumentInfo *arg_info, size_t num_arg_r
                                     osprey_ptr_edge_create(g_osprey_type_manager, ptr_node, ptr_node->points_to);
                                     g_array_append_val(pointer_nodes, ptr_node);
                                 } else {
-                                    trace_mem("[memgraph] [pointer-error] [no-node] [addr %lx]\n", prim->addr);
+                                    log_msg("[memgraph] [pointer-error] [no-node] [addr %lx]\n", prim->addr);
                                 }
                             }
                         }
@@ -2423,7 +2477,7 @@ static int analyze_collected_data(const ArgumentInfo *arg_info, size_t num_arg_r
             memcpy(ptr_data, ptr, sizeof(PointerAccess));
             g_hash_table_insert(g_read_access_pointers_original, GSIZE_TO_POINTER(ptr_data->addr), ptr_data);
             g_hash_table_insert(g_read_access_pointers_all, GSIZE_TO_POINTER(ptr_data->addr), ptr_data);
-            trace_mem("[analyze] [pointer] [index %d] [addr %lx] [target %lx] [id %ld]\n", i, ptr->addr, ptr->target, ptr->access_id);
+            log_msg("[analyze] [pointer] [index %d] [addr %lx] [target %lx] [id %ld]\n", i, ptr->addr, ptr->target, ptr->access_id);
             MutationCandidate mod = {
                 .addr = ptr->addr,
                 .size = sizeof(target_ulong),
@@ -2441,7 +2495,7 @@ static int analyze_collected_data(const ArgumentInfo *arg_info, size_t num_arg_r
                 uint64_t target_key = ptr->target_key ? ptr->target_key : (uint64_t)ptr->target;
                 OspreyObject *obj = osprey_object_get(g_osprey_type_manager, ptr_key, false);
                 if (obj != NULL) {
-                    trace_mem("[memgraph] [pointer] [type %s] [addr %lx] [target %lx]\n", obj->type ? obj->type->id : "unknown", ptr->addr, ptr->target);
+                    log_msg("[memgraph] [pointer] [type %s] [addr %lx] [target %lx]\n", obj->type ? obj->type->id : "unknown", ptr->addr, ptr->target);
                     // add_modification_pointer(mod_manager->modifications, &mod);
                     PtrNode *ptr_node = osprey_ptr_node_get(g_osprey_type_manager, ptr_key, false);
                     if (ptr_node) {
@@ -2454,7 +2508,7 @@ static int analyze_collected_data(const ArgumentInfo *arg_info, size_t num_arg_r
                         osprey_ptr_edge_create(g_osprey_type_manager, ptr_node, ptr_node->points_to);
                         g_array_append_val(pointer_nodes, ptr_node);
                     } else {
-                        trace_mem("[memgraph] [pointer-error] [no-node] [addr %lx]\n", ptr->addr);
+                        log_msg("[memgraph] [pointer-error] [no-node] [addr %lx]\n", ptr->addr);
                     }
                 }
                 continue;
@@ -2546,7 +2600,7 @@ static int analyze_collected_data(const ArgumentInfo *arg_info, size_t num_arg_r
                 }
             }
 
-            trace_mem("[memgraph] [candidate] [terminal %d] [pointing %d]\n",
+            log_msg("[memgraph] [candidate] [terminal %d] [pointing %d]\n",
                       terminal_nodes->len, terminal_pointing_nodes->len);
             for (int i = 0; i < terminal_pointing_nodes->len; i++) {
                 PtrNode *ptr_node = g_array_index(terminal_pointing_nodes, PtrNode *, i);
@@ -2568,11 +2622,11 @@ static int analyze_collected_data(const ArgumentInfo *arg_info, size_t num_arg_r
                 target_ulong actual_value;
                 memcpy(&actual_value, g2h(ptr_node->addr), sizeof(target_ulong));
                 if (actual_value == 0) {
-                    trace_mem("[candidate] [pointer] [null] [addr %lx] [size %d]\n", mod.addr, mod.size);
+                    log_msg("[candidate] [pointer] [null] [addr %lx] [size %d]\n", mod.addr, mod.size);
                     mod.value_addr = 1; // dummy non-null value
                     mod.value_obj = g_malloc0(size);
                 }
-                trace_mem("[candidate] [pointer] [addr %lx] [size %d] [actual_value %lx]\n", mod.addr, mod.size, actual_value);
+                log_msg("[candidate] [pointer] [addr %lx] [size %d] [actual_value %lx]\n", mod.addr, mod.size, actual_value);
                 Modification *modification = add_single_modification(&mod);
                 g_queue_push_tail(mod_manager->modifications, modification);
             }
@@ -2589,12 +2643,12 @@ static int analyze_collected_data(const ArgumentInfo *arg_info, size_t num_arg_r
         for (int i = 0; i < mod_primitive_candidates->len; i++) {
             MutationCandidate mod = g_array_index(mod_primitive_candidates, MutationCandidate, i);
             if (binradar_manager_check_addr(mod.addr)) {
-                trace_mem("[binradar] [skip-mod] [addr %lx]\n", mod.addr);
+                log_msg("[binradar] [skip-mod] [addr %lx]\n", mod.addr);
                 continue;
             }
             add_modification_primitive(mod_manager->modifications, &mod);
         }
-        trace_mem("[analyze] [queue] [len %d]\n", g_queue_get_length(mod_manager->modifications));
+        log_msg("[analyze] [queue] [len %d]\n", g_queue_get_length(mod_manager->modifications));
         g_array_free(pointer_nodes, true);
         g_array_free(mod_primitive_candidates, true);
         return g_queue_get_length(mod_manager->modifications);
@@ -2617,7 +2671,7 @@ static int analyze_collected_data(const ArgumentInfo *arg_info, size_t num_arg_r
         //         PrimitiveAccess *prim_data = g_new(PrimitiveAccess, 1);
         //         memcpy(prim_data, prim, sizeof(PrimitiveAccess));
         //         g_hash_table_insert(g_read_access_tainted_primitives_all, GSIZE_TO_POINTER(prim_data->addr), prim_data);
-        //         trace_mem("[analyze] [new-primitive] [index %d] [addr %lx] [size %d] [id %ld]\n", i, prim->addr, prim->size, prim->access_id);
+        //         log_msg("[analyze] [new-primitive] [index %d] [addr %lx] [size %d] [id %ld]\n", i, prim->addr, prim->size, prim->access_id);
         //         MutationCandidate mod = {
         //             .addr = prim->addr,
         //             .size = prim->size,
@@ -2652,7 +2706,7 @@ static int analyze_collected_data(const ArgumentInfo *arg_info, size_t num_arg_r
         //         PointerAccess *ptr_data = g_new(PointerAccess, 1);
         //         memcpy(ptr_data, ptr, sizeof(PointerAccess));
         //         g_hash_table_insert(g_read_access_pointers_all, GSIZE_TO_POINTER(ptr_data->addr), ptr_data);
-        //         trace_mem("[analyze] [new-pointer] [index %d] [addr %lx] [target %lx] [id %ld]\n", i, ptr->addr, ptr->target, ptr->access_id);
+        //         log_msg("[analyze] [new-pointer] [index %d] [addr %lx] [target %lx] [id %ld]\n", i, ptr->addr, ptr->target, ptr->access_id);
         //         MutationCandidate mod = {
         //             .addr = ptr->addr,
         //             .size = sizeof(target_ulong),
@@ -2673,7 +2727,7 @@ static int analyze_collected_data(const ArgumentInfo *arg_info, size_t num_arg_r
     mod_manager->current = g_queue_pop_head(mod_manager->modifications);
     // TODO: restore file offset if needed
     if (mod_manager->current == NULL) {
-        trace_mem("[analyze] [done] consumed all modifications\n");
+        log_msg("[analyze] [done] consumed all modifications\n");
         return 0;
     }
     // Clean expr and query added during child execution
@@ -2731,7 +2785,7 @@ static void binradar_commit(BinradarManager *manager) {
     for (uint32_t i = 0; i < manager->patch_cnt + 1; i++) {
         PatchedResult res = manager->current->patch_results[i];
         if (res.br_taken == NULL) {
-            trace_mem("[binradar] [commit] [iter %d] [patch %d] [br null]\n", cur_iter, i);
+            log_msg("[binradar] [commit] [iter %d] [patch %d] [br null]\n", cur_iter, i);
             clone->patch_results[i] = res;
             continue;
         }
@@ -2742,7 +2796,7 @@ static void binradar_commit(BinradarManager *manager) {
                 break;
             }
         }
-        trace_mem("[binradar] [commit] [iter %d] [patch %d] [br %s]\n", cur_iter, i, br_buf);
+        log_msg("[binradar] [commit] [iter %d] [patch %d] [br %s]\n", cur_iter, i, br_buf);
         clone->patch_results[i] = res;
         if (cur_iter == 1) {
             break;
@@ -2755,26 +2809,26 @@ static void binradar_commit(BinradarManager *manager) {
 static void set_nonblock(int fd) {
     int flags = fcntl(fd, F_GETFL);
     if (flags < 0) {
-        trace_mem("fcntl(F_GETFL)");
+        log_msg("fcntl(F_GETFL)");
         exit_with_status(1);
     }
     if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
-        trace_mem("fcntl(F_SETFL)");
+        log_msg("fcntl(F_SETFL)");
         exit_with_status(1);
     }
 }
 
 static PatchedResult *get_patched_result_tmp(BinradarManager *manager, uint32_t patch_id) {
     if (manager == NULL) {
-        trace_mem("Manager not initialized");
+        log_msg("Manager not initialized");
         exit_with_status(1);
     }
     if (manager->current == NULL) {
-        trace_mem("Current result not initialized");
+        log_msg("Current result not initialized");
         exit_with_status(1);
     }
     if (patch_id > manager->patch_cnt) {
-        trace_mem("Invalid patch ID: %u", patch_id);
+        log_msg("Invalid patch ID: %u", patch_id);
         exit_with_status(1);
     }
     return &manager->current->patch_results[patch_id];
@@ -2782,7 +2836,7 @@ static PatchedResult *get_patched_result_tmp(BinradarManager *manager, uint32_t 
 
 static void binradar_manager_handle_patch_line(BinradarManager *manager, const char *line) {
     sbsv_row *row = NULL;
-    trace_mem("[binradar] [patch-res] %s\n", line);
+    log_msg("[binradar] [patch-res] %s\n", line);
     sbsv_parser_parse_line_detached(manager->patch_result_parser, line, 0, &row);
     int cur_iter = binradar_manager_cur_iter(manager, -1);
     if (row != NULL) {
@@ -2792,12 +2846,12 @@ static void binradar_manager_handle_patch_line(BinradarManager *manager, const c
             int br = sbsv_row_get_bool(row, "br", NULL);
             long long iter = sbsv_row_get_int(row, "v", NULL);
             if (iter != cur_iter) {
-                trace_mem("[binradar] [iter-mismatch] [v %lld] [iter %d] [id %lld] [br %d]\n", iter, cur_iter, patch_id, br);
+                log_msg("[binradar] [iter-mismatch] [v %lld] [iter %d] [id %lld] [br %d]\n", iter, cur_iter, patch_id, br);
                 sbsv_row_free(row);
                 return;
             }
             if (patch_id < 0 || patch_id > UINT32_MAX) {
-                trace_mem("[binradar] [invalid-patch-id] [id %lld]\n", patch_id);
+                log_msg("[binradar] [invalid-patch-id] [id %lld]\n", patch_id);
                 sbsv_row_free(row);
                 return;
             }
@@ -2885,7 +2939,7 @@ static int wait_child_and_drain_patch(pid_t child_pid, uint32_t *status_out) {
             child_exited = true;
             break;
         } else if (r < 0) {
-            trace_mem("waitpid(WNOHANG)\n");
+            log_msg("waitpid(WNOHANG)\n");
             return -1;
         }
 
@@ -2894,7 +2948,7 @@ static int wait_child_and_drain_patch(pid_t child_pid, uint32_t *status_out) {
             if (errno == EINTR) {
                 continue;
             }
-            trace_mem("poll\n");
+            log_msg("poll\n");
             return -1;
         }
 
@@ -2907,7 +2961,7 @@ static int wait_child_and_drain_patch(pid_t child_pid, uint32_t *status_out) {
         }
 
         if (pfd.revents & POLLERR) {
-            trace_mem("patch pipe POLLERR\n");
+            log_msg("patch pipe POLLERR\n");
             binradar_manager_drain_patch_fd_once(binradar_manager);
         }
     }
@@ -2920,13 +2974,13 @@ static int wait_child_and_drain_patch(pid_t child_pid, uint32_t *status_out) {
 
 
 void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env, const ArgumentInfo *arg_info, size_t num_arg_regs) {
-    trace_mem("[snapshot] [forkserver] [called %d]\n", forkserver_installed);
+    log_msg("[snapshot] [forkserver] [called %d]\n", forkserver_installed);
     if (forkserver_installed) return;
     forkserver_installed = true;
     rcu_disable_atfork();
     snapshot_save();
     if (binradar_forkserver_ctrl_r == -1 || binradar_forkserver_stat_w == -1) {
-        trace_mem("[snapshot] [forkserver] [error] invalid binradar control fds\n");
+        log_msg("[snapshot] [forkserver] [error] invalid binradar control fds\n");
         exit_with_status(1);
     }
     pid_t child_pid;
@@ -2953,30 +3007,30 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env, const ArgumentInf
        to talk, assume that we're not running in forkserver mode. */
   
     if (write(binradar_forkserver_stat_w, msg, 4) != 4) {
-        trace_mem("[snapshot] [forkserver] [error] failed to write to %d %d\n", binradar_forkserver_stat_w, status);
+        log_msg("[snapshot] [forkserver] [error] failed to write to %d %d\n", binradar_forkserver_stat_w, status);
         exit_with_status(1);
     }
   
     afl_forksrv_pid = getpid();
   
     if (read(binradar_forkserver_ctrl_r, reply, 4) != 4) {
-        trace_mem("[snapshot] [forkserver] [error] fuzzolic not responding to %d\n", binradar_forkserver_ctrl_r);
+        log_msg("[snapshot] [forkserver] [error] fuzzolic not responding to %d\n", binradar_forkserver_ctrl_r);
         exit_with_status(1);
     }
     if (tmp != reply_value) {
-        trace_mem("wrong forkserver message from fuzzolic.py");
+        log_msg("wrong forkserver message from fuzzolic.py");
         exit_with_status(1);
     }
 
     // send welcome message as final message
     if (write(binradar_forkserver_stat_w, msg, 4) != 4) { 
-        trace_mem("[snapshot] [forkserver] [error] failed to send final handshake to %d %d\n", binradar_forkserver_stat_w, status);
+        log_msg("[snapshot] [forkserver] [error] failed to send final handshake to %d %d\n", binradar_forkserver_stat_w, status);
         exit_with_status(1);
     }
   
   
     // END forkserver handshake
-    trace_mem("[forkserver] [start]\n");
+    log_msg("[forkserver] [start]\n");
   
     /* All right, let's await orders... */
   
@@ -2985,7 +3039,7 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env, const ArgumentInf
         /* Whoops, parent dead? */
     
         if (read(binradar_forkserver_ctrl_r, &was_killed, 4) != 4) {
-            trace_mem("[forkserver] [exit] parent (fuzzolic) dead or exit\n");
+            log_msg("[forkserver] [exit] parent (fuzzolic) dead or exit\n");
             exit_with_status(2);
         }
         binradar_commit(binradar_manager); // Commit collected patch results from previous iteration
@@ -3007,9 +3061,11 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env, const ArgumentInf
                 status[1] = i; // patch id
                 status[2] = binradar_iter; // iter
                 binradar_manager_cur_patch_id(binradar_manager, i);
-                trace_mem("[binradar] [shm] [patch-id %d] [iter %d]\n", *binradar_manager->cur_patch_id, *binradar_manager->cur_iter);
+                log_msg("[binradar] [shm] [patch-id %d] [iter %d]\n", *binradar_manager->cur_patch_id, *binradar_manager->cur_iter);
             }
             fflush(NULL);
+            trace_mem_flush();
+            log_msg_flush();
             child_pid = fork();
             if (child_pid < 0) exit_with_status(4);
 
@@ -3048,10 +3104,10 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env, const ArgumentInf
 
             // Get type inference result
             if (read(binradar_forkserver_ctrl_r, &analyze_result_len, 4) != 4) {
-                trace_mem("[forkserver] [error] failed to read analyze_result_len from %d\n", binradar_forkserver_ctrl_r);
+                log_msg("[forkserver] [error] failed to read analyze_result_len from %d\n", binradar_forkserver_ctrl_r);
                 exit_with_status(8);
             }
-            trace_mem("[forkserver] [analyze-result] [len %lu]\n", analyze_result_len);
+            log_msg("[forkserver] [analyze-result] [len %lu]\n", analyze_result_len);
 
             if (analyze_result_len > 0) {
                 if (analyze_result_len > analyze_result_len_prev) {
@@ -3063,13 +3119,13 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env, const ArgumentInf
                 while (total_read < analyze_result_len) {
                     ssize_t bytes_read = read(binradar_forkserver_ctrl_r, analyze_result + total_read, analyze_result_len - total_read);
                     if (bytes_read <= 0) {
-                        trace_mem("[forkserver] [error] failed to read analyze_result from %d\n", binradar_forkserver_ctrl_r);
+                        log_msg("[forkserver] [error] failed to read analyze_result from %d\n", binradar_forkserver_ctrl_r);
                         exit_with_status(9);
                     }
                     total_read += bytes_read;
                 }
                 analyze_result[analyze_result_len] = '\0';
-                trace_mem("[forkserver] [analyze-result] [accept %lu]\n", analyze_result_len);
+                log_msg("[forkserver] [analyze-result] [accept %lu]\n", analyze_result_len);
                 snapshot_load_inferred_types(analyze_result);
             }
 
@@ -3163,13 +3219,12 @@ void snapshot_load_inferred_types(uint8_t *analyze_result) {
     sbsv_parser_add_schema(parser, "[array-elem] [RT: region_type] [RB: hex] [RI: hex] [off: hex] [sz: hex] [type: str] [array-offset: hex] [array-id: str] [idx: int] [P: float]");
     sbsv_parser_add_schema(parser, "[scalar] [RT: region_type] [RB: hex] [RI: hex] [off: hex] [sz: hex] [type: str] [P: float]");
     sbsv_parser_add_schema(parser, "[pointer-var] [RT: region_type] [RB: hex] [RI: hex] [off: hex] [sz: hex] [type: str] [target: hex] [t-role: str] [t-val: str] [P: float]");
-    // trace_mem("%s", (const char *)analyze_result);
     if (sbsv_parser_loads(parser, (const char *)analyze_result) != SBSV_OK) {
-        trace_mem("Failed to load inferred types - %s\n", sbsv_parser_last_error(parser));
+        log_msg("Failed to load inferred types - %s\n", sbsv_parser_last_error(parser));
         sbsv_parser_free(parser);
         return;
     }
-    trace_mem("[snapshot] [load-inferred-types] [start]\n");
+    log_msg("[snapshot] [load-inferred-types] [start]\n");
     const sbsv_row** rows = NULL;
     size_t num_rows = 0;
     int valid = 1;
@@ -3188,7 +3243,7 @@ void snapshot_load_inferred_types(uint8_t *analyze_result) {
         type->is_pointer = false;
         osprey_type_manager_add_type(g_osprey_type_manager, type);
         g_array_append_val(primitive_types, type);
-        // trace_mem("[inferred-type] [primitive] [id %s] [size %lld] [body %s]\n", id, size, body);
+        // log_msg("[inferred-type] [primitive] [id %s] [size %lld] [body %s]\n", id, size, body);
     }
     sbsv_free_row_ref_array(rows);
 
@@ -3268,7 +3323,7 @@ void snapshot_load_inferred_types(uint8_t *analyze_result) {
         obj->size = hi - lo;
         obj->type = osprey_type_get(g_osprey_type_manager, type_id);
         if (obj->type == NULL) {
-            trace_mem("Failed to find type for array start: %s\n", type_id);
+            log_msg("Failed to find type for array start: %s\n", type_id);
         }
         ObjNode *obj_node = osprey_obj_node_get(g_osprey_type_manager, array_key, true);
         obj_node->obj = obj;
@@ -3284,7 +3339,7 @@ void snapshot_load_inferred_types(uint8_t *analyze_result) {
         obj->role = OSPREY_ROLE_STRUCT_BASE;
         obj->type = osprey_type_get(g_osprey_type_manager, type_id);
         if (obj->type == NULL) {
-            trace_mem("Failed to find type for struct base: %s\n", type_id);
+            log_msg("Failed to find type for struct base: %s\n", type_id);
         }
         ObjNode *obj_node = osprey_obj_node_get(g_osprey_type_manager, base, true);
         obj_node->obj = obj;
@@ -3365,7 +3420,7 @@ void snapshot_load_inferred_types(uint8_t *analyze_result) {
             ptr_node->is_value_pointer = true;
             ptr_node->base = osprey_obj_node_get(g_osprey_type_manager, array_start_key, false);
         } else if (obj->type == NULL) {
-            trace_mem("[inferred-type] [array-elem] missing type [addr %lx] [type-id %s]\n",
+            log_msg("[inferred-type] [array-elem] missing type [addr %lx] [type-id %s]\n",
                       (uint64_t)(region_base + off), type_id ? type_id : "(null)");
         }
     }
@@ -3395,7 +3450,7 @@ void snapshot_load_inferred_types(uint8_t *analyze_result) {
             ptr_node->is_value_pointer = true;
             ptr_node->base = osprey_obj_node_get(g_osprey_type_manager, base_key, false);
         } else if (obj->type == NULL) {
-            trace_mem("[inferred-type] [field] missing type [addr %lx] [type-id %s]\n",
+            log_msg("[inferred-type] [field] missing type [addr %lx] [type-id %s]\n",
                       (uint64_t)(region_base + off), type_id ? type_id : "(null)");
         }
         
@@ -3451,7 +3506,7 @@ void snapshot_load_inferred_types(uint8_t *analyze_result) {
         // uint64_t addr = GPOINTER_TO_UINT(key);
         OspreyObject *obj = (OspreyObject *)value;
         if (obj->type == NULL) {
-            trace_mem("Failed to find type for address %lx, role %d\n", obj->addr, obj->role);
+            log_msg("Failed to find type for address %lx, role %d\n", obj->addr, obj->role);
         }
     }
     g_hash_table_iter_init(&iter, g_osprey_type_manager->obj_addr_to_type);
@@ -3459,8 +3514,8 @@ void snapshot_load_inferred_types(uint8_t *analyze_result) {
         // uint64_t addr = GPOINTER_TO_UINT(key);
         OspreyObject *obj = (OspreyObject *)value;
         if (obj->type == NULL) {
-            trace_mem("Failed to find type for object address %lx, role %d\n", obj->addr, obj->role);
+            log_msg("Failed to find type for object address %lx, role %d\n", obj->addr, obj->role);
         }
     }
-    trace_mem("[snapshot] [load-inferred-types] [finish]\n");
+    log_msg("[snapshot] [load-inferred-types] [finish]\n");
 }

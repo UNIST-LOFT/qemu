@@ -14,6 +14,7 @@
 typedef struct Expr Expr;
 
 void trace_mem(const char* fmt, ...);
+void log_msg(const char *fmt, ...);
 
 extern bool restoring_to_snapshot;
 extern target_ulong binradar_entrypoint;

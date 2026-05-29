@@ -2531,7 +2531,7 @@ static void load_elf_image(const char *image_name, int image_fd,
         if (binradar_entrypoint == 0) {
             binradar_entrypoint = info->entry;
         }
-        trace_mem("[snapshot] [entrypoint] [addr %lx] [bias %lx]\n", binradar_entrypoint, load_bias);
+        log_msg("[snapshot] [entrypoint] [addr %lx] [bias %lx]\n", binradar_entrypoint, load_bias);
     }
     fprintf(stderr, "load_addr: %lx, load_bias: %lx\n", load_addr, load_bias);
     
