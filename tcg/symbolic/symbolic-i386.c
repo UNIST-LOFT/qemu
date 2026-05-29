@@ -602,8 +602,8 @@ static inline void qemu_memmove(CPUArchState *cpu_env, uintptr_t src, uintptr_t 
         memcpy(&val, mem_access.target, size);
         is_ptr = is_valid_address(val, false);
     }
-    SnapshotMemRegion *mr_src = snapshot_mem_region_search(src);
-    SnapshotMemRegion *mr_dst = snapshot_mem_region_search(dst);
+    SnapshotMemRegion *mr_src = snapshot_mem_region_search_with_size(src, size);
+    SnapshotMemRegion *mr_dst = snapshot_mem_region_search_with_size(dst, size);
     trace_mem("[memmoveh] [src %lx] [dst %lx] [size %lx] [val %lx] [is-ptr %d] [src-r %s] [src-rb %lx] [dst-r %s] [dst-rb %lx]\n", src, dst, size, val, is_ptr, snapshot_mem_region_str(mr_src), mr_src ? mr_src->base : 0, snapshot_mem_region_str(mr_dst), mr_dst ? mr_dst->base : 0);
     // Add snapshot_write_access to dst if needed
 

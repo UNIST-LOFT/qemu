@@ -5067,7 +5067,9 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
 
 #ifdef SYMBOLIC_INSTRUMENTATION
 #if SYMBOLIC_CALLSTACK_INSTRUMENTATION
-            gen_helper_instrument_call(s->T1);
+            TCGv t_call_pc = tcg_const_tl(pc_start - s->cs_base);
+            gen_helper_instrument_call(t_call_pc, s->T1, cpu_regs[R_ESP]);
+            tcg_temp_free(t_call_pc);
 #endif
 #endif
 
@@ -6525,7 +6527,7 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
 
 #ifdef SYMBOLIC_INSTRUMENTATION
 #if SYMBOLIC_CALLSTACK_INSTRUMENTATION
-        gen_helper_instrument_ret(s->T0);
+        gen_helper_instrument_ret(s->T0, cpu_regs[R_ESP]);
 #endif
 #endif
 
@@ -6540,7 +6542,7 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
 
 #ifdef SYMBOLIC_INSTRUMENTATION
 #if SYMBOLIC_CALLSTACK_INSTRUMENTATION
-        gen_helper_instrument_ret(s->T0);
+        gen_helper_instrument_ret(s->T0, cpu_regs[R_ESP]);
 #endif
 #endif
 
@@ -6614,7 +6616,9 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
 
 #ifdef SYMBOLIC_INSTRUMENTATION
 #if SYMBOLIC_CALLSTACK_INSTRUMENTATION
-            gen_helper_instrument_call(s->T0);
+            TCGv t_call_pc = tcg_const_tl(pc_start - s->cs_base);
+            gen_helper_instrument_call(t_call_pc, s->T0, cpu_regs[R_ESP]);
+            tcg_temp_free(t_call_pc);
 #endif
 #endif
 

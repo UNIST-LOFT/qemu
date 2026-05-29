@@ -68,6 +68,21 @@ typedef struct SnapshotMemRegionManager {
     GArray *global_data;
 } SnapshotMemRegionManager;
 
+typedef struct DynStackFrame {
+    uint64_t frame_id;
+    target_ulong entry_sp;
+    target_ulong min_sp;
+    target_ulong call_pc;
+    target_ulong ret_pc;
+    target_ulong maybe_rbp;
+    bool has_rbp;
+    bool imprecise;
+    bool synthetic;
+    SnapshotMemRegion region;
+} DynStackFrame;
+
+static uint64_t next_dyn_frame_id = 1;
+
 static SnapshotMemRegionManager mr_manager;
 static GArray *pending_allocs = NULL;
 
@@ -108,6 +123,7 @@ typedef struct PrimitiveAccess {
     uintptr_t addr;
     uintptr_t pc;
     uint64_t access_id;
+    uint64_t type_key;
     Expr *expr;
 } PrimitiveAccess;
 
@@ -116,6 +132,8 @@ typedef struct PointerAccess {
     uintptr_t target;
     uintptr_t pc;
     uint64_t access_id;
+    uint64_t type_key;
+    uint64_t target_key;
     Expr *expr;
 } PointerAccess;
 
@@ -404,15 +422,15 @@ struct ObjNode {
 };
 
 struct MemGraph {
-    GHashTable *ptr_nodes; // addr -> PtrNode
-    GHashTable *obj_nodes; // addr -> ObjNode
+    GHashTable *ptr_nodes; // canonical key -> PtrNode
+    GHashTable *obj_nodes; // canonical key -> ObjNode
 };
 
 typedef struct OspreyTypeManager {
     GHashTable *type_table; // char* id -> OspreyType*
-    GHashTable *obj_addr_to_type; // uint64_t addr -> OspreyObject* (scalar, pointer, array_elem, field)
-    GHashTable *addr_to_type; // uint64_t addr -> OspreyObject* (array_start, struct)
-    GHashTable *addr_to_type_id; // uint64_t addr -> char* type_id
+    GHashTable *obj_addr_to_type; // canonical key -> OspreyObject* (scalar, pointer, array_elem, field)
+    GHashTable *addr_to_type; // canonical key -> OspreyObject* (array_start, struct)
+    GHashTable *addr_to_type_id; // canonical key -> char* type_id
     MemGraph mem_graph;
 } OspreyTypeManager;
 
@@ -527,6 +545,79 @@ static OspreyType *osprey_type_get(OspreyTypeManager *manager, const char *type_
     }
     OspreyType *type = (OspreyType *)g_hash_table_lookup(manager->type_table, type_id);
     return type;
+}
+
+#define OSPREY_REGION_STACK 0
+#define OSPREY_STACK_KEY_TAG (1ULL << 63)
+#define OSPREY_STACK_KEY_ID_BITS 40
+#define OSPREY_STACK_KEY_OFF_BITS 23
+#define OSPREY_STACK_KEY_ID_MASK ((1ULL << OSPREY_STACK_KEY_ID_BITS) - 1)
+#define OSPREY_STACK_KEY_OFF_MASK ((1ULL << OSPREY_STACK_KEY_OFF_BITS) - 1)
+#define OSPREY_STACK_KEY_OFF_MIN (-(1LL << (OSPREY_STACK_KEY_OFF_BITS - 1)))
+#define OSPREY_STACK_KEY_OFF_MAX ((1LL << (OSPREY_STACK_KEY_OFF_BITS - 1)) - 1)
+
+static target_ulong dyn_frame_legacy_id(const DynStackFrame *frame) {
+    if (frame == NULL) {
+        return 0;
+    }
+    if (frame->call_pc != 0) {
+        return frame->call_pc;
+    }
+    if (frame->ret_pc != 0) {
+        return frame->ret_pc;
+    }
+    return frame->frame_id;
+}
+
+static uint64_t osprey_stack_type_key(uint64_t region_id, int64_t offset) {
+    if (offset < OSPREY_STACK_KEY_OFF_MIN || offset > OSPREY_STACK_KEY_OFF_MAX) {
+        trace_mem("[osprey-key] [stack-offset-overflow] [ri %lx] [off %ld]\n",
+                  (unsigned long)region_id, (long)offset);
+    }
+    return OSPREY_STACK_KEY_TAG |
+           ((region_id & OSPREY_STACK_KEY_ID_MASK) << OSPREY_STACK_KEY_OFF_BITS) |
+           ((uint64_t)offset & OSPREY_STACK_KEY_OFF_MASK);
+}
+
+static uint64_t osprey_type_key_from_region(int64_t region_type,
+                                            int64_t region_base,
+                                            int64_t region_id,
+                                            int64_t offset) {
+    if (region_type == OSPREY_REGION_STACK) {
+        return osprey_stack_type_key((uint64_t)region_id, offset);
+    }
+    return (uint64_t)(region_base + offset);
+}
+
+static DynStackFrame *dyn_stack_find_frame_for_access_key(uintptr_t addr,
+                                                          uintptr_t size) {
+    if (mr_manager.stack_data == NULL || size == 0) {
+        return NULL;
+    }
+    uintptr_t end = addr + size;
+    if (end < addr) {
+        return NULL;
+    }
+    for (ssize_t i = mr_manager.stack_data->len - 1; i >= 0; i--) {
+        DynStackFrame *frame = g_array_index(mr_manager.stack_data,
+                                             DynStackFrame *, i);
+        if (frame == NULL) {
+            continue;
+        }
+        if (addr >= frame->min_sp && end <= frame->entry_sp) {
+            return frame;
+        }
+    }
+    return NULL;
+}
+
+static uint64_t osprey_type_key_for_access(uintptr_t addr, uintptr_t size) {
+    DynStackFrame *frame = dyn_stack_find_frame_for_access_key(addr, size);
+    if (frame != NULL) {
+        int64_t off = (int64_t)addr - (int64_t)frame->entry_sp;
+        return osprey_stack_type_key(dyn_frame_legacy_id(frame), off);
+    }
+    return (uint64_t)addr;
 }
 
 OspreyTypeManager *g_osprey_type_manager = NULL;
@@ -811,9 +902,13 @@ static void add_read_access_pointer(uintptr_t addr, uintptr_t target, uintptr_t 
     ptr->target = target;
     ptr->pc = pc;
     ptr->access_id = __atomic_fetch_add(&shared_trace_data->ptr_access_cnt, 1, __ATOMIC_RELAXED);
+    ptr->type_key = osprey_type_key_for_access(addr, sizeof(target_ulong));
+    ptr->target_key = target ? osprey_type_key_for_access(target, 1) : 0;
     ptr->expr = NULL;
     entry->data = ptr;
-    trace_mem("[rpo] [addr %lx] [target %lx] [pc %lx] [index %d] [id %ld]\n", addr, target, pc, entry->shared_index, ptr->access_id);
+    trace_mem("[rpo] [addr %lx] [target %lx] [pc %lx] [index %d] [id %ld] [key %lx] [target-key %lx]\n",
+              addr, target, pc, entry->shared_index, ptr->access_id,
+              ptr->type_key, ptr->target_key);
 }
 
 static void add_read_access_primitive(uintptr_t addr, int size, uintptr_t pc) {
@@ -846,9 +941,12 @@ static void add_read_access_primitive(uintptr_t addr, int size, uintptr_t pc) {
     prim->size = size;
     prim->pc = pc;
     prim->access_id = __atomic_fetch_add(&shared_trace_data->prim_access_cnt, 1, __ATOMIC_RELAXED);
+    prim->type_key = osprey_type_key_for_access(addr, size);
     prim->expr = NULL;
     entry->data = prim;
-    trace_mem("[rpi] [addr %lx] [size %d] [pc %lx] [index %d] [id %ld]\n", addr, size, pc, entry->shared_index, prim->access_id);
+    trace_mem("[rpi] [addr %lx] [size %d] [pc %lx] [index %d] [id %ld] [key %lx]\n",
+              addr, size, pc, entry->shared_index, prim->access_id,
+              prim->type_key);
 }
 
 void snapshot_bind_read_expr(uintptr_t addr, uintptr_t size, Expr *expr) {
@@ -983,10 +1081,163 @@ static int check_addr_in_region(SnapshotMemRegion *mr, target_ulong addr) {
     return 0;
 }
 
+static target_ulong dyn_frame_low(const DynStackFrame *frame) {
+    return frame ? frame->min_sp : 0;
+}
+
+static target_ulong dyn_frame_high(const DynStackFrame *frame) {
+    return frame ? frame->entry_sp : 0;
+}
+
+static void dyn_frame_sync_region(DynStackFrame *frame) {
+    if (frame == NULL) {
+        return;
+    }
+    frame->region.is_heap = false;
+    frame->region.is_stack = true;
+    frame->region.base = frame->entry_sp;
+    frame->region.size = frame->entry_sp >= frame->min_sp
+        ? frame->entry_sp - frame->min_sp
+        : 0;
+    frame->region.pc = frame->frame_id;
+}
+
+static DynStackFrame *dyn_stack_top(void) {
+    if (mr_manager.stack_data == NULL || mr_manager.stack_data->len == 0) {
+        return NULL;
+    }
+    return g_array_index(mr_manager.stack_data, DynStackFrame *,
+                         mr_manager.stack_data->len - 1);
+}
+
+static void dyn_stack_update_summary(void) {
+    mr_manager.stack_region.is_heap = false;
+    mr_manager.stack_region.is_stack = true;
+    mr_manager.stack_region.pc = 0;
+
+    if (mr_manager.stack_data == NULL || mr_manager.stack_data->len == 0) {
+        mr_manager.stack_region.base = 0;
+        mr_manager.stack_region.size = 0;
+        return;
+    }
+
+    target_ulong high = 0;
+    target_ulong low = (target_ulong)-1;
+    for (guint i = 0; i < mr_manager.stack_data->len; i++) {
+        DynStackFrame *frame = g_array_index(mr_manager.stack_data,
+                                             DynStackFrame *, i);
+        if (frame == NULL) {
+            continue;
+        }
+        dyn_frame_sync_region(frame);
+        if (frame->entry_sp > high) {
+            high = frame->entry_sp;
+        }
+        if (frame->min_sp < low) {
+            low = frame->min_sp;
+        }
+    }
+
+    if (high == 0 || low == (target_ulong)-1 || low > high) {
+        mr_manager.stack_region.base = 0;
+        mr_manager.stack_region.size = 0;
+        return;
+    }
+    mr_manager.stack_region.base = high;
+    mr_manager.stack_region.size = high - low;
+}
+
+static bool dyn_frame_contains_access(const DynStackFrame *frame,
+                                      target_ulong addr,
+                                      target_ulong size) {
+    if (frame == NULL || size == 0) {
+        return false;
+    }
+    target_ulong end = addr + size;
+    if (end < addr) {
+        return false;
+    }
+    return addr >= dyn_frame_low(frame) && end <= dyn_frame_high(frame);
+}
+
+static bool dyn_frame_can_grow_for_access(const DynStackFrame *frame,
+                                          target_ulong addr,
+                                          target_ulong size) {
+    if (frame == NULL || size == 0) {
+        return false;
+    }
+    target_ulong end = addr + size;
+    if (end < addr || end > frame->entry_sp || addr >= frame->min_sp) {
+        return false;
+    }
+    return frame->min_sp - addr <= SNAPSHOT_STACK_LAZY_WINDOW;
+}
+
+static void dyn_stack_check_invariants(const char *where) {
+    if (mr_manager.stack_data == NULL) {
+        return;
+    }
+
+    for (guint i = 0; i < mr_manager.stack_data->len; i++) {
+        DynStackFrame *frame = g_array_index(mr_manager.stack_data,
+                                             DynStackFrame *, i);
+        if (frame == NULL) {
+            trace_mem("[stack-frame] [invariant-error] [where %s] "
+                      "[depth %d] [reason null-frame]\n",
+                      where ? where : "unknown", (int)i + 1);
+            continue;
+        }
+        if (frame->frame_id == 0 || frame->min_sp > frame->entry_sp) {
+            trace_mem("[stack-frame] [invariant-error] [where %s] "
+                      "[fid %lx] [entry-sp %lx] [min-sp %lx] "
+                      "[reason bad-frame-range]\n",
+                      where ? where : "unknown",
+                      (unsigned long)frame->frame_id, frame->entry_sp,
+                      frame->min_sp);
+        }
+
+        if (i > 0) {
+            DynStackFrame *caller = g_array_index(mr_manager.stack_data,
+                                                  DynStackFrame *, i - 1);
+            if (caller != NULL && caller->min_sp > frame->entry_sp) {
+                trace_mem("[stack-frame] [invariant-error] [where %s] "
+                          "[caller-fid %lx] [callee-fid %lx] "
+                          "[caller-min-sp %lx] [callee-entry-sp %lx] "
+                          "[reason caller-does-not-reach-call-sp]\n",
+                          where ? where : "unknown",
+                          (unsigned long)caller->frame_id,
+                          (unsigned long)frame->frame_id,
+                          caller->min_sp, frame->entry_sp);
+            }
+        }
+    }
+}
+
+static void dyn_frame_grow_to_access(DynStackFrame *frame,
+                                     target_ulong addr,
+                                     target_ulong size,
+                                     const char *reason) {
+    if (frame == NULL) {
+        return;
+    }
+    if (addr < frame->min_sp) {
+        frame->min_sp = addr;
+        frame->imprecise = true;
+        dyn_frame_sync_region(frame);
+        dyn_stack_update_summary();
+        dyn_stack_check_invariants(reason);
+        trace_mem("[stack-frame] [grow] [fid %lx] [addr %lx] [size %lx] "
+                  "[entry-sp %lx] [min-sp %lx] [reason %s]\n",
+                  (unsigned long)frame->frame_id, addr, size,
+                  frame->entry_sp, frame->min_sp,
+                  reason ? reason : "unknown");
+    }
+}
+
 static void init_mr_manager(void) {
     mr_manager.stack_region.is_stack = true;
     if (mr_manager.stack_data == NULL) {
-        mr_manager.stack_data = g_array_new(FALSE, FALSE, sizeof(SnapshotMemRegion *));
+        mr_manager.stack_data = g_array_new(FALSE, FALSE, sizeof(DynStackFrame *));
     }
     if (mr_manager.heap_data == NULL) {
         mr_manager.heap_data = g_tree_new_full(
@@ -1044,37 +1295,6 @@ static SnapshotMemRegion *mr_manager_get_cache(SnapshotMemRegion **mr_cache, int
         return mr_cache[index];
     }
     return NULL;
-}
-
-static void mr_manager_update_region(SnapshotMemRegion *old_mr, SnapshotMemRegion *new_mr) {
-    if (new_mr->is_stack) {
-        // For stack, just update size
-        if (old_mr->base == 0) {
-            *old_mr = *new_mr;
-            old_mr->size += SNAPSHOT_STACK_LAZY_WINDOW;
-            trace_mem("[stack] [lazy init] [base %lx] [size %lx]\n", old_mr->base, old_mr->size);
-            return;
-        }
-        if (old_mr->base > new_mr->base) {
-            if (old_mr->size < (old_mr->base - new_mr->base + SNAPSHOT_STACK_LAZY_WINDOW)) {
-                old_mr->size = (old_mr->base - new_mr->base + SNAPSHOT_STACK_LAZY_WINDOW);
-                trace_mem("[stack] [lazy update] [base %lx] [size %lx]\n", old_mr->base, old_mr->size);
-            }
-        }
-        return;
-    }
-    
-    if (old_mr->size == 0) {
-        *old_mr = *new_mr;
-        return;
-    }
-    // Update base, size
-    if (old_mr->base > new_mr->base) {
-        old_mr->size += (old_mr->base - new_mr->base);
-        old_mr->base = new_mr->base;
-    } else if (old_mr->base + old_mr->size < new_mr->base + new_mr->size) {
-        old_mr->size = (new_mr->base + new_mr->size) - old_mr->base;
-    }
 }
 
 static void mr_manager_heap_insert(SnapshotMemRegion *mr) {
@@ -1142,90 +1362,161 @@ void snapshot_trace_free(target_ulong base, target_ulong pc) {
     mr_manager_heap_remove(&query);
 }
 
-static SnapshotMemRegion *mr_manager_stack_search(target_ulong addr) {
-    // int query_result = mr_manager_search_cache(mr_manager.stack_cache, addr);
-    // SnapshotMemRegion *mr = mr_manager_get_cache(mr_manager.stack_cache, query_result);
-    // if (mr != NULL) {
-    //     return mr;
-    // }
-    // trace_mem("[mr] [stack] [search] [addr %lx] [depth %d]\n", addr, mr_manager.stack_data->len);
-    SnapshotMemRegion *mr = NULL;
+static SnapshotMemRegion *mr_manager_stack_search(target_ulong addr,
+                                                   target_ulong size) {
     GArray *stack = mr_manager.stack_data;
+    if (stack == NULL || stack->len == 0 || size == 0) {
+        return NULL;
+    }
+
     for (ssize_t i = stack->len - 1; i >= 0; i--) {
-        SnapshotMemRegion* tmp = g_array_index(stack, SnapshotMemRegion *, i);
-        if (tmp == NULL) continue;
-        if (check_addr_in_region(tmp, addr) == 0) {
-            mr = tmp;
-            // trace_mem("[mr] [stack] [found] [addr %lx] [base %lx] [size %lx] [pc %lx] [depth %d] [full-depth %d]\n",
-            //           addr, mr->base, mr->size, mr->pc, i + 1, stack->len);
-            break;
+        DynStackFrame *frame = g_array_index(stack, DynStackFrame *, i);
+        if (frame == NULL) {
+            continue;
+        }
+        dyn_frame_sync_region(frame);
+        if (dyn_frame_contains_access(frame, addr, size)) {
+#ifdef SNAPSHOT_STACK_TRACE_VERBOSE
+            int64_t off = (int64_t)addr - (int64_t)frame->entry_sp;
+            trace_mem("[stack-frame] [lookup] [fid %lx] [addr %lx] "
+                      "[off %ld] [size %lx] [depth %d]\n",
+                      (unsigned long)frame->frame_id, addr, (long)off,
+                      size, (int)i + 1);
+#endif
+            return &frame->region;
         }
     }
-    if (mr != NULL) {
-        // Update cache
-        // int new_cache_index = mr_manager_new_cache_index(mr_manager.stack_cache_index);
-        // mr_manager_update_cache(mr_manager.stack_cache, mr, new_cache_index);
-        // mr_manager.stack_cache_index = new_cache_index;
-        return mr;
+
+    DynStackFrame *top = dyn_stack_top();
+    if (dyn_frame_can_grow_for_access(top, addr, size)) {
+        dyn_frame_grow_to_access(top, addr, size, "access-below-min-sp");
+#ifdef SNAPSHOT_STACK_TRACE_VERBOSE
+        int64_t off = (int64_t)addr - (int64_t)top->entry_sp;
+        trace_mem("[stack-frame] [lookup-fallback] [fid %lx] [addr %lx] "
+                  "[off %ld] [size %lx] [depth %d]\n",
+                  (unsigned long)top->frame_id, addr, (long)off,
+                  size, stack->len);
+#endif
+        return &top->region;
     }
-    // trace_mem("[mr] [stack] [error] failed to search region for [addr %lx]\n", addr);
+
+#ifdef SNAPSHOT_STACK_TRACE_VERBOSE
+    trace_mem("[stack-frame] [lookup-miss] [addr %lx] [size %lx] [depth %d]\n",
+              addr, size, stack->len);
+#endif
     return NULL;
 }
 
-void snapshot_trace_stack_push(target_ulong sp, target_ulong pc) {
+void snapshot_trace_stack_call(target_ulong sp, target_ulong call_pc,
+                               target_ulong ret_pc) {
     if (mr_manager.stack_data == NULL) {
         init_mr_manager();
     }
-    /* Fix size of the previous frame lazily using the new stack top */
-    trace_mem("[stack] [ipush] [sp %lx] [pc %lx]\n", sp, pc);
-    if (mr_manager.stack_data->len > 0) {
-        SnapshotMemRegion *prev = g_array_index(mr_manager.stack_data, SnapshotMemRegion *, mr_manager.stack_data->len - 1);
-        if (prev == NULL) {
-            trace_mem("[stack] [push-error] previous frame is NULL!\n");
-            return;
-        }
-        if (sp < prev->base) {
-            target_ulong new_size = prev->base - sp;
-            if (new_size > prev->size) {
-                // prev->size = new_size;
-                mr_manager_update_region(&mr_manager.stack_region, prev);
-            }
-        }
+
+    DynStackFrame *caller = dyn_stack_top();
+    if (caller != NULL && sp < caller->min_sp) {
+        dyn_frame_grow_to_access(caller, sp, 1, "call-sp-below-caller-min");
     }
 
-    SnapshotMemRegion *mr = g_new(SnapshotMemRegion, 1);
-    mr->is_heap = false;
-    mr->is_stack = true;
-    mr->base = sp;
-    mr->size = 0;
-    mr->pc = pc;
-    g_array_append_val(mr_manager.stack_data, mr);
-    mr_manager_update_region(&mr_manager.stack_region, mr);
-    trace_mem("[stack] [push] [sp %lx] [size %lx] [pc %lx] [depth %d] [sr-base %lx] [sr-size %lx]\n", sp, mr->size, pc, mr_manager.stack_data->len, mr_manager.stack_region.base, mr_manager.stack_region.size);
+    DynStackFrame *frame = g_new0(DynStackFrame, 1);
+    frame->frame_id = next_dyn_frame_id++;
+    frame->entry_sp = sp;
+    frame->min_sp = sp >= sizeof(target_ulong) ? sp - sizeof(target_ulong) : 0;
+    frame->call_pc = call_pc;
+    frame->ret_pc = ret_pc;
+    dyn_frame_sync_region(frame);
+
+    g_array_append_val(mr_manager.stack_data, frame);
+    dyn_stack_update_summary();
+    dyn_stack_check_invariants("push");
+
+    trace_mem("[stack-frame] [push] [fid %lx] [entry-sp %lx] [min-sp %lx] "
+              "[call-pc %lx] [ret-pc %lx] [depth %d]\n",
+              (unsigned long)frame->frame_id, frame->entry_sp, frame->min_sp,
+              frame->call_pc, frame->ret_pc, mr_manager.stack_data->len);
+
+    /* Keep the legacy Python analyzer grouping stable.  The exact dynamic
+     * identity is frame_id above and frame->region.pc; the old [stack]
+     * schema's pc field is a stable site key to avoid one MemoryRegion per
+     * invocation in analyze_type.py. */
+    target_ulong legacy_pc = frame->call_pc != 0 ? frame->call_pc : frame->ret_pc;
+    if (legacy_pc == 0) {
+        legacy_pc = frame->frame_id;
+    }
+    trace_mem("[stack] [push] [sp %lx] [size %lx] [pc %lx] [depth %d] "
+              "[sr-base %lx] [sr-size %lx]\n",
+              frame->entry_sp, frame->region.size, legacy_pc,
+              mr_manager.stack_data->len, mr_manager.stack_region.base,
+              mr_manager.stack_region.size);
+}
+
+void snapshot_trace_stack_ret(target_ulong sp, target_ulong actual_ret_pc) {
+    if (mr_manager.stack_data == NULL) {
+        init_mr_manager();
+    }
+
+    GArray *stack = mr_manager.stack_data;
+    if (stack->len == 0) {
+        trace_mem("[stack-frame] [ret-miss] [sp %lx] [ret-pc %lx] [depth 0]\n",
+                  sp, actual_ret_pc);
+        return;
+    }
+
+    DynStackFrame *frame = g_array_index(stack, DynStackFrame *, stack->len - 1);
+    if (frame == NULL) {
+        trace_mem("[stack-frame] [ret-error] [sp %lx] [ret-pc %lx] "
+                  "[depth %d] [reason null-top]\n",
+                  sp, actual_ret_pc, stack->len);
+        return;
+    }
+
+    if (frame->ret_pc != 0 && frame->ret_pc != actual_ret_pc) {
+        frame->imprecise = true;
+        trace_mem("[stack-frame] [ret-mismatch] [fid %lx] [expected %lx] "
+                  "[actual %lx] [sp %lx] [depth %d]\n",
+                  (unsigned long)frame->frame_id, frame->ret_pc,
+                  actual_ret_pc, sp, stack->len);
+    }
+
+    if (sp < frame->entry_sp) {
+        frame->imprecise = true;
+        trace_mem("[stack-frame] [ret-sp-mismatch] [fid %lx] "
+                  "[entry-sp %lx] [sp %lx] [ret-pc %lx] "
+                  "[reason stack-not-unwound-to-entry]\n",
+                  (unsigned long)frame->frame_id, frame->entry_sp, sp,
+                  actual_ret_pc);
+    } else if (sp > frame->entry_sp) {
+        trace_mem("[stack-frame] [ret-sp-adjust] [fid %lx] "
+                  "[entry-sp %lx] [sp %lx] [ret-pc %lx] "
+                  "[delta %lx]\n",
+                  (unsigned long)frame->frame_id, frame->entry_sp, sp,
+                  actual_ret_pc, sp - frame->entry_sp);
+    }
+
+    trace_mem("[stack-frame] [pop] [fid %lx] [sp %lx] [entry-sp %lx] "
+              "[min-sp %lx] [ret-pc %lx] [imprecise %d] [depth %d]\n",
+              (unsigned long)frame->frame_id, sp, frame->entry_sp,
+              frame->min_sp, actual_ret_pc, frame->imprecise,
+              stack->len - 1);
+    target_ulong legacy_pc = frame->call_pc != 0 ? frame->call_pc : frame->ret_pc;
+    if (legacy_pc == 0) {
+        legacy_pc = frame->frame_id;
+    }
+    trace_mem("[stack] [pop] [sp %lx] [base %lx] [pc %lx] [depth %d]\n",
+              sp, frame->entry_sp, legacy_pc, stack->len - 1);
+
+    g_array_set_size(stack, stack->len - 1);
+    g_free(frame);
+    dyn_stack_update_summary();
+    dyn_stack_check_invariants("pop");
+}
+
+void snapshot_trace_stack_push(target_ulong sp, target_ulong pc) {
+    snapshot_trace_stack_call(sp, 0, pc);
 }
 
 void snapshot_trace_stack_pop(target_ulong sp) {
-    if (mr_manager.stack_data == NULL) {
-        init_mr_manager();
-    }
-    trace_mem("[stack] [ipop] [sp %lx]\n", sp);
-    GArray *stack = mr_manager.stack_data;
-    if (stack->len == 0) {
-        trace_mem("[stack] [pop-error] [sp %lx] [depth %d] empty stack!\n", sp, stack->len);
-        return;
-    }
-    for (ssize_t i = stack->len - 1; i >= 0; i--) {
-        SnapshotMemRegion *mr = g_array_index(stack, SnapshotMemRegion *, i);
-        if (mr == NULL) continue;
-        if (check_addr_in_region(mr, sp) == 0) {
-            g_array_remove_index(stack, i);
-            trace_mem("[stack] [pop] [sp %lx] [base %lx] [pc %lx] [depth %d]\n",
-                      sp, mr->base, mr->pc, stack->len);
-            g_free(mr);
-            return;
-        }
-    }
-    trace_mem("[stack] [pop-error] [sp %lx] [depth %d] not found!\n", sp, stack->len);
+    snapshot_trace_stack_ret(sp, 0);
 }
 
 void snapshot_trace_global_add(target_ulong base, target_ulong size, target_ulong pc, const char *name) {
@@ -1290,29 +1581,27 @@ static SnapshotMemRegion *mr_manager_global_search(target_ulong addr) {
     return NULL;
 }
 
-SnapshotMemRegion *snapshot_mem_region_search(target_ulong addr) {
-    // Determine region by address
-    SnapshotMemRegion *mr = NULL;
-    if (check_addr_in_region(&mr_manager.stack_region, addr) == 0) {
-        // trace_mem("[mr] [search] [stack] [addr %lx]\n", addr);
-        mr = mr_manager_stack_search(addr);
-    } 
+SnapshotMemRegion *snapshot_mem_region_search_with_size(target_ulong addr,
+                                                        target_ulong size) {
+    SnapshotMemRegion *mr = mr_manager_stack_search(addr, size);
     if (mr != NULL) {
         return mr;
     }
-    // trace_mem("[mr] [search] [global] [addr %lx]\n", addr);
+
     mr = mr_manager_global_search(addr);
     if (mr != NULL) {
         return mr;
     }
 
-    // trace_mem("[mr] [search] [heap] [addr %lx]\n", addr);
     mr = mr_manager_heap_search(addr);
     if (mr != NULL) {
         return mr;
     }
-    // trace_mem("[mr] [search] [error] no region found for [addr %lx]\n", addr);
     return NULL;
+}
+
+SnapshotMemRegion *snapshot_mem_region_search(target_ulong addr) {
+    return snapshot_mem_region_search_with_size(addr, 1);
 }
 
 bool snapshot_is_taken(void) {
@@ -1322,6 +1611,7 @@ bool snapshot_is_taken(void) {
 
 void snapshot_init(void) {
     memset(&mr_manager, 0, sizeof(SnapshotMemRegionManager));
+    next_dyn_frame_id = 1;
     init_mr_manager();
     memset(&g_snapshot, 0, sizeof(SnapshotState));
     g_snapshot.pages = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, NULL);
@@ -2086,7 +2376,8 @@ static int analyze_collected_data(const ArgumentInfo *arg_info, size_t num_arg_r
             // If type inference is available, apply type-specific modifications (e.g., for pointers, try null, valid, out-of-bounds)
             if (g_osprey_type_manager != NULL) {
                 // Check if pointer
-                OspreyObject *obj = osprey_object_get(g_osprey_type_manager, prim->addr, false);
+                uint64_t prim_key = prim->type_key ? prim->type_key : (uint64_t)prim->addr;
+                OspreyObject *obj = osprey_object_get(g_osprey_type_manager, prim_key, false);
                 if (obj != NULL) {
                     if (obj->type) {
                         trace_mem("[memgraph] [prim] [type %s] [addr %lx]\n", obj->type->id, prim->addr);
@@ -2095,13 +2386,14 @@ static int analyze_collected_data(const ArgumentInfo *arg_info, size_t num_arg_r
                             g_array_append_val(mod_primitive_candidates, mod);
                         } else if (obj->type->kind == OSPREY_TYPE_POINTER) {
                             // Build MemGraph (null pointer)
-                            PtrNode *ptr_node = osprey_ptr_node_get(g_osprey_type_manager, prim->addr, false);
+                            PtrNode *ptr_node = osprey_ptr_node_get(g_osprey_type_manager, prim_key, false);
                             uint64_t target_value;
                             memcpy(&target_value, mod.value, sizeof(uint64_t));
                             trace_mem("[inferred] [pointer] [addr %lx] [target %lx] [type %s]\n", prim->addr, target_value, obj->type->id);
                             if (ptr_node == NULL) {
-                                ptr_node = osprey_ptr_node_get(g_osprey_type_manager, prim->addr, false);
+                                ptr_node = osprey_ptr_node_get(g_osprey_type_manager, prim_key, false);
                                 if (ptr_node) {
+                                    ptr_node->addr = prim->addr;
                                     ptr_node->is_value_pointer = true;
                                     ptr_node->points_to = osprey_ptr_node_get(g_osprey_type_manager, target_value, true);
                                     osprey_ptr_edge_create(g_osprey_type_manager, ptr_node, ptr_node->points_to);
@@ -2145,14 +2437,20 @@ static int analyze_collected_data(const ArgumentInfo *arg_info, size_t num_arg_r
             memcpy(mod.value, &actual_value, sizeof(target_ulong));
             // Check type inference
             if (g_osprey_type_manager != NULL) {
-                OspreyObject *obj = osprey_object_get(g_osprey_type_manager, ptr->addr, false);
+                uint64_t ptr_key = ptr->type_key ? ptr->type_key : (uint64_t)ptr->addr;
+                uint64_t target_key = ptr->target_key ? ptr->target_key : (uint64_t)ptr->target;
+                OspreyObject *obj = osprey_object_get(g_osprey_type_manager, ptr_key, false);
                 if (obj != NULL) {
                     trace_mem("[memgraph] [pointer] [type %s] [addr %lx] [target %lx]\n", obj->type ? obj->type->id : "unknown", ptr->addr, ptr->target);
                     // add_modification_pointer(mod_manager->modifications, &mod);
-                    PtrNode *ptr_node = osprey_ptr_node_get(g_osprey_type_manager, ptr->addr, false);
+                    PtrNode *ptr_node = osprey_ptr_node_get(g_osprey_type_manager, ptr_key, false);
                     if (ptr_node) {
+                        ptr_node->addr = ptr->addr;
                         ptr_node->is_value_pointer = true;
-                        ptr_node->points_to = osprey_ptr_node_get(g_osprey_type_manager, ptr->target, true);
+                        ptr_node->points_to = osprey_ptr_node_get(g_osprey_type_manager, target_key, true);
+                        if (ptr->target != 0) {
+                            ptr_node->points_to->addr = ptr->target;
+                        }
                         osprey_ptr_edge_create(g_osprey_type_manager, ptr_node, ptr_node->points_to);
                         g_array_append_val(pointer_nodes, ptr_node);
                     } else {
@@ -2918,15 +3216,21 @@ void snapshot_load_inferred_types(uint8_t *analyze_result) {
     for (size_t i = 0; i < num_rows; i++) {
         const sbsv_row *r = rows[i];
         const char *id = sbsv_row_get_string(r, "id");
-        // int region_type = sbsv_row_get_int(r, "RT", &valid);
+        int64_t region_type = sbsv_row_get_int(r, "RT", &valid);
         int64_t region_base = sbsv_row_get_int(r, "RB", &valid);
-        // int64_t region_size = sbsv_row_get_int(r, "RI", &valid);
+        int64_t region_id = sbsv_row_get_int(r, "RI", &valid);
         int64_t base_offset = sbsv_row_get_int(r, "base", &valid);
         const sbsv_value_list *fields = sbsv_row_get_list(r, "fields");
         OspreyType *type = g_new0(OspreyType, 1);
         osprey_type_parse_field(type, base_offset, id, fields);
         osprey_type_manager_add_type(g_osprey_type_manager, type);
-        osprey_type_manager_add_addr_to_type_id(g_osprey_type_manager, (uint64_t)(region_base + base_offset), type);
+        uint64_t base_key = osprey_type_key_from_region(region_type, region_base, region_id, base_offset);
+        osprey_type_manager_add_addr_to_type_id(g_osprey_type_manager, base_key, type);
+        OspreyObject *obj = osprey_address_get(g_osprey_type_manager, base_key, true);
+        obj->role = OSPREY_ROLE_STRUCT_BASE;
+        obj->type = type;
+        ObjNode *obj_node = osprey_obj_node_get(g_osprey_type_manager, base_key, true);
+        obj_node->obj = obj;
     }
     sbsv_free_row_ref_array(rows);
 
@@ -2950,22 +3254,23 @@ void snapshot_load_inferred_types(uint8_t *analyze_result) {
     sbsv_parser_get_rows(parser, "[array-start]", &rows, &num_rows);
     for (size_t i = 0; i < num_rows; i++) {
         const sbsv_row *r = rows[i];
-        // int region_type = sbsv_row_get_int(r, "RT", &valid);
+        int64_t region_type = sbsv_row_get_int(r, "RT", &valid);
         int64_t region_base = sbsv_row_get_int(r, "RB", &valid);
-        // int64_t region_size = sbsv_row_get_int(r, "RI", &valid);
+        int64_t region_id = sbsv_row_get_int(r, "RI", &valid);
         const char *type_id = sbsv_row_get_string(r, "type");
         int64_t lo = sbsv_row_get_int(r, "lo", &valid);
         int64_t hi = sbsv_row_get_int(r, "hi", &valid);
         // const char *elem = sbsv_row_get_string(r, "elem");
         // double p = sbsv_row_get_float(r, "P", &valid);
-        OspreyObject *obj = osprey_address_get(g_osprey_type_manager, region_base + lo, true);
+        uint64_t array_key = osprey_type_key_from_region(region_type, region_base, region_id, lo);
+        OspreyObject *obj = osprey_address_get(g_osprey_type_manager, array_key, true);
         obj->role = OSPREY_ROLE_ARRAY_START;
         obj->size = hi - lo;
         obj->type = osprey_type_get(g_osprey_type_manager, type_id);
         if (obj->type == NULL) {
             trace_mem("Failed to find type for array start: %s\n", type_id);
         }
-        ObjNode *obj_node = osprey_obj_node_get(g_osprey_type_manager, region_base + lo, true);
+        ObjNode *obj_node = osprey_obj_node_get(g_osprey_type_manager, array_key, true);
         obj_node->obj = obj;
     }
     sbsv_free_row_ref_array(rows);
@@ -2990,13 +3295,14 @@ void snapshot_load_inferred_types(uint8_t *analyze_result) {
     sbsv_parser_get_rows(parser, "[scalar]", &rows, &num_rows);
     for (size_t i = 0; i < num_rows; i++) {
         const sbsv_row *r = rows[i];
-        // int region_type = sbsv_row_get_int(r, "RT", &valid);
+        int64_t region_type = sbsv_row_get_int(r, "RT", &valid);
         int64_t region_base = sbsv_row_get_int(r, "RB", &valid);
-        // int64_t region_size = sbsv_row_get_int(r, "RI", &valid);
+        int64_t region_id = sbsv_row_get_int(r, "RI", &valid);
         int64_t off = sbsv_row_get_int(r, "off", &valid);
         int64_t sz = sbsv_row_get_int(r, "sz", &valid);
         // double p = sbsv_row_get_float(r, "P", &valid);
-        OspreyObject *obj = osprey_object_get(g_osprey_type_manager, region_base + off, true);
+        uint64_t obj_key = osprey_type_key_from_region(region_type, region_base, region_id, off);
+        OspreyObject *obj = osprey_object_get(g_osprey_type_manager, obj_key, true);
         obj->role = OSPREY_ROLE_SCALAR;
         // obj->type_id = g_strdup()
         for (size_t j = 0; j < primitive_types->len; j++) {
@@ -3012,21 +3318,18 @@ void snapshot_load_inferred_types(uint8_t *analyze_result) {
     sbsv_parser_get_rows(parser, "[pointer-var]", &rows, &num_rows);
     for (size_t i = 0; i < num_rows; i++) {
         const sbsv_row *r = rows[i];
-        // int region_type = sbsv_row_get_int(r, "RT", &valid);
+        int64_t region_type = sbsv_row_get_int(r, "RT", &valid);
         int64_t region_base = sbsv_row_get_int(r, "RB", &valid);
-        // int64_t region_size = sbsv_row_get_int(r, "RI", &valid);
+        int64_t region_id = sbsv_row_get_int(r, "RI", &valid);
         int64_t off = sbsv_row_get_int(r, "off", &valid);
         int64_t size = sbsv_row_get_int(r, "sz", &valid);
-        // int64_t target = sbsv_row_get_int(r, "target", &valid);
         const char *type_id = sbsv_row_get_string(r, "type");
-        // const char *t_val = sbsv_row_get_string(r, "t-val");
-        // double p = sbsv_row_get_float(r, "P", &valid);
-        // trace_mem("[inferred-type] [pointer] [region-type %d] [region-base %lx] [region-size %lx] [off %lx] [size %lx] [target %lx] [type-id %s] [P %f]\n", region_type, region_base, region_size, off, size, target, type_id, p);
-        OspreyObject *obj = osprey_object_get(g_osprey_type_manager, region_base + off, true);
+        uint64_t ptr_key = osprey_type_key_from_region(region_type, region_base, region_id, off);
+        OspreyObject *obj = osprey_object_get(g_osprey_type_manager, ptr_key, true);
         obj->role = OSPREY_ROLE_SCALAR;
         obj->size = size;
         obj->type = osprey_type_get(g_osprey_type_manager, type_id);
-        PtrNode *ptr_node = osprey_ptr_node_get(g_osprey_type_manager, region_base + off, true);
+        PtrNode *ptr_node = osprey_ptr_node_get(g_osprey_type_manager, ptr_key, true);
         ptr_node->is_value_pointer = true;
     }
     sbsv_free_row_ref_array(rows);
@@ -3034,32 +3337,33 @@ void snapshot_load_inferred_types(uint8_t *analyze_result) {
     sbsv_parser_get_rows(parser, "[array-elem]", &rows, &num_rows);
     for (size_t i = 0; i < num_rows; i++) {
         const sbsv_row *r = rows[i];
-        // int region_type = sbsv_row_get_int(r, "RT", &valid);
+        int64_t region_type = sbsv_row_get_int(r, "RT", &valid);
         int64_t region_base = sbsv_row_get_int(r, "RB", &valid);
-        // int64_t region_size = sbsv_row_get_int(r, "RI", &valid);
+        int64_t region_id = sbsv_row_get_int(r, "RI", &valid);
         int64_t off = sbsv_row_get_int(r, "off", &valid);
         int64_t sz = sbsv_row_get_int(r, "sz", &valid);
         int64_t array_start_offset = sbsv_row_get_int(r, "array-offset", &valid);
         const char *type_id = sbsv_row_get_string(r, "type");
         // double p = sbsv_row_get_float(r, "P", &valid);
-        OspreyObject *obj = osprey_object_get(g_osprey_type_manager, region_base + off, true);
+        uint64_t elem_key = osprey_type_key_from_region(region_type, region_base, region_id, off);
+        uint64_t array_start_key = osprey_type_key_from_region(region_type, region_base, region_id, array_start_offset);
+        OspreyObject *obj = osprey_object_get(g_osprey_type_manager, elem_key, true);
         obj->role = OSPREY_ROLE_ARRAY_ELEM;
         obj->size = sz;
         obj->type = osprey_type_get(g_osprey_type_manager, type_id);
-        int64_t array_start_addr = region_base + array_start_offset;
-        OspreyObject *array_start_obj = osprey_address_get(g_osprey_type_manager, array_start_addr, false);
+        OspreyObject *array_start_obj = osprey_address_get(g_osprey_type_manager, array_start_key, false);
         obj->parent = array_start_obj;
-        ObjNode *obj_node = osprey_obj_node_get(g_osprey_type_manager, region_base + off, false);
+        ObjNode *obj_node = osprey_obj_node_get(g_osprey_type_manager, elem_key, false);
         if (obj_node == NULL) {
-            obj_node = osprey_obj_node_get(g_osprey_type_manager, region_base + off, true);
+            obj_node = osprey_obj_node_get(g_osprey_type_manager, elem_key, true);
         }
         if (obj_node != NULL && obj_node->obj == NULL) {
             obj_node->obj = obj;
         }
         if (obj->type != NULL && obj->type->kind == OSPREY_TYPE_POINTER) {
-            PtrNode *ptr_node = osprey_ptr_node_get(g_osprey_type_manager, region_base + off, true);
+            PtrNode *ptr_node = osprey_ptr_node_get(g_osprey_type_manager, elem_key, true);
             ptr_node->is_value_pointer = true;
-            ptr_node->base = osprey_obj_node_get(g_osprey_type_manager, array_start_addr, false);
+            ptr_node->base = osprey_obj_node_get(g_osprey_type_manager, array_start_key, false);
         } else if (obj->type == NULL) {
             trace_mem("[inferred-type] [array-elem] missing type [addr %lx] [type-id %s]\n",
                       (uint64_t)(region_base + off), type_id ? type_id : "(null)");
@@ -3070,24 +3374,26 @@ void snapshot_load_inferred_types(uint8_t *analyze_result) {
     sbsv_parser_get_rows(parser, "[field]", &rows, &num_rows);
     for (size_t i = 0; i < num_rows; i++) {
         const sbsv_row *r = rows[i];
-        // int region_type = sbsv_row_get_int(r, "RT", &valid);
+        int64_t region_type = sbsv_row_get_int(r, "RT", &valid);
         int64_t region_base = sbsv_row_get_int(r, "RB", &valid);
-        // int64_t region_size = sbsv_row_get_int(r, "RI", &valid);
+        int64_t region_id = sbsv_row_get_int(r, "RI", &valid);
         int64_t off = sbsv_row_get_int(r, "off", &valid);
         int64_t sz = sbsv_row_get_int(r, "sz", &valid);
         int64_t base = sbsv_row_get_int(r, "base", &valid);
         const char *type_id = sbsv_row_get_string(r, "type");
         // double p = sbsv_row_get_float(r, "P", &valid);
-        OspreyObject *obj = osprey_object_get(g_osprey_type_manager, region_base + off, true);
+        uint64_t field_key = osprey_type_key_from_region(region_type, region_base, region_id, off);
+        uint64_t base_key = osprey_type_key_from_region(region_type, region_base, region_id, base);
+        OspreyObject *obj = osprey_object_get(g_osprey_type_manager, field_key, true);
         obj->role = OSPREY_ROLE_FIELD;
         obj->size = sz;
         obj->type = osprey_type_get(g_osprey_type_manager, type_id);
-        OspreyObject *base_obj = osprey_address_get(g_osprey_type_manager, region_base + base, false);
+        OspreyObject *base_obj = osprey_address_get(g_osprey_type_manager, base_key, false);
         
         if (obj->type != NULL && obj->type->kind == OSPREY_TYPE_POINTER) {
-            PtrNode *ptr_node = osprey_ptr_node_get(g_osprey_type_manager, region_base + off, true);
+            PtrNode *ptr_node = osprey_ptr_node_get(g_osprey_type_manager, field_key, true);
             ptr_node->is_value_pointer = true;
-            ptr_node->base = osprey_obj_node_get(g_osprey_type_manager, region_base + base, false);
+            ptr_node->base = osprey_obj_node_get(g_osprey_type_manager, base_key, false);
         } else if (obj->type == NULL) {
             trace_mem("[inferred-type] [field] missing type [addr %lx] [type-id %s]\n",
                       (uint64_t)(region_base + off), type_id ? type_id : "(null)");

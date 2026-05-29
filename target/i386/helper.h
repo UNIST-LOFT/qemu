@@ -233,7 +233,7 @@ DEF_HELPER_1(rdrand, tl, env)
 
 #ifdef SYMBOLIC_INSTRUMENTATION
 #if SYMBOLIC_CALLSTACK_INSTRUMENTATION
-DEF_HELPER_1(instrument_call, void, tl)
-DEF_HELPER_1(instrument_ret, void, tl)
+DEF_HELPER_3(instrument_call, void, tl, tl, tl)
+DEF_HELPER_2(instrument_ret, void, tl, tl)
 #endif
 #endif

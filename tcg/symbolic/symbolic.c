@@ -1599,29 +1599,12 @@ typedef struct {
 
 static CallStack callstack = {.depth = 0};
 
-static inline target_ulong cpu_get_current_sp(void)
+void helper_instrument_call(target_ulong call_pc, target_ulong ret_pc, target_ulong sp)
 {
-    if (thread_cpu == NULL || thread_cpu->env_ptr == NULL) {
-        return 0;
-    }
-    /* x86/x64 specific: get stack pointer from CPUArchState */
-    CPUArchState *env = thread_cpu->env_ptr;
-#ifdef TARGET_I386
-    return env->regs[R_ESP];
-#elif defined(TARGET_X86_64)
-    return env->regs[R_RSP];
-#else
-    return 0;
-#endif
-}
+    snapshot_trace_stack_call(sp, call_pc, ret_pc);
 
-void helper_instrument_call(target_ulong pc)
-{
-    /* Record call with estimated stack frame size */
-    snapshot_trace_stack_push(cpu_get_current_sp(), pc);
-
-    /* Original callstack hashing for coverage */
-    target_ulong hash_pc = (pc >> 4) ^ (pc << 8);
+    /* Coverage callstack remains keyed by return PC, independent of frames. */
+    target_ulong hash_pc = (ret_pc >> 4) ^ (ret_pc << 8);
     hash_pc &= BRANCH_BITMAP_SIZE - 1;
     callstack.entries[callstack.depth].address = hash_pc;
     callstack.hash ^= hash_pc;
@@ -1631,10 +1614,9 @@ void helper_instrument_call(target_ulong pc)
     }
 }
 
-void helper_instrument_ret(target_ulong pc)
+void helper_instrument_ret(target_ulong pc, target_ulong sp)
 {
-    /* Pop stack frame from tracker */
-    snapshot_trace_stack_pop(cpu_get_current_sp());
+    snapshot_trace_stack_ret(sp, pc);
 
     intptr_t initial_depth          = callstack.depth;
     uint16_t initial_callstack_hash = callstack.hash;
@@ -3564,7 +3546,7 @@ static inline void qemu_load_helper(CPUArchState *env, uintptr_t orig_addr,
         }
     }
 
-    SnapshotMemRegion *mr = snapshot_mem_region_search(addr);
+    SnapshotMemRegion *mr = snapshot_mem_region_search_with_size(addr, size);
 
     if (mr && mr->is_heap) {
         add_symbolic_heap_bounds_query(addr_idx, mr->base, offset, size);
@@ -4059,7 +4041,7 @@ static inline void qemu_store_helper(CPUArchState *env,
         }
     }
 
-    SnapshotMemRegion *mr = snapshot_mem_region_search(addr);
+    SnapshotMemRegion *mr = snapshot_mem_region_search_with_size(addr, size);
 
     if (mr && mr->is_heap) {
         add_symbolic_heap_bounds_query(addr_idx, mr->base, offset, size);
