@@ -2339,6 +2339,31 @@ static bool binradar_manager_check_addr(target_ulong addr) {
     return false;
 }
 
+static void add_new_object_modification(GQueue *modifications, MutationCandidate *mod, OspreyType *type) {
+    if (type == NULL) {
+        log_msg("[mod-object] [error] type is null for addr %lx\n", mod->addr);
+        return;
+    }
+    if (mod->value_obj == NULL) {
+        mod->value_obj = g_malloc0(mod->size);
+    }
+    // Fill value_obj with valid data based on its type
+    if (type->kind == OSPREY_TYPE_PRIMITIVE) {
+        // For primitive type, use the default value (e.g., 0)
+        memset(mod->value_obj, 0, mod->size);
+    } else if (type->kind == OSPREY_TYPE_STRUCT) {
+        // For struct type, recursively fill fields
+    } else if (type->kind == OSPREY_TYPE_ARRAY) {
+        // For array type, recursively fill elements
+    } else {
+        // For pointer types, use NULL
+        memset(mod->value_obj, 0, mod->size);
+    }
+    log_msg("[candidate] [pointer] [addr %lx] [size %ld] [actual_value 0]\n", mod->addr, mod->size);
+    g_queue_push_tail(modifications, add_single_modification(mod));
+}
+
+
 // In parent process, called after child execution
 // Return: remaining modifications
 static int analyze_collected_data(const ArgumentInfo *arg_info, size_t num_arg_regs) {
@@ -2624,11 +2649,20 @@ static int analyze_collected_data(const ArgumentInfo *arg_info, size_t num_arg_r
                 if (actual_value == 0) {
                     log_msg("[candidate] [pointer] [null] [addr %lx] [size %d]\n", mod.addr, mod.size);
                     mod.value_addr = 1; // dummy non-null value
-                    mod.value_obj = g_malloc0(size);
+                    // mod.value_obj = g_malloc0(size);
+                    // Fill value_obj with valid data if possible
+                    if (ptr_node->points_to && ptr_node->points_to->base && ptr_node->points_to->base->obj) {
+                        OspreyObject *pointee_obj = ptr_node->points_to->base->obj;
+                        if (pointee_obj->type) {
+                            // Fill value_obj with valid data based on its type
+                            add_new_object_modification(mod_manager->modifications, &mod, pointee_obj->type);
+                        }
+                    }
+                } else {
+                    log_msg("[candidate] [pointer] [addr %lx] [size %d] [actual_value %lx]\n", mod.addr, mod.size, actual_value);
+                    Modification *modification = add_single_modification(&mod);
+                    g_queue_push_tail(mod_manager->modifications, modification);
                 }
-                log_msg("[candidate] [pointer] [addr %lx] [size %d] [actual_value %lx]\n", mod.addr, mod.size, actual_value);
-                Modification *modification = add_single_modification(&mod);
-                g_queue_push_tail(mod_manager->modifications, modification);
             }
             // Generate modifications using solver
             // snapshot_request_solver_modifications(mod_primitive_candidates);
