@@ -198,6 +198,8 @@ static BinradarResult *binradar_manager_alloc_one_iter(BinradarManager *manager)
 }
 
 static void trace_mem_flush(void);
+static int binradar_manager_cur_patch_id(BinradarManager *manager, int new_patch_id);
+static int binradar_manager_cur_iter(BinradarManager *manager, int new_iter);
 
 void snapshot_protect_mapping(target_ulong addr, target_ulong len) {
     if (addr == (target_ulong)-1 || len == 0) {
@@ -866,6 +868,13 @@ void snapshot_record_guest_normal_exit(CPUArchState *cpu_env, int exit_code, con
     snapshot_exit_info_set_reason(info, reason ? reason : "normal_exit");
     log_msg("[snapshot] [exit] [normal] [entrypoint-hit %lu]\n",
               binradar_entrypoint_hit_count);
+    if (binradar_manager) {
+        int patch_id = binradar_manager_cur_patch_id(binradar_manager, -1);
+        int iter = binradar_manager_cur_iter(binradar_manager, -1);
+        log_msg("[binradar] [normal] [iter %d] [patch %d] [guest_pc %lx] [guest_cs_base %lx] [reason %s]\n",
+                  iter, patch_id, info->guest_pc, info->guest_cs_base, reason ? reason : "normal_exit");
+    }
+    
     dump_coverage_edge_log(true);
 }
 
@@ -895,6 +904,13 @@ void snapshot_record_guest_crash(CPUArchState *cpu_env, int target_signal, int h
               binradar_entrypoint_hit_count);
     log_msg("[snapshot] [crash] [hit-count %lu] [reason %s] [guest_pc %lx] [guest_cs_base %lx] [fault_addr %lx] [host_fault_addr %lx]\n",
                 binradar_entrypoint_hit_count, buffer, info->guest_pc, info->guest_cs_base, info->fault_addr, info->host_fault_addr);
+    if (binradar_manager) {
+        int patch_id = binradar_manager_cur_patch_id(binradar_manager, -1);
+        int iter = binradar_manager_cur_iter(binradar_manager, -1);
+        log_msg("[binradar] [crash] [iter %d] [patch %d] [guest_pc %lx] [guest_cs_base %lx] [fault_addr %lx] [host_fault_addr %lx] [reason %s]\n",
+                  iter, patch_id, info->guest_pc, info->guest_cs_base, info->fault_addr, info->host_fault_addr, buffer);
+    }
+    
     if (binradar_probe_file) {
         FILE *binradar_probe_file_fp = fopen(binradar_probe_file, "a");
         if (binradar_probe_file_fp == NULL) {
