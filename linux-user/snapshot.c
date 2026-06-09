@@ -2355,8 +2355,8 @@ static bool binradar_manager_check_addr(target_ulong addr) {
     return false;
 }
 
-static void add_new_object_modification(GQueue *modifications, MutationCandidate *mod, OspreyType *type) {
-    if (type == NULL) {
+static void add_new_object_modification(GQueue *modifications, MutationCandidate *mod, OspreyType *pointee_type) {
+    if (pointee_type == NULL) {
         log_msg("[mod-object] [error] type is null for addr %lx\n", mod->addr);
         return;
     }
@@ -2364,19 +2364,88 @@ static void add_new_object_modification(GQueue *modifications, MutationCandidate
         mod->value_obj = g_malloc0(mod->size);
     }
     // Fill value_obj with valid data based on its type
-    if (type->kind == OSPREY_TYPE_PRIMITIVE) {
-        // For primitive type, use the default value (e.g., 0)
+    if (pointee_type->kind == OSPREY_TYPE_PRIMITIVE) {
+        // For primitive type, use the default value (e.g., 0, 1, -1, random)
+        switch (mod->size) {
+            case 1: {
+                uint8_t val = 1;
+                memcpy(mod->value_obj, &val, 1);
+                g_queue_push_tail(modifications, add_single_modification(mod));
+                val = 0xFF;
+                memcpy(mod->value_obj, &val, 1);
+                g_queue_push_tail(modifications, add_single_modification(mod));
+                val = 0;
+                memcpy(mod->value_obj, &val, 1);
+                g_queue_push_tail(modifications, add_single_modification(mod));
+                break;
+            }
+            case 2: {
+                uint16_t val = 1; // Default value for uint16_t
+                memcpy(mod->value_obj, &val, 2);
+                g_queue_push_tail(modifications, add_single_modification(mod));
+                val = 0xFFFF;
+                memcpy(mod->value_obj, &val, 2);
+                g_queue_push_tail(modifications, add_single_modification(mod));
+                val = 0;
+                memcpy(mod->value_obj, &val, 2);
+                g_queue_push_tail(modifications, add_single_modification(mod));
+                break;
+            }
+            case 4: {
+                uint32_t val = 1; // Default value for uint32_t
+                memcpy(mod->value_obj, &val, 4);
+                g_queue_push_tail(modifications, add_single_modification(mod));
+                val = 0xFFFFFFFF;
+                memcpy(mod->value_obj, &val, 4);
+                g_queue_push_tail(modifications, add_single_modification(mod));
+                val = 0;
+                memcpy(mod->value_obj, &val, 4);
+                g_queue_push_tail(modifications, add_single_modification(mod));
+                break;
+            }
+            case 8: {
+                uint64_t val = 1; // Default value for uint64_t
+                memcpy(mod->value_obj, &val, 8);
+                g_queue_push_tail(modifications, add_single_modification(mod));
+                val = 0xFFFFFFFFFFFFFFFF;
+                memcpy(mod->value_obj, &val, 8);
+                g_queue_push_tail(modifications, add_single_modification(mod));
+                val = 0;
+                memcpy(mod->value_obj, &val, 8);
+                g_queue_push_tail(modifications, add_single_modification(mod));
+                break;
+            }
+            default: {
+                // For other sizes, fill with zeros
+                memset(mod->value_obj, 0, mod->size);
+                break;
+            }
+        }
         memset(mod->value_obj, 0, mod->size);
-    } else if (type->kind == OSPREY_TYPE_STRUCT) {
+        log_msg("[candidate] [pointer] [prim] [addr %lx] [size %ld] [actual_value 0]\n", mod->addr, mod->size);
+    } else if (pointee_type->kind == OSPREY_TYPE_STRUCT) {
         // For struct type, recursively fill fields
-    } else if (type->kind == OSPREY_TYPE_ARRAY) {
+        log_msg("[candidate] [pointer] [struct] [addr %lx] [size %ld] [fields %ld]\n", mod->addr, mod->size, pointee_type->meta.struct_info.fields ? pointee_type->meta.struct_info.fields->len : 0);
+        for (size_t i = 0; i < pointee_type->meta.struct_info.fields->len; i++) {
+            OspreyStructField *field = &g_array_index(pointee_type->meta.struct_info.fields, OspreyStructField, i);
+            MutationCandidate field_mod = {
+                .addr = mod->addr + field->offset,
+                .size = osprey_type_size(field->type),
+                .kind = 0,
+                .expr = NULL,
+                .value_obj = NULL
+            };
+            add_new_object_modification(modifications, &field_mod, field->type);
+        }
+    } else if (pointee_type->kind == OSPREY_TYPE_ARRAY) {
         // For array type, recursively fill elements
+        log_msg("[candidate] [pointer] [array] [addr %lx] [size %ld] [elements %ld]\n", mod->addr, mod->size, pointee_type->meta.array_info.count);
     } else {
         // For pointer types, use NULL
         memset(mod->value_obj, 0, mod->size);
+        g_queue_push_tail(modifications, add_single_modification(mod));
+        log_msg("[candidate] [pointer] [ptr] [addr %lx] [size %ld] [actual_value 0]\n", mod->addr, mod->size);
     }
-    log_msg("[candidate] [pointer] [addr %lx] [size %ld] [actual_value 0]\n", mod->addr, mod->size);
-    g_queue_push_tail(modifications, add_single_modification(mod));
 }
 
 
