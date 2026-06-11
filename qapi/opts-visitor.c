@@ -48,7 +48,8 @@ enum ListMode
                           * next element of the signed interval.
                           */
 
-    LM_UNSIGNED_INTERVAL /* Same as above, only for an unsigned interval. */
+    LM_UNSIGNED_INTERVAL, /* Same as above, only for an unsigned interval. */
+    LM_TRAVERSED          /* opts_next_list() has been called. */
 };
 
 typedef enum ListMode ListMode;
@@ -238,6 +239,8 @@ opts_next_list(Visitor *v, GenericList *tail, size_t size)
     OptsVisitor *ov = to_ov(v);
 
     switch (ov->list_mode) {
+    case LM_TRAVERSED:
+        return NULL;
     case LM_SIGNED_INTERVAL:
     case LM_UNSIGNED_INTERVAL:
         if (ov->list_mode == LM_SIGNED_INTERVAL) {
@@ -258,6 +261,8 @@ opts_next_list(Visitor *v, GenericList *tail, size_t size)
         opt = g_queue_pop_head(ov->repeated_opts);
         if (g_queue_is_empty(ov->repeated_opts)) {
             g_hash_table_remove(ov->unprocessed_opts, opt->name);
+            ov->repeated_opts = NULL;
+            ov->list_mode = LM_TRAVERSED;
             return NULL;
         }
         break;
@@ -289,7 +294,8 @@ opts_end_list(Visitor *v, void **obj)
 
     assert(ov->list_mode == LM_IN_PROGRESS ||
            ov->list_mode == LM_SIGNED_INTERVAL ||
-           ov->list_mode == LM_UNSIGNED_INTERVAL);
+           ov->list_mode == LM_UNSIGNED_INTERVAL ||
+           ov->list_mode == LM_TRAVERSED);
     ov->repeated_opts = NULL;
     ov->list_mode = LM_NONE;
 }
@@ -305,6 +311,10 @@ lookup_scalar(const OptsVisitor *ov, const char *name, Error **errp)
          */
         list = lookup_distinct(ov, name, errp);
         return list ? g_queue_peek_tail(list) : NULL;
+    }
+    if (ov->list_mode == LM_TRAVERSED) {
+        error_setg(errp, "Fewer list elements than expected");
+        return NULL;
     }
     assert(ov->list_mode == LM_IN_PROGRESS);
     return g_queue_peek_head(ov->repeated_opts);
