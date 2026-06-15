@@ -18,6 +18,7 @@ void log_msg(const char *fmt, ...);
 
 extern bool restoring_to_snapshot;
 extern target_ulong binradar_entrypoint;
+extern uintptr_t patch_region_start;
 
 #define SNAPSHOT_PAGE_SIZE 4096
 #define SNAPSHOT_PAGE_MASK ~(SNAPSHOT_PAGE_SIZE - 1)
@@ -110,6 +111,8 @@ typedef struct ArgumentInfo {
     target_ulong value;
     Expr *expr;
 } ArgumentInfo;
+
+bool is_in_patch_region(target_ulong pc);
 
 void snapshot_set_binradar_patch_shm(uint32_t *shm);
 const char *snapshot_mem_region_str(SnapshotMemRegion *mr);

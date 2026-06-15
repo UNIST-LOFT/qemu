@@ -6480,6 +6480,10 @@ int        parse_translation_block(TranslationBlock* tb, uintptr_t tb_pc,
         return 0;
     }
 #endif
+    if (is_in_patch_region(tb_pc)) {
+        log_msg("[instrument] [skip] [patch region] [pc %lx]\n", tb_pc);
+        return 0;
+    }
     int force_flush_cache = 0;
     if (symbolic_mode == 1) {
         instrument = 1;

@@ -45,6 +45,7 @@ static uint8_t  binradar_query_window_dumped    = 0;
 bool forkserver_installed = false;
 unsigned char afl_fork_child;
 unsigned int  afl_forksrv_pid;
+uintptr_t patch_region_start = 0;
 
 GHashTable *coverage_log_edges_cnt = NULL;
 static SnapshotState g_snapshot;
@@ -200,6 +201,14 @@ static BinradarResult *binradar_manager_alloc_one_iter(BinradarManager *manager)
 static void trace_mem_flush(void);
 static int binradar_manager_cur_patch_id(BinradarManager *manager, int new_patch_id);
 static int binradar_manager_cur_iter(BinradarManager *manager, int new_iter);
+
+bool is_in_patch_region(target_ulong pc) {
+    // Inserted patch should not exceed 1MB
+    if (pc >= patch_region_start && pc < patch_region_start + 0x100000) {
+        return true;
+    }
+    return false;
+}
 
 void snapshot_protect_mapping(target_ulong addr, target_ulong len) {
     if (addr == (target_ulong)-1 || len == 0) {
