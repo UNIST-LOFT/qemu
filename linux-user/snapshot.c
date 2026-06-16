@@ -2753,7 +2753,7 @@ static int analyze_collected_data(const ArgumentInfo *arg_info, size_t num_arg_r
                         }
                     }
                 } else {
-                    log_msg("[candidate] [pointer] [addr %lx] [size %d] [actual_value %lx]\n", mod.addr, mod.size, actual_value);
+                    log_msg("[candidate] [pointer] [non-null] [addr %lx] [size %d] [actual_value %lx]\n", mod.addr, mod.size, actual_value);
                     Modification *modification = add_single_modification(&mod);
                     g_queue_push_tail(mod_manager->modifications, modification);
                 }
