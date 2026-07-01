@@ -20,6 +20,7 @@
 #include "sysemu/replay.h"
 
 #include "qemuafl/common.h"
+#include "qemuafl/binradar-trace.h"
 
 /* Pairs with tcg_clear_temp_count.
    To be called by #TranslatorOps.{translate_insn,tb_stop} if
@@ -95,7 +96,18 @@ void translator_loop(const TranslatorOps *ops, DisasContextBase *db,
 
         if (db->pc_next == afl_entry_point) {
             afl_setup();
+            if (binradar_trace_is_enabled()) {
+                TCGv pc_v = tcg_const_tl(db->pc_next);
+                gen_helper_binradar_trace_start(pc_v);
+                tcg_temp_free(pc_v);
+            }
             gen_helper_afl_entry_routine(cpu_env);
+        }
+
+        if (binradar_trace_should_hook_pc(db->pc_next)) {
+            TCGv pc_v = tcg_const_tl(db->pc_next);
+            gen_helper_binradar_trace_insn(pc_v);
+            tcg_temp_free(pc_v);
         }
 
         /* Disassemble one instruction.  The translate_insn hook should

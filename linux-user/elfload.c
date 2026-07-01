@@ -16,6 +16,7 @@
 #include "qapi/error.h"
 
 #include "qemuafl/common.h"
+#include "qemuafl/binradar-trace.h"
 
 #ifdef _ARCH_PPC64
 #undef ARCH_DLINFO
@@ -2924,7 +2925,7 @@ static void load_elf_image(const char *image_name, int image_fd,
         info->end_data = info->end_code;
     }
 
-    if (qemu_log_enabled()) {
+    if (qemu_log_enabled() || binradar_trace_symbols_enabled()) {
         load_symbols(ehdr, image_fd, load_bias);
     }
 

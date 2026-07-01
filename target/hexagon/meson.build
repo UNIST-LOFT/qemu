@@ -34,7 +34,7 @@ semantics_generated = custom_target(
     'semantics_generated.pyinc',
     output: 'semantics_generated.pyinc',
     input: gen_semantics,
-    command: ['@INPUT@', '@OUTPUT@'],
+    command: [gen_semantics, '@OUTPUT@'],
 )
 hexagon_ss.add(semantics_generated)
 
@@ -155,7 +155,7 @@ iset_py = custom_target(
     'iset.py',
     output: 'iset.py',
     input: gen_dectree_import,
-    command: ['@INPUT@', '@OUTPUT@'],
+    command: [gen_dectree_import, '@OUTPUT@'],
 )
 hexagon_ss.add(iset_py)
 
@@ -168,7 +168,8 @@ dectree_generated = custom_target(
     output: 'dectree_generated.h.inc',
     input: 'dectree.py',
     depends: [iset_py],
-    command: ['PYTHONPATH=' + meson.current_build_dir(), '@INPUT@', '@OUTPUT@'],
+    command: [python, '@INPUT@', '@OUTPUT@'],
+    env: {'PYTHONPATH': meson.current_build_dir()},
 )
 hexagon_ss.add(dectree_generated)
 

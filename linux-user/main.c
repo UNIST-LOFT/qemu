@@ -50,6 +50,7 @@
 #include "crypto/init.h"
 
 #include "qemuafl/qasan-qemu.h"
+#include "qemuafl/binradar-trace.h"
 
 char *exec_path;
 
@@ -524,6 +525,20 @@ static const struct qemu_argument arg_table[] = {
      "",           "run in singlestep mode"},
     {"strace",     "QEMU_STRACE",      false, handle_arg_strace,
      "",           "log system calls"},
+    {"input",      "BINRADAR_INPUT",   true,  binradar_trace_set_input,
+     "path",       "qemu_stacktrace-compatible input path for @@ replacement"},
+    {"patch-loc",  "BINRADAR_PATCH_LOC", true, binradar_trace_set_patch_loc,
+     "address",    "qemu_stacktrace-compatible patch location"},
+    {"patch-func-entry", "BINRADAR_PATCH_FUNC_ENTRY", true, binradar_trace_set_patch_func_entry,
+     "address",    "qemu_stacktrace-compatible patch function entry"},
+    {"asan",       "BINRADAR_ASAN",    true,  binradar_trace_set_asan,
+     "mode",       "accept host, guest, or none without enabling QASAN"},
+    {"asan-include", "",               true,  binradar_trace_ignore_arg,
+     "range",      "accepted for qemu_stacktrace CLI compatibility"},
+    {"asan-exclude", "",               true,  binradar_trace_ignore_arg,
+     "range",      "accepted for qemu_stacktrace CLI compatibility"},
+    {"trace-basic-blocks", "BINRADAR_TRACE_BASIC_BLOCKS", false, binradar_trace_enable_basic_blocks,
+     "",           "print qemu_stacktrace-compatible basic block hits"},
     {"seed",       "QEMU_RAND_SEED",   true,  handle_arg_seed,
      "",           "Seed for pseudo-random number generator"},
     {"trace",      "QEMU_TRACE",       true,  handle_arg_trace,
@@ -701,6 +716,8 @@ int main(int argc, char **argv, char **envp)
     int log_mask;
     unsigned long max_reserved_va;
 
+    binradar_trace_init_time();
+
     use_qasan = !!getenv("AFL_USE_QASAN");
 
     if (getenv("QASAN_MAX_CALL_STACK"))
@@ -781,6 +798,11 @@ int main(int argc, char **argv, char **envp)
     qemu_plugin_add_opts();
 
     optind = parse_args(argc, argv);
+
+    if (binradar_trace_is_enabled()) {
+        struct rlimit lim = { 0, 0 };
+        setrlimit(RLIMIT_CORE, &lim);
+    }
 
     log_mask = last_log_mask | (enable_strace ? LOG_STRACE : 0);
     if (log_mask) {
@@ -917,10 +939,14 @@ int main(int argc, char **argv, char **envp)
     if (argv0 != NULL) {
         target_argv[i++] = strdup(argv0);
     }
-    for (; i < target_argc; i++) {
-        target_argv[i] = strdup(argv[optind + i]);
+    for (int src_i = argv0 != NULL ? 1 : 0; src_i < target_argc; src_i++) {
+        const char *arg = argv[optind + src_i];
+        if (binradar_trace_should_drop_separator(src_i, arg)) {
+            continue;
+        }
+        target_argv[i++] = binradar_trace_rewrite_arg(arg);
     }
-    target_argv[target_argc] = NULL;
+    target_argv[i] = NULL;
 
     ts = g_new0(TaskState, 1);
     init_task_state(ts);
@@ -936,6 +962,9 @@ int main(int argc, char **argv, char **envp)
         printf("Error while loading %s: %s\n", exec_path, strerror(-ret));
         _exit(EXIT_FAILURE);
     }
+
+    binradar_trace_after_load(info->entry, info->start_code, info->end_code,
+                              exec_path);
 
     for (wrk = target_environ; *wrk; wrk++) {
         g_free(*wrk);
