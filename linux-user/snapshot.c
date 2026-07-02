@@ -45,7 +45,17 @@ static uint8_t  binradar_query_window_dumped    = 0;
 bool forkserver_installed = false;
 unsigned char afl_fork_child;
 unsigned int  afl_forksrv_pid;
-uintptr_t patch_region_start = 0;
+typedef struct exclude_region {
+    uintptr_t start;
+    uintptr_t end;
+} exclude_region;
+
+exclude_region binradar_exclude_regions[4] = {
+    {0, 0}, // PATCH_RESERVE_RANGE
+    {0, 0}, // E9_TRAMPOLINE_RANGE
+    {0, 0}, // E9_LOADER_RANGE
+    {0, 0}
+};
 
 GHashTable *coverage_log_edges_cnt = NULL;
 static SnapshotState g_snapshot;
@@ -201,11 +211,122 @@ static BinradarResult *binradar_manager_alloc_one_iter(BinradarManager *manager)
 static void trace_mem_flush(void);
 static int binradar_manager_cur_patch_id(BinradarManager *manager, int new_patch_id);
 static int binradar_manager_cur_iter(BinradarManager *manager, int new_iter);
+void parse_exclude_region_str(const char *name, uintptr_t load_bias, exclude_region *region);
 
-bool is_in_patch_region(target_ulong pc) {
+static int read_exact(int fd, void *buf, size_t len) {
+    uint8_t *p = buf;
+    size_t total = 0;
+
+    while (total < len) {
+        ssize_t n = read(fd, p + total, len - total);
+        if (n == 0) {
+            return -1;
+        }
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+        total += (size_t)n;
+    }
+
+    return 0;
+}
+
+static int write_exact(int fd, const void *buf, size_t len) {
+    const uint8_t *p = buf;
+    size_t total = 0;
+
+    while (total < len) {
+        ssize_t n = write(fd, p + total, len - total);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+        if (n == 0) {
+            return -1;
+        }
+        total += (size_t)n;
+    }
+
+    return 0;
+}
+
+void parse_exclude_region_str(const char *name, uintptr_t load_bias, exclude_region *region) {
+    if (name == NULL || region == NULL) {
+        return;
+    }
+    // Expected format: "0x20e9e9000-0x20e9ea000"
+    char *region_str = getenv(name);
+    char *dash = strchr(region_str, '-');
+    if (dash == NULL) {
+        log_msg("[snapshot] [parse-exclude-region] [name %s] [invalid-format] %s\n", name, region_str ? region_str : "NULL");
+        return;
+    }
+    *dash = '\0';
+    region->start = strtoull(region_str, NULL, 16) + load_bias;
+    region->end = strtoull(dash + 1, NULL, 16) + load_bias;
+    log_msg("[snapshot] [parse-exclude-region] [name %s] [start %lx] [end %lx]\n", name, region->start, region->end);
+}
+
+static void check_env_var(const char *name) {
+    char *value = getenv(name);
+    if (value == NULL) {
+        log_msg("[snapshot] [check-env-var] [name %s] [not-set]\n", name);
+    } else {
+        log_msg("[snapshot] [check-env-var] [name %s] [value %s]\n", name, value);
+    }
+}
+
+void check_all_env_var(void) {
+    // Log
+    check_env_var("BINRADAR_TRACER_LOG_FILE");
+    check_env_var("BINRADAR_TRACE_FILE");
+    // Fuzzolic
+    check_env_var("SYMBOLIC_INJECT_INPUT_MODE");
+    check_env_var("SYMBOLIC_TESTCASE_NAME");
+    check_env_var("PLT_INFO_FILE");
+    // Forkserver releated
+    check_env_var("BINRADAR_FORKSERVER_ENABLE");
+    check_env_var("BINRADAR_ENTRYPOINT");
+    check_env_var("BINRADAR_FORKSERVER_CTRL_R");
+    check_env_var("BINRADAR_FORKSERVER_STAT_W");
+    check_env_var("BINRADAR_FORKSERVER_TARGET_HIT_COUNT");
+    check_env_var("BINRADAR_PRESERVE_CHILD_QUERIES");
+    check_env_var("BINRADAR_PROBE_FILE");
+    check_env_var("BINRADAR_QUERY_WINDOW_FILE");
+    // Patch related
+    check_env_var("BINRADAR_PATCH_FD_R");
+    check_env_var("PATCH_FD"); // Used by brpatch
+    check_env_var("PATCH_ID"); // Used by brpatch, 123456
+    check_env_var("BINRADAR_PATCH_CNT");
+    // e9tool patch region related
+    check_env_var("PATCH_RESERVE_RANGE");
+    check_env_var("E9_TRAMPOLINE_RANGE");
+    check_env_var("E9_LOADER_RANGE");
+    // Shared memory
+    check_env_var("EXPR_POOL_SHM_KEY");
+    check_env_var("QUERY_SHM_KEY");
+    check_env_var("BITMAP_SHM_KEY");
+    check_env_var("BINRADAR_PATCH_SHM_KEY");
+}
+
+void add_exclude_regions(uintptr_t load_bias) {
+    parse_exclude_region_str("PATCH_RESERVE_RANGE", load_bias, &binradar_exclude_regions[0]);
+    parse_exclude_region_str("E9_TRAMPOLINE_RANGE", load_bias, &binradar_exclude_regions[1]);
+    parse_exclude_region_str("E9_LOADER_RANGE", load_bias, &binradar_exclude_regions[2]);
+}
+
+bool is_in_exclude_region(target_ulong pc) {
     // Inserted patch should not exceed 1MB
-    if (pc >= patch_region_start && pc < patch_region_start + 0x100000) {
-        return true;
+    for (int i = 0; i < 3; i++) {
+        exclude_region *region = &binradar_exclude_regions[i];
+        if (pc >= region->start && pc < region->end) {
+            return true;
+        }
     }
     return false;
 }
@@ -242,7 +363,6 @@ void snapshot_set_binradar_patch_shm(uint32_t *shm) {
     binradar_manager = g_new0(BinradarManager, 1);
     binradar_manager->patch_cnt = 1;
     binradar_manager->results = g_ptr_array_new();
-    binradar_manager->current = binradar_manager_alloc_one_iter(binradar_manager);
     binradar_manager->cur_patch_id = shm;
     *binradar_manager->cur_patch_id = 0;
     binradar_manager->cur_iter = shm + 1;
@@ -261,6 +381,7 @@ void snapshot_set_binradar_patch_shm(uint32_t *shm) {
         log_msg("BINRADAR_PATCH_CNT not set");
         exit_with_status(1);
     }
+    binradar_manager->current = binradar_manager_alloc_one_iter(binradar_manager);
     binradar_manager->patch_result_parser = sbsv_parser_new(SBSV_PARSER_DEFAULT);
     sbsv_parser_add_schema(binradar_manager->patch_result_parser, "[patch] [id: int] [br: bool] [v: int]");
 }
@@ -2460,6 +2581,30 @@ static void add_new_object_modification(GQueue *modifications, MutationCandidate
 
 // In parent process, called after child execution
 // Return: remaining modifications
+static int select_next_modification(SnapshotExitInfo *exit_info) {
+    (void)exit_info;
+
+    if (mod_manager == NULL) {
+        return 0;
+    }
+
+    if (mod_manager->current != NULL) {
+        g_array_append_val(mod_manager->done, mod_manager->current);
+    }
+    mod_manager->current = g_queue_pop_head(mod_manager->modifications);
+    if (mod_manager->current == NULL) {
+        log_msg("[analyze] [done] consumed all modifications\n");
+        if (shared_trace_data != NULL) {
+            memset(shared_trace_data, 0, sizeof(SharedTraceData));
+        }
+        return 0;
+    }
+
+    // Finished: reset shared_trace_data
+    memset(shared_trace_data, 0, sizeof(SharedTraceData));
+    return g_queue_get_length(mod_manager->modifications) + 1;
+}
+
 static int analyze_collected_data(const ArgumentInfo *arg_info, size_t num_arg_regs) {
     if (shared_trace_data == NULL) {
         log_msg("Snapshot init error: shared_trace_data is null\n");
@@ -2779,7 +2924,7 @@ static int analyze_collected_data(const ArgumentInfo *arg_info, size_t num_arg_r
         log_msg("[analyze] [queue] [len %d]\n", g_queue_get_length(mod_manager->modifications));
         g_array_free(pointer_nodes, true);
         g_array_free(mod_primitive_candidates, true);
-        return g_queue_get_length(mod_manager->modifications);
+        return select_next_modification(exit_info);
     } else {
         // TODO: Implement feedback loop
         // // Collect only delta, give feedback
@@ -2850,30 +2995,7 @@ static int analyze_collected_data(const ArgumentInfo *arg_info, size_t num_arg_r
         g_array_free(pointer_nodes, true);
         g_array_free(mod_primitive_candidates, true);
     }
-    // Select one modification
-    g_array_append_val(mod_manager->done, mod_manager->current);
-    mod_manager->current = g_queue_pop_head(mod_manager->modifications);
-    // TODO: restore file offset if needed
-    if (mod_manager->current == NULL) {
-        log_msg("[analyze] [done] consumed all modifications\n");
-        return 0;
-    }
-    // Clean expr and query added during child execution
-    if (!binradar_preserve_child_queries) {
-        uint8_t *expr_base = (uint8_t *)next_free_expr;
-        uint8_t *expr_top  = (uint8_t *)exit_info->next_free_expr;
-        if (expr_top > expr_base) {
-            memset(next_free_expr, 0, expr_top - expr_base);
-        }
-        uint8_t *query_base = (uint8_t *)next_query;
-        uint8_t *query_top  = (uint8_t *)exit_info->next_query;
-        if (query_top > query_base) {
-            memset(next_query, 0, query_top - query_base);
-        }
-    }
-    // Finished: reset shared_trace_data
-    memset(shared_trace_data, 0, sizeof(SharedTraceData));
-    return g_queue_get_length(mod_manager->modifications) + 1;
+    return select_next_modification(exit_info);
 }
 
 static int binradar_manager_cur_patch_id(BinradarManager *manager, int new_patch_id) {
@@ -3119,6 +3241,7 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env, const ArgumentInf
         binradar_manager_reset_line_buf(binradar_manager);
     }
     int binradar_iter = 0;
+    int binradar_patch_id = 0;
     bool binradar_mode = (binradar_manager != NULL);
     
     uint32_t   was_killed;
@@ -3134,14 +3257,14 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env, const ArgumentInf
     /* Tell the parent that we're alive. If the parent doesn't want
        to talk, assume that we're not running in forkserver mode. */
   
-    if (write(binradar_forkserver_stat_w, msg, 4) != 4) {
+    if (write_exact(binradar_forkserver_stat_w, msg, 4) < 0) {
         log_msg("[snapshot] [forkserver] [error] failed to write to %d %d\n", binradar_forkserver_stat_w, status);
         exit_with_status(1);
     }
   
     afl_forksrv_pid = getpid();
   
-    if (read(binradar_forkserver_ctrl_r, reply, 4) != 4) {
+    if (read_exact(binradar_forkserver_ctrl_r, reply, 4) < 0) {
         log_msg("[snapshot] [forkserver] [error] fuzzolic not responding to %d\n", binradar_forkserver_ctrl_r);
         exit_with_status(1);
     }
@@ -3151,7 +3274,7 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env, const ArgumentInf
     }
 
     // send welcome message as final message
-    if (write(binradar_forkserver_stat_w, msg, 4) != 4) { 
+    if (write_exact(binradar_forkserver_stat_w, msg, 4) < 0) { 
         log_msg("[snapshot] [forkserver] [error] failed to send final handshake to %d %d\n", binradar_forkserver_stat_w, status);
         exit_with_status(1);
     }
@@ -3166,107 +3289,108 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env, const ArgumentInf
   
         /* Whoops, parent dead? */
     
-        if (read(binradar_forkserver_ctrl_r, &was_killed, 4) != 4) {
+        if (read_exact(binradar_forkserver_ctrl_r, &was_killed, 4) < 0) {
             log_msg("[forkserver] [exit] parent (fuzzolic) dead or exit\n");
             exit_with_status(2);
         }
-        binradar_commit(binradar_manager); // Commit collected patch results from previous iteration
-        binradar_iter++;
-        binradar_manager_cur_iter(binradar_manager, binradar_iter);
-        if (binradar_iter > 1) {
-            // Select one modification to apply for next iteration
-            // Pop from modification queue and set as current
-            remaining_mods = analyze_collected_data(arg_info, num_arg_regs);
+        if (binradar_mode && binradar_iter == 0) {
+            binradar_iter = 1;
+            binradar_patch_id = 0;
+        } else if (!binradar_mode) {
+            binradar_iter++;
         }
-    
+        binradar_manager_cur_iter(binradar_manager, binradar_iter);
+
         /* Establish a channel with child to grab translation commands. We'll
         read from t_fd[0], child will write to TSL_FD. */
 
         // if (pipe(t_fd) || dup2(t_fd[1], TSL_FD) < 0) exit(3);
         // close(t_fd[1]);
-        for (int i = 0; i < patch_cnt + 1; i++) {
-            if (binradar_mode) {
-                status[1] = i; // patch id
-                status[2] = binradar_iter; // iter
-                binradar_manager_cur_patch_id(binradar_manager, i);
-                log_msg("[binradar] [shm] [patch-id %d] [iter %d]\n", *binradar_manager->cur_patch_id, *binradar_manager->cur_iter);
-            }
-            fflush(NULL);
-            trace_mem_flush();
-            log_msg_flush();
-            child_pid = fork();
-            if (child_pid < 0) exit_with_status(4);
+        if (binradar_mode) {
+            status[1] = binradar_patch_id;
+            status[2] = binradar_iter;
+            binradar_manager_cur_patch_id(binradar_manager, binradar_patch_id);
+            log_msg("[binradar] [shm] [patch-id %d] [iter %d]\n", *binradar_manager->cur_patch_id, *binradar_manager->cur_iter);
+        }
+        fflush(NULL);
+        trace_mem_flush();
+        log_msg_flush();
+        child_pid = fork();
+        if (child_pid < 0) exit_with_status(4);
 
-            if (!child_pid) {
+        if (!child_pid) {
 #ifdef SNAPSHOT_DEBUG
-                snapshot_install_crash_handler();
+            snapshot_install_crash_handler();
 #endif
-                /* Child process. Close descriptors and run free. */
-                snapshot_modify_memory(cpu_env);
-                afl_fork_child = 1;
-                close(binradar_forkserver_ctrl_r);
-                close(binradar_forkserver_stat_w);
-                // close(t_fd[0]);
-                return;
-
-            }
-
-            /* Parent. */
-
-            // close(TSL_FD);
-
-        
-            /* Parent. */
-        
-            /* Collect translation requests until child dies and closes the pipe. */
-        
-            // afl_wait_tsl(cpu, t_fd[0]);
-        
-            /* Get and relay exit status to parent. */
-        
-            if (wait_child_and_drain_patch(child_pid, status) < 0) exit_with_status(6);
-
-            // Child process exit
-            trace_mem_flush();
-            if (write(binradar_forkserver_stat_w, status, sizeof(status)) != sizeof(status)) exit_with_status(7);
-
-            // Get type inference result
-            if (read(binradar_forkserver_ctrl_r, &analyze_result_len, 4) != 4) {
-                log_msg("[forkserver] [error] failed to read analyze_result_len from %d\n", binradar_forkserver_ctrl_r);
-                exit_with_status(8);
-            }
-            log_msg("[forkserver] [analyze-result] [len %lu]\n", analyze_result_len);
-
-            if (analyze_result_len > 0) {
-                if (analyze_result_len > analyze_result_len_prev) {
-                    g_free(analyze_result);
-                    analyze_result = g_malloc(analyze_result_len + 1);
-                    analyze_result_len_prev = analyze_result_len;
-                }
-                size_t total_read = 0;
-                while (total_read < analyze_result_len) {
-                    ssize_t bytes_read = read(binradar_forkserver_ctrl_r, analyze_result + total_read, analyze_result_len - total_read);
-                    if (bytes_read <= 0) {
-                        log_msg("[forkserver] [error] failed to read analyze_result from %d\n", binradar_forkserver_ctrl_r);
-                        exit_with_status(9);
-                    }
-                    total_read += bytes_read;
-                }
-                analyze_result[analyze_result_len] = '\0';
-                log_msg("[forkserver] [analyze-result] [accept %lu]\n", analyze_result_len);
-                snapshot_load_inferred_types(analyze_result);
-            }
-
-            if (binradar_mode && binradar_iter == 1) {
-                remaining_mods = analyze_collected_data(arg_info, num_arg_regs);
-                if (write(binradar_forkserver_stat_w, &remaining_mods, 4) != 4) exit_with_status(10);
-                break; // We don't have to run other patches for original input
-            }
-            
-            // Send remaining count
-            if (write(binradar_forkserver_stat_w, &remaining_mods, 4) != 4) exit_with_status(10);
+            /* Child process. Close descriptors and run free. */
+            snapshot_modify_memory(cpu_env);
+            afl_fork_child = 1;
+            close(binradar_forkserver_ctrl_r);
+            close(binradar_forkserver_stat_w);
+            // close(t_fd[0]);
+            return;
 
         }
+
+        /* Parent. */
+
+        // close(TSL_FD);
+
+
+        /* Parent. */
+
+        /* Collect translation requests until child dies and closes the pipe. */
+
+        // afl_wait_tsl(cpu, t_fd[0]);
+
+        /* Get and relay exit status to parent. */
+
+        if (wait_child_and_drain_patch(child_pid, status) < 0) exit_with_status(6);
+
+        // Child process exit
+        trace_mem_flush();
+        if (write_exact(binradar_forkserver_stat_w, status, sizeof(status)) < 0) exit_with_status(7);
+
+        // Get type inference result
+        if (read_exact(binradar_forkserver_ctrl_r, &analyze_result_len, 4) < 0) {
+            log_msg("[forkserver] [error] failed to read analyze_result_len from %d\n", binradar_forkserver_ctrl_r);
+            exit_with_status(8);
+        }
+        log_msg("[forkserver] [analyze-result] [len %lu]\n", analyze_result_len);
+
+        if (analyze_result_len > 0) {
+            if (analyze_result_len > analyze_result_len_prev) {
+                g_free(analyze_result);
+                analyze_result = g_malloc(analyze_result_len + 1);
+                analyze_result_len_prev = analyze_result_len;
+            }
+            if (read_exact(binradar_forkserver_ctrl_r, analyze_result, analyze_result_len) < 0) {
+                log_msg("[forkserver] [error] failed to read analyze_result from %d\n", binradar_forkserver_ctrl_r);
+                exit_with_status(9);
+            }
+            analyze_result[analyze_result_len] = '\0';
+            log_msg("[forkserver] [analyze-result] [accept %lu]\n", analyze_result_len);
+            snapshot_load_inferred_types(analyze_result);
+        }
+
+        if (binradar_mode) {
+            if (binradar_iter == 1) {
+                remaining_mods = analyze_collected_data(arg_info, num_arg_regs);
+                binradar_commit(binradar_manager);
+                binradar_iter = 2;
+                binradar_patch_id = 0;
+            } else if (binradar_patch_id >= patch_cnt) {
+                binradar_commit(binradar_manager);
+                remaining_mods = analyze_collected_data(arg_info, num_arg_regs);
+                binradar_iter++;
+                binradar_patch_id = 0;
+            } else {
+                binradar_patch_id++;
+            }
+        }
+
+        // Send remaining count
+        if (write_exact(binradar_forkserver_stat_w, &remaining_mods, 4) < 0) exit_with_status(10);
   
     }
 

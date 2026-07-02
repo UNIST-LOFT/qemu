@@ -586,6 +586,10 @@ static void QEMU_NORETURN dump_core_and_abort(int target_sig, const target_sigin
     int si_code = info ? info->si_code : 0;
     snapshot_record_guest_crash(env, target_sig, host_sig, si_code, fault_addr, 0, "unhandled_target_signal");
 
+    if (afl_fork_child) {
+        _exit(128 + host_sig);
+    }
+
     /* dump core if supported by target binary format */
     if (core_dump_signal(target_sig) && (ts->bprm->core_dump != NULL)) {
         stop_all_tasks();

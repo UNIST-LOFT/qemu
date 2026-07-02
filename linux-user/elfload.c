@@ -2521,6 +2521,7 @@ static void load_elf_image(const char *image_name, int image_fd,
     }
     
     if (pinterp_name != NULL) {
+        check_all_env_var();
         char *binradar_entrypoint_str = getenv("BINRADAR_ENTRYPOINT");
         if (binradar_entrypoint_str) {
             binradar_entrypoint = strtoul(binradar_entrypoint_str, NULL, 16);
@@ -2532,14 +2533,8 @@ static void load_elf_image(const char *image_name, int image_fd,
             binradar_entrypoint = info->entry;
         }
         log_msg("[snapshot] [entrypoint] [addr %lx] [bias %lx]\n", binradar_entrypoint, load_bias);
-        char *patch_reserve_addr = getenv("PATCH_RESERVE_ADDR");
-        if (patch_reserve_addr) {
-            patch_region_start = strtoull(patch_reserve_addr, NULL, 16);
-        }
-        if (patch_region_start != 0) {
-            patch_region_start += load_bias;
-        }
-        log_msg("[snapshot] [patch-reserve-addr] [addr %lx]\n", patch_region_start);
+        add_exclude_regions(load_bias);
+        // log_msg("[snapshot] [patch-reserve-addr] [addr %lx]\n", patch_region_start);
     }
     fprintf(stderr, "load_addr: %lx, load_bias: %lx\n", load_addr, load_bias);
     
