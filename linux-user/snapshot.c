@@ -3322,7 +3322,10 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env, const ArgumentInf
 #ifdef SNAPSHOT_DEBUG
             snapshot_install_crash_handler();
 #endif
-            /* Child process. Close descriptors and run free. */
+            /* Child process. Reset shared trace data, close descriptors, run target program. */
+            if (shared_trace_data != NULL) {
+                memset(shared_trace_data, 0, sizeof(SharedTraceData));
+            }
             snapshot_modify_memory(cpu_env);
             afl_fork_child = 1;
             close(binradar_forkserver_ctrl_r);
