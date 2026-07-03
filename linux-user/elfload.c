@@ -2800,6 +2800,11 @@ static void load_elf_image(const char *image_name, int image_fd,
       fprintf(stderr, "AFL forkserver entrypoint: 0x%lx\n",
               (unsigned long)afl_entry_point);
 
+    if (getenv("AFL_TARGET_ADDR") != NULL) {
+      afl_target_addr = strtoul(getenv("AFL_TARGET_ADDR"), NULL, 16);
+      if (afl_target_addr) afl_target_addr += load_bias;
+    }
+
     prot_exec = PROT_EXEC;
 #ifdef TARGET_AARCH64
     /*

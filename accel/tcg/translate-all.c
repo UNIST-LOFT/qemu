@@ -78,6 +78,12 @@ void HELPER(afl_maybe_log)(target_ulong cur_loc) {
 
 }
 
+void HELPER(afl_target_reached)(void) {
+
+  afl_area_ptr[1] = 0xFF;
+
+}
+
 /* Generates TCG code for AFL's tracing instrumentation. */
 static void afl_gen_trace(target_ulong cur_loc) {
 
@@ -88,6 +94,15 @@ static void afl_gen_trace(target_ulong cur_loc) {
 
   if (!cur_block_is_good)
     return;
+
+  /* If -a <target_addr> was given and this BB matches, emit a helper
+     that sets the target_reached signal in the shared memory bitmap. */
+
+  if (afl_target_addr && cur_loc == afl_target_addr) {
+
+    gen_helper_afl_target_reached();
+
+  }
 
   /* Looks like QEMU always maps to fixed locations, so ASLR is not a
      concern. Phew. But instruction addresses may be aligned. Let's mangle

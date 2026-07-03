@@ -73,7 +73,8 @@ unsigned char *afl_area_ptr = dummy;          /* Exported for afl_gen_trace */
 
 abi_ulong afl_entry_point,                      /* ELF entry point (_start) */
     afl_start_code,                             /* .text start pointer      */
-    afl_end_code;                               /* .text end pointer        */
+    afl_end_code,                               /* .text end pointer        */
+    afl_target_addr;                            /* target address (-a)      */
 
 struct vmrange* afl_instr_code;
 
