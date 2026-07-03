@@ -737,21 +737,6 @@ int main(int argc, char **argv, char **envp)
         (void) envlist_setenv(envlist, *wrk);
     }
 
-    /* Expand AFL_PRELOAD to append preload libraries */
-    char *afl_preload = getenv("AFL_PRELOAD");
-    if (afl_preload) {
-        /* NOTE: If there is more than one in the list, LD_PRELOAD allows spaces or colons
-                 as separators, but DYLD_INSERT_LIBRARIES allows only colons.
-                 Maybe we should attempt to normalize the list here before we assign it? */
-        char * ld_preload;
-        ignore_result(asprintf(&ld_preload, "LD_PRELOAD=%s", afl_preload));
-        envlist_setenv(envlist, ld_preload);
-
-        char * dyld_insert;
-        ignore_result(asprintf(&dyld_insert, "DYLD_INSERT_LIBRARIES=%s", afl_preload));
-        envlist_setenv(envlist, dyld_insert);
-    }
-
     /* Read the stack limit from the kernel.  If it's "unlimited",
        then we can do little else besides use the default.  */
     {
@@ -785,7 +770,8 @@ int main(int argc, char **argv, char **envp)
     }
 #endif
 
-    /* Add AFL_PRELOAD for qasan if it is enabled */
+    /* Add AFL_PRELOAD for qasan if it is enabled.
+       This MUST happen BEFORE the envlist AFL_PRELOAD expansion below. */
     if (use_qasan) {
         char *preload = getenv("AFL_PRELOAD");
         char *libqasan = get_libqasan_path(argv[0]);
@@ -807,6 +793,22 @@ int main(int argc, char **argv, char **envp)
             free(afl_preload);
         }
         free(libqasan);
+    }
+
+    /* Expand AFL_PRELOAD to append preload libraries into envlist.
+       This is placed AFTER setenv("AFL_PRELOAD", ...) above so that
+       libqasan is included when --asan host/guest is used. */
+    {
+        char *afl_preload = getenv("AFL_PRELOAD");
+        if (afl_preload) {
+            char * ld_preload;
+            ignore_result(asprintf(&ld_preload, "LD_PRELOAD=%s", afl_preload));
+            envlist_setenv(envlist, ld_preload);
+
+            char * dyld_insert;
+            ignore_result(asprintf(&dyld_insert, "DYLD_INSERT_LIBRARIES=%s", afl_preload));
+            envlist_setenv(envlist, dyld_insert);
+        }
     }
 
     log_mask = last_log_mask | (enable_strace ? LOG_STRACE : 0);

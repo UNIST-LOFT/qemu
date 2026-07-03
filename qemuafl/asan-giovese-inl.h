@@ -1307,7 +1307,7 @@ int asan_giovese_report_and_crash(int access_type, target_ulong addr, size_t n,
 
   if (binradar_trace_is_enabled()) {
     binradar_trace_report_qasan_crash(pc, fault_addr, SIGSEGV);
-    return 0;
+    _exit(1);
   }
   
   fprintf(stderr,

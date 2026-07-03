@@ -951,9 +951,6 @@ static void handle_pending_signal(CPUArchState *cpu_env, int sig,
                    sig != TARGET_SIGCONT) {
 
             binradar_trace_report_signal(cpu_env, sig);
-            if (binradar_trace_is_enabled()) {
-                _exit(128 + target_to_host_signal(sig));
-            }
 
 #ifdef ASAN_GIOVESE
             if (use_qasan) {
@@ -973,6 +970,10 @@ static void handle_pending_signal(CPUArchState *cpu_env, int sig,
             }
 #endif
 
+            if (binradar_trace_is_enabled()) {
+                _exit(128 + target_to_host_signal(sig));
+            }
+
             dump_core_and_abort(sig);
         }
     } else if (handler == TARGET_SIG_IGN) {
@@ -980,9 +981,6 @@ static void handle_pending_signal(CPUArchState *cpu_env, int sig,
     } else if (handler == TARGET_SIG_ERR) {
 
         binradar_trace_report_signal(cpu_env, sig);
-        if (binradar_trace_is_enabled()) {
-            _exit(128 + target_to_host_signal(sig));
-        }
 
 #ifdef ASAN_GIOVESE
       if (use_qasan) {
@@ -1001,6 +999,10 @@ static void handle_pending_signal(CPUArchState *cpu_env, int sig,
                                      SP_GET(cpu_env));
       }
 #endif
+
+      if (binradar_trace_is_enabled()) {
+          _exit(128 + target_to_host_signal(sig));
+      }
 
         dump_core_and_abort(sig);
     } else {
