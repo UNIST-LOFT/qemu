@@ -14,6 +14,7 @@ void binradar_trace_enable_basic_blocks(const char *unused);
 int binradar_trace_is_enabled(void);
 int binradar_trace_symbols_enabled(void);
 int binradar_trace_trace_basic_blocks(void);
+int binradar_trace_qasan_requested(void);
 int binradar_trace_should_hook_pc(target_ulong pc);
 int binradar_trace_should_drop_separator(int target_index, const char *arg);
 char *binradar_trace_rewrite_arg(const char *arg);
@@ -33,6 +34,8 @@ void binradar_trace_post_syscall(void *cpu_env, int num, target_long ret,
                                  target_long arg3, target_long arg4,
                                  target_long arg5, target_long arg6);
 void binradar_trace_report_signal(void *cpu_env, int sig);
+void binradar_trace_report_qasan_crash(target_ulong pc, target_ulong fault_addr,
+                                       int sig);
 void binradar_trace_report_exit(void *cpu_env, int code);
 
 #endif

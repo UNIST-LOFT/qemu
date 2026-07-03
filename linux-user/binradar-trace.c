@@ -47,6 +47,7 @@ static bool pending_patch_hit;
 static bool patch_covered;
 static bool patch_func_entry_covered;
 static bool patch_func_entry_hit;
+static bool qasan_requested;
 static int64_t start_ms;
 
 static char *input_path;
@@ -143,6 +144,7 @@ void binradar_trace_set_asan(const char *mode)
     enable_trace();
     if (mode && (!strcmp(mode, "host") || !strcmp(mode, "guest") || !strcmp(mode, "none"))) {
         asan_mode = mode;
+        qasan_requested = !strcmp(mode, "host") || !strcmp(mode, "guest");
     } else {
         fprintf(stderr, "qemu: invalid --asan mode '%s'\n", mode ? mode : "");
         exit(EXIT_FAILURE);
@@ -175,6 +177,11 @@ int binradar_trace_symbols_enabled(void)
 int binradar_trace_trace_basic_blocks(void)
 {
     return trace_enabled && trace_basic_blocks;
+}
+
+int binradar_trace_qasan_requested(void)
+{
+    return qasan_requested;
 }
 
 int binradar_trace_should_hook_pc(target_ulong pc)
@@ -743,12 +750,11 @@ static int cmp_func_hit(const void *a, const void *b)
     return aa->entry > bb->entry;
 }
 
-static void print_stacktrace(target_ulong pc)
+static void print_stacktrace(target_ulong pc, target_ulong fault_addr)
 {
     size_t idx = 0;
     ssize_t i;
     int fault_idx = -1;
-    target_ulong fault_addr = 0;
     char *symbol;
 
     trace_log("stacktrace:");
@@ -777,6 +783,9 @@ static void print_stacktrace(target_ulong pc)
         idx++;
     }
 
+    if (fault_idx < 0 && fault_addr && in_target(fault_addr)) {
+        fault_idx = 0;
+    }
     if (fault_idx < 0 && in_target(pc)) {
         fault_idx = 0;
         fault_addr = pc;
@@ -788,6 +797,21 @@ static void print_stacktrace(target_ulong pc)
                   fault_idx, (uint64_t)fault_addr, symbol);
         g_free(symbol);
     }
+}
+
+static const char *target_signal_name(int sig);
+static void print_final_common(void);
+
+static void print_crash_common(target_ulong pc, target_ulong fault_addr,
+                               int sig)
+{
+    trace_log("exit-raw Ok(Crash)");
+    trace_log("[qemu-exit] [kind crash] [detail target crash]");
+    trace_log("[exit] [result crash]");
+    trace_log("[crash] [signal %d] [name %s]", target_to_host_signal(sig),
+              target_signal_name(sig));
+    print_stacktrace(pc, fault_addr);
+    print_final_common();
 }
 
 static const char *target_signal_name(int sig)
@@ -887,13 +911,17 @@ void binradar_trace_report_signal(void *cpu_env, int sig)
     }
     printed_final = true;
     pc = PC_GET(env);
-    trace_log("exit-raw Ok(Crash)");
-    trace_log("[qemu-exit] [kind crash] [detail target crash]");
-    trace_log("[exit] [result crash]");
-    trace_log("[crash] [signal %d] [name %s]", target_to_host_signal(sig),
-              target_signal_name(sig));
-    print_stacktrace(pc);
-    print_final_common();
+    print_crash_common(pc, 0, sig);
+}
+
+void binradar_trace_report_qasan_crash(target_ulong pc, target_ulong fault_addr,
+                                       int sig)
+{
+    if (!trace_enabled || printed_final) {
+        return;
+    }
+    printed_final = true;
+    print_crash_common(pc, fault_addr, sig);
 }
 
 void binradar_trace_report_exit(void *cpu_env, int code)

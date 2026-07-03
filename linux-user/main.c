@@ -725,11 +725,6 @@ int main(int argc, char **argv, char **envp)
     if (getenv("QASAN_SYMBOLIZE"))
       qasan_symbolize = atoi(getenv("QASAN_SYMBOLIZE"));
 
-#ifdef ASAN_GIOVESE
-    if (use_qasan)
-      asan_giovese_init();
-#endif
-
     error_init(argv[0]);
     module_call_init(MODULE_INIT_TRACE);
     qemu_init_cpu_list();
@@ -740,30 +735,6 @@ int main(int argc, char **argv, char **envp)
     /* add current environment into the list */
     for (wrk = environ; *wrk != NULL; wrk++) {
         (void) envlist_setenv(envlist, *wrk);
-    }
-
-    /* Add AFL_PRELOAD for qasan if it is enabled */
-    if(use_qasan) {
-        char *preload = getenv("AFL_PRELOAD");
-        char *libqasan = get_libqasan_path(argv[0]);
-
-        if (!preload) {
-            setenv("AFL_PRELOAD", libqasan, 0);
-        } else {
-            /* NOTE: If there is more than one in the list, LD_PRELOAD allows spaces or colons
-                     as separators (but no escaping provided), but DYLD_INSERT_LIBRARIES allows only colons.
-                     Prefer colons for maximum compatibility, but use space if the string already has any. */
-            char * afl_preload;
-            if (strchr(preload, ' ')) {
-                ignore_result(asprintf(&afl_preload, "%s %s", libqasan, preload));
-            } else {
-                ignore_result(asprintf(&afl_preload, "%s:%s", libqasan, preload));
-            }
-
-            setenv("AFL_PRELOAD", afl_preload, 1);
-            free(afl_preload);
-        }
-        free(libqasan);
     }
 
     /* Expand AFL_PRELOAD to append preload libraries */
@@ -802,6 +773,40 @@ int main(int argc, char **argv, char **envp)
     if (binradar_trace_is_enabled()) {
         struct rlimit lim = { 0, 0 };
         setrlimit(RLIMIT_CORE, &lim);
+    }
+
+    if (binradar_trace_qasan_requested()) {
+        use_qasan = 1;
+    }
+
+#ifdef ASAN_GIOVESE
+    if (use_qasan) {
+        asan_giovese_init();
+    }
+#endif
+
+    /* Add AFL_PRELOAD for qasan if it is enabled */
+    if (use_qasan) {
+        char *preload = getenv("AFL_PRELOAD");
+        char *libqasan = get_libqasan_path(argv[0]);
+
+        if (!preload) {
+            setenv("AFL_PRELOAD", libqasan, 0);
+        } else {
+            /* NOTE: If there is more than one in the list, LD_PRELOAD allows spaces or colons
+                     as separators (but no escaping provided), but DYLD_INSERT_LIBRARIES allows only colons.
+                     Prefer colons for maximum compatibility, but use space if the string already has any. */
+            char * afl_preload;
+            if (strchr(preload, ' ')) {
+                ignore_result(asprintf(&afl_preload, "%s %s", libqasan, preload));
+            } else {
+                ignore_result(asprintf(&afl_preload, "%s:%s", libqasan, preload));
+            }
+
+            setenv("AFL_PRELOAD", afl_preload, 1);
+            free(afl_preload);
+        }
+        free(libqasan);
     }
 
     log_mask = last_log_mask | (enable_strace ? LOG_STRACE : 0);
