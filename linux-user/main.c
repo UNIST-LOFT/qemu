@@ -50,6 +50,7 @@
 #include "crypto/init.h"
 
 #include "qemuafl/qasan-qemu.h"
+#include "qemuafl/binradar-trace.h"
 
 char *exec_path;
 
@@ -538,6 +539,23 @@ static const struct qemu_argument arg_table[] = {
     {"xtensa-abi-call0", "QEMU_XTENSA_ABI_CALL0", false, handle_arg_abi_call0,
      "",           "assume CALL0 Xtensa ABI"},
 #endif
+    {"input",      "BINRADAR_INPUT",   true,  binradar_trace_set_input,
+     "path",       "qemu_stacktrace-compatible input path for @@ replacement"},
+    {"patch-loc",
+     "BINRADAR_PATCH_LOC",             true, binradar_trace_set_patch_loc,
+     "address",    "qemu_stacktrace-compatible patch location"},
+    {"patch-func-entry",
+     "BINRADAR_PATCH_FUNC_ENTRY",      true, binradar_trace_set_patch_func_entry,
+     "address",    "qemu_stacktrace-compatible patch function entry"},
+    {"asan",       "BINRADAR_ASAN",    true,  binradar_trace_set_asan,
+     "mode",       "accept host, guest, or none without enabling QASAN"},
+    {"asan-include", "",               true,  binradar_trace_ignore_arg,
+     "range",      "accepted for qemu_stacktrace CLI compatibility"},
+    {"asan-exclude", "",               true,  binradar_trace_ignore_arg,
+     "range",      "accepted for qemu_stacktrace CLI compatibility"},
+    {"trace-basic-blocks",
+     "BINRADAR_TRACE_BASIC_BLOCKS",    false, binradar_trace_enable_basic_blocks,
+     "",           "print qemu_stacktrace-compatible basic block hits"},
     {NULL, NULL, false, NULL, NULL, NULL}
 };
 
@@ -701,6 +719,7 @@ int main(int argc, char **argv, char **envp)
     int log_mask;
     unsigned long max_reserved_va;
 
+    binradar_trace_init_time();
     use_qasan = !!getenv("AFL_USE_QASAN");
 
     if (getenv("QASAN_MAX_CALL_STACK"))
@@ -937,6 +956,9 @@ int main(int argc, char **argv, char **envp)
         _exit(EXIT_FAILURE);
     }
 
+
+    binradar_trace_after_load(info->entry,
+        info->start_code, info->end_code, exec_path);
     for (wrk = target_environ; *wrk; wrk++) {
         g_free(*wrk);
     }

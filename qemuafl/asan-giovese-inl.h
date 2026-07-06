@@ -27,6 +27,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 *******************************************************************************/
 
 #include "asan-giovese.h"
+#include "qemuafl/binradar-trace.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <stddef.h>
@@ -1305,7 +1306,12 @@ int asan_giovese_report_and_crash(int access_type, target_ulong addr, size_t n,
   const char*  error_type;
 
   if (!poisoned_find_error(addr, n, &fault_addr, &error_type)) return 0;
-  
+
+  if (binradar_trace_is_enabled()) {
+    binradar_trace_report_qasan_crash(pc, fault_addr, SIGSEGV);
+    _exit(1);
+  }
+
   fprintf(stderr,
           "=================================================================\n"
           ANSI_COLOR_HRED "==%d==ERROR: " ASAN_NAME_STR ": %s on address 0x"

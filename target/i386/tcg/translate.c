@@ -38,6 +38,7 @@
 #include "qemuafl/api.h"
 
 #include "qemuafl/qemu-ijon-support.h"
+#include "qemuafl/binradar-trace.h"
 
 #define AFL_QEMU_TARGET_I386_SNIPPET                                          \
   if (is_persistent) {                                                        \
@@ -5188,6 +5189,13 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
               gen_helper_afl_cmplog_rtn(cpu_env);
             if (use_qasan && qasan_max_call_stack)
               gen_helper_qasan_shadow_stack_push(tcg_const_tl(s->pc));
+            if (binradar_trace_is_enabled()) {
+                TCGv pc_v = tcg_const_tl(pc_start);
+                TCGv ret_v = tcg_const_tl(s->cs_base + next_eip);
+                gen_helper_binradar_trace_call(pc_v, ret_v, s->T0);
+                tcg_temp_free(pc_v);
+                tcg_temp_free(ret_v);
+            }
             tcg_gen_movi_tl(s->T1, next_eip);
             gen_push_v(s, s->T1);
             gen_op_jmp_v(s->T0);
@@ -6647,6 +6655,11 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
         gen_stack_update(s, val + (1 << ot));
         if (use_qasan && qasan_max_call_stack)
           gen_helper_qasan_shadow_stack_pop(s->T0);
+        if (binradar_trace_is_enabled()) {
+            TCGv pc_v = tcg_const_tl(pc_start);
+            gen_helper_binradar_trace_ret(pc_v, s->T0);
+            tcg_temp_free(pc_v);
+        }
         /* Note that gen_pop_T0 uses a zero-extending load.  */
         gen_op_jmp_v(s->T0);
         gen_bnd_jmp(s);
@@ -6657,6 +6670,11 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
         gen_pop_update(s, ot);
         if (use_qasan && qasan_max_call_stack)
           gen_helper_qasan_shadow_stack_pop(s->T0);
+        if (binradar_trace_is_enabled()) {
+            TCGv pc_v = tcg_const_tl(pc_start);
+            gen_helper_binradar_trace_ret(pc_v, s->T0);
+            tcg_temp_free(pc_v);
+        }
         /* Note that gen_pop_T0 uses a zero-extending load.  */
         gen_op_jmp_v(s->T0);
         gen_bnd_jmp(s);
@@ -6677,6 +6695,11 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
             gen_op_ld_v(s, dflag, s->T0, s->A0);
             if (use_qasan && qasan_max_call_stack)
               gen_helper_qasan_shadow_stack_pop(s->T0);
+            if (binradar_trace_is_enabled()) {
+                TCGv pc_v = tcg_const_tl(pc_start);
+                gen_helper_binradar_trace_ret(pc_v, s->T0);
+                tcg_temp_free(pc_v);
+            }
             /* NOTE: keeping EIP updated is not a problem in case of
                exception */
             gen_op_jmp_v(s->T0);
@@ -6729,6 +6752,15 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                 tval &= 0xffff;
             } else if (!CODE64(s)) {
                 tval &= 0xffffffff;
+            }
+            if (binradar_trace_is_enabled()) {
+                TCGv pc_v = tcg_const_tl(pc_start);
+                TCGv ret_v = tcg_const_tl(s->cs_base + next_eip);
+                TCGv entry_v = tcg_const_tl(s->cs_base + tval);
+                gen_helper_binradar_trace_call(pc_v, ret_v, entry_v);
+                tcg_temp_free(pc_v);
+                tcg_temp_free(ret_v);
+                tcg_temp_free(entry_v);
             }
             tcg_gen_movi_tl(s->T0, next_eip);
             gen_push_v(s, s->T0);

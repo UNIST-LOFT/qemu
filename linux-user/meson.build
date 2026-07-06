@@ -1,4 +1,5 @@
 linux_user_ss.add(files(
+  'binradar-trace.c',
   'elfload.c',
   'exit.c',
   'fd-trans.c',

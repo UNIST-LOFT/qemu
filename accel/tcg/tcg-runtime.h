@@ -359,3 +359,9 @@ DEF_HELPER_FLAGS_1(qasan_shadow_stack_push, TCG_CALL_NO_RWG, void, tl)
 DEF_HELPER_FLAGS_1(qasan_shadow_stack_pop, TCG_CALL_NO_RWG, void, tl)
 
 DEF_HELPER_FLAGS_4(ijon_func_call, TCG_CALL_NO_RWG, void, tl, tl, tl, tl)
+
+DEF_HELPER_FLAGS_1(binradar_trace_start, 0, void, tl)
+DEF_HELPER_FLAGS_1(binradar_trace_bb, 0, void, tl)
+DEF_HELPER_FLAGS_1(binradar_trace_insn, 0, void, tl)
+DEF_HELPER_FLAGS_3(binradar_trace_call, 0, void, tl, tl, tl)
+DEF_HELPER_FLAGS_2(binradar_trace_ret, 0, void, tl, tl)

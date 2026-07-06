@@ -66,6 +66,7 @@
 #include "qemuafl/common.h"
 #include "tcg/tcg-op.h"
 #include "qemuafl/imported/afl_hash.h"
+#include "qemuafl/binradar-trace.h"
 #include <sys/mman.h>
 
 #include <math.h>
@@ -2202,6 +2203,11 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
 
     tcg_ctx->cpu = env_cpu(env);
     afl_gen_trace(pc);
+    if (binradar_trace_trace_basic_blocks()) {
+        TCGv pc_v = tcg_const_tl(pc);
+        gen_helper_binradar_trace_bb(pc_v);
+        tcg_temp_free(pc_v);
+    }
     gen_intermediate_code(cpu, tb, max_insns);
     tcg_ctx->cpu = NULL;
     max_insns = tb->icount;

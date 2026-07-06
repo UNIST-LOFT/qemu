@@ -26,6 +26,7 @@
 #include "signal-common.h"
 
 #include "qemuafl/qasan-qemu.h"
+#include "qemuafl/binradar-trace.h"
 
 static struct target_sigaction sigact_table[TARGET_NSIG];
 
@@ -948,6 +949,7 @@ static void handle_pending_signal(CPUArchState *cpu_env, int sig,
                    sig != TARGET_SIGURG &&
                    sig != TARGET_SIGWINCH &&
                    sig != TARGET_SIGCONT) {
+            binradar_trace_report_signal(cpu_env, sig);
 
 #if defined(ASAN_GIOVESE) && !defined(DO_NOT_USE_QASAN)
             if (use_qasan) {
@@ -967,11 +969,14 @@ static void handle_pending_signal(CPUArchState *cpu_env, int sig,
             }
 #endif
 
+            if (binradar_trace_is_enabled())
+                _exit(128 + target_to_host_signal(sig));
             dump_core_and_abort(sig);
         }
     } else if (handler == TARGET_SIG_IGN) {
         /* ignore sig */
     } else if (handler == TARGET_SIG_ERR) {
+        binradar_trace_report_signal(cpu_env, sig);
 
 #if defined(ASAN_GIOVESE) && !defined(DO_NOT_USE_QASAN)
       if (use_qasan) {
@@ -991,6 +996,8 @@ static void handle_pending_signal(CPUArchState *cpu_env, int sig,
       }
 #endif
 
+        if (binradar_trace_is_enabled())
+            _exit(128 + target_to_host_signal(sig));
         dump_core_and_abort(sig);
     } else {
         /* compute the blocked signals during the handler execution */
