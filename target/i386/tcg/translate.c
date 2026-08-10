@@ -5225,6 +5225,16 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
             if (dflag == MO_16) {
                 tcg_gen_ext16u_tl(s->T0, s->T0);
             }
+            if (binradar_trace_is_enabled()) {
+                target_ulong call_site, ret_addr;
+                if (binradar_trace_e9_relocated_call_info(pc_start, &call_site, &ret_addr)) {
+                    TCGv site_v = tcg_const_tl(call_site);
+                    TCGv ret_v = tcg_const_tl(ret_addr);
+                    gen_helper_binradar_trace_relocated_call(s->T0, site_v, ret_v);
+                    tcg_temp_free(site_v);
+                    tcg_temp_free(ret_v);
+                }
+            }
             gen_op_jmp_v(s->T0);
             gen_bnd_jmp(s);
             gen_jr(s, s->T0);
@@ -6791,6 +6801,18 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
             tval &= 0xffff;
         } else if (!CODE64(s)) {
             tval &= 0xffffffff;
+        }
+        if (binradar_trace_is_enabled()) {
+            target_ulong call_site, ret_addr;
+            if (binradar_trace_e9_relocated_call_info(pc_start, &call_site, &ret_addr)) {
+                TCGv entry_v = tcg_const_tl(s->cs_base + tval);
+                TCGv site_v = tcg_const_tl(call_site);
+                TCGv ret_v = tcg_const_tl(ret_addr);
+                gen_helper_binradar_trace_relocated_call(entry_v, site_v, ret_v);
+                tcg_temp_free(entry_v);
+                tcg_temp_free(site_v);
+                tcg_temp_free(ret_v);
+            }
         }
         gen_bnd_jmp(s);
         gen_jmp(s, tval);

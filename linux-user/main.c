@@ -531,6 +531,8 @@ static const struct qemu_argument arg_table[] = {
      "address",    "qemu_stacktrace-compatible patch location"},
     {"patch-func-entry", "BINRADAR_PATCH_FUNC_ENTRY", true, binradar_trace_set_patch_func_entry,
      "address",    "qemu_stacktrace-compatible patch function entry"},
+    {"e9-relocated-call", "BINRADAR_E9_RELOCATED_CALL", true, binradar_trace_set_e9_relocated_call,
+     "address",    "treat the jump at this address as a call (E9Patch relocated call; repeatable)"},
     {"asan",       "BINRADAR_ASAN",    true,  binradar_trace_set_asan,
      "mode",       "accept host, guest, or none without enabling QASAN"},
     {"asan-include", "",               true,  binradar_trace_ignore_arg,

@@ -13,6 +13,12 @@ typedef struct BinradarFrame {
     bool saw_patch_hit;
 } BinradarFrame;
 
+typedef struct BinradarRelocatedCall {
+    target_ulong jump_addr;
+    target_ulong call_site;
+    target_ulong ret_addr;
+} BinradarRelocatedCall;
+
 typedef struct BinradarAddrHit {
     target_ulong addr;
     uint64_t hits;
@@ -58,6 +64,9 @@ static target_ulong patch_func_entry;
 static target_ulong patch_hit_loc;
 static target_ulong target_start;
 static target_ulong target_end;
+static BinradarRelocatedCall *e9_relocated_calls;
+static size_t e9_relocated_calls_len;
+static size_t e9_relocated_calls_cap;
 static uint64_t patch_hits;
 static uint64_t patch_unknown_hits;
 static uint64_t open_hits;
@@ -137,6 +146,47 @@ void binradar_trace_set_patch_func_entry(const char *value)
 {
     enable_trace();
     patch_func_entry = parse_addr(value);
+}
+
+void binradar_trace_set_e9_relocated_call(const char *value)
+{
+    char **parts;
+    BinradarRelocatedCall record;
+
+    enable_trace();
+    parts = g_strsplit(value ? value : "", ":", 3);
+    if (g_strv_length(parts) != 3) {
+        fprintf(stderr, "qemu: invalid --e9-relocated-call '%s' "
+                "(expected jump-addr:call-site:ret-addr)\n", value ? value : "");
+        exit(EXIT_FAILURE);
+    }
+    record.jump_addr = parse_addr(parts[0]);
+    record.call_site = parse_addr(parts[1]);
+    record.ret_addr = parse_addr(parts[2]);
+    g_strfreev(parts);
+
+    if (e9_relocated_calls_len == e9_relocated_calls_cap) {
+        e9_relocated_calls_cap = e9_relocated_calls_cap ? e9_relocated_calls_cap * 2 : 8;
+        e9_relocated_calls = g_realloc(e9_relocated_calls,
+                                       e9_relocated_calls_cap * sizeof(*e9_relocated_calls));
+    }
+    e9_relocated_calls[e9_relocated_calls_len++] = record;
+}
+
+int binradar_trace_e9_relocated_call_info(target_ulong pc,
+                                          target_ulong *call_site,
+                                          target_ulong *ret_addr)
+{
+    size_t i;
+
+    for (i = 0; i < e9_relocated_calls_len; i++) {
+        if (e9_relocated_calls[i].jump_addr == pc) {
+            *call_site = e9_relocated_calls[i].call_site;
+            *ret_addr = e9_relocated_calls[i].ret_addr;
+            return 1;
+        }
+    }
+    return 0;
 }
 
 void binradar_trace_set_asan(const char *mode)
@@ -408,6 +458,30 @@ void binradar_trace_ret(target_ulong pc, target_ulong return_addr)
         if (frame.return_addr == return_addr) {
             break;
         }
+    }
+}
+
+void binradar_trace_relocated_call(target_ulong entry, target_ulong call_site,
+                                   target_ulong ret_addr)
+{
+    if (!trace_enabled) {
+        return;
+    }
+
+    /* E9Patch's CALLQ relocation re-emits a call as
+     * `push ret_addr; jmp target` from the trampoline.  The caller passes
+     * the original call site and its return address, so push a call frame
+     * that keeps the tracer's call-chain (and the fault-addr attribution)
+     * identical to the unpatched binary.  The pending patch hit from the
+     * rewritten site is flushed like a real call at the site: before the
+     * push if it came from elsewhere, after the push (so it is attributed
+     * to the callee) if it is from this site. */
+    if (pending_patch_hit && pending_patch_pc != call_site) {
+        flush_pending_patch();
+    }
+    push_frame(entry, entry != 0, ret_addr);
+    if (pending_patch_hit && pending_patch_pc == call_site) {
+        flush_pending_patch();
     }
 }
 
@@ -958,6 +1032,13 @@ void HELPER(binradar_trace_call)(target_ulong pc, target_ulong return_addr,
                                 target_ulong entry)
 {
     binradar_trace_call(pc, return_addr, entry);
+}
+
+void HELPER(binradar_trace_relocated_call)(target_ulong entry,
+                                           target_ulong call_site,
+                                           target_ulong ret_addr)
+{
+    binradar_trace_relocated_call(entry, call_site, ret_addr);
 }
 
 void HELPER(binradar_trace_ret)(target_ulong pc, target_ulong return_addr)
