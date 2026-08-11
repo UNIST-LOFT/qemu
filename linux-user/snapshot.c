@@ -181,6 +181,11 @@ typedef struct BinradarManager {
     BinradarResult *current; // For temp use before write to results array
     size_t line_idx;
     char line_buf[4096];
+    // Candidate patch ids (survived patches from filter.sbsv), length patch_cnt.
+    // NULL means candidates are 1..patch_cnt.
+    uint32_t *patch_list;
+    // Max patch id that can be indexed in patch_results (allocated size = patch_max_id + 1).
+    uint32_t patch_max_id;
 } BinradarManager;
 
 static SharedTraceData *shared_trace_data = NULL;
@@ -204,7 +209,7 @@ static BinradarResult *binradar_manager_alloc_one_iter(BinradarManager *manager)
     if (manager == NULL) return NULL;
     BinradarResult *result = g_new0(BinradarResult, 1);
     result->iter = 0;
-    result->patch_results = g_new0(PatchedResult, manager->patch_cnt + 1);
+    result->patch_results = g_new0(PatchedResult, manager->patch_max_id + 1);
     return result;
 }
 
@@ -303,6 +308,7 @@ void check_all_env_var(void) {
     check_env_var("PATCH_FD"); // Used by brpatch
     check_env_var("PATCH_ID"); // Used by brpatch, 123456
     check_env_var("BINRADAR_PATCH_CNT");
+    check_env_var("BINRADAR_PATCH_FILTER_FILE");
     // e9tool patch region related
     check_env_var("PATCH_RESERVE_RANGE");
     check_env_var("E9_TRAMPOLINE_RANGE");
@@ -359,6 +365,65 @@ static void exit_with_status(int status) {
     exit(status);
 }
 
+static void binradar_manager_load_filter(BinradarManager *manager, const char *path) {
+    FILE *fp = fopen(path, "r");
+    if (fp == NULL) {
+        log_msg("[binradar] [patch-filter] [error] cannot open filter file: %s\n", path);
+        return;
+    }
+    sbsv_parser *parser = sbsv_parser_new(SBSV_PARSER_DEFAULT);
+    sbsv_parser_add_schema(parser, "[patch] [id: int] [pass: bool]");
+    sbsv_status status = sbsv_parser_load_file(parser, fp);
+    fclose(fp);
+    if (status != SBSV_OK) {
+        log_msg("[binradar] [patch-filter] [error] failed to parse filter file: %s [status %s]\n",
+                path, sbsv_status_str(status));
+        sbsv_parser_free(parser);
+        return;
+    }
+    const sbsv_row **rows = NULL;
+    size_t count = 0;
+    if (sbsv_parser_get_rows(parser, "patch", &rows, &count) != SBSV_OK) {
+        log_msg("[binradar] [patch-filter] [error] failed to get patch rows: %s\n", path);
+        sbsv_parser_free(parser);
+        return;
+    }
+    GArray *ids = g_array_new(FALSE, FALSE, sizeof(uint32_t));
+    uint32_t max_id = 0;
+    for (size_t i = 0; i < count; i++) {
+        long long id = sbsv_row_get_int(rows[i], "id", NULL);
+        int pass = sbsv_row_get_bool(rows[i], "pass", NULL);
+        if (pass && id > 0 && (uint64_t)id <= UINT32_MAX) {
+            uint32_t patch_id = (uint32_t)id;
+            g_array_append_val(ids, patch_id);
+            if (patch_id > max_id) {
+                max_id = patch_id;
+            }
+        }
+    }
+    sbsv_free_row_ref_array(rows);
+    sbsv_parser_free(parser);
+    if (ids->len == 0) {
+        log_msg("[binradar] [patch-filter] [no-survivors] [file %s]\n", path);
+        manager->patch_cnt = 0;
+        manager->patch_max_id = 0;
+        g_array_free(ids, TRUE);
+        return;
+    }
+    manager->patch_list = g_new(uint32_t, ids->len);
+    for (guint i = 0; i < ids->len; i++) {
+        manager->patch_list[i] = g_array_index(ids, uint32_t, i);
+    }
+    manager->patch_cnt = ids->len;
+    manager->patch_max_id = max_id;
+    g_array_free(ids, TRUE);
+    log_msg("[binradar] [patch-filter] [file %s] [cnt %u] [max-id %u]\n",
+            path, manager->patch_cnt, manager->patch_max_id);
+    for (uint32_t i = 0; i < manager->patch_cnt; i++) {
+        log_msg("[binradar] [patch-filter] [id %u]\n", manager->patch_list[i]);
+    }
+}
+
 void snapshot_set_binradar_patch_shm(uint32_t *shm) {
     binradar_manager = g_new0(BinradarManager, 1);
     binradar_manager->patch_cnt = 1;
@@ -380,6 +445,12 @@ void snapshot_set_binradar_patch_shm(uint32_t *shm) {
     } else {
         log_msg("BINRADAR_PATCH_CNT not set");
         exit_with_status(1);
+    }
+    binradar_manager->patch_list = NULL;
+    binradar_manager->patch_max_id = binradar_manager->patch_cnt;
+    var = getenv("BINRADAR_PATCH_FILTER_FILE");
+    if (var != NULL && var[0] != '\0') {
+        binradar_manager_load_filter(binradar_manager, var);
     }
     binradar_manager->current = binradar_manager_alloc_one_iter(binradar_manager);
     binradar_manager->patch_result_parser = sbsv_parser_new(SBSV_PARSER_DEFAULT);
@@ -3022,6 +3093,15 @@ static int binradar_manager_get_patch_cnt(BinradarManager *manager) {
     return manager->patch_cnt;
 }
 
+// Actual patch id for iteration index (0 = original program, then candidates)
+static int binradar_manager_patch_id_at(BinradarManager *manager, uint32_t index) {
+    if (manager == NULL) return 0;
+    if (index == 0) return 0;
+    if (index > manager->patch_cnt) return 0;
+    if (manager->patch_list == NULL) return (int)index;
+    return (int)manager->patch_list[index - 1];
+}
+
 static void binradar_commit(BinradarManager *manager) {
     // Clone current patched result and add to results
     if (manager == NULL) return;
@@ -3033,10 +3113,11 @@ static void binradar_commit(BinradarManager *manager) {
     char br_buf[4096];
     memset(br_buf, 0, sizeof(br_buf));
     for (uint32_t i = 0; i < manager->patch_cnt + 1; i++) {
-        PatchedResult res = manager->current->patch_results[i];
+        int patch = binradar_manager_patch_id_at(manager, i);
+        PatchedResult res = manager->current->patch_results[patch];
         if (res.br_taken == NULL) {
-            log_msg("[binradar] [commit] [iter %d] [patch %d] [br null]\n", cur_iter, i);
-            clone->patch_results[i] = res;
+            log_msg("[binradar] [commit] [iter %d] [patch %d] [br null]\n", cur_iter, patch);
+            clone->patch_results[patch] = res;
             continue;
         }
         for (size_t j = 0; j < res.br_taken->len; j++) {
@@ -3046,13 +3127,13 @@ static void binradar_commit(BinradarManager *manager) {
                 break;
             }
         }
-        log_msg("[binradar] [commit] [iter %d] [patch %d] [br %s]\n", cur_iter, i, br_buf);
-        clone->patch_results[i] = res;
+        log_msg("[binradar] [commit] [iter %d] [patch %d] [br %s]\n", cur_iter, patch, br_buf);
+        clone->patch_results[patch] = res;
         if (cur_iter == 1) {
             break;
         }
     }
-    memset(manager->current->patch_results, 0, sizeof(PatchedResult) * (manager->patch_cnt + 1));
+    memset(manager->current->patch_results, 0, sizeof(PatchedResult) * (manager->patch_max_id + 1));
     g_ptr_array_add(manager->results, clone);
 }
 
@@ -3077,7 +3158,7 @@ static PatchedResult *get_patched_result_tmp(BinradarManager *manager, uint32_t 
         log_msg("Current result not initialized");
         exit_with_status(1);
     }
-    if (patch_id > manager->patch_cnt) {
+    if (patch_id > manager->patch_max_id) {
         log_msg("Invalid patch ID: %u", patch_id);
         exit_with_status(1);
     }
@@ -3307,9 +3388,10 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env, const ArgumentInf
         // if (pipe(t_fd) || dup2(t_fd[1], TSL_FD) < 0) exit(3);
         // close(t_fd[1]);
         if (binradar_mode) {
-            status[1] = binradar_patch_id;
+            int actual_patch_id = binradar_manager_patch_id_at(binradar_manager, (uint32_t)binradar_patch_id);
+            status[1] = actual_patch_id;
             status[2] = binradar_iter;
-            binradar_manager_cur_patch_id(binradar_manager, binradar_patch_id);
+            binradar_manager_cur_patch_id(binradar_manager, actual_patch_id);
             log_msg("[binradar] [shm] [patch-id %d] [iter %d]\n", *binradar_manager->cur_patch_id, *binradar_manager->cur_iter);
         }
         fflush(NULL);
