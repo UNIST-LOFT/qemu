@@ -114,6 +114,7 @@ typedef struct ArgumentInfo {
 
 void add_exclude_regions(uintptr_t load_bias);
 bool is_in_exclude_region(target_ulong pc);
+void parse_e9_relocated_calls(uintptr_t load_bias);
 void check_all_env_var(void);
 
 void snapshot_set_binradar_patch_shm(uint32_t *shm);

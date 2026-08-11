@@ -2534,6 +2534,7 @@ static void load_elf_image(const char *image_name, int image_fd,
         }
         log_msg("[snapshot] [entrypoint] [addr %lx] [bias %lx]\n", binradar_entrypoint, load_bias);
         add_exclude_regions(load_bias);
+        parse_e9_relocated_calls(load_bias);
         // log_msg("[snapshot] [patch-reserve-addr] [addr %lx]\n", patch_region_start);
     }
     fprintf(stderr, "load_addr: %lx, load_bias: %lx\n", load_addr, load_bias);

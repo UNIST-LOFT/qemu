@@ -7,6 +7,11 @@
 extern uint64_t  symbolic_start_code;
 extern uint64_t  symbolic_end_code;
 extern int       symbolic_force_flush_cache;
+// E9Patch relocated call jumps (parsed from E9_RELOCATED_CALL_JUMPS in
+// snapshot.c): returns the original call site / return address of the call
+// that the jump at `pc` re-implements.
+bool is_e9_relocated_call(target_ulong pc, target_ulong *call_site,
+                          target_ulong *ret_addr);
 extern void qemu_syscall_helper(uintptr_t syscall_no, uintptr_t syscall_arg0,
                                 uintptr_t syscall_arg1, uintptr_t syscall_arg2,
                                 uintptr_t syscall_arg3, uintptr_t syscall_arg4,

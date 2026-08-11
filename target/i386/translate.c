@@ -5101,6 +5101,32 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
             if (dflag == MO_16) {
                 tcg_gen_ext16u_tl(s->T0, s->T0);
             }
+#ifdef SYMBOLIC_INSTRUMENTATION
+#if SYMBOLIC_CALLSTACK_INSTRUMENTATION
+            {
+                target_ulong e9_call_site, e9_ret_addr;
+                if (is_e9_relocated_call(pc_start - s->cs_base,
+                                         &e9_call_site, &e9_ret_addr)) {
+                    /* E9Patch CALLQ relocation rewrites a call into
+                     * `push return_addr; jmp target`; SP already accounts
+                     * for the pushed return address, so undo the push when
+                     * recording the frame.  Treat the jump as the original
+                     * call so the stack frames (and coverage callstack)
+                     * match the unpatched binary. */
+                    int sp_adj = CODE64(s) ? 8 : (dflag == MO_16 ? 2 : 4);
+                    TCGv t_call_pc = tcg_const_tl(e9_call_site);
+                    TCGv t_ret_pc = tcg_const_tl(e9_ret_addr);
+                    TCGv t_sp = tcg_temp_new();
+                    tcg_gen_mov_tl(t_sp, cpu_regs[R_ESP]);
+                    tcg_gen_addi_tl(t_sp, t_sp, sp_adj);
+                    gen_helper_instrument_call(t_call_pc, t_ret_pc, t_sp);
+                    tcg_temp_free(t_call_pc);
+                    tcg_temp_free(t_ret_pc);
+                    tcg_temp_free(t_sp);
+                }
+            }
+#endif
+#endif
             gen_op_jmp_v(s->T0);
             gen_bnd_jmp(s);
             gen_jr(s, s->T0);
@@ -6653,6 +6679,32 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
         } else if (!CODE64(s)) {
             tval &= 0xffffffff;
         }
+#ifdef SYMBOLIC_INSTRUMENTATION
+#if SYMBOLIC_CALLSTACK_INSTRUMENTATION
+        {
+            target_ulong e9_call_site, e9_ret_addr;
+            if (is_e9_relocated_call(pc_start - s->cs_base,
+                                     &e9_call_site, &e9_ret_addr)) {
+                /* E9Patch CALLQ relocation rewrites a call into
+                 * `push return_addr; jmp target`; SP already accounts
+                 * for the pushed return address, so undo the push when
+                 * recording the frame.  Treat the jump as the original
+                 * call so the stack frames (and coverage callstack)
+                 * match the unpatched binary. */
+                int sp_adj = CODE64(s) ? 8 : (dflag == MO_16 ? 2 : 4);
+                TCGv t_call_pc = tcg_const_tl(e9_call_site);
+                TCGv t_ret_pc = tcg_const_tl(e9_ret_addr);
+                TCGv t_sp = tcg_temp_new();
+                tcg_gen_mov_tl(t_sp, cpu_regs[R_ESP]);
+                tcg_gen_addi_tl(t_sp, t_sp, sp_adj);
+                gen_helper_instrument_call(t_call_pc, t_ret_pc, t_sp);
+                tcg_temp_free(t_call_pc);
+                tcg_temp_free(t_ret_pc);
+                tcg_temp_free(t_sp);
+            }
+        }
+#endif
+#endif
         gen_bnd_jmp(s);
         gen_jmp(s, tval);
         break;

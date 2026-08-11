@@ -57,6 +57,16 @@ exclude_region binradar_exclude_regions[4] = {
     {0, 0}
 };
 
+typedef struct e9_relocated_call {
+    target_ulong jump_addr;
+    target_ulong call_site;
+    target_ulong ret_addr;
+} e9_relocated_call;
+
+static e9_relocated_call *e9_relocated_calls = NULL;
+static size_t e9_relocated_calls_len = 0;
+static size_t e9_relocated_calls_cap = 0;
+
 GHashTable *coverage_log_edges_cnt = NULL;
 static SnapshotState g_snapshot;
 
@@ -217,6 +227,8 @@ static void trace_mem_flush(void);
 static int binradar_manager_cur_patch_id(BinradarManager *manager, int new_patch_id);
 static int binradar_manager_cur_iter(BinradarManager *manager, int new_iter);
 void parse_exclude_region_str(const char *name, uintptr_t load_bias, exclude_region *region);
+bool is_e9_relocated_call(target_ulong pc, target_ulong *call_site,
+                          target_ulong *ret_addr);
 
 static int read_exact(int fd, void *buf, size_t len) {
     uint8_t *p = buf;
@@ -286,6 +298,70 @@ static void check_env_var(const char *name) {
     }
 }
 
+void parse_e9_relocated_calls(uintptr_t load_bias) {
+    // Expected format: "0x<jump>:0x<site>:0x<ret>,0x<jump>:0x<site>:0x<ret>,..."
+    // One record per E9Patch CALLQ relocation: the address of the jump that
+    // re-implements the call, the original call site, and the return address.
+    char *value = getenv("E9_RELOCATED_CALL_JUMPS");
+    if (value == NULL || value[0] == '\0') {
+        return;
+    }
+    char *copy = g_strdup(value);
+    char *saveptr = NULL;
+    for (char *record = strtok_r(copy, ",", &saveptr); record != NULL;
+         record = strtok_r(NULL, ",", &saveptr)) {
+        char *jump_str = record;
+        char *colon = strchr(record, ':');
+        if (colon == NULL) {
+            log_msg("[snapshot] [e9-relocated-call] [invalid-format] [record %s]\n", record);
+            continue;
+        }
+        *colon = '\0';
+        char *site_str = colon + 1;
+        colon = strchr(site_str, ':');
+        if (colon == NULL) {
+            log_msg("[snapshot] [e9-relocated-call] [invalid-format] [record %s]\n", record);
+            continue;
+        }
+        *colon = '\0';
+        char *ret_str = colon + 1;
+
+        if (e9_relocated_calls_len == e9_relocated_calls_cap) {
+            e9_relocated_calls_cap = e9_relocated_calls_cap ? e9_relocated_calls_cap * 2 : 8;
+            e9_relocated_calls = g_realloc(e9_relocated_calls,
+                                           e9_relocated_calls_cap * sizeof(*e9_relocated_calls));
+        }
+        e9_relocated_calls[e9_relocated_calls_len].jump_addr =
+            strtoull(jump_str, NULL, 16) + load_bias;
+        e9_relocated_calls[e9_relocated_calls_len].call_site =
+            strtoull(site_str, NULL, 16) + load_bias;
+        e9_relocated_calls[e9_relocated_calls_len].ret_addr =
+            strtoull(ret_str, NULL, 16) + load_bias;
+        log_msg("[snapshot] [e9-relocated-call] [jump %lx] [site %lx] [ret %lx]\n",
+                (unsigned long)e9_relocated_calls[e9_relocated_calls_len].jump_addr,
+                (unsigned long)e9_relocated_calls[e9_relocated_calls_len].call_site,
+                (unsigned long)e9_relocated_calls[e9_relocated_calls_len].ret_addr);
+        e9_relocated_calls_len++;
+    }
+    g_free(copy);
+}
+
+bool is_e9_relocated_call(target_ulong pc, target_ulong *call_site,
+                          target_ulong *ret_addr) {
+    for (size_t i = 0; i < e9_relocated_calls_len; i++) {
+        if (e9_relocated_calls[i].jump_addr == pc) {
+            if (call_site != NULL) {
+                *call_site = e9_relocated_calls[i].call_site;
+            }
+            if (ret_addr != NULL) {
+                *ret_addr = e9_relocated_calls[i].ret_addr;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
 void check_all_env_var(void) {
     // Log
     check_env_var("BINRADAR_TRACER_LOG_FILE");
@@ -313,6 +389,8 @@ void check_all_env_var(void) {
     check_env_var("PATCH_RESERVE_RANGE");
     check_env_var("E9_TRAMPOLINE_RANGE");
     check_env_var("E9_LOADER_RANGE");
+    // E9Patch relocated call jumps (jump-addr:call-site:ret-addr, comma separated)
+    check_env_var("E9_RELOCATED_CALL_JUMPS");
     // Shared memory
     check_env_var("EXPR_POOL_SHM_KEY");
     check_env_var("QUERY_SHM_KEY");
