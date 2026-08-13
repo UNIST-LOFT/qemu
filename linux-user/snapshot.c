@@ -171,7 +171,7 @@ typedef struct SharedTraceData {
 
 typedef struct PatchedResult {
     uint32_t patch_id;
-    GArray *br_taken; // Array<bool>
+    GArray *br_taken; // Array<int> (0 = not taken, 1 = taken, 2 = patch crashed)
     bool is_crash;
     uint64_t fault_loc;
 } PatchedResult;
@@ -532,7 +532,7 @@ void snapshot_set_binradar_patch_shm(uint32_t *shm) {
     }
     binradar_manager->current = binradar_manager_alloc_one_iter(binradar_manager);
     binradar_manager->patch_result_parser = sbsv_parser_new(SBSV_PARSER_DEFAULT);
-    sbsv_parser_add_schema(binradar_manager->patch_result_parser, "[patch] [id: int] [br: bool] [v: int]");
+    sbsv_parser_add_schema(binradar_manager->patch_result_parser, "[patch] [id: int] [br: int] [v: int]");
 }
 
 static void snapshot_load_binradar_env(void) {
@@ -3198,13 +3198,15 @@ static void binradar_commit(BinradarManager *manager) {
             clone->patch_results[patch] = res;
             continue;
         }
-        for (size_t j = 0; j < res.br_taken->len; j++) {
-            bool taken = g_array_index(res.br_taken, bool, j);
-            br_buf[j] = taken ? '1' : '0';
-            if (j + 1 > sizeof(br_buf)) {
-                break;
-            }
+        size_t n = res.br_taken->len;
+        if (n >= sizeof(br_buf)) {
+            n = sizeof(br_buf) - 1;
         }
+        for (size_t j = 0; j < n; j++) {
+            int taken = g_array_index(res.br_taken, int, j);
+            br_buf[j] = taken == 2 ? '2' : (taken ? '1' : '0');
+        }
+        br_buf[n] = '\0';
         log_msg("[binradar] [commit] [iter %d] [patch %d] [br %s]\n", cur_iter, patch, br_buf);
         clone->patch_results[patch] = res;
         if (cur_iter == 1) {
@@ -3252,10 +3254,10 @@ static void binradar_manager_handle_patch_line(BinradarManager *manager, const c
         if (strcmp(sbsv_row_schema_name(row), "patch") == 0) {
             // Process patch row
             long long patch_id = sbsv_row_get_int(row, "id", NULL);
-            int br = sbsv_row_get_bool(row, "br", NULL);
+            long long br = sbsv_row_get_int(row, "br", NULL);
             long long iter = sbsv_row_get_int(row, "v", NULL);
             if (iter != cur_iter) {
-                log_msg("[binradar] [iter-mismatch] [v %lld] [iter %d] [id %lld] [br %d]\n", iter, cur_iter, patch_id, br);
+                log_msg("[binradar] [iter-mismatch] [v %lld] [iter %d] [id %lld] [br %lld]\n", iter, cur_iter, patch_id, br);
                 sbsv_row_free(row);
                 return;
             }
@@ -3266,9 +3268,9 @@ static void binradar_manager_handle_patch_line(BinradarManager *manager, const c
             }
             PatchedResult *result = get_patched_result_tmp(manager, patch_id);
             if (result->br_taken == NULL) {
-                result->br_taken = g_array_new(FALSE, FALSE, sizeof(bool));
+                result->br_taken = g_array_new(FALSE, FALSE, sizeof(int));
             }
-            bool br_taken = br ? true : false;
+            int br_taken = (int)br;
             g_array_append_val(result->br_taken, br_taken);
         }
         sbsv_row_free(row);
