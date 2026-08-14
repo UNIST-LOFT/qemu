@@ -1167,9 +1167,12 @@ void snapshot_record_guest_crash(CPUArchState *cpu_env, int target_signal, int h
     info->host_signal = host_signal;
     info->si_code = si_code;
     info->exit_code = (host_signal > 0) ? (128 + host_signal) : -target_signal;
-    info->fault_addr = fault_addr;
     info->host_fault_addr = host_fault_addr;
     snapshot_exit_info_capture(info, cpu_env);
+    /* The binradar comparison matches this against the probe's [fault-addr],
+     * which is a code address (the faulting instruction).  Store guest_pc
+     * here rather than the siginfo data address so both sides agree. */
+    info->fault_addr = info->guest_pc;
     char buffer[SNAPSHOT_EXIT_DESC_LEN];
     const char *base = reason ? reason : "unhandled signal";
     const char *host_name = (host_signal > 0) ? strsignal(host_signal) : NULL;
