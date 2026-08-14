@@ -831,12 +831,23 @@ static void print_stacktrace(target_ulong pc, target_ulong fault_addr)
     int fault_idx = -1;
     char *symbol;
 
+    /* The crash location is the faulting instruction (pc).  The fault_addr
+     * passed in by QASAN is the bad *data* address and must not be reported
+     * as the crash location.  When the pc is outside the target (e.g. a
+     * crash inside a shared library), attribute the crash to the innermost
+     * target frame instead. */
+
     trace_log("stacktrace:");
     symbol = resolve_addr(pc);
     trace_log("[stacktrace] [idx %zu] [addr 0x%" PRIx64 "] [symbol %s]",
               idx, (uint64_t)pc, symbol);
     g_free(symbol);
     idx++;
+
+    if (in_target(pc)) {
+        fault_idx = 0;
+        fault_addr = pc;
+    }
 
     for (i = (ssize_t)frames_len - 1; i >= 0; i--) {
         target_ulong addr = frames[i].return_addr;
@@ -855,14 +866,6 @@ static void print_stacktrace(target_ulong pc, target_ulong fault_addr)
             fault_addr = addr;
         }
         idx++;
-    }
-
-    if (fault_idx < 0 && fault_addr && in_target(fault_addr)) {
-        fault_idx = 0;
-    }
-    if (fault_idx < 0 && in_target(pc)) {
-        fault_idx = 0;
-        fault_addr = pc;
     }
 
     if (fault_idx >= 0) {

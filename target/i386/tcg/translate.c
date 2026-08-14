@@ -8730,8 +8730,18 @@ static void i386_tr_tb_start(DisasContextBase *db, CPUState *cpu)
 static void i386_tr_insn_start(DisasContextBase *dcbase, CPUState *cpu)
 {
     DisasContext *dc = container_of(dcbase, DisasContext, base);
+    TCGv eip;
 
     tcg_gen_insn_start(dc->base.pc_next, dc->cc_op);
+
+    /* QASAN reports the crash pc from env->eip, which is otherwise only
+     * synced at basic-block boundaries.  Sync it to the instruction being
+     * translated so the reported crash location is exact. */
+    if (use_qasan) {
+        eip = tcg_const_tl(dc->base.pc_next);
+        tcg_gen_st_tl(eip, cpu_env, offsetof(CPUX86State, eip));
+        tcg_temp_free(eip);
+    }
 }
 
 static bool i386_tr_breakpoint_check(DisasContextBase *dcbase, CPUState *cpu,
