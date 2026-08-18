@@ -30,6 +30,8 @@ target_ulong binradar_entrypoint = (target_ulong)-1;
 
 extern Query *query_queue;
 extern Query *next_query;
+extern uint64_t symbolic_start_code;
+extern uint64_t symbolic_end_code;
 
 static uint64_t binradar_entrypoint_hit_count   = 0;
 static uint64_t binradar_forkserver_target_hit_count = 1;
@@ -106,6 +108,13 @@ static uint64_t next_dyn_frame_id = 1;
 
 static SnapshotMemRegionManager mr_manager;
 static GArray *pending_allocs = NULL;
+
+/* ---- QASAN-like concrete bounds checking ---- */
+int binradar_memcheck_enabled = 0;
+#define HEAP_QUARANTINE_MAX_BYTES (50 * 1024 * 1024)
+#define MEMCHECK_REDZONE 128
+static GQueue *heap_quarantine = NULL;
+static size_t heap_quarantine_bytes = 0;
 
 // TODO: add trace or coverage info
 typedef struct SnapshotExitInfo {
@@ -579,10 +588,16 @@ static void snapshot_load_binradar_env(void) {
     if (binradar_query_window_file && binradar_query_window_file[0] == '\0') {
         binradar_query_window_file = NULL;
     }
-    log_msg("[snapshot-load-binradar] [forkserver %d] [hit-count %lu] [probe-file %s] [query-window-file %s]\n",
+
+    var = getenv("BINRADAR_MEMCHECK_ENABLE");
+    if (var) {
+        binradar_memcheck_enabled = atoi(var) != 0;
+    }
+    log_msg("[snapshot-load-binradar] [forkserver %d] [hit-count %lu] [probe-file %s] [query-window-file %s] [memcheck %d]\n",
               binradar_forkserver_enable, binradar_forkserver_target_hit_count,
               binradar_probe_file ? binradar_probe_file : "null",
-              binradar_query_window_file ? binradar_query_window_file : "null");
+              binradar_query_window_file ? binradar_query_window_file : "null",
+              binradar_memcheck_enabled);
 }
 
 static void snapshot_dump_query_window(Query* q, Expr *e) {
@@ -1653,21 +1668,6 @@ static void mr_manager_heap_insert(SnapshotMemRegion *mr) {
     g_tree_insert(mr_manager.heap_data, mr, mr);
 }
 
-static void mr_manager_heap_remove(SnapshotMemRegion *query) {
-    // Remove from cache
-    int query_result = SNAPSHOT_MEM_REG_CACHE;
-    while (query_result >= 0) {
-        query_result = mr_manager_search_cache_exact(mr_manager.heap_cache, query);
-        mr_manager_update_cache(mr_manager.heap_cache, NULL, query_result);
-    }
-    
-    // Remove from heap_data
-    if (!g_tree_remove(mr_manager.heap_data, query)) {
-        trace_mem("[free] [error] [base %lx] [pc %lx] not exist\n", query->base, query->pc);
-    } else {
-        trace_mem("[free] [done] [base %lx] [pc %lx]\n", query->base, query->pc);
-    }
-}
 
 static gint search_region(gconstpointer a, gconstpointer b) {
     const SnapshotMemRegion *region = (const SnapshotMemRegion *)a;
@@ -1711,7 +1711,43 @@ void snapshot_trace_free(target_ulong base, target_ulong pc) {
     SnapshotMemRegion query;
     query.base = base;
     query.pc = pc;
-    mr_manager_heap_remove(&query);
+
+    /* Lazily initialize the quarantine queue. */
+    if (heap_quarantine == NULL) {
+        heap_quarantine = g_queue_new();
+    }
+
+    /* Remove from cache (same as mr_manager_heap_remove). */
+    int query_result = SNAPSHOT_MEM_REG_CACHE;
+    while (query_result >= 0) {
+        query_result = mr_manager_search_cache_exact(mr_manager.heap_cache, &query);
+        mr_manager_update_cache(mr_manager.heap_cache, NULL, query_result);
+    }
+
+    /* Steal (not remove) from the heap tree so the SnapshotMemRegion is
+     * not freed by g_tree_remove's key-destroy callback.  If the region
+     * is not found, there is nothing to quarantine. */
+    SnapshotMemRegion *mr = g_tree_search(mr_manager.heap_data,
+                                          (GCompareFunc)search_region, &base);
+    if (mr != NULL) {
+        g_tree_steal(mr_manager.heap_data, mr);
+        g_queue_push_tail(heap_quarantine, mr);
+        heap_quarantine_bytes += mr->size;
+        trace_mem("[free] [quarantine] [base %lx] [size %lx] [pc %lx] [total %lu]\n",
+                  base, mr->size, pc, heap_quarantine_bytes);
+
+        /* Evict oldest entries until under the byte cap. */
+        while (heap_quarantine_bytes > HEAP_QUARANTINE_MAX_BYTES &&
+               !g_queue_is_empty(heap_quarantine)) {
+            SnapshotMemRegion *old = g_queue_pop_head(heap_quarantine);
+            if (old != NULL) {
+                heap_quarantine_bytes -= old->size;
+                g_free(old);
+            }
+        }
+    } else {
+        trace_mem("[free] [error] [base %lx] [pc %lx] not exist\n", base, pc);
+    }
 }
 
 static SnapshotMemRegion *mr_manager_stack_search(target_ulong addr,
@@ -1956,6 +1992,111 @@ SnapshotMemRegion *snapshot_mem_region_search(target_ulong addr) {
     return snapshot_mem_region_search_with_size(addr, 1);
 }
 
+/* ---- QASAN-like concrete bounds checking ---- */
+/* MemcheckResult enum and binradar_memcheck_enabled are declared in snapshot.h */
+
+/* Linearly scan the quarantine queue for a region containing addr.
+ * Returns the SnapshotMemRegion * if found, NULL otherwise. */
+static SnapshotMemRegion *snapshot_mem_region_search_quarantine(target_ulong addr) {
+    if (heap_quarantine == NULL) return NULL;
+    GList *link;
+    for (link = heap_quarantine->head; link != NULL; link = link->next) {
+        SnapshotMemRegion *mr = (SnapshotMemRegion *)link->data;
+        if (mr != NULL && check_addr_in_region(mr, addr) == 0) {
+            return mr;
+        }
+    }
+    return NULL;
+}
+
+/* Closure for the near-heap OOB foreach search. */
+typedef struct {
+    target_ulong addr;
+    MemcheckResult result;
+} MemcheckNearClosure;
+
+static gboolean memcheck_near_foreach(gpointer key, gpointer value,
+                                       gpointer data) {
+    SnapshotMemRegion *mr = (SnapshotMemRegion *)key;
+    MemcheckNearClosure *closure = (MemcheckNearClosure *)data;
+    target_ulong addr = closure->addr;
+    /* Check if addr is within [base - REDZONE, base + size + REDZONE)
+     * but NOT within [base, base + size). */
+    target_ulong region_start = mr->base;
+    target_ulong region_end = mr->base + mr->size;
+    /* Guard against overflow in the redzone arithmetic. */
+    target_ulong lo = (region_start > MEMCHECK_REDZONE)
+                      ? (region_start - MEMCHECK_REDZONE) : 0;
+    target_ulong hi = region_end + MEMCHECK_REDZONE;
+    if (hi < region_end) hi = (target_ulong)-1; /* overflow */
+    if (addr >= lo && addr < hi &&
+        !(addr >= region_start && addr < region_end)) {
+        closure->result = MEMCHECK_HEAP_OOB;
+        return TRUE; /* stop iteration */
+    }
+    return FALSE;
+}
+
+/* Check whether a memory access is within bounds of a known heap
+ * allocation, or hits a quarantined (freed) region.
+ *   MEMCHECK_OK        — access is within a valid heap region, or to
+ *                        stack/global/unmapped memory (handled by MMU).
+ *   MEMCHECK_HEAP_OOB  — access is near a heap allocation but outside
+ *                        its bounds (within the redzone window).
+ *   MEMCHECK_HEAP_UAF  — access is to a freed (quarantined) region.
+ * Only checks heap regions; stack/global/unmapped accesses are
+ * MEMCHECK_OK (they're handled by the MMU). */
+MemcheckResult snapshot_memcheck_access(target_ulong addr, target_ulong size) {
+    /* 1. Check quarantine first (UAF). */
+    if (snapshot_mem_region_search_quarantine(addr) != NULL) {
+        return MEMCHECK_HEAP_UAF;
+    }
+
+    /* 2. Check heap tree (exact bounds or OOB). */
+    SnapshotMemRegion *mr = mr_manager_heap_search(addr);
+    if (mr != NULL) {
+        /* Verify the full access range [addr, addr+size) is in bounds. */
+        target_ulong region_end = mr->base + mr->size;
+        if (addr + size > region_end) {
+            return MEMCHECK_HEAP_OOB;
+        }
+        return MEMCHECK_OK;
+    }
+
+    /* 3. Check if addr is near a known heap allocation (OOB redzone). */
+    MemcheckNearClosure closure = { .addr = addr, .result = MEMCHECK_OK };
+    g_tree_foreach(mr_manager.heap_data, memcheck_near_foreach, &closure);
+    return closure.result;
+}
+
+/* Runtime helper called from instrumented TCG code (non-symbolic mode).
+ * Checks the access and crashes the guest if it's an OOB/UAF error. */
+void snapshot_memcheck_helper(target_ulong addr, target_ulong size, target_ulong pc) {
+    if (!binradar_memcheck_enabled) return;
+    /* Only check accesses from the main binary's code, not library code.
+     * This avoids false positives from glibc's internal memory management. */
+    if (symbolic_start_code > 0 && (pc < symbolic_start_code || pc >= symbolic_end_code)) {
+        return;
+    }
+    MemcheckResult mc = snapshot_memcheck_access(addr, size);
+    if (mc != MEMCHECK_OK) {
+        const char *reason = (mc == MEMCHECK_HEAP_UAF)
+            ? "memcheck: heap-use-after-free"
+            : "memcheck: heap-buffer-overflow";
+        CPUState *cpu = thread_cpu;
+        CPUArchState *env = cpu ? cpu->env_ptr : NULL;
+        if (env) {
+            snapshot_record_guest_crash(env, TARGET_SIGSEGV, 0,
+                                        SEGV_ACCERR, addr, 0, reason);
+        }
+        trace_mem_flush();
+        _exit(128 + SIGSEGV);
+    }
+}
+
+/* Forward declaration: defined in tcg/symbolic/symbolic.c */
+void memcheck_init(void);
+
 bool snapshot_is_taken(void) {
     // return g_snapshot.is_snapshot_taken;
     return true;
@@ -1977,6 +2118,11 @@ void snapshot_init(void) {
         exit_with_status(1);
     }
     memset(shared_trace_data, 0, shm_size);
+    /* Load binradar env vars early so binradar_memcheck_enabled is set
+     * before any memory access instrumentation runs. */
+    snapshot_load_binradar_env();
+    /* Initialize PLT hooks for memcheck-only mode. */
+    memcheck_init();
 }
 
 static int walk_memory_cb(void *priv, target_ulong start, target_ulong end,

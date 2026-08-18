@@ -160,6 +160,18 @@ SnapshotMemRegion *snapshot_mem_region_search(target_ulong addr);
 void snapshot_protect_mapping(target_ulong addr, target_ulong len);
 bool snapshot_addr_is_protected(target_ulong addr);
 
+/* ---- QASAN-like concrete bounds checking ---- */
+extern int binradar_memcheck_enabled;
+
+typedef enum {
+    MEMCHECK_OK = 0,
+    MEMCHECK_HEAP_OOB,
+    MEMCHECK_HEAP_UAF,
+} MemcheckResult;
+
+MemcheckResult snapshot_memcheck_access(target_ulong addr, target_ulong size);
+void snapshot_memcheck_helper(target_ulong addr, target_ulong size, target_ulong pc);
+
 void snapshot_syscall(uintptr_t syscall_no, uintptr_t syscall_arg0,
                       uintptr_t syscall_arg1, uintptr_t syscall_arg2,
                       uintptr_t syscall_arg3, uintptr_t syscall_arg4,

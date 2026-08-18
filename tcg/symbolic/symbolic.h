@@ -141,6 +141,10 @@ void init_symbolic_mode(void);
 int  parse_translation_block(TranslationBlock* tb, uintptr_t pc,
                              uint8_t* tb_code, TCGContext* tcg_ctx, CPUArchState *cpu_env);
 
+void memcheck_instrument_tb(TranslationBlock *tb, TCGContext *tcg_ctx,
+                            CPUArchState *cpu_env);
+void memcheck_init(void);
+
 typedef enum {
     INSTRUMENT_BEFORE,
     INSTRUMENT_AFTER,

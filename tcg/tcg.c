@@ -71,6 +71,7 @@
 #include "symbolic/symbolic.h"
 #ifdef TCG_INSTRUMENTATION
 int symbolic_force_flush_cache = 0;
+extern int binradar_memcheck_enabled;
 #endif
 
 /* Forward declarations for functions declared in tcg-target.inc.c and
@@ -4418,6 +4419,9 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, CPUArchState *cpu_env)
 #ifdef TCG_INSTRUMENTATION
     if (symbolic_mode) {
         symbolic_force_flush_cache = parse_translation_block(tb, tb->pc, tb->tc.ptr, tcg_ctx, cpu_env);
+    }
+    if (binradar_memcheck_enabled && !symbolic_mode) {
+        memcheck_instrument_tb(tb, tcg_ctx, cpu_env);
     }
 #endif
 

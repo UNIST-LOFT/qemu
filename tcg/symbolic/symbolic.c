@@ -904,6 +904,21 @@ void init_symbolic_mode(void)
     main_thread = pthread_self();
 }
 
+/* Initialize PLT hooks for memcheck-only mode (non-symbolic).
+ * Loads the PLT info file so malloc/free/realloc/calloc can be tracked. */
+void memcheck_init(void) {
+    if (!binradar_memcheck_enabled) return;
+    if (plt_info != NULL) return; /* already loaded */
+    char *plt_info_file = getenv("PLT_INFO_FILE");
+    if (plt_info_file != NULL) {
+        parse_plt_info(plt_info_file);
+        log_msg("[memcheck-init] [plt-info %s] [entries %d]\n",
+                plt_info_file, g_slist_length(plt_info));
+    } else {
+        log_msg("[memcheck-init] [plt-info not-set] [warning] heap tracking disabled\n");
+    }
+}
+
 static inline int count_free_temps(TCGContext* tcg_ctx)
 {
     int count = 0;
@@ -3548,6 +3563,20 @@ static inline void qemu_load_helper(CPUArchState *env, uintptr_t orig_addr,
 
     SnapshotMemRegion *mr = snapshot_mem_region_search_with_size(addr, size);
 
+    if (binradar_memcheck_enabled && symbolic_start_code > 0 &&
+        current_tb_pc >= symbolic_start_code && current_tb_pc < symbolic_end_code) {
+        MemcheckResult mc = snapshot_memcheck_access(addr, size);
+        if (mc != MEMCHECK_OK) {
+            const char *reason = (mc == MEMCHECK_HEAP_UAF)
+                ? "memcheck: heap-use-after-free"
+                : "memcheck: heap-buffer-overflow";
+            snapshot_record_guest_crash(env, TARGET_SIGSEGV, 0,
+                                        SEGV_ACCERR, addr, 0, reason);
+            fflush(NULL);
+            _exit(128 + SIGSEGV);
+        }
+    }
+
     if (mr && mr->is_heap) {
         add_symbolic_heap_bounds_query(addr_idx, mr->base, offset, size);
     }
@@ -4042,6 +4071,20 @@ static inline void qemu_store_helper(CPUArchState *env,
     }
 
     SnapshotMemRegion *mr = snapshot_mem_region_search_with_size(addr, size);
+
+    if (binradar_memcheck_enabled && symbolic_start_code > 0 &&
+        current_tb_pc >= symbolic_start_code && current_tb_pc < symbolic_end_code) {
+        MemcheckResult mc = snapshot_memcheck_access(addr, size);
+        if (mc != MEMCHECK_OK) {
+            const char *reason = (mc == MEMCHECK_HEAP_UAF)
+                ? "memcheck: heap-use-after-free"
+                : "memcheck: heap-buffer-overflow";
+            snapshot_record_guest_crash(env, TARGET_SIGSEGV, 0,
+                                        SEGV_ACCERR, addr, 0, reason);
+            fflush(NULL);
+            _exit(128 + SIGSEGV);
+        }
+    }
 
     if (mr && mr->is_heap) {
         add_symbolic_heap_bounds_query(addr_idx, mr->base, offset, size);
@@ -6448,6 +6491,54 @@ static void update_last_translation_block(uintptr_t pc) {
     last_translation_block = pc;
 }
 
+/* Lightweight TCG pass for non-symbolic mode: insert a helper call
+ * before each qemu_ld/qemu_st to check heap bounds (QASAN-like).
+ * Gated by binradar_memcheck_enabled.  Independent of symbolic_mode. */
+void memcheck_instrument_tb(TranslationBlock *tb, TCGContext *tcg_ctx,
+                            CPUArchState *cpu_env) {
+    if (!binradar_memcheck_enabled) return;
+    /* Only instrument TBs within the main binary's code range.
+     * This avoids false positives from library code (e.g., glibc). */
+    if (symbolic_start_code > 0 &&
+        (tb->pc < symbolic_start_code || tb->pc >= symbolic_end_code)) {
+        return;
+    }
+
+    TCGOp *op;
+    uintptr_t pc = tb->pc;
+
+    QTAILQ_FOREACH(op, &tcg_ctx->ops, link) {
+        switch (op->opc) {
+        case INDEX_op_qemu_ld_i32:
+        case INDEX_op_qemu_ld_i64:
+        case INDEX_op_qemu_st_i32:
+        case INDEX_op_qemu_st_i64: {
+            /* args[1] is the address temp for both ld and st. */
+            TCGTemp *t_addr = arg_temp(op->args[1]);
+            TCGMemOp mem_op = get_memop(op->args[2]);
+            size_t size = get_mem_op_size(mem_op);
+
+            TCGTemp *t_size = new_non_conflicting_temp(TCG_TYPE_I64);
+            tcg_movi(t_size, (uintptr_t)size, 0, op, NULL, tcg_ctx);
+
+            TCGTemp *t_pc = new_non_conflicting_temp(TCG_TYPE_I64);
+            tcg_movi(t_pc, (uintptr_t)pc, 0, op, NULL, tcg_ctx);
+
+            MARK_TEMP_AS_ALLOCATED(t_addr);
+            add_void_call_3(snapshot_memcheck_helper, t_addr, t_size, t_pc,
+                            op, NULL, tcg_ctx);
+            MARK_TEMP_AS_NOT_ALLOCATED(t_addr);
+
+            tcg_temp_free_internal(t_size);
+            tcg_temp_free_internal(t_pc);
+            break;
+        }
+        default:
+            break;
+        }
+    }
+}
+
 static int instrument = 0;
 int        parse_translation_block(TranslationBlock* tb, uintptr_t tb_pc,
                                    uint8_t* tb_code, TCGContext* tcg_ctx, CPUArchState *cpu_env)
@@ -8836,7 +8927,7 @@ int        parse_translation_block(TranslationBlock* tb, uintptr_t tb_pc,
 
 static uintptr_t model_caller_addr = 0;
 int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
-    if (symbolic_mode == 0 || plt_addrs == NULL) {
+    if ((symbolic_mode == 0 && !binradar_memcheck_enabled) || plt_addrs == NULL) {
         return 0;
     }
 
@@ -8847,6 +8938,11 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
     if (mode == 0 && model > 0) {
         uintptr_t rsp = env->regs[R_ESP];
         model_caller_addr = *((uintptr_t*)rsp);
+        /* In memcheck-only mode, only handle allocation-related models. */
+        if (!symbolic_mode && model != MALLOC && model != FREE &&
+            model != REALLOC && model != CALLOC) {
+            return 0;
+        }
         // printf("Executing LIB MODEL %d at %lx\n", model, pc);
         if (model == STRCMP) {
             // printf("[0x%lx] strcmp(%s, %s)\n", model_caller_addr, (char *)(uintptr_t)env->regs[R_EDI], (char *)(uintptr_t)env->regs[R_ESI]);
@@ -8869,33 +8965,51 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
             clear_call_args_temps();
             clear_xmm_regs(env);
         } else if (model == MALLOC) {
-            // printf("[0x%lx] malloc(%lu)\n", model_caller_addr, (uintptr_t)env->regs[R_EDI]);
-            model_alloc(env, model_caller_addr, R_EDI);
-            clear_call_args_temps();
-            clear_xmm_regs(env);
+            if (symbolic_mode) {
+                model_alloc(env, model_caller_addr, R_EDI);
+                clear_call_args_temps();
+                clear_xmm_regs(env);
+            } else {
+                /* memcheck-only: record pending alloc for return hook */
+                snapshot_trace_pending_allocs(env->regs[R_EDI], model_caller_addr);
+            }
             mode = 1;
         } else if (model == REALLOC) {
-            // printf("[0x%lx] realloc(0x%lx, %lu)\n", model_caller_addr, (uintptr_t)env->regs[R_EDI], (uintptr_t)env->regs[R_ESI]);
-            symbolic_trace_free(env->regs[R_EDI]);
+            if (symbolic_mode) {
+                symbolic_trace_free(env->regs[R_EDI]);
+            }
             snapshot_trace_free(env->regs[R_EDI], model_caller_addr);
-            model_alloc(env, model_caller_addr, R_ESI);
-            clear_call_args_temps();
-            clear_xmm_regs(env);
+            if (symbolic_mode) {
+                model_alloc(env, model_caller_addr, R_ESI);
+                clear_call_args_temps();
+                clear_xmm_regs(env);
+            } else {
+                /* memcheck-only: record pending alloc for return hook */
+                snapshot_trace_pending_allocs(env->regs[R_ESI], model_caller_addr);
+            }
             mode = 1;
         } else if (model == FREE) {
-            // printf("[0x%lx] free(0x%lx)\n", model_caller_addr, (uintptr_t)env->regs[R_EDI]);
-            symbolic_trace_free(env->regs[R_EDI]);
+            if (symbolic_mode) {
+                symbolic_trace_free(env->regs[R_EDI]);
+            }
             snapshot_trace_free(env->regs[R_EDI], model_caller_addr);
-            clear_call_args_temps();
-            clear_xmm_regs(env);
+            if (symbolic_mode) {
+                clear_call_args_temps();
+                clear_xmm_regs(env);
+            }
             mode = 1;
         }  else if (model == CALLOC) {
-            // printf("[0x%lx] calloc(%lu)\n", model_caller_addr, (uintptr_t)env->regs[R_EDI]);
-            // For array detection
-            trace_mem("[calloc] [size %lx] [pc %lx]\n]", env->regs[R_EDI], model_caller_addr);
-            model_alloc(env, model_caller_addr, R_EDI);
-            clear_call_args_temps();
-            clear_xmm_regs(env);
+            if (symbolic_mode) {
+                trace_mem("[calloc] [size %lx] [pc %lx]\n]", env->regs[R_EDI], model_caller_addr);
+                model_alloc(env, model_caller_addr, R_EDI);
+                clear_call_args_temps();
+                clear_xmm_regs(env);
+            } else {
+                /* memcheck-only: record pending alloc for return hook.
+                 * calloc(n, size) → total = n * size, in R_EDI * R_ESI */
+                target_ulong total = env->regs[R_EDI] * env->regs[R_ESI];
+                snapshot_trace_pending_allocs(total, model_caller_addr);
+            }
             mode = 1;
         } else if (model == PRINTF) {
             // printf("[0x%lx] printf(%s, ...)\n", model_caller_addr, (char *)(uintptr_t)env->regs[R_EDI]);
@@ -8990,10 +9104,12 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
     }
     if (mode > 0 && pc == model_caller_addr) {
         // printf("Switch mode back\n");
-        Expr* ret_expr = take_pending_model_return_expr();
-        if (ret_expr != NULL) {
-            s_temps[temp_idx(tcg_find_temp_arch_reg(tcg_ctx, "rax"))] =
-                ret_expr;
+        if (symbolic_mode) {
+            Expr* ret_expr = take_pending_model_return_expr();
+            if (ret_expr != NULL) {
+                s_temps[temp_idx(tcg_find_temp_arch_reg(tcg_ctx, "rax"))] =
+                    ret_expr;
+            }
         }
         model_caller_addr = 0;
         int r = 0;
@@ -9002,14 +9118,22 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
         }
         mode = 0;
         PendingAlloc alloc_info = snapshot_trace_get_pending_allocs(pc);
-        SymbolicPendingAlloc sym_alloc_info =
-            symbolic_trace_get_pending_alloc(pc);
-        if (alloc_info.size != 0 && alloc_info.pc != 0) {
-            target_ulong base = env->regs[R_EAX];
-            snapshot_trace_alloc(base, alloc_info.size, alloc_info.pc);
-            if (sym_alloc_info.size_expr != NULL) {
-                symbolic_trace_alloc(base, sym_alloc_info.size_expr,
-                                    sym_alloc_info.size, sym_alloc_info.pc);
+        if (symbolic_mode) {
+            SymbolicPendingAlloc sym_alloc_info =
+                symbolic_trace_get_pending_alloc(pc);
+            if (alloc_info.size != 0 && alloc_info.pc != 0) {
+                target_ulong base = env->regs[R_EAX];
+                snapshot_trace_alloc(base, alloc_info.size, alloc_info.pc);
+                if (sym_alloc_info.size_expr != NULL) {
+                    symbolic_trace_alloc(base, sym_alloc_info.size_expr,
+                                        sym_alloc_info.size, sym_alloc_info.pc);
+                }
+            }
+        } else {
+            /* memcheck-only: record the allocation */
+            if (alloc_info.size != 0 && alloc_info.pc != 0) {
+                target_ulong base = env->regs[R_EAX];
+                snapshot_trace_alloc(base, alloc_info.size, alloc_info.pc);
             }
         }
         return r;
