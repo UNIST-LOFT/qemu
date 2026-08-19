@@ -41,6 +41,11 @@
 
 #include "../../tcg/symbolic/symbolic-instrumentation.h"
 
+/* Defined in linux-user/snapshot.c; gates per-instruction env->eip sync
+ * (mirrors QASan's use_qasan gate). Not declared via snapshot.h here to
+ * avoid pulling qemu.h into the translator. */
+extern int binradar_memcheck_enabled;
+
 #ifdef TARGET_X86_64
 #define CODE64(s) ((s)->code64)
 #define REX_X(s) ((s)->rex_x)
@@ -8625,6 +8630,15 @@ static void i386_tr_insn_start(DisasContextBase *dcbase, CPUState *cpu)
     DisasContext *dc = container_of(dcbase, DisasContext, base);
 
     tcg_gen_insn_start(dc->base.pc_next, dc->cc_op);
+    /* Sync env->eip per instruction on the memcheck path so a crash
+     * mid-TB reports the exact faulting PC (matches QASan, which gates on
+     * use_qasan the same way). Without this, env->eip is only synced at TB
+     * boundaries and snapshot_record_guest_crash captures the TB start. */
+    if (binradar_memcheck_enabled) {
+        TCGv eip = tcg_const_tl(dc->base.pc_next);
+        tcg_gen_st_tl(eip, cpu_env, offsetof(CPUX86State, eip));
+        tcg_temp_free(eip);
+    }
 }
 
 static bool i386_tr_breakpoint_check(DisasContextBase *dcbase, CPUState *cpu,
