@@ -388,6 +388,9 @@ void check_all_env_var(void) {
     check_env_var("BINRADAR_PRESERVE_CHILD_QUERIES");
     check_env_var("BINRADAR_PROBE_FILE");
     check_env_var("BINRADAR_QUERY_WINDOW_FILE");
+    check_env_var("BINRADAR_FORKSERVER_CHILD_TIMEOUT");
+    // Memcheck related
+    check_env_var("BINRADAR_MEMCHECK_ENABLE");
     // Patch related
     check_env_var("BINRADAR_PATCH_FD_R");
     check_env_var("PATCH_FD"); // Used by brpatch
@@ -3475,12 +3478,46 @@ static void binradar_manager_reset_line_buf(BinradarManager *manager) {
     memset(manager->line_buf, 0, sizeof(manager->line_buf));
 }
 
+static int64_t forkserver_child_timeout_ms(void) {
+    const char *var = getenv("BINRADAR_FORKSERVER_CHILD_TIMEOUT");
+    if (var == NULL) return -1;
+    int64_t secs = atoll(var);
+    if (secs <= 0) return -1;
+    return secs * 1000;
+}
+
 static int wait_child_and_drain_patch(pid_t child_pid, uint32_t *status_out) {
     if (binradar_manager == NULL) {
         // Not binradar mode - fallback to original
-        return waitpid(child_pid, (int *)status_out, 0);
+        int64_t timeout_ms = forkserver_child_timeout_ms();
+        if (timeout_ms < 0) {
+            return waitpid(child_pid, (int *)status_out, 0);
+        }
+        // Bounded wait with deadline
+        int status = 0;
+        int64_t deadline = g_get_monotonic_time() + timeout_ms * 1000; /* us */
+        for (;;) {
+            pid_t r = waitpid(child_pid, &status, WNOHANG);
+            if (r == child_pid) {
+                *status_out = (uint32_t)status;
+                return 0;
+            }
+            if (r < 0) {
+                log_msg("waitpid(WNOHANG)\n");
+                return -1;
+            }
+            if (g_get_monotonic_time() >= deadline) {
+                log_msg("[forkserver] [child-timeout] killing child %d after %ld ms\n",
+                        (int)child_pid, (long)timeout_ms);
+                kill(child_pid, SIGKILL);
+                waitpid(child_pid, &status, 0);
+                *status_out = (uint32_t)status;
+                return 0;
+            }
+            g_usleep(50 * 1000);
+        }
     }
-    
+
     struct pollfd pfd;
     int status = 0;
     bool child_exited = false;
@@ -3493,7 +3530,19 @@ static int wait_child_and_drain_patch(pid_t child_pid, uint32_t *status_out) {
         set_nonblock(binradar_manager->patch_fd_r);
     }
 
+    int64_t timeout_ms = forkserver_child_timeout_ms();
+    int64_t deadline = (timeout_ms >= 0) ? g_get_monotonic_time() + timeout_ms * 1000 : -1; /* us */
+
     while (!child_exited) {
+        if (deadline >= 0 && g_get_monotonic_time() >= deadline) {
+            log_msg("[forkserver] [child-timeout] killing child %d after %ld ms\n",
+                    (int)child_pid, (long)timeout_ms);
+            kill(child_pid, SIGKILL);
+            waitpid(child_pid, &status, 0);
+            child_exited = true;
+            break;
+        }
+
         pid_t r = waitpid(child_pid, &status, WNOHANG);
         if (r == child_pid) {
             child_exited = true;
