@@ -5319,6 +5319,7 @@ static Expr** get_expr_addr(uintptr_t addr, size_t size, uint8_t allocate,
     return &l3_page->entries[l3_page_idx];
 }
 
+__attribute__((unused))
 Expr* symbolic_rebuild_load_expr(uintptr_t addr, uint32_t size,
                                  const uint8_t *concrete_bytes,
                                  uint8_t sign_extend)

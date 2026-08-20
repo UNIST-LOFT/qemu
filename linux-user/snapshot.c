@@ -112,7 +112,6 @@ static GArray *pending_allocs = NULL;
 /* ---- QASAN-like concrete bounds checking ---- */
 int binradar_memcheck_enabled = 0;
 #define HEAP_QUARANTINE_MAX_BYTES (50 * 1024 * 1024)
-#define MEMCHECK_REDZONE 128
 static GQueue *heap_quarantine = NULL;
 static size_t heap_quarantine_bytes = 0;
 
@@ -2012,53 +2011,35 @@ static SnapshotMemRegion *snapshot_mem_region_search_quarantine(target_ulong add
     return NULL;
 }
 
-/* Closure for the near-heap OOB foreach search. */
-typedef struct {
-    target_ulong addr;
-    MemcheckResult result;
-} MemcheckNearClosure;
-
-static gboolean memcheck_near_foreach(gpointer key, gpointer value,
-                                       gpointer data) {
-    SnapshotMemRegion *mr = (SnapshotMemRegion *)key;
-    MemcheckNearClosure *closure = (MemcheckNearClosure *)data;
-    target_ulong addr = closure->addr;
-    /* Check if addr is within [base - REDZONE, base + size + REDZONE)
-     * but NOT within [base, base + size). */
-    target_ulong region_start = mr->base;
-    target_ulong region_end = mr->base + mr->size;
-    /* Guard against overflow in the redzone arithmetic. */
-    target_ulong lo = (region_start > MEMCHECK_REDZONE)
-                      ? (region_start - MEMCHECK_REDZONE) : 0;
-    target_ulong hi = region_end + MEMCHECK_REDZONE;
-    if (hi < region_end) hi = (target_ulong)-1; /* overflow */
-    if (addr >= lo && addr < hi &&
-        !(addr >= region_start && addr < region_end)) {
-        closure->result = MEMCHECK_HEAP_OOB;
-        return TRUE; /* stop iteration */
-    }
-    return FALSE;
-}
-
 /* Check whether a memory access is within bounds of a known heap
  * allocation, or hits a quarantined (freed) region.
  *   MEMCHECK_OK        — access is within a valid heap region, or to
  *                        stack/global/unmapped memory (handled by MMU).
- *   MEMCHECK_HEAP_OOB  — access is near a heap allocation but outside
- *                        its bounds (within the redzone window).
+ *   MEMCHECK_HEAP_OOB  — access starts inside a heap region but extends
+ *                        past its recorded end (exact-bounds overrun).
  *   MEMCHECK_HEAP_UAF  — access is to a freed (quarantined) region.
- * Only checks heap regions; stack/global/unmapped accesses are
- * MEMCHECK_OK (they're handled by the MMU). */
+ *
+ * Only exact-bounds overruns and UAF are reported. We deliberately do NOT
+ * flag accesses that merely fall *near* (but outside) a recorded region:
+ * the region tree is built from PLT-call-site malloc/free hooks and can
+ * miss regions allocated through un-modelled entry points or by libraries,
+ * so a "near a known region" heuristic produces false OOB reports on
+ * accesses that actually belong to an adjacent, untracked allocation.
+ * (This was the source of the pre-entrypoint memcheck crashes that broke
+ * 23/30 benchmark subjects.) */
 MemcheckResult snapshot_memcheck_access(target_ulong addr, target_ulong size) {
     /* 1. Check quarantine first (UAF). */
     if (snapshot_mem_region_search_quarantine(addr) != NULL) {
         return MEMCHECK_HEAP_UAF;
     }
 
-    /* 2. Check heap tree (exact bounds or OOB). */
+    /* 2. Check heap tree (exact bounds or OOB).
+     * An access whose start lands inside a recorded region but whose full
+     * range [addr, addr+size) exceeds the region end is an exact-bounds
+     * overrun. Accesses outside every recorded region are MEMCHECK_OK —
+     * the region may simply be untracked (see comment above). */
     SnapshotMemRegion *mr = mr_manager_heap_search(addr);
     if (mr != NULL) {
-        /* Verify the full access range [addr, addr+size) is in bounds. */
         target_ulong region_end = mr->base + mr->size;
         if (addr + size > region_end) {
             return MEMCHECK_HEAP_OOB;
@@ -2066,10 +2047,7 @@ MemcheckResult snapshot_memcheck_access(target_ulong addr, target_ulong size) {
         return MEMCHECK_OK;
     }
 
-    /* 3. Check if addr is near a known heap allocation (OOB redzone). */
-    MemcheckNearClosure closure = { .addr = addr, .result = MEMCHECK_OK };
-    g_tree_foreach(mr_manager.heap_data, memcheck_near_foreach, &closure);
-    return closure.result;
+    return MEMCHECK_OK;
 }
 
 /* Runtime helper called from instrumented TCG code (non-symbolic mode).
