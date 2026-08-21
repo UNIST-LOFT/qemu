@@ -22,6 +22,7 @@
 #include "qemu.h"
 #include "cpu_loop-common.h"
 #include "../snapshot.h"
+#include "../provenance.h"
 
 /***********************************************************/
 /* CPUX86 core interface */
@@ -120,6 +121,10 @@ void cpu_loop(CPUX86State *env)
                 env->eip -= 2;
             } else if (ret != -TARGET_QEMU_ESIGRETURN) {
                 env->regs[R_EAX] = ret;
+                /* Syscall return clobbers RAX with a fresh value (or
+                 * preserves errno on failure): the pointer tag must not
+                 * survive a syscall boundary. */
+                provenance_invalidate_reg(env, R_EAX, pc);
             }
             break;
 #ifndef TARGET_ABI32
@@ -144,6 +149,8 @@ void cpu_loop(CPUX86State *env)
                 env->eip -= 2;
             } else if (ret != -TARGET_QEMU_ESIGRETURN) {
                 env->regs[R_EAX] = ret;
+                /* Syscall return clobbers RAX; kill the tag. */
+                provenance_invalidate_reg(env, R_EAX, pc);
             }
             break;
 #endif

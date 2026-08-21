@@ -173,6 +173,10 @@ typedef struct SharedTraceData {
     uint64_t prim_access_cnt;
     uint64_t ptr_access_cnt;
     SnapshotExitInfo exit_info;
+    /* Deferred provenance finding.  Lives in the shared mmap so the
+     * parent can read it after waitpid even when the child was killed or
+     * timed out (timeout-safe transport; see Step 5). */
+    PendingProvenanceFault prov_pending_fault;
     PrimitiveAccess primitives[MAX_PRIMITIVE_ACCESS];
     PointerAccess pointers[MAX_POINTER_ACCESS];
 } SharedTraceData;
@@ -1162,12 +1166,12 @@ void snapshot_record_guest_normal_exit(CPUArchState *cpu_env, int exit_code, con
     if (provenance_finalize_fault(cpu_env)) {
         PendingProvenanceFault *fault = provenance_get_pending_fault();
         const char *pf_reason = provenance_fault_reason();
-        log_msg("[prov] [finalize] [finding] [reason %s] [access_pc %lx] [access_addr %lx] [width %u] [obj_id %lu] [gen %u] [obj_base %lx] [size %lx] [offset %ld] [producer_pc %lx] [kind %d] [is_uaf %d] [ea_reg %d]\n",
+        log_msg("[prov] [finalize] [finding] [reason %s] [access_pc %lx] [access_addr %lx] [width %u] [obj_id %lu] [gen %u] [obj_base %lx] [size %lx] [offset %ld] [producer_pc %lx] [kind %d] [last_writer %lx] [is_uaf %d] [ea_reg %d]\n",
                 pf_reason ? pf_reason : "?", fault->access_pc, fault->access_addr,
                 fault->access_width, fault->object_id, fault->generation,
                 fault->object_base, fault->requested_size, fault->tracked_offset,
-                fault->producer_pc, fault->producer_kind, fault->is_uaf,
-                fault->ea_base_reg);
+                fault->producer_pc, fault->producer_kind, fault->last_writer_pc,
+                fault->is_uaf, fault->ea_base_reg);
 
         SnapshotExitInfo *info = snapshot_exit_info_ptr();
         if (info->valid && info->crashed) {
@@ -1418,21 +1422,21 @@ static GArray *get_pending_allocs(void) {
 
 void snapshot_trace_pending_allocs(target_ulong size, target_ulong pc) {
     GArray *stack = get_pending_allocs();
-    PendingAlloc alloc = {size, pc};
+    PendingAlloc alloc = {true, size, pc};
     g_array_append_val(stack, alloc);
     trace_mem("[alloc] [temp] [size %lx] [pc %lx]\n", size, pc);
 }
 
 PendingAlloc snapshot_trace_get_pending_allocs(target_ulong pc) {
     GArray *stack = get_pending_allocs();
-    PendingAlloc result = {0, 0};
+    PendingAlloc result = {false, 0, 0};
     if (stack->len == 0) {
         // This should not happen
         return result;
     }
     result = g_array_index(stack, PendingAlloc, stack->len - 1);
     if (result.pc != pc) {
-        result = (PendingAlloc){0, 0};
+        result = (PendingAlloc){false, 0, 0};
         return result;
     }
     g_array_set_size(stack, stack->len - 1);
@@ -1474,7 +1478,9 @@ static int check_addr_in_region(SnapshotMemRegion *mr, target_ulong addr) {
         }
         return (addr > mr->base) ? 1 : -1;
     }
-    if (mr->base + mr->size < addr) return -1;
+    /* Heap/global regions are half-open: [base, base+size).  An access
+     * exactly at base+size (one-past-end) is NOT inside. */
+    if (mr->base + mr->size <= addr) return -1;
     if (mr->base > addr) return 1;
     return 0;
 }
@@ -2070,7 +2076,12 @@ MemcheckResult snapshot_memcheck_access(target_ulong addr, target_ulong size) {
     SnapshotMemRegion *mr = mr_manager_heap_search(addr);
     if (mr != NULL) {
         target_ulong region_end = mr->base + mr->size;
-        if (addr + size > region_end) {
+        /* Half-open containment: mr->base <= addr < region_end (the tree
+         * search guarantees this), so region_end - addr cannot wrap.
+         * size > region_end - addr ⇔ addr + size > region_end, computed
+         * overflow-safe. */
+        if (addr < region_end &&
+            (uint64_t)size > (uint64_t)(region_end - addr)) {
             return MEMCHECK_HEAP_OOB;
         }
         return MEMCHECK_OK;
@@ -2139,6 +2150,9 @@ void snapshot_init(void) {
     snapshot_load_binradar_env();
     /* Initialize PLT hooks for memcheck-only mode. */
     memcheck_init();
+    /* Deferred provenance findings live in the shared mmap so the parent
+     * can read them after waitpid even on timeout/SIGKILL. */
+    provenance_set_shared_fault_ptr(&shared_trace_data->prov_pending_fault);
     provenance_init();
 }
 
@@ -2293,6 +2307,7 @@ void snapshot_read_access(SnapshotMemAccess *mem_access) {
 // }
 
 // Syscall Hook
+static target_ulong last_brk_end;  /* previous brk end (for shrink detection) */
 void snapshot_syscall(uintptr_t syscall_no, uintptr_t syscall_arg0,
                       uintptr_t syscall_arg1, uintptr_t syscall_arg2,
                       uintptr_t syscall_arg3, uintptr_t syscall_arg4,
@@ -2345,21 +2360,34 @@ void snapshot_syscall(uintptr_t syscall_no, uintptr_t syscall_arg0,
     case TARGET_NR_readlinkat: // Read path from symbolic link
         // readlinkat(dirfd, pathname, buf, bufsize)
         // snapshot_write_access(syscall_arg2, syscall_arg3);
+        // Kernel wrote the link target into buf: invalidate shadow.
+        if ((long)ret_val > 0) {
+            provenance_on_modify_mem(syscall_arg2, ret_val);
+        }
+        break;
 #if defined(TARGET_NR_futex)
     case TARGET_NR_futex: // Fast user mutex
         // futex(uaddr, op, val, timeout)
         // snapshot_write_access(syscall_arg0, syscall_arg3);
+        // The futex word is modified by the kernel on some ops.
+        if ((long)ret_val >= 0) {
+            provenance_on_modify_mem(syscall_arg0, sizeof(target_ulong));
+        }
         break;
 #endif
 #if defined(TARGET_NR_newfstatat)
     case TARGET_NR_newfstatat: // Return file status as stat
         // newfstatat(dirfd, pathname, statbuf, flags)
         // snapshot_write_access(syscall_arg2, 4096);
+        // Kernel wrote the stat struct: invalidate shadow (conservative
+        // 256-byte window covers x86-64 struct stat).
+        provenance_on_modify_mem(syscall_arg2, 256);
         break;
 #endif
 #if defined(TARGET_NR_fstatat64)
     case TARGET_NR_fstatat64:
         // snapshot_write_access(syscall_arg2, 4096);
+        provenance_on_modify_mem(syscall_arg2, 256);
         break;
 #endif
     case TARGET_NR_statfs:
@@ -2367,6 +2395,9 @@ void snapshot_syscall(uintptr_t syscall_no, uintptr_t syscall_arg0,
     case TARGET_NR_fstatfs:
         // fstat(fd, statbuf)
         // snapshot_write_access(syscall_arg1, 4096);
+        // Kernel wrote the stat buffer (x86-64 statfs is ~120 bytes,
+        // stat is 144): invalidate conservatively.
+        provenance_on_modify_mem(syscall_arg1, 256);
         break;
     case TARGET_NR_getrandom: {
         // getrandom(buf, buflen, flags)
@@ -2392,20 +2423,43 @@ void snapshot_syscall(uintptr_t syscall_no, uintptr_t syscall_arg0,
         // brk(new_brk_addr)
         // Handled in snapshot_restore
         trace_mem("New brk %lx received.\n", syscall_arg0);
+        // On shrink (new brk below the previous end), stale shadow tags
+        // in the unmapped tail must not be reloaded after regrowth.
+        if ((long)ret_val < (long)last_brk_end) {
+            provenance_on_modify_mem(ret_val, last_brk_end - ret_val);
+        }
+        last_brk_end = ret_val;
         break;
     // System call that changes heap shape:
     case TARGET_NR_mmap: // Memory map to file
         // mmap(addr, size, prot, flags, fd, offset) -> mapped addr
         snapshot_add_mapping(ret_val, syscall_arg1);
+        // A fresh mapping must never inherit stale shadow entries (an
+        // address previously used by another object).
+        if ((long)ret_val > 0) {
+            provenance_on_modify_mem(ret_val, syscall_arg1);
+        }
         break;
     case TARGET_NR_mremap: // memory remap
         // mremap(old_addr, old_size, new_size, flags, new_addr) -> new addr
         // snapshot_remove_mapping(syscall_arg0, syscall_arg1);
         snapshot_add_mapping(ret_val, syscall_arg2);
+        // Old range's shadow entries are stale (pages may be moved/freed).
+        if ((long)ret_val >= 0) {
+            provenance_on_modify_mem(syscall_arg0, syscall_arg1);
+            if ((uintptr_t)ret_val != (uintptr_t)syscall_arg0) {
+                provenance_on_modify_mem(ret_val, syscall_arg2);
+            }
+        }
         break;
     case TARGET_NR_munmap: // unmap
         // munmap(addr, length)
         // snapshot_remove_mapping(syscall_arg0, syscall_arg1);
+        // Invalidate shadow for the unmapped range (stale tags must not
+        // survive an address-space reuse).
+        if ((long)ret_val == 0) {
+            provenance_on_modify_mem(syscall_arg0, syscall_arg1);
+        }
         break;
     case TARGET_NR_mprotect: // permission
         // mprotect(start, len, prot)
@@ -3510,8 +3564,32 @@ static int64_t forkserver_child_timeout_ms(void) {
     return secs * 1000;
 }
 
+/* Parent-side deferred-finding reporter: after the child died (or was
+ * killed on timeout), surface any provenance finding the child recorded
+ * in shared memory.  Returns true if a finding was reported. */
+static bool report_shared_prov_finding(uint32_t *status_out) {
+    if (shared_trace_data == NULL) return false;
+    PendingProvenanceFault *fault = &shared_trace_data->prov_pending_fault;
+    if (!fault->detected) return false;
+    const char *pf_reason = fault->is_uaf
+        ? "memcheck: heap-use-after-free (provenance)"
+        : "memcheck: heap-buffer-overflow (provenance)";
+    log_msg("[prov] [finalize] [finding] [reason %s] [access_pc %lx] [access_addr %lx] [width %u] [obj_id %lu] [gen %u] [obj_base %lx] [size %lx] [offset %ld] [producer_pc %lx] [kind %d] [last_writer %lx] [is_uaf %d] [ea_reg %d]\n",
+            pf_reason, fault->access_pc, fault->access_addr,
+            fault->access_width, fault->object_id, fault->generation,
+            fault->object_base, fault->requested_size, fault->tracked_offset,
+            fault->producer_pc, fault->producer_kind, fault->last_writer_pc,
+            fault->is_uaf, fault->ea_base_reg);
+    /* Synthetic crash verdict (SIGSEGV) so the outer harness sees a crash
+     * rather than a pure timeout. */
+    if (status_out != NULL) {
+        *status_out = 128 + SIGSEGV;
+    }
+    return true;
+}
+
 static int wait_child_and_drain_patch(pid_t child_pid, uint32_t *status_out) {
-    if (binradar_manager == NULL) {
+        if (binradar_manager == NULL) {
         // Not binradar mode - fallback to original
         int64_t timeout_ms = forkserver_child_timeout_ms();
         if (timeout_ms < 0) {
@@ -3524,6 +3602,8 @@ static int wait_child_and_drain_patch(pid_t child_pid, uint32_t *status_out) {
             pid_t r = waitpid(child_pid, &status, WNOHANG);
             if (r == child_pid) {
                 *status_out = (uint32_t)status;
+                /* Child exited on its own; a deferred finding is already
+                 * surfaced by the child's finalize path. */
                 return 0;
             }
             if (r < 0) {
@@ -3536,6 +3616,10 @@ static int wait_child_and_drain_patch(pid_t child_pid, uint32_t *status_out) {
                 kill(child_pid, SIGKILL);
                 waitpid(child_pid, &status, 0);
                 *status_out = (uint32_t)status;
+                /* Timeout-safe transport: the child may have recorded a
+                 * provenance finding before looping forever.  Surface it
+                 * as a synthetic crash instead of a bare timeout. */
+                report_shared_prov_finding(status_out);
                 return 0;
             }
             g_usleep(50 * 1000);
@@ -3564,6 +3648,9 @@ static int wait_child_and_drain_patch(pid_t child_pid, uint32_t *status_out) {
             kill(child_pid, SIGKILL);
             waitpid(child_pid, &status, 0);
             child_exited = true;
+            /* Timeout-safe transport: surface a deferred finding as a
+             * synthetic crash (see non-binradar path above). */
+            report_shared_prov_finding((uint32_t *)&status);
             break;
         }
 

@@ -21,6 +21,7 @@
 #include "signal-common.h"
 #include "linux-user/trace.h"
 #include "../snapshot.h"
+#include "../provenance.h"
 
 /* from the Linux kernel - /arch/x86/include/uapi/asm/sigcontext.h */
 
@@ -454,6 +455,9 @@ void setup_rt_frame(int sig, struct target_sigaction *ka,
     env->regs[R_EDX] = (unsigned long)&frame->uc;
 #endif
 
+    /* Signal delivery rewrites the register file: no GPR keeps a tag. */
+    provenance_invalidate_all_regs(env);
+
     cpu_x86_load_seg(env, R_DS, __USER_DS);
     cpu_x86_load_seg(env, R_ES, __USER_DS);
     cpu_x86_load_seg(env, R_CS, __USER_CS);
@@ -512,6 +516,11 @@ restore_sigcontext(CPUX86State *env, struct target_sigcontext *sc)
 
     env->eip = tswapl(sc->rip);
 #endif
+
+    /* Signal return restores the full register file: provenance tags
+     * saved in the context belong to the interrupted code, and the
+     * registers now hold restored values — invalidate all. */
+    provenance_invalidate_all_regs(env);
 
     cpu_x86_load_seg(env, R_CS, lduw_p(&sc->cs) | 3);
     cpu_x86_load_seg(env, R_SS, lduw_p(&sc->ss) | 3);

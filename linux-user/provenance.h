@@ -67,6 +67,7 @@ typedef struct ProvenanceObject {
 /* Pending allocator operation (call entry, not yet returned). */
 typedef struct {
     bool                   valid;
+    bool                   overflowed;    /* calloc: n*size overflowed */
     ProvenancePendingKind  kind;
     target_ulong           call_pc;
     target_ulong           arg_size;       /* malloc/calloc total           */
@@ -80,6 +81,20 @@ typedef struct {
 typedef struct PtrRegShadow {
     PtrTag       gpr[CPU_NB_REGS];
     target_ulong last_writer_pc[CPU_NB_REGS];
+    /* Pending allocator operation for this guest thread (per-CPU, so
+     * multithreaded guests keep independent pending ops). */
+    ProvenancePending pending;
+    /* Effective-address metadata for the in-flight access check.  Set by
+     * helper_prov_set_ea BEFORE the guest load/store (translation-time
+     * metadata), consumed by helper_prov_check_access AFTER it, so a
+     * faulting access never records a finding. */
+    struct ProvEAMeta {
+        int32_t      base_reg;   /* -1 if no base register              */
+        int32_t      index_reg;  /* -1 if no index register             */
+        int32_t      scale;      /* SIB scale: 0=*1 1=*2 2=*4 3=*8      */
+        target_long  disp;       /* constant displacement               */
+        bool         valid;      /* set by prov_set_ea, consumed by check */
+    } ea_meta;
 } PtrRegShadow;
 
 /* Memory shadow entry: maps an aligned 8-byte guest slot to a PtrTag. */
@@ -101,6 +116,7 @@ typedef struct {
     int64_t         tracked_offset;
     target_ulong    producer_pc;
     PtrProducerKind producer_kind;
+    target_ulong    last_writer_pc;   /* shadow last_writer_pc[ea_base_reg] */
     target_ulong    ea_base_reg_val;
     int             ea_base_reg;       /* -1 if unknown */
     bool            is_uaf;
@@ -123,14 +139,18 @@ ProvenanceObject *provenance_lookup_object(uint64_t object_id,
 ProvenanceObject *provenance_lookup_live_by_base(target_ulong base);
 
 /* ---- Pending allocator operations ---- */
-void provenance_set_pending(ProvenancePendingKind kind, target_ulong call_pc,
-                            target_ulong arg_size, target_ulong arg_ptr);
-ProvenancePending provenance_get_pending(target_ulong call_pc);
-void provenance_clear_pending(void);
+void provenance_set_pending(CPUArchState *env, ProvenancePendingKind kind,
+                            target_ulong call_pc, target_ulong arg_size,
+                            target_ulong arg_ptr);
+ProvenancePending provenance_get_pending(CPUArchState *env,
+                                         target_ulong call_pc);
+void provenance_clear_pending(CPUArchState *env);
 
 /* ---- Register tag operations ---- */
 /* Invalidate a register's tag (set to UNKNOWN). */
 void provenance_invalidate_reg(CPUArchState *env, int reg_idx, target_ulong pc);
+/* Invalidate every GPR tag (signal delivery/return, context switches). */
+void provenance_invalidate_all_regs(CPUArchState *env);
 /* Set a register's tag from an explicit PtrTag. */
 void provenance_set_reg_tag(CPUArchState *env, int reg_idx, PtrTag tag);
 void provenance_addsub_reg(CPUArchState *env, int dst_idx, int src_idx,
@@ -170,7 +190,16 @@ MemcheckResult provenance_check_access(CPUArchState *env, target_ulong addr,
                                        PtrTag ea_tag, int ea_base_reg,
                                        target_ulong ea_base_reg_val);
 
+/* C API for libc-model bodies: check an access whose pointer lives in a
+ * named register (no EA scratch involved). */
+void provenance_model_check_access(CPUArchState *env, target_ulong addr,
+                                   target_ulong size, target_ulong pc,
+                                   int reg);
+
 /* ---- Pending fault ---- */
+/* Point the per-run pending fault at the shared-memory slot (called from
+ * snapshot_init after the shared mmap exists). */
+void provenance_set_shared_fault_ptr(PendingProvenanceFault *ptr);
 PendingProvenanceFault *provenance_get_pending_fault(void);
 void provenance_clear_pending_fault(void);
 

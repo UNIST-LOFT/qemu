@@ -8994,18 +8994,27 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
                 /* memcheck-only: record pending alloc for return hook */
                 snapshot_trace_pending_allocs(env->regs[R_EDI], model_caller_addr);
             }
-            provenance_set_pending(PROV_OP_MALLOC, model_caller_addr,
+            provenance_set_pending(env, PROV_OP_MALLOC, model_caller_addr,
                                    env->regs[R_EDI], 0);
             /* mode = 2: flush TB cache at dispatch and return-hook so every
              * call re-enters tb_lookup__cpu_state (direct chains would
              * otherwise skip subsequent allocations). */
             mode = 2;
         } else if (model == REALLOC) {
-            if (symbolic_mode) {
-                symbolic_trace_free(env->regs[R_EDI]);
+            /* Two-phase realloc: record the old object identity at entry
+             * but do NOT retire/free/mutate any state.  The old object
+             * must remain LIVE until a successful return (failed realloc
+             * preserves it). */
+            uint64_t old_id = 0;
+            uint32_t old_gen = 0;
+            {
+                ProvenanceObject *old_obj =
+                    provenance_lookup_live_by_base(env->regs[R_EDI]);
+                if (old_obj != NULL) {
+                    old_id = old_obj->object_id;
+                    old_gen = old_obj->generation;
+                }
             }
-            snapshot_trace_free(env->regs[R_EDI], model_caller_addr);
-            provenance_retire_object(env->regs[R_EDI]);
             if (symbolic_mode) {
                 model_alloc(env, model_caller_addr, R_ESI);
                 clear_call_args_temps();
@@ -9014,21 +9023,30 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
                 /* memcheck-only: record pending alloc for return hook */
                 snapshot_trace_pending_allocs(env->regs[R_ESI], model_caller_addr);
             }
-            provenance_set_pending(PROV_OP_REALLOC, model_caller_addr,
+            provenance_set_pending(env, PROV_OP_REALLOC, model_caller_addr,
                                    env->regs[R_ESI], env->regs[R_EDI]);
+            /* Save the old object identity into the per-CPU pending op so
+             * the return hook can retire it only on success. */
+            {
+                PtrRegShadow *shadow = provenance_get_reg_shadow(env);
+                shadow->pending.old_object_id = old_id;
+                shadow->pending.old_generation = old_gen;
+            }
             mode = 2;
         } else if (model == FREE) {
-            if (symbolic_mode) {
-                symbolic_trace_free(env->regs[R_EDI]);
+            if (env->regs[R_EDI] != 0) {
+                if (symbolic_mode) {
+                    symbolic_trace_free(env->regs[R_EDI]);
+                }
+                snapshot_trace_free(env->regs[R_EDI], model_caller_addr);
+                provenance_retire_object(env->regs[R_EDI]);
             }
-            snapshot_trace_free(env->regs[R_EDI], model_caller_addr);
-            provenance_retire_object(env->regs[R_EDI]);
             if (symbolic_mode) {
                 clear_call_args_temps();
                 clear_xmm_regs(env);
             }
             mode = 2;
-        }  else if (model == CALLOC) {
+        } else if (model == CALLOC) {
             if (symbolic_mode) {
                 trace_mem("[calloc] [size %lx] [pc %lx]\n]", env->regs[R_EDI], model_caller_addr);
                 model_alloc(env, model_caller_addr, R_EDI);
@@ -9037,11 +9055,30 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
             } else {
                 /* memcheck-only: record pending alloc for return hook.
                  * calloc(n, size) → total = n * size, in R_EDI * R_ESI */
-                target_ulong total = env->regs[R_EDI] * env->regs[R_ESI];
-                snapshot_trace_pending_allocs(total, model_caller_addr);
+                target_ulong total;
+                if (__builtin_mul_overflow(env->regs[R_EDI],
+                                           env->regs[R_ESI], &total)) {
+                    /* Overflow: never create a wrapped-size allocation.
+                     * Record a failed pending op (size 0, overflow flag). */
+                    snapshot_trace_pending_allocs(0, model_caller_addr);
+                } else {
+                    snapshot_trace_pending_allocs(total, model_caller_addr);
+                }
             }
-            provenance_set_pending(PROV_OP_CALLOC, model_caller_addr,
-                                   env->regs[R_EDI] * env->regs[R_ESI], 0);
+            provenance_set_pending(env, PROV_OP_CALLOC, model_caller_addr,
+                                   0, 0);
+            /* Checked multiplication: on overflow mark the pending op as
+             * overflowed so the return hook creates no wrapped object. */
+            {
+                PtrRegShadow *shadow = provenance_get_reg_shadow(env);
+                target_ulong total;
+                if (__builtin_mul_overflow(env->regs[R_EDI],
+                                           env->regs[R_ESI], &total)) {
+                    shadow->pending.overflowed = true;
+                } else {
+                    shadow->pending.arg_size = total;
+                }
+            }
             mode = 2;
         } else if (model == PRINTF) {
             // printf("[0x%lx] printf(%s, ...)\n", model_caller_addr, (char *)(uintptr_t)env->regs[R_EDI]);
@@ -9072,14 +9109,18 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
              * copy interval here (access pc = caller), carrying the dst/src
              * register tags so tagged underruns/overruns are detected. */
             if (binradar_memcheck_enabled) {
-                helper_prov_check_access(env,
+                /* The model wrote raw bytes into the destination: stale
+                 * pointer shadow entries there must not be reloaded. */
+                provenance_on_modify_mem((target_ulong)env->regs[R_EDI],
+                                         (target_ulong)env->regs[R_EDX]);
+                provenance_model_check_access(env,
                                          (target_ulong)env->regs[R_EDI],
                                          (target_ulong)env->regs[R_EDX],
-                                         model_caller_addr, R_EDI, -1);
-                helper_prov_check_access(env,
+                                         model_caller_addr, R_EDI);
+                provenance_model_check_access(env,
                                          (target_ulong)env->regs[R_ESI],
                                          (target_ulong)env->regs[R_EDX],
-                                         model_caller_addr, R_ESI, -1);
+                                         model_caller_addr, R_ESI);
             }
             mode = 2;
             clear_call_args_temps();
@@ -9090,10 +9131,14 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
             qemu_memset(value, (uintptr_t)env->regs[R_EDI], (uintptr_t)env->regs[R_EDX]);
             /* memcheck-only: validate the full fill interval (see above). */
             if (binradar_memcheck_enabled) {
-                helper_prov_check_access(env,
+                /* The model wrote raw bytes into the destination: stale
+                 * pointer shadow entries there must not be reloaded. */
+                provenance_on_modify_mem((target_ulong)env->regs[R_EDI],
+                                         (target_ulong)env->regs[R_EDX]);
+                provenance_model_check_access(env,
                                          (target_ulong)env->regs[R_EDI],
                                          (target_ulong)env->regs[R_EDX],
-                                         model_caller_addr, R_EDI, -1);
+                                         model_caller_addr, R_EDI);
             }
             mode = 2;
             clear_call_args_temps();
@@ -9170,40 +9215,120 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
             r = 1; // switch code cache
         }
         mode = 0;
-        PendingAlloc alloc_info = snapshot_trace_get_pending_allocs(pc);
-        if (symbolic_mode) {
-            SymbolicPendingAlloc sym_alloc_info =
-                symbolic_trace_get_pending_alloc(pc);
-            if (alloc_info.size != 0 && alloc_info.pc != 0) {
-                target_ulong base = env->regs[R_EAX];
-                snapshot_trace_alloc(base, alloc_info.size, alloc_info.pc);
-                if (sym_alloc_info.size_expr != NULL) {
-                    symbolic_trace_alloc(base, sym_alloc_info.size_expr,
-                                        sym_alloc_info.size, sym_alloc_info.pc);
+        /* Modeled call boundary: the callee body executed as a model is not
+         * fully instrumented, so no transfer/kill was emitted for the real
+         * callee instructions.  Invalidate caller-saved registers (RAX,
+         * RCX, RDX, RSI, RDI, R8-R11) before installing the modeled
+         * return; the pending-alloc return tag (below) re-tags RAX. */
+        provenance_clobber_caller_saved(env);
+        PendingAlloc alloc = snapshot_trace_get_pending_allocs(pc);
+        target_ulong base = env->regs[R_EAX];
+        ProvenancePending pend = provenance_get_pending(env, pc);
+
+        if (pend.valid) {
+            if (pend.kind == PROV_OP_REALLOC) {
+                if (pend.arg_size == 0) {
+                    /* realloc(p, 0): glibc frees p and returns NULL.
+                     * Retire the old object; create a zero-size object
+                     * only if the guest libc returned a non-NULL pointer. */
+                    if (pend.arg_ptr != 0) {
+                        provenance_retire_object(pend.arg_ptr);
+                        snapshot_trace_free(pend.arg_ptr, pend.call_pc);
+                        if (symbolic_mode) {
+                            symbolic_trace_free(pend.arg_ptr);
+                        }
+                    }
+                    if (base != 0) {
+                        PtrTag tag = provenance_create_object(
+                            base, 0, pend.call_pc,
+                            PROV_PRODUCER_REALLOC_RETURN);
+                        provenance_set_reg_tag(env, R_EAX, tag);
+                        snapshot_trace_alloc(base, 0, pend.call_pc);
+                        if (symbolic_mode) {
+                            SymbolicPendingAlloc sym_alloc =
+                                symbolic_trace_get_pending_alloc(pc);
+                            if (sym_alloc.size_expr != NULL) {
+                                symbolic_trace_alloc(base, sym_alloc.size_expr,
+                                                     sym_alloc.size,
+                                                     sym_alloc.pc);
+                            }
+                        }
+                    } else {
+                        provenance_invalidate_reg(env, R_EAX, pc);
+                    }
+                    provenance_clear_pending(env);
+                } else if (base != 0) {
+                    /* Successful realloc: retire the old object (it must
+                     * stay LIVE until now) and create the new object, even
+                     * when the numeric address is unchanged. */
+                    if (pend.arg_ptr != 0) {
+                        provenance_retire_object(pend.arg_ptr);
+                        snapshot_trace_free(pend.arg_ptr, pend.call_pc);
+                        if (symbolic_mode) {
+                            symbolic_trace_free(pend.arg_ptr);
+                        }
+                    }
+                    PtrTag tag = provenance_create_object(
+                        base, pend.arg_size, pend.call_pc,
+                        PROV_PRODUCER_REALLOC_RETURN);
+                    provenance_set_reg_tag(env, R_EAX, tag);
+                    snapshot_trace_alloc(base, pend.arg_size, pend.call_pc);
+                    if (symbolic_mode) {
+                        SymbolicPendingAlloc sym_alloc =
+                            symbolic_trace_get_pending_alloc(pc);
+                        if (sym_alloc.size_expr != NULL) {
+                            symbolic_trace_alloc(base, sym_alloc.size_expr,
+                                                 sym_alloc.size, sym_alloc.pc);
+                        }
+                    }
+                    provenance_clear_pending(env);
+                } else {
+                    /* Failed realloc: the old object stays LIVE and the
+                     * old pointer remains usable.  RAX is NULL → UNKNOWN. */
+                    if (symbolic_mode) {
+                        symbolic_trace_get_pending_alloc(pc);
+                    }
+                    provenance_invalidate_reg(env, R_EAX, pc);
+                    provenance_clear_pending(env);
                 }
-            }
-        } else {
-            /* memcheck-only: record the allocation */
-            if (alloc_info.size != 0 && alloc_info.pc != 0) {
-                target_ulong base = env->regs[R_EAX];
-                snapshot_trace_alloc(base, alloc_info.size, alloc_info.pc);
-            }
-        }
-        /* Provenance: create the object and tag RAX with its tag. */
-        {
-            ProvenancePending pend = provenance_get_pending(pc);
-            if (pend.valid && alloc_info.size != 0 && alloc_info.pc != 0) {
-                target_ulong base = env->regs[R_EAX];
-                PtrProducerKind kind = PROV_PRODUCER_MALLOC_RETURN;
-                if (pend.kind == PROV_OP_CALLOC) {
-                    kind = PROV_PRODUCER_CALLOC_RETURN;
-                } else if (pend.kind == PROV_OP_REALLOC) {
-                    kind = PROV_PRODUCER_REALLOC_RETURN;
+            } else if (pend.overflowed || base == 0) {
+                /* Failed malloc/calloc, or calloc overflow: no object
+                 * (a NULL return creates nothing, and a wrapped size must
+                 * never produce a wrapped-size object). */
+                if (symbolic_mode) {
+                    symbolic_trace_get_pending_alloc(pc);
                 }
-                PtrTag tag = provenance_create_object(base, alloc_info.size,
-                                                      alloc_info.pc, kind);
+                provenance_invalidate_reg(env, R_EAX, pc);
+                provenance_clear_pending(env);
+            } else {
+                /* Successful malloc/calloc (size may be 0). */
+                PtrProducerKind kind = (pend.kind == PROV_OP_CALLOC)
+                    ? PROV_PRODUCER_CALLOC_RETURN
+                    : PROV_PRODUCER_MALLOC_RETURN;
+                PtrTag tag = provenance_create_object(
+                    base, pend.arg_size, pend.call_pc, kind);
                 provenance_set_reg_tag(env, R_EAX, tag);
-                provenance_clear_pending();
+                snapshot_trace_alloc(base, pend.arg_size, pend.call_pc);
+                if (symbolic_mode) {
+                    SymbolicPendingAlloc sym_alloc =
+                        symbolic_trace_get_pending_alloc(pc);
+                    if (sym_alloc.size_expr != NULL) {
+                        symbolic_trace_alloc(base, sym_alloc.size_expr,
+                                             sym_alloc.size, sym_alloc.pc);
+                    }
+                }
+                provenance_clear_pending(env);
+            }
+        } else if (alloc.valid && base != 0) {
+            /* No provenance pending (legacy path): record the region only. */
+            snapshot_trace_alloc(base, alloc.size, alloc.pc);
+            if (symbolic_mode) {
+                SymbolicPendingAlloc sym_alloc =
+                    symbolic_trace_get_pending_alloc(pc);
+                if (sym_alloc.size_expr != NULL) {
+                    symbolic_trace_alloc(base, sym_alloc.size_expr,
+                                         sym_alloc.size, sym_alloc.pc);
+                }
             }
         }
         return r;

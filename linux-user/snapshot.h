@@ -66,6 +66,7 @@ typedef struct {
 } SnapshotMemRegion;
 
 typedef struct {
+    bool         valid;
     target_ulong size;
     target_ulong pc;
 } PendingAlloc;
