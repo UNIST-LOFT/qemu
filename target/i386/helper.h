@@ -236,4 +236,19 @@ DEF_HELPER_1(rdrand, tl, env)
 DEF_HELPER_3(instrument_call, void, tl, tl, tl)
 DEF_HELPER_2(instrument_ret, void, tl, tl)
 #endif
+
+/* Provenance helpers for heap OOB/UAF detection.
+ * These have side effects (modify provenance shadow state) and read/write
+ * global state, so they must NOT use TCG_CALL_NO_RWG_SE (the default for
+ * DEF_HELPER_N).  Use TCG_CALL_NO_RWG to prevent the TCG optimizer from
+ * reordering or eliminating them. */
+DEF_HELPER_FLAGS_3(prov_invalidate_reg, TCG_CALL_NO_RWG, void, env, i32, tl)
+DEF_HELPER_FLAGS_5(prov_mov_reg, TCG_CALL_NO_RWG, void, env, i32, i32, tl, tl)
+DEF_HELPER_FLAGS_6(prov_lea_imm, TCG_CALL_NO_RWG, void, env, i32, i32, tl, tl, tl)
+DEF_HELPER_FLAGS_5(prov_addsub_imm, TCG_CALL_NO_RWG, void, env, i32, tl, tl, tl)
+DEF_HELPER_FLAGS_6(prov_addsub_reg, TCG_CALL_NO_RWG, void, env, i32, i32, tl, tl, tl)
+DEF_HELPER_FLAGS_1(prov_clobber_caller_saved, TCG_CALL_NO_RWG, void, env)
+DEF_HELPER_FLAGS_4(prov_on_load, TCG_CALL_NO_RWG, void, env, i32, tl, tl)
+DEF_HELPER_FLAGS_4(prov_on_store, TCG_CALL_NO_RWG, void, env, i32, tl, tl)
+DEF_HELPER_FLAGS_6(prov_check_access, TCG_CALL_NO_RWG, void, env, tl, tl, tl, i32, i32)
 #endif

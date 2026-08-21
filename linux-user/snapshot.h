@@ -181,6 +181,7 @@ void snapshot_syscall_munmap(target_ulong addr, target_ulong len);
 int snapshot_is_unmap_allowed(target_ulong addr, target_ulong len);
 
 void snapshot_add_mapping(target_ulong addr, target_ulong len);
+SnapshotMemRegion *mr_manager_heap_search_pub(target_ulong addr);
 void snapshot_remove_mapping(target_ulong addr, target_ulong len);
 
 void snapshot_fork_setup(void);

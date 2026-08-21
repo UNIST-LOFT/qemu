@@ -41,10 +41,121 @@
 
 #include "../../tcg/symbolic/symbolic-instrumentation.h"
 
-/* Defined in linux-user/snapshot.c; gates per-instruction env->eip sync
- * (mirrors QASan's use_qasan gate). Not declared via snapshot.h here to
- * avoid pulling qemu.h into the translator. */
-extern int binradar_memcheck_enabled;
+#include "../../linux-user/provenance.h"
+
+/* Declared here so the provenance helper wrappers below can pass register
+ * values as explicit helper args (env->regs may be stale inside helpers). */
+static TCGv cpu_regs[CPU_NB_REGS];
+
+/* Provenance helper wrappers — the DEF_HELPER system generates
+ * gen_helper_prov_* functions.  These update pointer-provenance shadow
+ * state at runtime.  Side-effect-only w.r.t. guest values and symbolic state. */
+
+static void gen_prov_invalidate_reg(int reg_idx, target_ulong pc) {
+    if (!binradar_memcheck_enabled) return;
+    TCGv_i32 t_reg = tcg_const_i32(reg_idx);
+    TCGv t_pc = tcg_const_tl(pc);
+    gen_helper_prov_invalidate_reg(cpu_env, t_reg, t_pc);
+    tcg_temp_free_i32(t_reg);
+    tcg_temp_free(t_pc);
+}
+
+static void gen_prov_mov_reg(int dst_idx, int src_idx) {
+    if (!binradar_memcheck_enabled) return;
+    TCGv_i32 t_dst = tcg_const_i32(dst_idx);
+    TCGv_i32 t_src = tcg_const_i32(src_idx);
+    /* Pass register values as explicit args (see gen_prov_addsub_reg:
+     * env->regs may be stale in the helper). */
+    gen_helper_prov_mov_reg(cpu_env, t_dst, t_src,
+                            cpu_regs[src_idx], cpu_regs[dst_idx]);
+    tcg_temp_free_i32(t_dst);
+    tcg_temp_free_i32(t_src);
+}
+
+static void gen_prov_lea_imm(int dst_idx, int base_idx, int64_t disp) {
+    if (!binradar_memcheck_enabled) return;
+    TCGv_i32 t_dst = tcg_const_i32(dst_idx);
+    TCGv_i32 t_base = tcg_const_i32(base_idx);
+    TCGv t_disp = tcg_const_tl((target_ulong)disp);
+    /* Pass the post-instruction register value as explicit arg (env->regs
+     * may be stale inside the helper). */
+    gen_helper_prov_lea_imm(cpu_env, t_dst, t_base, t_disp,
+                            cpu_regs[dst_idx], cpu_regs[base_idx]);
+    tcg_temp_free_i32(t_dst);
+    tcg_temp_free_i32(t_base);
+    tcg_temp_free(t_disp);
+}
+
+static void gen_prov_addsub_imm(int reg_idx, int64_t delta, TCGv pre) {
+    if (!binradar_memcheck_enabled) return;
+    TCGv_i32 t_reg = tcg_const_i32(reg_idx);
+    TCGv t_delta = tcg_const_tl((target_ulong)delta);
+    /* pre was snapshotted BEFORE gen_op's write-back (pre-op value);
+     * cpu_regs[reg_idx] is the post-op value.  Passing both as explicit
+     * args avoids stale env->regs reads inside the helper. */
+    gen_helper_prov_addsub_imm(cpu_env, t_reg, t_delta, pre,
+                               cpu_regs[reg_idx]);
+    tcg_temp_free_i32(t_reg);
+    tcg_temp_free(t_delta);
+    tcg_temp_free(pre);
+}
+
+/* reg-reg ADD/SUB provenance: fold the untagged operand's concrete value
+ * into the tagged operand's offset (see provenance_addsub_reg). */
+static void gen_prov_addsub_reg(int dst_idx, int src_idx, int is_sub,
+                                target_ulong pc) {
+    if (!binradar_memcheck_enabled) return;
+    TCGv_i32 t_dst = tcg_const_i32(dst_idx | (is_sub << 16));
+    TCGv_i32 t_src = tcg_const_i32(src_idx);
+    TCGv t_pc = tcg_const_tl(pc);
+    /* Pass post-instruction register values as explicit args: the helper
+     * must not read env->regs directly, since TCG may eliminate the
+     * dead store of the just-written global (stale value observed). */
+    gen_helper_prov_addsub_reg(cpu_env, t_dst, t_src, t_pc,
+                               cpu_regs[dst_idx], cpu_regs[src_idx]);
+    tcg_temp_free_i32(t_dst);
+    tcg_temp_free_i32(t_src);
+    tcg_temp_free(t_pc);
+}
+
+static void __attribute__((unused)) gen_prov_clobber_caller_saved(void) {
+    if (!binradar_memcheck_enabled) return;
+    gen_helper_prov_clobber_caller_saved(cpu_env);
+}
+
+static void gen_prov_on_load(int dst_idx, TCGv t_addr, TCGMemOp ot) {
+    if (!binradar_memcheck_enabled) return;
+    TCGv_i32 t_dst = tcg_const_i32(dst_idx);
+    TCGv t_size = tcg_const_tl(1 << ot);
+    gen_helper_prov_on_load(cpu_env, t_dst, t_addr, t_size);
+    tcg_temp_free_i32(t_dst);
+    tcg_temp_free(t_size);
+}
+
+static void gen_prov_on_store(int src_idx, TCGv t_addr, TCGMemOp ot) {
+    if (!binradar_memcheck_enabled) return;
+    TCGv_i32 t_src = tcg_const_i32(src_idx);
+    TCGv t_size = tcg_const_tl(1 << ot);
+    gen_helper_prov_on_store(cpu_env, t_src, t_addr, t_size);
+    tcg_temp_free_i32(t_src);
+    tcg_temp_free(t_size);
+}
+
+static void gen_prov_check_access(TCGv t_addr, TCGMemOp ot,
+                                  target_ulong pc, int base_reg,
+                                  int index_reg) {
+    if (!binradar_memcheck_enabled) return;
+    TCGv t_size = tcg_const_tl(1 << ot);
+    TCGv t_pc = tcg_const_tl(pc);
+    TCGv_i32 t_base = tcg_const_i32(base_reg);
+    TCGv_i32 t_index = tcg_const_i32(index_reg);
+    gen_helper_prov_check_access(cpu_env, t_addr, t_size, t_pc, t_base,
+                                 t_index);
+    tcg_temp_free(t_size);
+    tcg_temp_free(t_pc);
+    tcg_temp_free_i32(t_base);
+    tcg_temp_free_i32(t_index);
+}
 
 #ifdef TARGET_X86_64
 #define CODE64(s) ((s)->code64)
@@ -81,7 +192,6 @@ extern int binradar_memcheck_enabled;
 /* global register indexes */
 static TCGv cpu_cc_dst, cpu_cc_src, cpu_cc_src2;
 static TCGv_i32 cpu_cc_op;
-static TCGv cpu_regs[CPU_NB_REGS];
 static TCGv cpu_seg_base[6];
 static TCGv_i64 cpu_bndl[4];
 static TCGv_i64 cpu_bndu[4];
@@ -139,6 +249,15 @@ typedef struct DisasContext {
     TCGv A0;
     TCGv T0;
     TCGv T1;
+
+    /* provenance: suppress the reg write-back invalidation for one
+     * instruction so gen_prov_addsub_reg (emitted after gen_op) can read
+     * the pre-op tag and fold the post-op delta. */
+    bool prov_skip_invalidate;
+    /* provenance: pre-instruction register value snapshot for the
+     * add/sub-imm helper's consistency check (freed by the helper
+     * wrapper after emission). */
+    TCGv prov_pre_snapshot;
 
     /* TCG local register indexes (only used inside old micro ops) */
     TCGv tmp0;
@@ -392,6 +511,12 @@ static void gen_op_mov_reg_v(DisasContext *s, TCGMemOp ot, int reg, TCGv t0)
     default:
         tcg_abort();
     }
+    /* Default: invalidate the destination register's provenance tag,
+     * unless suppressed (reg-reg ADD/SUB propagation). */
+    if (!s->prov_skip_invalidate) {
+        gen_prov_invalidate_reg(reg, s->pc_start);
+    }
+    s->prov_skip_invalidate = false;
 }
 
 static inline
@@ -654,9 +779,15 @@ static void gen_check_io(DisasContext *s, TCGMemOp ot, target_ulong cur_eip,
 static inline void gen_movs(DisasContext *s, TCGMemOp ot)
 {
     gen_string_movl_A0_ESI(s);
+    if (s->aflag == MO_64 && s->override < 0)
+        gen_prov_check_access(s->A0, ot, s->pc_start, R_ESI, -1);
     gen_op_ld_v(s, ot, s->T0, s->A0);
     gen_string_movl_A0_EDI(s);
     gen_op_st_v(s, ot, s->T0, s->A0);
+    /* Provenance: copied value — not known pointer → invalidate. */
+    gen_prov_on_store(OR_TMP0, s->A0, ot);
+    if (s->aflag == MO_64 && s->override < 0)
+        gen_prov_check_access(s->A0, ot, s->pc_start, R_EDI, -1);
     gen_op_movl_T0_Dshift(s, ot);
     gen_op_add_reg_T0(s, s->aflag, R_ESI);
     gen_op_add_reg_T0(s, s->aflag, R_EDI);
@@ -1087,6 +1218,10 @@ static inline void gen_stos(DisasContext *s, TCGMemOp ot)
     gen_op_mov_v_reg(s, MO_32, s->T0, R_EAX);
     gen_string_movl_A0_EDI(s);
     gen_op_st_v(s, ot, s->T0, s->A0);
+    /* Provenance: store value not known to be a pointer → invalidate. */
+    gen_prov_on_store(OR_TMP0, s->A0, ot);
+    if (s->aflag == MO_64 && s->override < 0)
+        gen_prov_check_access(s->A0, ot, s->pc_start, R_EDI, -1);
     gen_op_movl_T0_Dshift(s, ot);
     gen_op_add_reg_T0(s, s->aflag, R_EDI);
 }
@@ -1094,8 +1229,12 @@ static inline void gen_stos(DisasContext *s, TCGMemOp ot)
 static inline void gen_lods(DisasContext *s, TCGMemOp ot)
 {
     gen_string_movl_A0_ESI(s);
+    if (s->aflag == MO_64 && s->override < 0)
+        gen_prov_check_access(s->A0, ot, s->pc_start, R_ESI, -1);
     gen_op_ld_v(s, ot, s->T0, s->A0);
     gen_op_mov_reg_v(s, ot, R_EAX, s->T0);
+    /* Provenance: restore tag from shadow (value-consistency guarded). */
+    gen_prov_on_load(R_EAX, s->A0, ot);
     gen_op_movl_T0_Dshift(s, ot);
     gen_op_add_reg_T0(s, s->aflag, R_ESI);
 }
@@ -1103,6 +1242,8 @@ static inline void gen_lods(DisasContext *s, TCGMemOp ot)
 static inline void gen_scas(DisasContext *s, TCGMemOp ot)
 {
     gen_string_movl_A0_EDI(s);
+    if (s->aflag == MO_64 && s->override < 0)
+        gen_prov_check_access(s->A0, ot, s->pc_start, R_EDI, -1);
     gen_op_ld_v(s, ot, s->T1, s->A0);
     gen_op(s, OP_CMPL, ot, R_EAX);
     gen_op_movl_T0_Dshift(s, ot);
@@ -1112,8 +1253,12 @@ static inline void gen_scas(DisasContext *s, TCGMemOp ot)
 static inline void gen_cmps(DisasContext *s, TCGMemOp ot)
 {
     gen_string_movl_A0_EDI(s);
+    if (s->aflag == MO_64 && s->override < 0)
+        gen_prov_check_access(s->A0, ot, s->pc_start, R_EDI, -1);
     gen_op_ld_v(s, ot, s->T1, s->A0);
     gen_string_movl_A0_ESI(s);
+    if (s->aflag == MO_64 && s->override < 0)
+        gen_prov_check_access(s->A0, ot, s->pc_start, R_ESI, -1);
     gen_op(s, OP_CMPL, ot, OR_TMP0);
     gen_op_movl_T0_Dshift(s, ot);
     gen_op_add_reg_T0(s, s->aflag, R_ESI);
@@ -2167,21 +2312,41 @@ static void gen_ldst_modrm(CPUX86State *env, DisasContext *s, int modrm,
             if (reg != OR_TMP0)
                 gen_op_mov_v_reg(s, ot, s->T0, reg);
             gen_op_mov_reg_v(s, ot, rm, s->T0);
+            /* Sound provenance transfer for full-width reg→reg mov. */
+            if (reg != OR_TMP0 && ot == MO_64)
+                gen_prov_mov_reg(rm, reg);
         } else {
             gen_op_mov_v_reg(s, ot, s->T0, rm);
             if (reg != OR_TMP0)
                 gen_op_mov_reg_v(s, ot, reg, s->T0);
+            /* Sound provenance transfer for full-width reg→reg mov. */
+            if (reg != OR_TMP0 && ot == MO_64)
+                gen_prov_mov_reg(reg, rm);
         }
     } else {
-        gen_lea_modrm(env, s, modrm);
+        AddressParts a = gen_lea_modrm_0(env, s, modrm);
+        TCGv ea = gen_lea_modrm_1(s, a);
+        gen_lea_v_seg(s, s->aflag, ea, a.def_seg, s->override);
+        /* Provenance access check (FIX_TRACER.md §6): 64-bit modes without
+         * segment override; base+index handled soundly in helper (two
+         * tagged inputs → UNKNOWN fallback). */
+        if (s->aflag == MO_64 && s->override < 0 && a.base >= 0) {
+            gen_prov_check_access(s->A0, ot, s->pc_start, a.base, a.index);
+        }
         if (is_store) {
             if (reg != OR_TMP0)
                 gen_op_mov_v_reg(s, ot, s->T0, reg);
             gen_op_st_v(s, ot, s->T0, s->A0);
+            /* Provenance: store source register's tag to memory shadow;
+             * OR_TMP0 (immediate) → invalidate. */
+            gen_prov_on_store(reg, s->A0, ot);
         } else {
             gen_op_ld_v(s, ot, s->T0, s->A0);
             if (reg != OR_TMP0)
                 gen_op_mov_reg_v(s, ot, reg, s->T0);
+            /* Provenance: restore tag from memory shadow. */
+            if (reg != OR_TMP0)
+                gen_prov_on_load(reg, s->A0, ot);
         }
     }
 }
@@ -4692,7 +4857,14 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                 mod = (modrm >> 6) & 3;
                 rm = (modrm & 7) | REX_B(s);
                 if (mod != 3) {
-                    gen_lea_modrm(env, s, modrm);
+                    AddressParts a = gen_lea_modrm_0(env, s, modrm);
+                    TCGv ea = gen_lea_modrm_1(s, a);
+                    gen_lea_v_seg(s, s->aflag, ea, a.def_seg, s->override);
+                    /* Provenance access check (FIX_TRACER.md §6). */
+                    if (s->aflag == MO_64 && s->override < 0 && a.base >= 0) {
+                        gen_prov_check_access(s->A0, ot, s->pc_start,
+                                              a.base, a.index);
+                    }
                     opreg = OR_TMP0;
                 } else if (op == OP_XORL && rm == reg) {
                 xor_zero:
@@ -4705,7 +4877,18 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                     opreg = rm;
                 }
                 gen_op_mov_v_reg(s, ot, s->T1, reg);
+                if (binradar_memcheck_enabled && opreg != OR_TMP0 &&
+                    (op == OP_ADDL || op == OP_SUBL)) {
+                    s->prov_skip_invalidate = true;
+                }
                 gen_op(s, op, ot, opreg);
+                /* reg-reg ADD/SUB provenance propagation (after write-back:
+                 * gen_op invalidated dst; recompute delta from result). */
+                if (binradar_memcheck_enabled && opreg != OR_TMP0 &&
+                    (op == OP_ADDL || op == OP_SUBL)) {
+                    gen_prov_addsub_reg(opreg, reg, op == OP_SUBL,
+                                        s->pc_start);
+                }
                 break;
             case 1: /* OP Gv, Ev */
                 modrm = x86_ldub_code(env, s);
@@ -4713,14 +4896,33 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                 reg = ((modrm >> 3) & 7) | rex_r;
                 rm = (modrm & 7) | REX_B(s);
                 if (mod != 3) {
-                    gen_lea_modrm(env, s, modrm);
+                    AddressParts a = gen_lea_modrm_0(env, s, modrm);
+                    TCGv ea = gen_lea_modrm_1(s, a);
+                    gen_lea_v_seg(s, s->aflag, ea, a.def_seg, s->override);
+                    /* Provenance access check (FIX_TRACER.md §6). */
+                    if (s->aflag == MO_64 && s->override < 0 && a.base >= 0) {
+                        gen_prov_check_access(s->A0, ot, s->pc_start,
+                                              a.base, a.index);
+                    }
                     gen_op_ld_v(s, ot, s->T1, s->A0);
                 } else if (op == OP_XORL && rm == reg) {
                     goto xor_zero;
                 } else {
                     gen_op_mov_v_reg(s, ot, s->T1, rm);
                 }
+                if (binradar_memcheck_enabled && mod == 3 &&
+                    (op == OP_ADDL || op == OP_SUBL)) {
+                    s->prov_skip_invalidate = true;
+                }
                 gen_op(s, op, ot, reg);
+                /* reg-reg ADD/SUB provenance propagation (after write-back).
+                 * Only for register Ev sources (mod == 3): a memory source
+                 * value carries no register provenance to fold. */
+                if (binradar_memcheck_enabled && mod == 3 &&
+                    (op == OP_ADDL || op == OP_SUBL)) {
+                    gen_prov_addsub_reg(reg, rm, op == OP_SUBL,
+                                        s->pc_start);
+                }
                 break;
             case 2: /* OP A, Iv */
                 val = insn_get(env, s, ot);
@@ -4753,7 +4955,14 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                     s->rip_offset = 1;
                 else
                     s->rip_offset = insn_const_size(ot);
-                gen_lea_modrm(env, s, modrm);
+                AddressParts a = gen_lea_modrm_0(env, s, modrm);
+                TCGv ea = gen_lea_modrm_1(s, a);
+                gen_lea_v_seg(s, s->aflag, ea, a.def_seg, s->override);
+                /* Provenance access check (FIX_TRACER.md §6). */
+                if (s->aflag == MO_64 && s->override < 0 && a.base >= 0) {
+                    gen_prov_check_access(s->A0, ot, s->pc_start,
+                                          a.base, a.index);
+                }
                 opreg = OR_TMP0;
             } else {
                 opreg = rm;
@@ -4771,7 +4980,25 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                 break;
             }
             tcg_gen_movi_tl(s->T1, val);
+            /* Provenance: add/sub reg, imm preserves tag (offset += val).
+             * Suppress the write-back invalidation so the post-op helper
+             * can fold the pre-op tag; snapshot the pre-op register value
+             * for the helper's consistency check. */
+            if (binradar_memcheck_enabled && mod == 3 && ot == MO_64 &&
+                (op == OP_ADDL || op == OP_SUBL)) {
+                s->prov_skip_invalidate = true;
+                s->prov_pre_snapshot = tcg_temp_new();
+                tcg_gen_mov_tl(s->prov_pre_snapshot, cpu_regs[opreg]);
+            }
             gen_op(s, op, ot, opreg);
+            /* Provenance: add/sub reg, imm preserves tag (offset += val).
+             * OP_ADDL (op==0) and OP_SUBL (op==5) are pointer-preserving. */
+            if (binradar_memcheck_enabled && mod == 3 && ot == MO_64 &&
+                (op == OP_ADDL || op == OP_SUBL)) {
+                int64_t delta = (op == OP_SUBL) ? -(int64_t)val : (int64_t)val;
+                gen_prov_addsub_imm(opreg, delta, s->prov_pre_snapshot);
+                s->prov_pre_snapshot = NULL;
+            }
         }
         break;
 
@@ -5438,12 +5665,19 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
     case 0x50 ... 0x57: /* push */
         gen_op_mov_v_reg(s, MO_32, s->T0, (b & 7) | REX_B(s));
         gen_push_v(s, s->T0);
+        /* Provenance: push stores register's tag to stack shadow.  The
+         * actual store width is mo_pushpop(s, s->dflag) (MO_64 in 64-bit
+         * mode); passing s->dflag (MO_32) would make the helper see a
+         * non-full-width store and invalidate the slot instead. */
+        gen_prov_on_store((b & 7) | REX_B(s), s->A0, mo_pushpop(s, s->dflag));
         break;
     case 0x58 ... 0x5f: /* pop */
         ot = gen_pop_T0(s);
         /* NOTE: order is important for pop %sp */
         gen_pop_update(s, ot);
         gen_op_mov_reg_v(s, ot, (b & 7) | REX_B(s), s->T0);
+        /* Provenance: pop restores tag from stack shadow. */
+        gen_prov_on_load((b & 7) | REX_B(s), s->A0, ot);
         break;
     case 0x60: /* pusha */
         if (CODE64(s))
@@ -5556,12 +5790,20 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
         mod = (modrm >> 6) & 3;
         if (mod != 3) {
             s->rip_offset = insn_const_size(ot);
-            gen_lea_modrm(env, s, modrm);
+            AddressParts a = gen_lea_modrm_0(env, s, modrm);
+            TCGv ea = gen_lea_modrm_1(s, a);
+            gen_lea_v_seg(s, s->aflag, ea, a.def_seg, s->override);
+            /* Provenance access check (FIX_TRACER.md §6). */
+            if (s->aflag == MO_64 && s->override < 0 && a.base >= 0) {
+                gen_prov_check_access(s->A0, ot, s->pc_start, a.base, a.index);
+            }
         }
         val = insn_get(env, s, ot);
         tcg_gen_movi_tl(s->T0, val);
         if (mod != 3) {
             gen_op_st_v(s, ot, s->T0, s->A0);
+            /* Provenance: immediate store → invalidate shadow slot. */
+            gen_prov_on_store(OR_TMP0, s->A0, ot);
         } else {
             gen_op_mov_reg_v(s, ot, (modrm & 7) | REX_B(s), s->T0);
         }
@@ -5574,6 +5816,9 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
 
         gen_ldst_modrm(env, s, modrm, ot, OR_TMP0, 0);
         gen_op_mov_reg_v(s, ot, reg, s->T0);
+        /* Provenance: restore tag from memory shadow (spill reload). */
+        if ((modrm >> 6) != 3)
+            gen_prov_on_load(reg, s->A0, ot);
         break;
     case 0x8e: /* mov seg, Gv */
         modrm = x86_ldub_code(env, s);
@@ -5647,7 +5892,14 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                 }
                 gen_op_mov_reg_v(s, d_ot, reg, s->T0);
             } else {
-                gen_lea_modrm(env, s, modrm);
+                AddressParts a = gen_lea_modrm_0(env, s, modrm);
+                TCGv ea = gen_lea_modrm_1(s, a);
+                gen_lea_v_seg(s, s->aflag, ea, a.def_seg, s->override);
+                /* Provenance access check (FIX_TRACER.md §6). */
+                if (s->aflag == MO_64 && s->override < 0 && a.base >= 0) {
+                    gen_prov_check_access(s->A0, ot, s->pc_start,
+                                          a.base, a.index);
+                }
                 gen_op_ld_v(s, s_ot, s->T0, s->A0);
                 gen_op_mov_reg_v(s, d_ot, reg, s->T0);
             }
@@ -5664,7 +5916,19 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
             AddressParts a = gen_lea_modrm_0(env, s, modrm);
             TCGv ea = gen_lea_modrm_1(s, a);
             gen_lea_v_seg(s, s->aflag, ea, -1, -1);
+            /* Provenance: lea dst, [base + disp] → propagate tag(base);
+             * suppress the write-back invalidation so the helper can
+             * read the pre-op dst tag. */
+            if (binradar_memcheck_enabled && dflag == MO_64 &&
+                a.index < 0 && a.base >= 0) {
+                s->prov_skip_invalidate = true;
+            }
             gen_op_mov_reg_v(s, dflag, reg, s->A0);
+            /* Provenance: lea dst, [base + disp] → propagate tag(base). */
+            if (binradar_memcheck_enabled && dflag == MO_64 &&
+                a.index < 0 && a.base >= 0) {
+                gen_prov_lea_imm(reg, a.base, a.disp);
+            }
         }
         break;
 

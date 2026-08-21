@@ -1,6 +1,6 @@
 obj-y = main.o syscall.o strace.o mmap.o signal.o \
 	elfload.o linuxload.o uaccess.o uname.o \
-	safe-syscall.o snapshot.o $(TARGET_ABI_DIR)/signal.o \
+	safe-syscall.o snapshot.o provenance.o $(TARGET_ABI_DIR)/signal.o \
         $(TARGET_ABI_DIR)/cpu_loop.o exit.o fd-trans.o \
 				sbsv.o sbsv_parser.o
 

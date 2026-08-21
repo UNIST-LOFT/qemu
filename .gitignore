@@ -66,6 +66,7 @@
 /vhost-user-scsi
 /vhost-user-blk
 /fsdev/virtfs-proxy-helper
+.cache
 *.tmp
 *.[1-9]
 *.a

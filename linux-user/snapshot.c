@@ -1,4 +1,5 @@
 #include "snapshot.h"
+#include "provenance.h"
 #include "../tcg/symbolic/symbolic-struct.h"
 #include "sbsv.h"
 #include "qemu/rcu.h"
@@ -1155,6 +1156,34 @@ static void dump_coverage_edge_log(gboolean update) {
 }
 
 void snapshot_record_guest_normal_exit(CPUArchState *cpu_env, int exit_code, const char *reason) {
+    /* Deferred provenance finding: finalize as a synthetic crash unless a
+     * real crash already won the exit-info slot (deterministic precedence,
+     * FIX_TRACER.md §8 / test 21). */
+    if (provenance_finalize_fault(cpu_env)) {
+        PendingProvenanceFault *fault = provenance_get_pending_fault();
+        const char *pf_reason = provenance_fault_reason();
+        log_msg("[prov] [finalize] [finding] [reason %s] [access_pc %lx] [access_addr %lx] [width %u] [obj_id %lu] [gen %u] [obj_base %lx] [size %lx] [offset %ld] [producer_pc %lx] [kind %d] [is_uaf %d] [ea_reg %d]\n",
+                pf_reason ? pf_reason : "?", fault->access_pc, fault->access_addr,
+                fault->access_width, fault->object_id, fault->generation,
+                fault->object_base, fault->requested_size, fault->tracked_offset,
+                fault->producer_pc, fault->producer_kind, fault->is_uaf,
+                fault->ea_base_reg);
+
+        SnapshotExitInfo *info = snapshot_exit_info_ptr();
+        if (info->valid && info->crashed) {
+            /* Real crash already recorded — keep it (real crash wins). */
+            return;
+        }
+        snapshot_record_guest_crash(cpu_env, TARGET_SIGSEGV, 0,
+                                    SEGV_ACCERR, fault->access_pc, 0,
+                                    pf_reason);
+        /* Crash record stores fault_addr = guest_pc (code address).
+         * Re-expose the provenance access PC for diagnostics. */
+        info = snapshot_exit_info_ptr();
+        info->fault_addr = fault->access_pc;
+        return;
+    }
+
     SnapshotExitInfo *info = snapshot_exit_info_ptr();
     if (!snapshot_exit_info_should_update(info, false)) return;
     info->valid = 1;
@@ -2051,7 +2080,10 @@ MemcheckResult snapshot_memcheck_access(target_ulong addr, target_ulong size) {
 }
 
 /* Runtime helper called from instrumented TCG code (non-symbolic mode).
- * Checks the access and crashes the guest if it's an OOB/UAF error. */
+ * Routes through the provenance checker: UNKNOWN tag → exact-bounds
+ * fallback on live allocations.  In concrete-only mode a finding still
+ * terminates (separate policy, FIX_TRACER.md §8); in symbolic mode the
+ * finding stays pending and is finalized as a synthetic crash at exit. */
 void snapshot_memcheck_helper(target_ulong addr, target_ulong size, target_ulong pc) {
     if (!binradar_memcheck_enabled) return;
     /* Only check accesses from the main binary's code, not library code.
@@ -2059,13 +2091,16 @@ void snapshot_memcheck_helper(target_ulong addr, target_ulong size, target_ulong
     if (symbolic_start_code > 0 && (pc < symbolic_start_code || pc >= symbolic_end_code)) {
         return;
     }
-    MemcheckResult mc = snapshot_memcheck_access(addr, size);
+    CPUState *cpu = thread_cpu;
+    CPUArchState *env = cpu ? cpu->env_ptr : NULL;
+    PtrTag unknown_tag = {0};
+    MemcheckResult mc = env ? provenance_check_access(env, addr, size, pc,
+                                                      unknown_tag, -1, 0)
+                            : MEMCHECK_OK;
     if (mc != MEMCHECK_OK) {
         const char *reason = (mc == MEMCHECK_HEAP_UAF)
             ? "memcheck: heap-use-after-free"
             : "memcheck: heap-buffer-overflow";
-        CPUState *cpu = thread_cpu;
-        CPUArchState *env = cpu ? cpu->env_ptr : NULL;
         if (env) {
             snapshot_record_guest_crash(env, TARGET_SIGSEGV, 0,
                                         SEGV_ACCERR, addr, 0, reason);
@@ -2104,6 +2139,7 @@ void snapshot_init(void) {
     snapshot_load_binradar_env();
     /* Initialize PLT hooks for memcheck-only mode. */
     memcheck_init();
+    provenance_init();
 }
 
 static int walk_memory_cb(void *priv, target_ulong start, target_ulong end,
@@ -2282,6 +2318,9 @@ void snapshot_syscall(uintptr_t syscall_no, uintptr_t syscall_arg0,
                 memcpy(mem_access.target, buf, ret_val);
             }
             snapshot_write_access(&mem_access);
+            /* Provenance: kernel wrote into the buffer — stale shadow
+             * entries must not be reloaded (FIX_TRACER.md test 18). */
+            provenance_on_modify_mem(syscall_arg1, ret_val);
         }
         break;
     case TARGET_NR_write:
@@ -2345,6 +2384,8 @@ void snapshot_syscall(uintptr_t syscall_no, uintptr_t syscall_arg0,
             memcpy(mem_access.target, buf, syscall_arg1);
         }
         snapshot_write_access(&mem_access);
+        /* Provenance: kernel wrote into the buffer — invalidate shadow. */
+        provenance_on_modify_mem(syscall_arg0, syscall_arg1);
         break;
     }
     case TARGET_NR_brk: // heap adjustment
@@ -2488,6 +2529,8 @@ static void snapshot_modify_memory(CPUArchState *cpu_env) {
             target_ulong reg_value;
             memcpy(&reg_value, single_mod.value, sizeof(target_ulong));
             cpu_env->regs[(size_t)single_mod.addr] = reg_value;
+            /* Provenance: register overwritten by modification → kill tag. */
+            provenance_on_modify_reg(cpu_env, (int)single_mod.addr);
             log_msg("[mod-reg] [register %ld] [size %ld] [total %d]\n",
                       single_mod.addr,
                       single_mod.size,
@@ -2496,6 +2539,9 @@ static void snapshot_modify_memory(CPUArchState *cpu_env) {
         }
         void *target_addr_h = g2h(single_mod.addr);
         memcpy(target_addr_h, single_mod.value, single_mod.size);
+        /* Provenance: memory overwritten by modification → stale shadow
+         * entries must not be reloaded (FIX_TRACER.md test 17). */
+        provenance_on_modify_mem(single_mod.addr, single_mod.size);
         log_msg("[mod] [addr %lx] [size %ld] [total %d]\n", single_mod.addr, single_mod.size, g_queue_get_length(mod_manager->modifications));
     }
 }
@@ -3665,6 +3711,8 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env, const ArgumentInf
                 memset(shared_trace_data, 0, sizeof(SharedTraceData));
             }
             snapshot_modify_memory(cpu_env);
+            /* Fresh per-input run: no inherited deferred fault. */
+            provenance_clear_pending_fault();
             afl_fork_child = 1;
             close(binradar_forkserver_ctrl_r);
             close(binradar_forkserver_stat_w);
@@ -4112,3 +4160,4 @@ void snapshot_load_inferred_types(uint8_t *analyze_result) {
     }
     log_msg("[snapshot] [load-inferred-types] [finish]\n");
 }
+SnapshotMemRegion *mr_manager_heap_search_pub(target_ulong addr) { return mr_manager_heap_search(addr); }

@@ -13,6 +13,7 @@
 #include "config.h"
 #include "symbolic-instrumentation.h"
 #include "../../linux-user/snapshot.h"
+#include "../../linux-user/provenance.h"
 
 #define DEBUG_CONSISTENCY_CHECK 0
 
@@ -3565,16 +3566,12 @@ static inline void qemu_load_helper(CPUArchState *env, uintptr_t orig_addr,
 
     if (binradar_memcheck_enabled && symbolic_start_code > 0 &&
         current_tb_pc >= symbolic_start_code && current_tb_pc < symbolic_end_code) {
-        MemcheckResult mc = snapshot_memcheck_access(addr, size);
-        if (mc != MEMCHECK_OK) {
-            const char *reason = (mc == MEMCHECK_HEAP_UAF)
-                ? "memcheck: heap-use-after-free"
-                : "memcheck: heap-buffer-overflow";
-            snapshot_record_guest_crash(env, TARGET_SIGSEGV, 0,
-                                        SEGV_ACCERR, addr, 0, reason);
-            fflush(NULL);
-            _exit(128 + SIGSEGV);
-        }
+        /* Non-fatal provenance check; UNKNOWN tag → exact-bounds fallback.
+         * FIX_TRACER.md §8: no _exit() in symbolic mode — finding is
+         * deferred and finalized as a synthetic crash at exit. */
+        PtrTag unknown_tag = {0};
+        provenance_check_access(env, addr, size, current_tb_pc,
+                                unknown_tag, -1, 0);
     }
 
     if (mr && mr->is_heap) {
@@ -4074,16 +4071,12 @@ static inline void qemu_store_helper(CPUArchState *env,
 
     if (binradar_memcheck_enabled && symbolic_start_code > 0 &&
         current_tb_pc >= symbolic_start_code && current_tb_pc < symbolic_end_code) {
-        MemcheckResult mc = snapshot_memcheck_access(addr, size);
-        if (mc != MEMCHECK_OK) {
-            const char *reason = (mc == MEMCHECK_HEAP_UAF)
-                ? "memcheck: heap-use-after-free"
-                : "memcheck: heap-buffer-overflow";
-            snapshot_record_guest_crash(env, TARGET_SIGSEGV, 0,
-                                        SEGV_ACCERR, addr, 0, reason);
-            fflush(NULL);
-            _exit(128 + SIGSEGV);
-        }
+        /* Non-fatal provenance check; UNKNOWN tag → exact-bounds fallback.
+         * FIX_TRACER.md §8: no _exit() in symbolic mode — finding is
+         * deferred and finalized as a synthetic crash at exit. */
+        PtrTag unknown_tag = {0};
+        provenance_check_access(env, addr, size, current_tb_pc,
+                                unknown_tag, -1, 0);
     }
 
     if (mr && mr->is_heap) {
@@ -6567,6 +6560,33 @@ int        parse_translation_block(TranslationBlock* tb, uintptr_t tb_pc,
 #endif
     if (symbolic_mode == 0)
         return 0;
+    /* The entrypoint itself may be a model/PLT address (e.g. malloc@plt).
+     * Its TB is translated while mode == 2 (post-dispatch re-lookup), so the
+     * mode-2 gate below would skip the entrypoint instrumentation entirely
+     * and collapse the forkserver hit count to zero.  Emit the hit counter
+     * here for mode-2 TBs; the main pass emits it for mode 0/1 TBs. */
+    if (tb_pc == binradar_entrypoint && mode == 2 &&
+        !is_in_exclude_region(tb_pc)) {
+        TCGOp *op;
+        QTAILQ_FOREACH(op, &tcg_ctx->ops, link) {
+            if (op->opc != INDEX_op_insn_start) {
+                continue;
+            }
+            TCGTemp *t_cpu_state = new_non_conflicting_temp(TCG_TYPE_PTR);
+            TCGTemp *t_cpu_env = new_non_conflicting_temp(TCG_TYPE_PTR);
+            TCGTemp *t_pc_entry = new_non_conflicting_temp(TCG_TYPE_PTR);
+            tcg_movi(t_cpu_state, (uintptr_t)env_cpu(cpu_env), 0, op, NULL,
+                     tcg_ctx);
+            tcg_movi(t_cpu_env, (uintptr_t)cpu_env, 0, op, NULL, tcg_ctx);
+            tcg_movi(t_pc_entry, (uintptr_t)tb_pc, 0, op, NULL, tcg_ctx);
+            add_void_call_3(snapshot_maybe_forkserver, t_cpu_state, t_cpu_env,
+                            t_pc_entry, op, NULL, tcg_ctx);
+            tcg_temp_free_internal(t_cpu_state);
+            tcg_temp_free_internal(t_cpu_env);
+            tcg_temp_free_internal(t_pc_entry);
+            break;
+        }
+    }
 #if 1
     if (mode == 2) {
         return 0;
@@ -8974,12 +8994,18 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
                 /* memcheck-only: record pending alloc for return hook */
                 snapshot_trace_pending_allocs(env->regs[R_EDI], model_caller_addr);
             }
-            mode = 1;
+            provenance_set_pending(PROV_OP_MALLOC, model_caller_addr,
+                                   env->regs[R_EDI], 0);
+            /* mode = 2: flush TB cache at dispatch and return-hook so every
+             * call re-enters tb_lookup__cpu_state (direct chains would
+             * otherwise skip subsequent allocations). */
+            mode = 2;
         } else if (model == REALLOC) {
             if (symbolic_mode) {
                 symbolic_trace_free(env->regs[R_EDI]);
             }
             snapshot_trace_free(env->regs[R_EDI], model_caller_addr);
+            provenance_retire_object(env->regs[R_EDI]);
             if (symbolic_mode) {
                 model_alloc(env, model_caller_addr, R_ESI);
                 clear_call_args_temps();
@@ -8988,17 +9014,20 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
                 /* memcheck-only: record pending alloc for return hook */
                 snapshot_trace_pending_allocs(env->regs[R_ESI], model_caller_addr);
             }
-            mode = 1;
+            provenance_set_pending(PROV_OP_REALLOC, model_caller_addr,
+                                   env->regs[R_ESI], env->regs[R_EDI]);
+            mode = 2;
         } else if (model == FREE) {
             if (symbolic_mode) {
                 symbolic_trace_free(env->regs[R_EDI]);
             }
             snapshot_trace_free(env->regs[R_EDI], model_caller_addr);
+            provenance_retire_object(env->regs[R_EDI]);
             if (symbolic_mode) {
                 clear_call_args_temps();
                 clear_xmm_regs(env);
             }
-            mode = 1;
+            mode = 2;
         }  else if (model == CALLOC) {
             if (symbolic_mode) {
                 trace_mem("[calloc] [size %lx] [pc %lx]\n]", env->regs[R_EDI], model_caller_addr);
@@ -9011,7 +9040,9 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
                 target_ulong total = env->regs[R_EDI] * env->regs[R_ESI];
                 snapshot_trace_pending_allocs(total, model_caller_addr);
             }
-            mode = 1;
+            provenance_set_pending(PROV_OP_CALLOC, model_caller_addr,
+                                   env->regs[R_EDI] * env->regs[R_ESI], 0);
+            mode = 2;
         } else if (model == PRINTF) {
             // printf("[0x%lx] printf(%s, ...)\n", model_caller_addr, (char *)(uintptr_t)env->regs[R_EDI]);
             clear_call_args_temps();
@@ -9036,6 +9067,20 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
             // printf("[0x%lx] %s(%p, %p, %lu)\n", model_caller_addr, model == MEMMOVE ? "memmove" : "memcpy", (char *)(uintptr_t)env->regs[R_EDI], (char*)(uintptr_t)env->regs[R_ESI], (uintptr_t)env->regs[R_EDX]);
             // FixMe: memmove may overlap!
             qemu_memmove(env, (uintptr_t)env->regs[R_ESI], (uintptr_t)env->regs[R_EDI], (uintptr_t)env->regs[R_EDX]);
+            /* memcheck-only: libc bodies are outside the symbolic window, so
+             * per-instruction checks can't see this range. Validate the full
+             * copy interval here (access pc = caller), carrying the dst/src
+             * register tags so tagged underruns/overruns are detected. */
+            if (binradar_memcheck_enabled) {
+                helper_prov_check_access(env,
+                                         (target_ulong)env->regs[R_EDI],
+                                         (target_ulong)env->regs[R_EDX],
+                                         model_caller_addr, R_EDI, -1);
+                helper_prov_check_access(env,
+                                         (target_ulong)env->regs[R_ESI],
+                                         (target_ulong)env->regs[R_EDX],
+                                         model_caller_addr, R_ESI, -1);
+            }
             mode = 2;
             clear_call_args_temps();
             clear_xmm_regs(env);
@@ -9043,6 +9088,13 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
             // printf("[0x%lx] memset(%p, %lx, %lu)\n", model_caller_addr, (char *)(uintptr_t)env->regs[R_EDI], (uintptr_t)env->regs[R_ESI], (uintptr_t)env->regs[R_EDX]);
             Expr* value = s_temps[temp_idx(tcg_find_temp_arch_reg(tcg_ctx, "rsi"))];
             qemu_memset(value, (uintptr_t)env->regs[R_EDI], (uintptr_t)env->regs[R_EDX]);
+            /* memcheck-only: validate the full fill interval (see above). */
+            if (binradar_memcheck_enabled) {
+                helper_prov_check_access(env,
+                                         (target_ulong)env->regs[R_EDI],
+                                         (target_ulong)env->regs[R_EDX],
+                                         model_caller_addr, R_EDI, -1);
+            }
             mode = 2;
             clear_call_args_temps();
             clear_xmm_regs(env);
@@ -9135,6 +9187,23 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
             if (alloc_info.size != 0 && alloc_info.pc != 0) {
                 target_ulong base = env->regs[R_EAX];
                 snapshot_trace_alloc(base, alloc_info.size, alloc_info.pc);
+            }
+        }
+        /* Provenance: create the object and tag RAX with its tag. */
+        {
+            ProvenancePending pend = provenance_get_pending(pc);
+            if (pend.valid && alloc_info.size != 0 && alloc_info.pc != 0) {
+                target_ulong base = env->regs[R_EAX];
+                PtrProducerKind kind = PROV_PRODUCER_MALLOC_RETURN;
+                if (pend.kind == PROV_OP_CALLOC) {
+                    kind = PROV_PRODUCER_CALLOC_RETURN;
+                } else if (pend.kind == PROV_OP_REALLOC) {
+                    kind = PROV_PRODUCER_REALLOC_RETURN;
+                }
+                PtrTag tag = provenance_create_object(base, alloc_info.size,
+                                                      alloc_info.pc, kind);
+                provenance_set_reg_tag(env, R_EAX, tag);
+                provenance_clear_pending();
             }
         }
         return r;
