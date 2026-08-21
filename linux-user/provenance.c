@@ -894,16 +894,20 @@ void helper_prov_check_access(CPUArchState *env, target_ulong addr,
     bool have_ea = shadow->ea_meta.valid;
     int base_reg = shadow->ea_meta.base_reg;
     int index_reg = shadow->ea_meta.index_reg;
-    int scale = shadow->ea_meta.scale;
     target_long disp = shadow->ea_meta.disp;
     shadow->ea_meta.valid = false;
     if (have_ea) {
 
-        /* Semantic EA propagation — no numeric reconstruction:
-         *   [tagged_base + disp]: propagate base identity, offset += disp.
-         *   [tagged_index * 1 + disp] (no base): same.
-         * Everything else (two tagged inputs, scale != 1 on the tagged
-         * operand, etc.) → UNKNOWN. */
+        /* Semantic EA propagation:
+         *   [tagged_base + disp]: propagate base identity, offset += disp
+         *     (translation-time disp, value-consistency checked).
+         *   [tagged_base + index*scale + disp]: propagate base identity,
+         *     fold the runtime delta (addr - base) into the offset; the
+         *     downstream value-consistency and bounds checks keep this
+         *     sound.  With a zero index the fold is exactly [base + disp].
+         *   [tagged_index*scale + disp], untagged base: same delta fold
+         *     on the index identity.
+         * Everything else → UNKNOWN. */
         if (base_reg >= 0 && base_reg < CPU_NB_REGS) {
             PtrTag base_tag = shadow->gpr[base_reg];
             target_ulong base_val = env->regs[base_reg];
@@ -928,37 +932,46 @@ void helper_prov_check_access(CPUArchState *env, target_ulong addr,
                                         ea_src_reg, ea_src_val);
                 return;
             }
-            /* two operands (or tagged index with scale): no sound merge */
-            if (index_reg >= 0 || !base_tag.valid) {
-                /* index-only case handled below; base+index or base
-                 * UNKNOWN → UNKNOWN fallback */
-                if (index_reg >= 0) {
-                    ea_src_reg = base_reg;
-                    ea_src_val = base_val;
-                    provenance_check_access(env, addr, size, pc,
-                                            (PtrTag){0}, ea_src_reg,
-                                            ea_src_val);
-                    return;
+            /* base + index: no static [base+disp] identity, but the base
+             * register carries the object identity and the index is a
+             * pure integer offset.  Fold the dynamic delta (addr - base)
+             * into the tracked offset; soundness is preserved by the
+             * downstream value-consistency and bounds checks.  This is
+             * the historical behavior (pre-redesign), required for
+             * array-indexed accesses ([base + idx*scale + disp]); when
+             * the index is 0 the delta fold is exact ([base + disp]). */
+            if (index_reg >= 0 && base_tag.valid) {
+                int64_t delta = (int64_t)addr - (int64_t)base_val;
+                int64_t new_offset = base_tag.concrete_offset + delta;
+                if ((delta > 0 && new_offset < base_tag.concrete_offset) ||
+                    (delta < 0 && new_offset > base_tag.concrete_offset)) {
+                    base_tag.valid = false;  /* overflow → UNKNOWN */
+                } else {
+                    base_tag.concrete_offset = new_offset;
                 }
+                ea_src_reg = base_reg;
+                ea_src_val = base_val;
+                provenance_check_access(env, addr, size, pc, base_tag,
+                                        ea_src_reg, ea_src_val);
+                return;
             }
         }
         if (index_reg >= 0 && index_reg < CPU_NB_REGS) {
             PtrTag idx_tag = shadow->gpr[index_reg];
             target_ulong index_val = env->regs[index_reg];
-            /* Only scale 1 (scale == 0 in AddressParts) with no base is
-             * sound: [index*1 + disp]. */
-            if (base_reg < 0 && scale == 0 && idx_tag.valid) {
-                target_ulong addr2 = (target_ulong)((int64_t)index_val + disp);
-                if (addr2 == addr) {
-                    int64_t new_offset = idx_tag.concrete_offset + disp;
-                    if ((disp > 0 && new_offset < idx_tag.concrete_offset) ||
-                        (disp < 0 && new_offset > idx_tag.concrete_offset)) {
-                        idx_tag.valid = false;
-                    } else {
-                        idx_tag.concrete_offset = new_offset;
-                    }
-                } else {
+            /* Index carries the provenance and the base is untagged (or
+             * absent): fold the dynamic delta (addr - index_val) into
+             * the tracked offset.  This is the historical behavior
+             * (pre-redesign); it covers scaled indexing of a pointer
+             * held in the index slot. */
+            if (idx_tag.valid) {
+                int64_t delta = (int64_t)addr - (int64_t)index_val;
+                int64_t new_offset = idx_tag.concrete_offset + delta;
+                if ((delta > 0 && new_offset < idx_tag.concrete_offset) ||
+                    (delta < 0 && new_offset > idx_tag.concrete_offset)) {
                     idx_tag.valid = false;
+                } else {
+                    idx_tag.concrete_offset = new_offset;
                 }
                 ea_src_reg = index_reg;
                 ea_src_val = index_val;

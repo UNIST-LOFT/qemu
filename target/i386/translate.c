@@ -92,6 +92,27 @@ static void gen_prov_lea_imm(int dst_idx, int base_idx, int64_t disp,
     tcg_temp_free(t_disp);
 }
 
+/* lea dst, [base + index*scale + disp]: the result is exactly
+ * base_value + (index*scale + disp), so the pointer identity of base is
+ * preserved with the runtime delta folded into the offset — same checked
+ * arithmetic as provenance_lea_imm, with the delta computed at runtime
+ * instead of translation time.  pre_base is the base register's value
+ * BEFORE the instruction (required when dst == base: cpu_regs[base] is
+ * the post-instruction value by the time the helper runs). */
+static void gen_prov_lea_dyn(int dst_idx, int base_idx, target_ulong pc,
+                             TCGv pre_base) {
+    if (!binradar_memcheck_enabled) return;
+    TCGv_i32 t_dst = tcg_const_i32(dst_idx | ((pc & 0xffff) << 16));
+    TCGv_i32 t_base = tcg_const_i32(base_idx);
+    TCGv t_delta = tcg_temp_new();
+    tcg_gen_sub_tl(t_delta, cpu_regs[dst_idx], pre_base);
+    gen_helper_prov_lea_imm(cpu_env, t_dst, t_base, t_delta,
+                            cpu_regs[dst_idx], pre_base);
+    tcg_temp_free_i32(t_dst);
+    tcg_temp_free_i32(t_base);
+    tcg_temp_free(t_delta);
+}
+
 static void gen_prov_addsub_imm(int reg_idx, int64_t delta, TCGv pre,
                                 target_ulong pc) {
     if (!binradar_memcheck_enabled) return;
@@ -6074,18 +6095,34 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
             AddressParts a = gen_lea_modrm_0(env, s, modrm);
             TCGv ea = gen_lea_modrm_1(s, a);
             gen_lea_v_seg(s, s->aflag, ea, -1, -1);
-            /* Provenance: lea dst, [base + disp] → propagate tag(base);
-             * suppress the write-back invalidation so the helper can
-             * read the pre-op dst tag. */
+            /* Provenance: lea dst, [base + index*scale + disp] →
+             * propagate tag(base); suppress the write-back invalidation
+             * so the helper can read the pre-op dst tag.  Snapshot the
+             * base's pre-instruction value for the runtime delta when an
+             * index is present (dst == base overwrites cpu_regs[base]). */
+            TCGv prov_pre_base = NULL;
             if (binradar_memcheck_enabled && dflag == MO_64 &&
-                a.index < 0 && a.base >= 0) {
+                a.base >= 0) {
                 s->prov_skip_invalidate = true;
+                if (a.index >= 0) {
+                    prov_pre_base = tcg_temp_new();
+                    tcg_gen_mov_tl(prov_pre_base, cpu_regs[a.base]);
+                }
             }
             gen_op_mov_reg_v(s, dflag, reg, s->A0);
-            /* Provenance: lea dst, [base + disp] → propagate tag(base). */
+            /* Provenance: lea dst, [base + disp] → propagate tag(base);
+             * lea dst, [base + index*scale + disp] → propagate tag(base)
+             * with the runtime delta (index*scale + disp) folded into the
+             * checked offset. */
             if (binradar_memcheck_enabled && dflag == MO_64 &&
-                a.index < 0 && a.base >= 0) {
-                gen_prov_lea_imm(reg, a.base, a.disp, s->pc_start);
+                a.base >= 0) {
+                if (a.index < 0) {
+                    gen_prov_lea_imm(reg, a.base, a.disp, s->pc_start);
+                } else {
+                    gen_prov_lea_dyn(reg, a.base, s->pc_start,
+                                     prov_pre_base);
+                    tcg_temp_free(prov_pre_base);
+                }
             }
         }
         break;
