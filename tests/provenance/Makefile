@@ -30,7 +30,11 @@ TESTS := t01_double_free t02_small_double_free t03_uaf_stack t04_uaf_heap \
          t15_ea_dynamic t16_ea_forkserver t17_free_null t18_memchr_unaligned \
          t19_plt_child_trace t20_concolic_heap_off t21_crash_precedence \
          t22_region_halfopen t23_stack_region t24_heap_uninit_read \
-         t25_global_uninit_read t26_use_after_free_gen t27_timeout_crash
+         t25_global_uninit_read t26_use_after_free_gen t27_timeout_crash \
+         t28_unknown_no_uaf t29_push_pop_uaf t30_untagged_pop_unknown \
+         t31_int_overwrite_clears t32_highbyte_clears t33_xchg_swap \
+         t34_failed_malloc t35_same_addr_realloc t36_self_overwrite_load \
+         t37_atomic_rmw
 
 GUEST_BINS := $(addprefix $(WORK)/,$(TESTS))
 PLT_FILES  := $(addprefix $(WORK)/,$(addsuffix .plt,$(TESTS)))

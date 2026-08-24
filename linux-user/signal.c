@@ -25,6 +25,7 @@
 #include "trace.h"
 #include "signal-common.h"
 #include "snapshot.h"
+#include "provenance.h"
 
 static struct target_sigaction sigact_table[TARGET_NSIG];
 
@@ -581,10 +582,14 @@ static void QEMU_NORETURN dump_core_and_abort(int target_sig, const target_sigin
     host_sig = target_to_host_signal(target_sig);
     trace_user_force_sig(env, target_sig, host_sig);
     gdb_signalled(env, target_sig);
-    
+
     target_ulong fault_addr = info ? info->_sifields._sigfault._addr : 0;
     int si_code = info ? info->si_code : 0;
-    snapshot_record_guest_crash(env, target_sig, host_sig, si_code, fault_addr, 0, "unhandled_target_signal");
+    /* Dual-record policy (§8): if a provenance finding is pending, emit
+     * its structured record before the real crash wins the verdict. */
+        provenance_report_pending_finding();
+    snapshot_record_guest_crash(env, target_sig, host_sig, si_code,
+                                fault_addr, 0, "unhandled_target_signal");
 
     if (afl_fork_child) {
         _exit(128 + host_sig);

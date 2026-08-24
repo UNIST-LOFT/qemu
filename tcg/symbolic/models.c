@@ -1,5 +1,4 @@
-#include "symbolic-struct.h"
-#include "../../linux-user/snapshot.h"
+#include "../../linux-user/provenance.h"
 
 #define MODEL_PARSE_MAX_INPUT 64
 
@@ -197,6 +196,12 @@ static inline int model_strcmp(CPUX86State* env, uintptr_t pc, uintptr_t n)
     size_t s2_len = n == 0 ? strlen(s2) : strnlen(s2, n);
     int res = n == 0 ? strcmp(s1, s2) : strncmp(s1, s2, n);
     size_t len = s1_len > s2_len ? s1_len : s2_len;
+    /* memcheck-only: the host string functions read guest memory without
+     * interval checks; validate the read ranges here (access pc = caller). */
+    if (binradar_memcheck_enabled) {
+        provenance_model_check_access(env, (target_ulong)s1, len, pc, R_EDI);
+        provenance_model_check_access(env, (target_ulong)s2, len, pc, R_ESI);
+    }
 
     Expr** s1_exprs = get_expr_addr((uintptr_t)s1, len, 0, NULL);
     Expr** s2_exprs = get_expr_addr((uintptr_t)s2, len, 0, NULL);
@@ -260,6 +265,11 @@ static inline int model_strlen(CPUX86State* env, uintptr_t pc, uintptr_t n)
 
     size_t s1_len = n == 0 ? strlen(s1) : strnlen(s1, n);
     size_t len = n == 0 || s1_len < n ? s1_len + 1 : s1_len;
+    /* memcheck-only: the host string function reads guest memory without
+     * interval checks; validate the read range here (access pc = caller). */
+    if (binradar_memcheck_enabled) {
+        provenance_model_check_access(env, (target_ulong)s1, len, pc, R_EDI);
+    }
     // printf("LEN: %lu\n", len);
     Expr** s1_exprs = get_expr_addr((uintptr_t)s1, len, 0, NULL);
 
@@ -313,6 +323,11 @@ static inline int model_memchr(CPUX86State* env, uintptr_t pc)
     }
 
     char c = (char)(uintptr_t)env->regs[R_ESI];
+    /* memcheck-only: the host memchr reads guest memory without interval
+     * checks; validate the read range here (access pc = caller). */
+    if (binradar_memcheck_enabled) {
+        provenance_model_check_access(env, (target_ulong)p, len, pc, R_EDI);
+    }
 
     Expr** exprs = get_expr_addr(p, len, 0, NULL);
     if (exprs == NULL) {
@@ -370,6 +385,12 @@ static inline int model_memcmp(CPUX86State* env, uintptr_t pc)
     }
 
     int res = memcmp(s1, s2, n);
+    /* memcheck-only: the host memcmp reads guest memory without interval
+     * checks; validate the read ranges here (access pc = caller). */
+    if (binradar_memcheck_enabled) {
+        provenance_model_check_access(env, (target_ulong)s1, n, pc, R_EDI);
+        provenance_model_check_access(env, (target_ulong)s2, n, pc, R_ESI);
+    }
 
     Expr** s1_exprs = get_expr_addr((uintptr_t)s1, n, 0, NULL);
     Expr** s2_exprs = get_expr_addr((uintptr_t)s2, n, 0, NULL);

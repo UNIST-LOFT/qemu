@@ -6487,8 +6487,17 @@ static void update_last_translation_block(uintptr_t pc) {
 }
 
 /* Lightweight TCG pass for non-symbolic mode: insert a helper call
- * before each qemu_ld/qemu_st to check heap bounds (QASAN-like).
- * Gated by binradar_memcheck_enabled.  Independent of symbolic_mode. */
+ * BEFORE each qemu_ld/qemu_st to check heap bounds (QASAN-like).
+ * Gated by binradar_memcheck_enabled.  Independent of symbolic_mode.
+ *
+ * Exception ordering (§4/§9): the check is inserted before the guest
+ * memory op, so a faulting access never records a finding first.  The
+ * helper records a non-fatal pending finding (deferred crash policy);
+ * it never _exit()s.
+ *
+ * Per-instruction PC: the guest instruction PC is tracked from the
+ * INDEX_op_insn_start ops (op->args[0] holds the instruction offset),
+ * the TB start. */
 void memcheck_instrument_tb(TranslationBlock *tb, TCGContext *tcg_ctx,
                             CPUArchState *cpu_env) {
     if (!binradar_memcheck_enabled) return;
@@ -6499,10 +6508,30 @@ void memcheck_instrument_tb(TranslationBlock *tb, TCGContext *tcg_ctx,
         return;
     }
 
+    /* Allocate the helper-arg temps past the current high-water mark.
+     * tcg_temp_new_internal() reuses freed guest temps (free_temps pool),
+     * and a guest temp may still be referenced by ops in this TB (e.g.
+     * the value temp of a qemu_st in a non-atomic RMW sequence).  Reusing
+     * such a temp would clobber the guest value.  Clearing the free pool
+     * forces fresh indices that no op in this TB references. */
+    TCGContext *s = tcg_ctx;
+    TCGTempSet saved_free[TCG_TYPE_COUNT * 2];
+    memcpy(saved_free, s->free_temps, sizeof(saved_free));
+    memset(s->free_temps, 0, sizeof(s->free_temps));
+    TCGTemp *t_size = tcg_temp_new_internal(TCG_TYPE_I64, false);
+    TCGTemp *t_pc = tcg_temp_new_internal(TCG_TYPE_I64, false);
+    memcpy(s->free_temps, saved_free, sizeof(saved_free));
+
     TCGOp *op;
     uintptr_t pc = tb->pc;
 
     QTAILQ_FOREACH(op, &tcg_ctx->ops, link) {
+        if (op->opc == INDEX_op_insn_start) {
+            /* args[0] is the absolute guest instruction PC
+             * (tcg_gen_insn_start(dc->base.pc_next, ...)). */
+            pc = (uintptr_t)op->args[0];
+            continue;
+        }
         switch (op->opc) {
         case INDEX_op_qemu_ld_i32:
         case INDEX_op_qemu_ld_i64:
@@ -6513,19 +6542,18 @@ void memcheck_instrument_tb(TranslationBlock *tb, TCGContext *tcg_ctx,
             TCGMemOp mem_op = get_memop(op->args[2]);
             size_t size = get_mem_op_size(mem_op);
 
-            TCGTemp *t_size = new_non_conflicting_temp(TCG_TYPE_I64);
             tcg_movi(t_size, (uintptr_t)size, 0, op, NULL, tcg_ctx);
-
-            TCGTemp *t_pc = new_non_conflicting_temp(TCG_TYPE_I64);
             tcg_movi(t_pc, (uintptr_t)pc, 0, op, NULL, tcg_ctx);
 
             MARK_TEMP_AS_ALLOCATED(t_addr);
+            /* Insert BEFORE the memory op: the address temp is still
+             * live here (after the op it is dead and TCG liveness
+             * aborts).  The helper is non-fatal — it only records a
+             * pending finding — so a real fault on the access still
+             * occurs and wins the exit-info slot (§8 precedence). */
             add_void_call_3(snapshot_memcheck_helper, t_addr, t_size, t_pc,
                             op, NULL, tcg_ctx);
             MARK_TEMP_AS_NOT_ALLOCATED(t_addr);
-
-            tcg_temp_free_internal(t_size);
-            tcg_temp_free_internal(t_pc);
             break;
         }
         default:
@@ -9155,6 +9183,16 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
             uintptr_t len = strlen((char*)(uintptr_t)env->regs[R_ESI]);
             mode = model_strlen(env, model_caller_addr, 0);
             qemu_memmove(env, (uintptr_t)env->regs[R_ESI], (uintptr_t)env->regs[R_EDI], len + 1);
+            /* memcheck-only: the model wrote raw bytes into the
+             * destination; stale pointer shadow must not be reloaded. */
+            if (binradar_memcheck_enabled) {
+                provenance_on_modify_mem((target_ulong)env->regs[R_EDI],
+                                         (target_ulong)len + 1);
+                provenance_model_check_access(env,
+                                         (target_ulong)env->regs[R_EDI],
+                                         (target_ulong)len + 1,
+                                         model_caller_addr, R_EDI);
+            }
             clear_call_args_temps();
             clear_xmm_regs(env);
         } else if (model == STRNCPY) {
@@ -9164,6 +9202,16 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
             uintptr_t len = strnlen((char*)(uintptr_t)env->regs[R_ESI], n);
             if (len < n) len += 1;
             qemu_memmove(env, (uintptr_t)env->regs[R_ESI], (uintptr_t)env->regs[R_EDI], len);
+            /* memcheck-only: the model wrote raw bytes into the
+             * destination; stale pointer shadow must not be reloaded. */
+            if (binradar_memcheck_enabled) {
+                provenance_on_modify_mem((target_ulong)env->regs[R_EDI],
+                                         (target_ulong)len);
+                provenance_model_check_access(env,
+                                         (target_ulong)env->regs[R_EDI],
+                                         (target_ulong)len,
+                                         model_caller_addr, R_EDI);
+            }
             clear_call_args_temps();
             clear_xmm_regs(env);
         }  else if (model == FPUTC) {

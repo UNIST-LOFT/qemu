@@ -81,18 +81,33 @@ typedef struct {
 typedef struct PtrRegShadow {
     PtrTag       gpr[CPU_NB_REGS];
     target_ulong last_writer_pc[CPU_NB_REGS];
+    /* Current instruction PC scratch: set by helper_prov_set_pc before
+     * transfer helpers whose argument list is full (LEA), so producer
+     * metadata carries the exact guest instruction PC, not a truncated
+     * low-16-bits approximation. */
+    target_ulong cur_pc;
     /* Pending allocator operation for this guest thread (per-CPU, so
      * multithreaded guests keep independent pending ops). */
     ProvenancePending pending;
     /* Effective-address metadata for the in-flight access check.  Set by
      * helper_prov_set_ea BEFORE the guest load/store (translation-time
      * metadata), consumed by helper_prov_check_access AFTER it, so a
-     * faulting access never records a finding. */
+     * faulting access never records a finding.
+     *
+     * The base/index concrete values and tags are SNAPSHOTTED at set_ea
+     * time (before the memory op).  A load whose destination overwrites
+     * its own EA base/index register (e.g. `mov (%rax), %rax`) must not
+     * make the post-access check observe the loaded value/tag instead of
+     * the address-producing state (§6). */
     struct ProvEAMeta {
         int32_t      base_reg;   /* -1 if no base register              */
         int32_t      index_reg;  /* -1 if no index register             */
         int32_t      scale;      /* SIB scale: 0=*1 1=*2 2=*4 3=*8      */
         target_long  disp;       /* constant displacement               */
+        target_ulong base_val;   /* pre-access concrete base value      */
+        target_ulong index_val;  /* pre-access concrete index value     */
+        PtrTag       base_tag;   /* pre-access base register tag        */
+        PtrTag       index_tag;  /* pre-access index register tag       */
         bool         valid;      /* set by prov_set_ea, consumed by check */
     } ea_meta;
 } PtrRegShadow;
@@ -106,6 +121,7 @@ typedef struct PtrMemEntry {
 /* Pending provenance fault (non-fatal, deferred crash). */
 typedef struct {
     bool            detected;
+    bool            reported;   /* structured finding line already emitted */
     target_ulong    access_pc;
     target_ulong    access_addr;
     uint32_t        access_width;
@@ -120,6 +136,11 @@ typedef struct {
     target_ulong    ea_base_reg_val;
     int             ea_base_reg;       /* -1 if unknown */
     bool            is_uaf;
+    /* Final solver cursors at finding time (child side, valid in the
+     * parent after fork because the pools are attached before fork at the
+     * same addresses).  Published by the timeout path (§P1). */
+    uintptr_t       next_query;
+    uintptr_t       next_free_expr;
 } PendingProvenanceFault;
 
 /* ---- Initialization ---- */
@@ -202,10 +223,10 @@ void provenance_model_check_access(CPUArchState *env, target_ulong addr,
 void provenance_set_shared_fault_ptr(PendingProvenanceFault *ptr);
 PendingProvenanceFault *provenance_get_pending_fault(void);
 void provenance_clear_pending_fault(void);
-
-/* ---- Deferred crash finalization ---- */
 /* Returns true if a pending provenance fault should be exposed as a crash. */
 bool provenance_finalize_fault(CPUArchState *env);
+/* Emit the structured finding line exactly once (dual-record policy). */
+bool provenance_report_pending_finding(void);
 /* Returns a human-readable reason string for the pending fault. */
 const char *provenance_fault_reason(void);
 

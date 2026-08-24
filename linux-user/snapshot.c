@@ -890,16 +890,16 @@ void snapshot_record_guest_normal_exit(CPUArchState *cpu_env, int exit_code, con
     if (provenance_finalize_fault(cpu_env)) {
         PendingProvenanceFault *fault = provenance_get_pending_fault();
         const char *pf_reason = provenance_fault_reason();
-        log_msg("[prov] [finalize] [finding] [reason %s] [access_pc %lx] [access_addr %lx] [width %u] [obj_id %lu] [gen %u] [obj_base %lx] [size %lx] [offset %ld] [producer_pc %lx] [kind %d] [last_writer %lx] [is_uaf %d] [ea_reg %d]\n",
-                pf_reason ? pf_reason : "?", fault->access_pc, fault->access_addr,
-                fault->access_width, fault->object_id, fault->generation,
-                fault->object_base, fault->requested_size, fault->tracked_offset,
-                fault->producer_pc, fault->producer_kind, fault->last_writer_pc,
-                fault->is_uaf, fault->ea_base_reg);
+        /* Emit the structured finding exactly once, even when a real
+         * crash already won the exit-info slot: §8 requires preserving
+         * BOTH records (the pending provenance event and the real
+         * signal), with the real crash selecting the verdict. */
+        provenance_report_pending_finding();
 
         SnapshotExitInfo *info = snapshot_exit_info_ptr();
         if (info->valid && info->crashed) {
-            /* Real crash already recorded — keep it (real crash wins). */
+            /* Real crash already recorded — keep it (real crash wins the
+             * verdict; the finding was preserved above). */
             return;
         }
         snapshot_record_guest_crash(cpu_env, TARGET_SIGSEGV, 0,
@@ -1747,32 +1747,14 @@ SnapshotMemRegion *snapshot_mem_region_search(target_ulong addr) {
     return snapshot_mem_region_search_with_size(addr, 1);
 }
 
-/* ---- QASAN-like concrete bounds checking ---- */
-/* MemcheckResult enum and binradar_memcheck_enabled are declared in snapshot.h */
-
-/* Linearly scan the quarantine queue for a region containing addr.
- * Returns the SnapshotMemRegion * if found, NULL otherwise. */
-static SnapshotMemRegion *snapshot_mem_region_search_quarantine(target_ulong addr) {
-    if (heap_quarantine == NULL) return NULL;
-    GList *link;
-    for (link = heap_quarantine->head; link != NULL; link = link->next) {
-        SnapshotMemRegion *mr = (SnapshotMemRegion *)link->data;
-        if (mr != NULL && check_addr_in_region(mr, addr) == 0) {
-            return mr;
-        }
-    }
-    return NULL;
-}
-
 /* Check whether a memory access is within bounds of a known heap
- * allocation, or hits a quarantined (freed) region.
+ * allocation.
  *   MEMCHECK_OK        — access is within a valid heap region, or to
  *                        stack/global/unmapped memory (handled by MMU).
  *   MEMCHECK_HEAP_OOB  — access starts inside a heap region but extends
  *                        past its recorded end (exact-bounds overrun).
- *   MEMCHECK_HEAP_UAF  — access is to a freed (quarantined) region.
  *
- * Only exact-bounds overruns and UAF are reported. We deliberately do NOT
+ * Only exact-bounds overruns are reported. We deliberately do NOT
  * flag accesses that merely fall *near* (but outside) a recorded region:
  * the region tree is built from PLT-call-site malloc/free hooks and can
  * miss regions allocated through un-modelled entry points or by libraries,
@@ -1781,62 +1763,49 @@ static SnapshotMemRegion *snapshot_mem_region_search_quarantine(target_ulong add
  * (This was the source of the pre-entrypoint memcheck crashes that broke
  * 23/30 benchmark subjects.) */
 MemcheckResult snapshot_memcheck_access(target_ulong addr, target_ulong size) {
-    /* 1. Check quarantine first (UAF). */
-    if (snapshot_mem_region_search_quarantine(addr) != NULL) {
-        return MEMCHECK_HEAP_UAF;
-    }
-
-    /* 2. Check heap tree (exact bounds or OOB).
-     * An access whose start lands inside a recorded region but whose full
-     * range [addr, addr+size) exceeds the region end is an exact-bounds
-     * overrun. Accesses outside every recorded region are MEMCHECK_OK —
-     * the region may simply be untracked (see comment above). */
-    SnapshotMemRegion *mr = mr_manager_heap_search(addr);
+    /* UNKNOWN provenance: exact-bounds fallback on LIVE objects only.
+     * Do NOT report UAF from numeric quarantine — UNKNOWN provenance
+     * cannot distinguish a stale pointer from a valid pointer to a
+     * reused or untracked allocation at the same address.  Provenance
+     * identity, not address history, is required for UAF (§7). */
+    SnapshotMemRegion *mr = mr_manager_heap_search_pub(addr);
     if (mr != NULL) {
+        /* Half-open containment: mr->base <= addr < region_end.
+         * The tree search guarantees this, so region_end - addr is
+         * well-defined (no wrap).  Access is OOB when its full interval
+         * exceeds the region end. */
         target_ulong region_end = mr->base + mr->size;
-        /* Half-open containment: mr->base <= addr < region_end (the tree
-         * search guarantees this), so region_end - addr cannot wrap.
-         * size > region_end - addr ⇔ addr + size > region_end, computed
-         * overflow-safe. */
-        if (addr < region_end &&
+        if (region_end >= mr->base &&
+            addr < region_end &&
             (uint64_t)size > (uint64_t)(region_end - addr)) {
             return MEMCHECK_HEAP_OOB;
         }
-        return MEMCHECK_OK;
     }
-
     return MEMCHECK_OK;
 }
 
 /* Runtime helper called from instrumented TCG code (non-symbolic mode).
- * Routes through the provenance checker: UNKNOWN tag → exact-bounds
- * fallback on live allocations.  In concrete-only mode a finding still
- * terminates (separate policy, FIX_TRACER.md §8); in symbolic mode the
- * finding stays pending and is finalized as a synthetic crash at exit. */
+ * Routes through the provenance checker with an UNKNOWN tag; the
+ * provenance checker applies the exact-bounds fallback on LIVE objects
+ * and records a non-fatal pending finding (deferred crash policy, §8).
+ * This helper must NOT call _exit(): a raw-TCG-level check runs before the
+ * guest memory op and must not terminate execution before a potential
+ * real fault.  The finding is finalized at guest exit. */
 void snapshot_memcheck_helper(target_ulong addr, target_ulong size, target_ulong pc) {
     if (!binradar_memcheck_enabled) return;
-    /* Only check accesses from the main binary's code, not library code.
-     * This avoids false positives from glibc's internal memory management. */
     if (symbolic_start_code > 0 && (pc < symbolic_start_code || pc >= symbolic_end_code)) {
         return;
     }
     CPUState *cpu = thread_cpu;
     CPUArchState *env = cpu ? cpu->env_ptr : NULL;
+    if (!env) return;
     PtrTag unknown_tag = {0};
-    MemcheckResult mc = env ? provenance_check_access(env, addr, size, pc,
-                                                      unknown_tag, -1, 0)
-                            : MEMCHECK_OK;
-    if (mc != MEMCHECK_OK) {
-        const char *reason = (mc == MEMCHECK_HEAP_UAF)
-            ? "memcheck: heap-use-after-free"
-            : "memcheck: heap-buffer-overflow";
-        if (env) {
-            snapshot_record_guest_crash(env, TARGET_SIGSEGV, 0,
-                                        SEGV_ACCERR, addr, 0, reason);
-        }
-        trace_mem_flush();
-        _exit(128 + SIGSEGV);
-    }
+    /* The finding is recorded as non-fatal (pending).  Do not _exit here:
+     * the raw-TCG pass inserts this helper BEFORE the qemu_ld/st, so an
+     * immediate exit would violate exception ordering (§4/§9).  The
+     * deferred finalize path converts pending findings to synthetic
+     * crashes at guest exit. */
+    provenance_check_access(env, addr, size, pc, unknown_tag, -1, 0);
 }
 
 /* Forward declaration: defined in tcg/symbolic/symbolic.c */
@@ -2101,14 +2070,56 @@ void snapshot_syscall(uintptr_t syscall_no, uintptr_t syscall_arg0,
             snapshot_read_access(&mem_access);
         }
         break;
-    case TARGET_NR_readlinkat: // Read path from symbolic link
-        // readlinkat(dirfd, pathname, buf, bufsize)
-        // snapshot_write_access(syscall_arg2, syscall_arg3);
-        // Kernel wrote the link target into buf: invalidate shadow.
+#if defined(TARGET_NR_readv)
+    case TARGET_NR_readv: // readv(fd, iov, iovcnt)
+        // Kernel wrote into each iovec base.  The iovec array itself is
+        // guest memory: walk it and invalidate each written range.
         if ((long)ret_val > 0) {
-            provenance_on_modify_mem(syscall_arg2, ret_val);
+            target_ulong iov = syscall_arg1;
+            target_ulong cnt = syscall_arg2;
+            target_ulong left = ret_val;
+            for (target_ulong i = 0; i < cnt && left > 0; i++) {
+                struct target_iovec {
+                    abi_ulong base;
+                    abi_ulong len;
+                } ent;
+                if (copy_from_user(&ent, iov + i * sizeof(ent),
+                                   sizeof(ent))) {
+                    break;
+                }
+                target_ulong n = ent.len < left ? ent.len : left;
+                if (n > 0) {
+                    provenance_on_modify_mem(ent.base, n);
+                    left -= n;
+                }
+            }
         }
         break;
+#endif
+#if defined(TARGET_NR_preadv)
+    case TARGET_NR_preadv: // preadv(fd, iov, iovcnt, pos)
+        if ((long)ret_val > 0) {
+            target_ulong iov = syscall_arg1;
+            target_ulong cnt = syscall_arg2;
+            target_ulong left = ret_val;
+            for (target_ulong i = 0; i < cnt && left > 0; i++) {
+                struct target_iovec {
+                    abi_ulong base;
+                    abi_ulong len;
+                } ent;
+                if (copy_from_user(&ent, iov + i * sizeof(ent),
+                                   sizeof(ent))) {
+                    break;
+                }
+                target_ulong n = ent.len < left ? ent.len : left;
+                if (n > 0) {
+                    provenance_on_modify_mem(ent.base, n);
+                    left -= n;
+                }
+            }
+        }
+        break;
+#endif
 #if defined(TARGET_NR_futex)
     case TARGET_NR_futex: // Fast user mutex
         // futex(uaddr, op, val, timeout)
@@ -2143,26 +2154,91 @@ void snapshot_syscall(uintptr_t syscall_no, uintptr_t syscall_arg0,
         // stat is 144): invalidate conservatively.
         provenance_on_modify_mem(syscall_arg1, 256);
         break;
-    case TARGET_NR_getrandom: {
-        // getrandom(buf, buflen, flags)
-        SnapshotMemAccess mem_access = {
-            .symbolic_addr = false,
-            .symbolic_value = false,
-            .addr = syscall_arg0,
-            .pc = 0,
-            .target = {0},
-            .ptr = NULL,
-            .size = syscall_arg1
-        };
-        if (syscall_arg1 <= 8) {
-            void *buf = g2h(syscall_arg0);
-            memcpy(mem_access.target, buf, syscall_arg1);
+#if defined(TARGET_NR_gettimeofday)
+    case TARGET_NR_gettimeofday: // gettimeofday(tv, tz)
+        // Kernel wrote struct timeval (16 bytes) and timezone (8).
+        if ((long)ret_val >= 0) {
+            if (syscall_arg0) {
+                provenance_on_modify_mem(syscall_arg0, 16);
+            }
+            if (syscall_arg1) {
+                provenance_on_modify_mem(syscall_arg1, 8);
+            }
         }
-        snapshot_write_access(&mem_access);
-        /* Provenance: kernel wrote into the buffer — invalidate shadow. */
-        provenance_on_modify_mem(syscall_arg0, syscall_arg1);
         break;
-    }
+#endif
+#if defined(TARGET_NR_clock_gettime)
+    case TARGET_NR_clock_gettime: // clock_gettime(clockid, tp)
+        // Kernel wrote struct timespec (16 bytes).
+        if ((long)ret_val >= 0 && syscall_arg1) {
+            provenance_on_modify_mem(syscall_arg1, 16);
+        }
+        break;
+#endif
+#if defined(TARGET_NR_getdents)
+    case TARGET_NR_getdents: // getdents(fd, dirp, count)
+        // Kernel wrote dirent records into dirp.
+        if ((long)ret_val > 0) {
+            provenance_on_modify_mem(syscall_arg1, ret_val);
+        }
+        break;
+#endif
+#if defined(TARGET_NR_getdents64)
+    case TARGET_NR_getdents64: // getdents64(fd, dirp, count)
+        if ((long)ret_val > 0) {
+            provenance_on_modify_mem(syscall_arg1, ret_val);
+        }
+        break;
+#endif
+#if defined(TARGET_NR_recvfrom)
+    case TARGET_NR_recvfrom: // recvfrom(fd, buf, len, flags, src_addr, addrlen)
+        // Kernel wrote the packet into buf (and optionally src_addr).
+        if ((long)ret_val > 0) {
+            provenance_on_modify_mem(syscall_arg1, ret_val);
+            if (syscall_arg4) {
+                provenance_on_modify_mem(syscall_arg4, 16);
+            }
+        }
+        break;
+#endif
+#if defined(TARGET_NR_recvmsg)
+    case TARGET_NR_recvmsg: // recvmsg(fd, msg, flags)
+        // Kernel wrote into msg_iov buffers and msg_name.  Walk the
+        // iovec array like readv.
+        if ((long)ret_val > 0) {
+            struct target_msghdr {
+                abi_ulong msg_name;
+                abi_ulong msg_namelen;
+                abi_ulong msg_iov;
+                abi_ulong msg_iovlen;
+                abi_ulong msg_control;
+                abi_ulong msg_controllen;
+                abi_ulong msg_flags;
+            } mh;
+            if (!copy_from_user(&mh, syscall_arg1, sizeof(mh))) {
+                if (mh.msg_name) {
+                    provenance_on_modify_mem(mh.msg_name, mh.msg_namelen);
+                }
+                target_ulong left = ret_val;
+                for (target_ulong i = 0; i < mh.msg_iovlen && left > 0; i++) {
+                    struct target_iovec {
+                        abi_ulong base;
+                        abi_ulong len;
+                    } ent;
+                    if (copy_from_user(&ent, mh.msg_iov + i * sizeof(ent),
+                                       sizeof(ent))) {
+                        break;
+                    }
+                    target_ulong n = ent.len < left ? ent.len : left;
+                    if (n > 0) {
+                        provenance_on_modify_mem(ent.base, n);
+                        left -= n;
+                    }
+                }
+            }
+        }
+        break;
+#endif
     case TARGET_NR_brk: // heap adjustment
         // brk(new_brk_addr)
         // Handled in snapshot_restore
@@ -3011,19 +3087,44 @@ static bool report_shared_prov_finding(uint32_t *status_out) {
     if (shared_trace_data == NULL) return false;
     PendingProvenanceFault *fault = &shared_trace_data->prov_pending_fault;
     if (!fault->detected) return false;
-    const char *pf_reason = fault->is_uaf
-        ? "memcheck: heap-use-after-free (provenance)"
-        : "memcheck: heap-buffer-overflow (provenance)";
-    log_msg("[prov] [finalize] [finding] [reason %s] [access_pc %lx] [access_addr %lx] [width %u] [obj_id %lu] [gen %u] [obj_base %lx] [size %lx] [offset %ld] [producer_pc %lx] [kind %d] [last_writer %lx] [is_uaf %d] [ea_reg %d]\n",
-            pf_reason, fault->access_pc, fault->access_addr,
-            fault->access_width, fault->object_id, fault->generation,
-            fault->object_base, fault->requested_size, fault->tracked_offset,
-            fault->producer_pc, fault->producer_kind, fault->last_writer_pc,
-            fault->is_uaf, fault->ea_base_reg);
+    /* Emit the structured finding exactly once (dual-record policy). */
+    provenance_report_pending_finding();
     /* Synthetic crash verdict (SIGSEGV) so the outer harness sees a crash
      * rather than a pure timeout. */
     if (status_out != NULL) {
         *status_out = 128 + SIGSEGV;
+    }
+    /* Publish the exit record with the child's final solver cursors
+     * (shared pools are attached at the same addresses before fork, so
+     * the child's cursor values are valid in the parent).  The child was
+     * killed before guest-exit finalization, so this is the only exit
+     * publication for the timeout path (§P1). */
+    SnapshotExitInfo *info = snapshot_exit_info_ptr();
+    if (info != NULL && !info->valid) {
+        memset(info, 0, sizeof(*info));
+        info->valid = 1;
+        info->crashed = 1;
+        info->target_signal = TARGET_SIGSEGV;
+        info->host_signal = 0;
+        info->si_code = SEGV_ACCERR;
+        info->exit_code = 139;
+        info->guest_pc = fault->access_pc;
+        info->guest_cs_base = 0;
+        info->fault_addr = fault->access_pc;
+        info->host_fault_addr = 0;
+        info->guest_last_translation_block = last_translation_block;
+        info->next_query = (Query *)fault->next_query;
+        info->next_free_expr = (Expr *)fault->next_free_expr;
+        const char *pf_reason = provenance_fault_reason();
+        g_strlcpy(info->description,
+                  pf_reason ? pf_reason : "memcheck: provenance finding",
+                  SNAPSHOT_EXIT_DESC_LEN);
+        log_msg("[snapshot] [exit] [crash] [entrypoint-hit %lu]\n",
+                binradar_entrypoint_hit_count);
+        log_msg("[snapshot] [crash] [hit-count %lu] [reason %s] [guest_pc %lx] [guest_cs_base %lx] [fault_addr %lx] [host_fault_addr %lx]\n",
+                binradar_entrypoint_hit_count,
+                info->description, info->guest_pc, info->guest_cs_base,
+                info->fault_addr, info->host_fault_addr);
     }
     return true;
 }

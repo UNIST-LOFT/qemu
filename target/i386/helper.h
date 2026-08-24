@@ -249,9 +249,10 @@ DEF_HELPER_FLAGS_6(prov_addsub_imm, TCG_CALL_NO_RWG, void, env, i32, tl, tl, tl,
 DEF_HELPER_FLAGS_6(prov_addsub_reg, TCG_CALL_NO_RWG, void, env, i32, i32, tl, tl, tl)
 DEF_HELPER_FLAGS_1(prov_clobber_caller_saved, TCG_CALL_NO_RWG, void, env)
 DEF_HELPER_FLAGS_3(prov_xchg_reg, TCG_CALL_NO_RWG, void, env, i32, i32)
-DEF_HELPER_FLAGS_4(prov_on_load, TCG_CALL_NO_RWG, void, env, i32, tl, tl)
+DEF_HELPER_FLAGS_5(prov_on_load, TCG_CALL_NO_RWG, void, env, i32, tl, tl, tl)
 DEF_HELPER_FLAGS_4(prov_on_store, TCG_CALL_NO_RWG, void, env, i32, tl, tl)
 DEF_HELPER_FLAGS_5(prov_set_ea, TCG_CALL_NO_RWG, void, env, i32, i32, i32, tl)
+DEF_HELPER_FLAGS_2(prov_set_pc, TCG_CALL_NO_RWG, void, env, tl)
 DEF_HELPER_FLAGS_4(prov_check_access, TCG_CALL_NO_RWG, void, env, tl, tl, tl)
 
 /* OSPREY structural type-analysis hooks (in-process replacement for the

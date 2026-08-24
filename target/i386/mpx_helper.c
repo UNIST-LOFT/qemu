@@ -22,6 +22,8 @@
 #include "exec/helper-proto.h"
 #include "exec/cpu_ldst.h"
 #include "exec/exec-all.h"
+#include "../../linux-user/snapshot.h"
+#include "../../linux-user/provenance.h"
 
 
 void helper_bndck(CPUX86State *env, uint32_t fail)
@@ -115,6 +117,10 @@ void helper_bndstx64(CPUX86State *env, target_ulong base, target_ulong ptr,
     cpu_stq_data_ra(env, bte, lb, ra);
     cpu_stq_data_ra(env, bte + 8, ub, ra);
     cpu_stq_data_ra(env, bte + 16, ptr, ra);
+    /* Provenance: 24-byte BTE store; invalidate the shadow. */
+    if (binradar_memcheck_enabled) {
+        provenance_mem_invalidate(bte, 24);
+    }
 }
 
 void helper_bndstx32(CPUX86State *env, target_ulong base, target_ulong ptr,
@@ -127,6 +133,10 @@ void helper_bndstx32(CPUX86State *env, target_ulong base, target_ulong ptr,
     cpu_stl_data_ra(env, bte, lb, ra);
     cpu_stl_data_ra(env, bte + 4, ub, ra);
     cpu_stl_data_ra(env, bte + 8, ptr, ra);
+    /* Provenance: 12-byte BTE store; invalidate the shadow. */
+    if (binradar_memcheck_enabled) {
+        provenance_mem_invalidate(bte, 12);
+    }
 }
 
 void helper_bnd_jmp(CPUX86State *env)

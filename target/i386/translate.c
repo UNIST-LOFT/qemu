@@ -185,10 +185,13 @@ static void gen_prov_mov_reg(int dst_idx, int src_idx, target_ulong pc) {
 static void gen_prov_lea_imm(int dst_idx, int base_idx, int64_t disp,
                              target_ulong pc) {
     if (!binradar_memcheck_enabled) return;
-    /* Arity is full (env + 5); pack pc's low 16 bits into dst_idx high
-     * bits (plan-sanctioned fallback; low bits identify the instruction
-     * page offset — the diagnostic-relevant part). */
-    TCGv_i32 t_dst = tcg_const_i32(dst_idx | ((pc & 0xffff) << 16));
+    /* Arity is full (env + 5); record the exact instruction PC in the
+     * per-CPU scratch (helper_prov_set_pc) so producer metadata carries
+     * the full guest PC, not a truncated low-16-bits approximation. */
+    TCGv t_pc = tcg_const_tl(pc);
+    gen_helper_prov_set_pc(cpu_env, t_pc);
+    tcg_temp_free(t_pc);
+    TCGv_i32 t_dst = tcg_const_i32(dst_idx);
     TCGv_i32 t_base = tcg_const_i32(base_idx);
     TCGv t_disp = tcg_const_tl((target_ulong)disp);
     /* Pass the post-instruction register value as explicit arg (env->regs
@@ -210,7 +213,10 @@ static void gen_prov_lea_imm(int dst_idx, int base_idx, int64_t disp,
 static void gen_prov_lea_dyn(int dst_idx, int base_idx, target_ulong pc,
                              TCGv pre_base) {
     if (!binradar_memcheck_enabled) return;
-    TCGv_i32 t_dst = tcg_const_i32(dst_idx | ((pc & 0xffff) << 16));
+    TCGv t_pc = tcg_const_tl(pc);
+    gen_helper_prov_set_pc(cpu_env, t_pc);
+    tcg_temp_free(t_pc);
+    TCGv_i32 t_dst = tcg_const_i32(dst_idx);
     TCGv_i32 t_base = tcg_const_i32(base_idx);
     TCGv t_delta = tcg_temp_new();
     tcg_gen_sub_tl(t_delta, cpu_regs[dst_idx], pre_base);
@@ -261,13 +267,16 @@ static void __attribute__((unused)) gen_prov_clobber_caller_saved(void) {
     gen_helper_prov_clobber_caller_saved(cpu_env);
 }
 
-static void gen_prov_on_load(int dst_idx, TCGv t_addr, TCGMemOp ot) {
+static void gen_prov_on_load(int dst_idx, TCGv t_addr, TCGMemOp ot,
+                             target_ulong pc) {
     if (!binradar_memcheck_enabled) return;
     TCGv_i32 t_dst = tcg_const_i32(dst_idx);
     TCGv t_size = tcg_const_tl(1 << ot);
-    gen_helper_prov_on_load(cpu_env, t_dst, t_addr, t_size);
+    TCGv t_pc = tcg_const_tl(pc);
+    gen_helper_prov_on_load(cpu_env, t_dst, t_addr, t_size, t_pc);
     tcg_temp_free_i32(t_dst);
     tcg_temp_free(t_size);
+    tcg_temp_free(t_pc);
 }
 
 static void gen_prov_on_store(int src_idx, TCGv t_addr, TCGMemOp ot) {
@@ -1434,7 +1443,7 @@ static inline void gen_lods(DisasContext *s, TCGMemOp ot)
     gen_op_ld_v(s, ot, s->T0, s->A0);
     gen_op_mov_reg_v(s, ot, R_EAX, s->T0);
     /* Provenance: restore tag from shadow (value-consistency guarded). */
-    gen_prov_on_load(R_EAX, s->A0, ot);
+    gen_prov_on_load(R_EAX, s->A0, ot, s->pc_start);
     gen_osprey_on_load(R_EAX, s->A0, ot);
     if (s->aflag == MO_64 && s->override < 0) {
         gen_prov_check_access(s->A0, ot, s->pc_start);
@@ -1679,6 +1688,8 @@ static void gen_op(DisasContext *s1, int op, TCGMemOp ot, int d)
             tcg_gen_add_tl(s1->T0, s1->tmp4, s1->T1);
             tcg_gen_atomic_add_fetch_tl(s1->T0, s1->A0, s1->T0,
                                         s1->mem_index, ot | MO_LE);
+            /* LOCKed RMW: atomic store bypasses gen_op_st_v; invalidate. */
+            gen_prov_on_store(OR_TMP0, s1->A0, ot);
         } else {
             tcg_gen_add_tl(s1->T0, s1->T0, s1->T1);
             tcg_gen_add_tl(s1->T0, s1->T0, s1->tmp4);
@@ -1694,6 +1705,8 @@ static void gen_op(DisasContext *s1, int op, TCGMemOp ot, int d)
             tcg_gen_neg_tl(s1->T0, s1->T0);
             tcg_gen_atomic_add_fetch_tl(s1->T0, s1->A0, s1->T0,
                                         s1->mem_index, ot | MO_LE);
+            /* LOCKed RMW: atomic store bypasses gen_op_st_v; invalidate. */
+            gen_prov_on_store(OR_TMP0, s1->A0, ot);
         } else {
             tcg_gen_sub_tl(s1->T0, s1->T0, s1->T1);
             tcg_gen_sub_tl(s1->T0, s1->T0, s1->tmp4);
@@ -1706,6 +1719,8 @@ static void gen_op(DisasContext *s1, int op, TCGMemOp ot, int d)
         if (s1->prefix & PREFIX_LOCK) {
             tcg_gen_atomic_add_fetch_tl(s1->T0, s1->A0, s1->T1,
                                         s1->mem_index, ot | MO_LE);
+            /* LOCKed RMW: atomic store bypasses gen_op_st_v; invalidate. */
+            gen_prov_on_store(OR_TMP0, s1->A0, ot);
         } else {
             tcg_gen_add_tl(s1->T0, s1->T0, s1->T1);
             gen_op_st_rm_T0_A0(s1, ot, d);
@@ -1719,6 +1734,8 @@ static void gen_op(DisasContext *s1, int op, TCGMemOp ot, int d)
             tcg_gen_atomic_fetch_add_tl(s1->cc_srcT, s1->A0, s1->T0,
                                         s1->mem_index, ot | MO_LE);
             tcg_gen_sub_tl(s1->T0, s1->cc_srcT, s1->T1);
+            /* LOCKed RMW: atomic store bypasses gen_op_st_v; invalidate. */
+            gen_prov_on_store(OR_TMP0, s1->A0, ot);
         } else {
             tcg_gen_mov_tl(s1->cc_srcT, s1->T0);
             tcg_gen_sub_tl(s1->T0, s1->T0, s1->T1);
@@ -1732,6 +1749,8 @@ static void gen_op(DisasContext *s1, int op, TCGMemOp ot, int d)
         if (s1->prefix & PREFIX_LOCK) {
             tcg_gen_atomic_and_fetch_tl(s1->T0, s1->A0, s1->T1,
                                         s1->mem_index, ot | MO_LE);
+            /* LOCKed RMW: atomic store bypasses gen_op_st_v; invalidate. */
+            gen_prov_on_store(OR_TMP0, s1->A0, ot);
         } else {
             tcg_gen_and_tl(s1->T0, s1->T0, s1->T1);
             gen_op_st_rm_T0_A0(s1, ot, d);
@@ -1743,6 +1762,8 @@ static void gen_op(DisasContext *s1, int op, TCGMemOp ot, int d)
         if (s1->prefix & PREFIX_LOCK) {
             tcg_gen_atomic_or_fetch_tl(s1->T0, s1->A0, s1->T1,
                                        s1->mem_index, ot | MO_LE);
+            /* LOCKed RMW: atomic store bypasses gen_op_st_v; invalidate. */
+            gen_prov_on_store(OR_TMP0, s1->A0, ot);
         } else {
             tcg_gen_or_tl(s1->T0, s1->T0, s1->T1);
             gen_op_st_rm_T0_A0(s1, ot, d);
@@ -1754,6 +1775,8 @@ static void gen_op(DisasContext *s1, int op, TCGMemOp ot, int d)
         if (s1->prefix & PREFIX_LOCK) {
             tcg_gen_atomic_xor_fetch_tl(s1->T0, s1->A0, s1->T1,
                                         s1->mem_index, ot | MO_LE);
+            /* LOCKed RMW: atomic store bypasses gen_op_st_v; invalidate. */
+            gen_prov_on_store(OR_TMP0, s1->A0, ot);
         } else {
             tcg_gen_xor_tl(s1->T0, s1->T0, s1->T1);
             gen_op_st_rm_T0_A0(s1, ot, d);
@@ -1782,6 +1805,8 @@ static void gen_inc(DisasContext *s1, TCGMemOp ot, int d, int c)
         tcg_gen_movi_tl(s1->T0, c > 0 ? 1 : -1);
         tcg_gen_atomic_add_fetch_tl(s1->T0, s1->A0, s1->T0,
                                     s1->mem_index, ot | MO_LE);
+        /* LOCKed RMW: atomic store bypasses gen_op_st_v; invalidate. */
+        gen_prov_on_store(OR_TMP0, s1->A0, ot);
     } else {
         if (d != OR_TMP0) {
             gen_op_mov_v_reg(s1, ot, s1->T0, d);
@@ -2592,7 +2617,7 @@ static void gen_ldst_modrm(CPUX86State *env, DisasContext *s, int modrm,
                 gen_op_mov_reg_v(s, ot, reg, s->T0);
             /* Provenance: restore tag from memory shadow. */
             if (reg != OR_TMP0)
-                gen_prov_on_load(reg, s->A0, ot);
+                gen_prov_on_load(reg, s->A0, ot, s->pc_start);
             /* OSPREY: reload origin + load fact. */
             if (reg != OR_TMP0) {
                 gen_osprey_on_load(reg, s->A0, ot);
@@ -3088,6 +3113,9 @@ static inline void gen_stq_env_A0(DisasContext *s, int offset)
 {
     tcg_gen_ld_i64(s->tmp1_i64, cpu_env, offset);
     tcg_gen_qemu_st_i64(s->tmp1_i64, s->A0, s->mem_index, MO_LEQ);
+    /* Provenance: SSE scalar store — not a modeled pointer spill;
+     * invalidate the overlapping shadow slot. */
+    gen_prov_on_store(OR_TMP0, s->A0, MO_64);
 }
 
 static inline void gen_ldo_env_A0(DisasContext *s, int offset)
@@ -3105,9 +3133,14 @@ static inline void gen_sto_env_A0(DisasContext *s, int offset)
     int mem_index = s->mem_index;
     tcg_gen_ld_i64(s->tmp1_i64, cpu_env, offset + offsetof(ZMMReg, ZMM_Q(0)));
     tcg_gen_qemu_st_i64(s->tmp1_i64, s->A0, mem_index, MO_LEQ);
+    /* Provenance: invalidate after each constituent store so a fault on
+     * a later store cannot leave stale metadata from an earlier one. */
+    gen_prov_on_store(OR_TMP0, s->A0, MO_64);
     tcg_gen_addi_tl(s->tmp0, s->A0, 8);
     tcg_gen_ld_i64(s->tmp1_i64, cpu_env, offset + offsetof(ZMMReg, ZMM_Q(1)));
     tcg_gen_qemu_st_i64(s->tmp1_i64, s->tmp0, mem_index, MO_LEQ);
+    /* Provenance: 128-bit SSE store — invalidate both shadow slots. */
+    gen_prov_on_store(OR_TMP0, s->tmp0, MO_64);
 }
 
 static inline void gen_op_movo(DisasContext *s, int d_offset, int s_offset)
@@ -4264,9 +4297,11 @@ static void gen_sse(CPUX86State *env, DisasContext *s, int b,
                 } else {
                     tcg_gen_qemu_st_tl(cpu_regs[reg], s->A0,
                                        s->mem_index, ot | MO_BE);
+                    /* Provenance: byte-swapped store — the bytes are not
+                     * the register's native value; invalidate the slot. */
+                    gen_prov_on_store(OR_TMP0, s->A0, ot);
                 }
                 break;
-
             case 0x0f2: /* andn Gy, By, Ey */
                 if (!(s->cpuid_7_0_ebx_features & CPUID_7_0_EBX_BMI1)
                     || !(s->prefix & PREFIX_VEX)
@@ -4604,6 +4639,8 @@ static void gen_sse(CPUX86State *env, DisasContext *s, int b,
                     } else {
                         tcg_gen_qemu_st_tl(s->T0, s->A0,
                                            s->mem_index, MO_UB);
+                        /* Provenance: SIMD extract store — invalidate. */
+                        gen_prov_on_store(OR_TMP0, s->A0, MO_8);
                     }
                     break;
                 case 0x15: /* pextrw */
@@ -4614,6 +4651,8 @@ static void gen_sse(CPUX86State *env, DisasContext *s, int b,
                     } else {
                         tcg_gen_qemu_st_tl(s->T0, s->A0,
                                            s->mem_index, MO_LEUW);
+                        /* Provenance: SIMD extract store — invalidate. */
+                        gen_prov_on_store(OR_TMP0, s->A0, MO_16);
                     }
                     break;
                 case 0x16:
@@ -4626,6 +4665,8 @@ static void gen_sse(CPUX86State *env, DisasContext *s, int b,
                         } else {
                             tcg_gen_qemu_st_i32(s->tmp2_i32, s->A0,
                                                 s->mem_index, MO_LEUL);
+                            /* Provenance: SIMD extract store — invalidate. */
+                            gen_prov_on_store(OR_TMP0, s->A0, MO_32);
                         }
                     } else { /* pextrq */
 #ifdef TARGET_X86_64
@@ -4637,6 +4678,8 @@ static void gen_sse(CPUX86State *env, DisasContext *s, int b,
                         } else {
                             tcg_gen_qemu_st_i64(s->tmp1_i64, s->A0,
                                                 s->mem_index, MO_LEQ);
+                            /* Provenance: SIMD extract store — invalidate. */
+                            gen_prov_on_store(OR_TMP0, s->A0, MO_64);
                         }
 #else
                         goto illegal_op;
@@ -4655,9 +4698,10 @@ static void gen_sse(CPUX86State *env, DisasContext *s, int b,
                     } else {
                         tcg_gen_qemu_st_tl(s->T0, s->A0,
                                            s->mem_index, MO_LEUL);
+                        /* Provenance: SIMD extract store — invalidate. */
+                        gen_prov_on_store(OR_TMP0, s->A0, MO_32);
                     }
                     break;
-                case 0x20: /* pinsrb */
                     if (mod == 3) {
                         gen_op_mov_v_reg(s, MO_32, s->T0, rm);
                     } else {
@@ -4726,7 +4770,6 @@ static void gen_sse(CPUX86State *env, DisasContext *s, int b,
                 }
                 return;
             }
-
             if (b1) {
                 op1_offset = offsetof(CPUX86State,xmm_regs[reg]);
                 if (mod == 3) {
@@ -5388,6 +5431,8 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                 tcg_gen_movi_tl(s->T0, ~0);
                 tcg_gen_atomic_xor_fetch_tl(s->T0, s->A0, s->T0,
                                             s->mem_index, ot | MO_LE);
+                /* LOCKed RMW: atomic store bypasses gen_op_st_v; invalidate. */
+                gen_prov_on_store(OR_TMP0, s->A0, ot);
             } else {
                 tcg_gen_not_tl(s->T0, s->T0);
                 if (mod != 3) {
@@ -5421,6 +5466,8 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                                           s->mem_index, ot | MO_LE);
                 tcg_temp_free(t1);
                 tcg_gen_brcond_tl(TCG_COND_NE, t0, t2, label1);
+                /* LOCKed RMW: atomic store bypasses gen_op_st_v; invalidate. */
+                gen_prov_on_store(OR_TMP0, a0, ot);
 
                 tcg_temp_free(t2);
                 tcg_temp_free(a0);
@@ -5902,6 +5949,8 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                 tcg_gen_atomic_fetch_add_tl(s->T1, s->A0, s->T0,
                                             s->mem_index, ot | MO_LE);
                 tcg_gen_add_tl(s->T0, s->T0, s->T1);
+                /* LOCKed RMW: atomic store bypasses gen_op_st_v; invalidate. */
+                gen_prov_on_store(OR_TMP0, s->A0, ot);
             } else {
                 gen_op_ld_v(s, ot, s->T1, s->A0);
                 tcg_gen_add_tl(s->T0, s->T0, s->T1);
@@ -5935,6 +5984,8 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                 tcg_gen_atomic_cmpxchg_tl(oldv, s->A0, cmpv, newv,
                                           s->mem_index, ot | MO_LE);
                 gen_op_mov_reg_v(s, ot, R_EAX, oldv);
+                /* LOCKed RMW: atomic store bypasses gen_op_st_v; invalidate. */
+                gen_prov_on_store(OR_TMP0, s->A0, ot);
             } else {
                 if (mod == 3) {
                     rm = (modrm & 7) | REX_B(s);
@@ -5989,6 +6040,14 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                 } else {
                     gen_helper_cmpxchg16b_unlocked(cpu_env, s->A0);
                 }
+                /* cmpxchg16b always stores 16 bytes at A0 and may write
+                 * EAX:EDX (mismatch); invalidate both shadow slots and
+                 * the registers. */
+                gen_prov_on_store(OR_TMP0, s->A0, MO_64);
+                tcg_gen_addi_tl(s->tmp0, s->A0, 8);
+                gen_prov_on_store(OR_TMP0, s->tmp0, MO_64);
+                gen_prov_invalidate_reg(R_EAX, s->pc_start);
+                gen_prov_invalidate_reg(R_EDX, s->pc_start);
                 set_cc_op(s, CC_OP_EFLAGS);
                 break;
             }
@@ -6003,6 +6062,11 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
             } else {
                 gen_helper_cmpxchg8b_unlocked(cpu_env, s->A0);
             }
+            /* cmpxchg8b always stores 8 bytes at A0 and may write
+             * EAX:EDX (mismatch); invalidate the slot and both regs. */
+            gen_prov_on_store(OR_TMP0, s->A0, MO_64);
+            gen_prov_invalidate_reg(R_EAX, s->pc_start);
+            gen_prov_invalidate_reg(R_EDX, s->pc_start);
             set_cc_op(s, CC_OP_EFLAGS);
             break;
 
@@ -6053,7 +6117,7 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
         gen_pop_update(s, ot);
         gen_op_mov_reg_v(s, ot, (b & 7) | REX_B(s), s->T0);
         /* Provenance: pop restores tag from stack shadow. */
-        gen_prov_on_load((b & 7) | REX_B(s), s->A0, ot);
+        gen_prov_on_load((b & 7) | REX_B(s), s->A0, ot, s->pc_start);
         /* OSPREY: pop reloads the origin from the stack shadow. */
         if (osprey_active()) {
             gen_osprey_on_load((b & 7) | REX_B(s), s->A0, ot);
@@ -6211,7 +6275,7 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
         gen_op_mov_reg_v(s, ot, reg, s->T0);
         /* Provenance: restore tag from memory shadow (spill reload). */
         if ((modrm >> 6) != 3) {
-            gen_prov_on_load(reg, s->A0, ot);
+            gen_prov_on_load(reg, s->A0, ot, s->pc_start);
             gen_osprey_on_load(reg, s->A0, ot);
         }
         break;
@@ -6689,17 +6753,23 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                         gen_helper_fisttl_ST0(s->tmp2_i32, cpu_env);
                         tcg_gen_qemu_st_i32(s->tmp2_i32, s->A0,
                                             s->mem_index, MO_LEUL);
+                        /* Provenance: FPU store — invalidate shadow. */
+                        gen_prov_on_store(OR_TMP0, s->A0, MO_32);
                         break;
                     case 2:
                         gen_helper_fisttll_ST0(s->tmp1_i64, cpu_env);
                         tcg_gen_qemu_st_i64(s->tmp1_i64, s->A0,
                                             s->mem_index, MO_LEQ);
+                        /* Provenance: FPU store — invalidate shadow. */
+                        gen_prov_on_store(OR_TMP0, s->A0, MO_64);
                         break;
                     case 3:
                     default:
                         gen_helper_fistt_ST0(s->tmp2_i32, cpu_env);
                         tcg_gen_qemu_st_i32(s->tmp2_i32, s->A0,
                                             s->mem_index, MO_LEUW);
+                        /* Provenance: FPU store — invalidate shadow. */
+                        gen_prov_on_store(OR_TMP0, s->A0, MO_16);
                         break;
                     }
                     gen_helper_fpop(cpu_env);
@@ -6710,22 +6780,30 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                         gen_helper_fsts_ST0(s->tmp2_i32, cpu_env);
                         tcg_gen_qemu_st_i32(s->tmp2_i32, s->A0,
                                             s->mem_index, MO_LEUL);
+                        /* Provenance: FPU store — invalidate shadow. */
+                        gen_prov_on_store(OR_TMP0, s->A0, MO_32);
                         break;
                     case 1:
                         gen_helper_fistl_ST0(s->tmp2_i32, cpu_env);
                         tcg_gen_qemu_st_i32(s->tmp2_i32, s->A0,
                                             s->mem_index, MO_LEUL);
+                        /* Provenance: FPU store — invalidate shadow. */
+                        gen_prov_on_store(OR_TMP0, s->A0, MO_32);
                         break;
                     case 2:
                         gen_helper_fstl_ST0(s->tmp1_i64, cpu_env);
                         tcg_gen_qemu_st_i64(s->tmp1_i64, s->A0,
                                             s->mem_index, MO_LEQ);
+                        /* Provenance: FPU store — invalidate shadow. */
+                        gen_prov_on_store(OR_TMP0, s->A0, MO_64);
                         break;
                     case 3:
                     default:
                         gen_helper_fist_ST0(s->tmp2_i32, cpu_env);
                         tcg_gen_qemu_st_i32(s->tmp2_i32, s->A0,
                                             s->mem_index, MO_LEUW);
+                        /* Provenance: FPU store — invalidate shadow. */
+                        gen_prov_on_store(OR_TMP0, s->A0, MO_16);
                         break;
                     }
                     if ((op & 7) == 3)
@@ -6741,46 +6819,92 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                                     s->mem_index, MO_LEUW);
                 gen_helper_fldcw(cpu_env, s->tmp2_i32);
                 break;
-            case 0x0e: /* fnstenv mem */
-                gen_helper_fstenv(cpu_env, s->A0, tcg_const_i32(dflag - 1));
+                /* Provenance: helper writes 14/28 bytes; invalidate. */
+                gen_prov_on_store(OR_TMP0, s->A0, MO_64);
+                tcg_gen_addi_tl(s->tmp0, s->A0, 8);
+                gen_prov_on_store(OR_TMP0, s->tmp0, MO_64);
+                tcg_gen_addi_tl(s->tmp0, s->A0, 16);
+                gen_prov_on_store(OR_TMP0, s->tmp0, MO_64);
+                tcg_gen_addi_tl(s->tmp0, s->A0, 24);
+                gen_prov_on_store(OR_TMP0, s->tmp0, MO_32);
+                break;
                 break;
             case 0x0f: /* fnstcw mem */
                 gen_helper_fnstcw(s->tmp2_i32, cpu_env);
                 tcg_gen_qemu_st_i32(s->tmp2_i32, s->A0,
                                     s->mem_index, MO_LEUW);
+                /* Provenance: FPU control-word store — invalidate. */
+                gen_prov_on_store(OR_TMP0, s->A0, MO_16);
                 break;
             case 0x1d: /* fldt mem */
                 gen_helper_fldt_ST0(cpu_env, s->A0);
                 break;
-            case 0x1f: /* fstpt mem */
-                gen_helper_fstt_ST0(cpu_env, s->A0);
-                gen_helper_fpop(cpu_env);
+                /* Provenance: helper writes 10 bytes; invalidate. */
+                gen_prov_on_store(OR_TMP0, s->A0, MO_64);
+                tcg_gen_addi_tl(s->tmp0, s->A0, 8);
+                gen_prov_on_store(OR_TMP0, s->tmp0, MO_16);
+                break;
                 break;
             case 0x2c: /* frstor mem */
                 gen_helper_frstor(cpu_env, s->A0, tcg_const_i32(dflag - 1));
                 break;
-            case 0x2e: /* fnsave mem */
-                gen_helper_fsave(cpu_env, s->A0, tcg_const_i32(dflag - 1));
+                /* Provenance: helper writes env (14/28) + 8x10 ST bytes;
+                 * invalidate the full 108-byte range. */
+                gen_prov_on_store(OR_TMP0, s->A0, MO_64);
+                tcg_gen_addi_tl(s->tmp0, s->A0, 8);
+                gen_prov_on_store(OR_TMP0, s->tmp0, MO_64);
+                tcg_gen_addi_tl(s->tmp0, s->A0, 16);
+                gen_prov_on_store(OR_TMP0, s->tmp0, MO_64);
+                tcg_gen_addi_tl(s->tmp0, s->A0, 24);
+                gen_prov_on_store(OR_TMP0, s->tmp0, MO_64);
+                tcg_gen_addi_tl(s->tmp0, s->A0, 32);
+                gen_prov_on_store(OR_TMP0, s->tmp0, MO_64);
+                tcg_gen_addi_tl(s->tmp0, s->A0, 40);
+                gen_prov_on_store(OR_TMP0, s->tmp0, MO_64);
+                tcg_gen_addi_tl(s->tmp0, s->A0, 48);
+                gen_prov_on_store(OR_TMP0, s->tmp0, MO_64);
+                tcg_gen_addi_tl(s->tmp0, s->A0, 56);
+                gen_prov_on_store(OR_TMP0, s->tmp0, MO_64);
+                tcg_gen_addi_tl(s->tmp0, s->A0, 64);
+                gen_prov_on_store(OR_TMP0, s->tmp0, MO_64);
+                tcg_gen_addi_tl(s->tmp0, s->A0, 72);
+                gen_prov_on_store(OR_TMP0, s->tmp0, MO_64);
+                tcg_gen_addi_tl(s->tmp0, s->A0, 80);
+                gen_prov_on_store(OR_TMP0, s->tmp0, MO_64);
+                tcg_gen_addi_tl(s->tmp0, s->A0, 88);
+                gen_prov_on_store(OR_TMP0, s->tmp0, MO_64);
+                tcg_gen_addi_tl(s->tmp0, s->A0, 96);
+                gen_prov_on_store(OR_TMP0, s->tmp0, MO_64);
+                tcg_gen_addi_tl(s->tmp0, s->A0, 104);
+                gen_prov_on_store(OR_TMP0, s->tmp0, MO_32);
+                break;
                 break;
             case 0x2f: /* fnstsw mem */
                 gen_helper_fnstsw(s->tmp2_i32, cpu_env);
                 tcg_gen_qemu_st_i32(s->tmp2_i32, s->A0,
                                     s->mem_index, MO_LEUW);
+                /* Provenance: FPU status-word store — invalidate. */
+                gen_prov_on_store(OR_TMP0, s->A0, MO_16);
                 break;
             case 0x3c: /* fbld */
                 gen_helper_fbld_ST0(cpu_env, s->A0);
                 break;
-            case 0x3e: /* fbstp */
-                gen_helper_fbst_ST0(cpu_env, s->A0);
-                gen_helper_fpop(cpu_env);
+                /* Provenance: helper writes 10 bytes; invalidate. */
+                gen_prov_on_store(OR_TMP0, s->A0, MO_64);
+                tcg_gen_addi_tl(s->tmp0, s->A0, 8);
+                gen_prov_on_store(OR_TMP0, s->tmp0, MO_16);
+                break;
                 break;
             case 0x3d: /* fildll */
                 tcg_gen_qemu_ld_i64(s->tmp1_i64, s->A0, s->mem_index, MO_LEQ);
                 gen_helper_fildll_ST0(cpu_env, s->tmp1_i64);
                 break;
             case 0x3f: /* fistpll */
+                /* Provenance: FPU store — invalidate shadow. */
                 gen_helper_fistll_ST0(s->tmp1_i64, cpu_env);
                 tcg_gen_qemu_st_i64(s->tmp1_i64, s->A0, s->mem_index, MO_LEQ);
+                /* Provenance: FPU store — invalidate shadow. */
+                gen_prov_on_store(OR_TMP0, s->A0, MO_64);
                 gen_helper_fpop(cpu_env);
                 break;
             default:
@@ -7699,16 +7823,22 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
             case 1: /* bts */
                 tcg_gen_atomic_fetch_or_tl(s->T0, s->A0, s->tmp0,
                                            s->mem_index, ot | MO_LE);
+                /* LOCKed RMW: atomic store bypasses gen_op_st_v; invalidate. */
+                gen_prov_on_store(OR_TMP0, s->A0, ot);
                 break;
             case 2: /* btr */
                 tcg_gen_not_tl(s->tmp0, s->tmp0);
                 tcg_gen_atomic_fetch_and_tl(s->T0, s->A0, s->tmp0,
                                             s->mem_index, ot | MO_LE);
+                /* LOCKed RMW: atomic store bypasses gen_op_st_v; invalidate. */
+                gen_prov_on_store(OR_TMP0, s->A0, ot);
                 break;
             default:
             case 3: /* btc */
                 tcg_gen_atomic_fetch_xor_tl(s->T0, s->A0, s->tmp0,
                                             s->mem_index, ot | MO_LE);
+                /* LOCKed RMW: atomic store bypasses gen_op_st_v; invalidate. */
+                gen_prov_on_store(OR_TMP0, s->A0, ot);
                 break;
             }
             tcg_gen_shr_tl(s->tmp4, s->T0, s->T1);
@@ -8048,6 +8178,9 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
             gen_io_start();
         }
         gen_helper_rdtsc(cpu_env);
+        /* rdtsc writes EAX:EDX inside the helper; default-kill both. */
+        gen_prov_invalidate_reg(R_EAX, s->pc_start);
+        gen_prov_invalidate_reg(R_EDX, s->pc_start);
         if (tb_cflags(s->base.tb) & CF_USE_ICOUNT) {
             gen_io_end();
             gen_jmp(s, s->pc - s->cs_base);
@@ -8520,6 +8653,10 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                 gen_io_start();
             }
             gen_helper_rdtscp(cpu_env);
+            /* rdtscp writes EAX:EDX:ECX inside the helper; default-kill. */
+            gen_prov_invalidate_reg(R_EAX, s->pc_start);
+            gen_prov_invalidate_reg(R_EDX, s->pc_start);
+            gen_prov_invalidate_reg(R_ECX, s->pc_start);
             if (tb_cflags(s->base.tb) & CF_USE_ICOUNT) {
                 gen_io_end();
                 gen_jmp(s, s->pc - s->cs_base);
@@ -8809,15 +8946,23 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                     if (CODE64(s)) {
                         tcg_gen_qemu_st_i64(cpu_bndl[reg], s->A0,
                                             s->mem_index, MO_LEQ);
+                        /* Provenance: MPX bound store — invalidate. */
+                        gen_prov_on_store(OR_TMP0, s->A0, MO_64);
                         tcg_gen_addi_tl(s->A0, s->A0, 8);
                         tcg_gen_qemu_st_i64(cpu_bndu[reg], s->A0,
                                             s->mem_index, MO_LEQ);
+                        /* Provenance: MPX bound store — invalidate. */
+                        gen_prov_on_store(OR_TMP0, s->A0, MO_64);
                     } else {
                         tcg_gen_qemu_st_i64(cpu_bndl[reg], s->A0,
                                             s->mem_index, MO_LEUL);
+                        /* Provenance: MPX bound store — invalidate. */
+                        gen_prov_on_store(OR_TMP0, s->A0, MO_32);
                         tcg_gen_addi_tl(s->A0, s->A0, 4);
                         tcg_gen_qemu_st_i64(cpu_bndu[reg], s->A0,
                                             s->mem_index, MO_LEUL);
+                        /* Provenance: MPX bound store — invalidate. */
+                        gen_prov_on_store(OR_TMP0, s->A0, MO_32);
                     }
                 }
             } else if (mod != 3) {

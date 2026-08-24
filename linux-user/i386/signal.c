@@ -334,8 +334,11 @@ void setup_frame(int sig, struct target_sigaction *ka,
     setup_sigcontext(&frame->sc, &frame->fpstate, env, set->sig[0],
             frame_addr + offsetof(struct sigframe, fpstate));
 
-    for(i = 1; i < TARGET_NSIG_WORDS; i++) {
-        __put_user(set->sig[i], &frame->extramask[i - 1]);
+    /* Provenance: the whole frame was written via host __put_user /
+     * cpu_x86_fsave, bypassing TCG; stale pointer shadow in the frame
+     * must not be reloaded by the handler. */
+    if (binradar_memcheck_enabled) {
+        provenance_mem_invalidate(frame_addr, sizeof(*frame));
     }
 
     /* Set up to return from userspace.  If provided, use a stub
@@ -417,6 +420,12 @@ void setup_rt_frame(int sig, struct target_sigaction *ka,
 
     for(i = 0; i < TARGET_NSIG_WORDS; i++) {
         __put_user(set->sig[i], &frame->uc.tuc_sigmask.sig[i]);
+    }
+    /* Provenance: the whole frame was written via host __put_user /
+     * cpu_x86_fxsave, bypassing TCG; stale pointer shadow in the frame
+     * must not be reloaded by the handler. */
+    if (binradar_memcheck_enabled) {
+        provenance_mem_invalidate(frame_addr, sizeof(*frame));
     }
 
     /* Set up to return from userspace.  If provided, use a stub

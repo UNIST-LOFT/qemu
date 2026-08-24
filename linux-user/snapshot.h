@@ -12,6 +12,7 @@
 #include <stdarg.h>
 
 typedef struct Expr Expr;
+typedef struct Query Query;
 
 void trace_mem(const char* fmt, ...);
 void log_msg(const char *fmt, ...);
