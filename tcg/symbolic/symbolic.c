@@ -14,6 +14,7 @@
 #include "symbolic-instrumentation.h"
 #include "../../linux-user/snapshot.h"
 #include "../../linux-user/provenance.h"
+#include "../../linux-user/osprey.h"
 
 #define DEBUG_CONSISTENCY_CHECK 0
 
@@ -8603,7 +8604,12 @@ int        parse_translation_block(TranslationBlock* tb, uintptr_t tb_pc,
 
                         const char* helper_whitelist[] = {
                             "lookup_tb_ptr", "rechecking_single_step",
-                            "instrument_call", "instrument_ret"};
+                            "instrument_call", "instrument_ret",
+                            "osprey_invalidate_reg", "osprey_reg_copy",
+                            "osprey_reg_lea", "osprey_set_ea",
+                            "osprey_mem_access", "osprey_mem_copy",
+                            "osprey_on_load", "osprey_on_store",
+                            "osprey_call", "osprey_ret"};
 
                         int helper_is_whitelisted = 0;
                         for (size_t i = 0;
@@ -9040,6 +9046,7 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
                 }
                 snapshot_trace_free(env->regs[R_EDI], model_caller_addr);
                 provenance_retire_object(env->regs[R_EDI]);
+                osprey_on_free(env, env->regs[R_EDI], model_caller_addr);
             }
             if (symbolic_mode) {
                 clear_call_args_temps();
@@ -9234,6 +9241,7 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
                     if (pend.arg_ptr != 0) {
                         provenance_retire_object(pend.arg_ptr);
                         snapshot_trace_free(pend.arg_ptr, pend.call_pc);
+                        osprey_on_free(env, pend.arg_ptr, pend.call_pc);
                         if (symbolic_mode) {
                             symbolic_trace_free(pend.arg_ptr);
                         }
@@ -9244,6 +9252,7 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
                             PROV_PRODUCER_REALLOC_RETURN);
                         provenance_set_reg_tag(env, R_EAX, tag);
                         snapshot_trace_alloc(base, 0, pend.call_pc);
+                        osprey_on_alloc_success(env, base, 0, pend.call_pc);
                         if (symbolic_mode) {
                             SymbolicPendingAlloc sym_alloc =
                                 symbolic_trace_get_pending_alloc(pc);
@@ -9273,6 +9282,8 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
                         PROV_PRODUCER_REALLOC_RETURN);
                     provenance_set_reg_tag(env, R_EAX, tag);
                     snapshot_trace_alloc(base, pend.arg_size, pend.call_pc);
+                    osprey_on_alloc_success(env, base, pend.arg_size,
+                                            pend.call_pc);
                     if (symbolic_mode) {
                         SymbolicPendingAlloc sym_alloc =
                             symbolic_trace_get_pending_alloc(pc);
@@ -9290,6 +9301,7 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
                     }
                     provenance_invalidate_reg(env, R_EAX, pc);
                     provenance_clear_pending(env);
+                    osprey_on_alloc_failure(env, pend.call_pc);
                 }
             } else if (pend.overflowed || base == 0) {
                 /* Failed malloc/calloc, or calloc overflow: no object
@@ -9300,6 +9312,7 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
                 }
                 provenance_invalidate_reg(env, R_EAX, pc);
                 provenance_clear_pending(env);
+                osprey_on_alloc_failure(env, pend.call_pc);
             } else {
                 /* Successful malloc/calloc (size may be 0). */
                 PtrProducerKind kind = (pend.kind == PROV_OP_CALLOC)
@@ -9309,6 +9322,8 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
                     base, pend.arg_size, pend.call_pc, kind);
                 provenance_set_reg_tag(env, R_EAX, tag);
                 snapshot_trace_alloc(base, pend.arg_size, pend.call_pc);
+                osprey_on_alloc_success(env, base, pend.arg_size,
+                                        pend.call_pc);
                 if (symbolic_mode) {
                     SymbolicPendingAlloc sym_alloc =
                         symbolic_trace_get_pending_alloc(pc);

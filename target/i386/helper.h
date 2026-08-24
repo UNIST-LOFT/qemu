@@ -253,4 +253,19 @@ DEF_HELPER_FLAGS_4(prov_on_load, TCG_CALL_NO_RWG, void, env, i32, tl, tl)
 DEF_HELPER_FLAGS_4(prov_on_store, TCG_CALL_NO_RWG, void, env, i32, tl, tl)
 DEF_HELPER_FLAGS_5(prov_set_ea, TCG_CALL_NO_RWG, void, env, i32, i32, i32, tl)
 DEF_HELPER_FLAGS_4(prov_check_access, TCG_CALL_NO_RWG, void, env, tl, tl, tl)
+
+/* OSPREY structural type-analysis hooks (in-process replacement for the
+ * external Python analyzer).  Same side-effect discipline as the
+ * provenance helpers: TCG_CALL_NO_RWG prevents elimination/reordering. */
+DEF_HELPER_FLAGS_2(osprey_invalidate_reg, TCG_CALL_NO_RWG, void, env, i32)
+DEF_HELPER_FLAGS_5(osprey_reg_copy, TCG_CALL_NO_RWG, void, env, i32, i32, tl, tl)
+DEF_HELPER_FLAGS_6(osprey_reg_lea, TCG_CALL_NO_RWG, void, env, i32, i32, tl, tl, tl)
+DEF_HELPER_FLAGS_5(osprey_mem_access, TCG_CALL_NO_RWG, void, env, tl, tl, tl, i32)
+DEF_HELPER_FLAGS_4(osprey_mem_copy, TCG_CALL_NO_RWG, void, env, tl, tl, tl)
+DEF_HELPER_FLAGS_5(osprey_set_ea, TCG_CALL_NO_RWG, void, env, i32, i32, tl, tl)
+DEF_HELPER_FLAGS_4(osprey_on_load, TCG_CALL_NO_RWG, void, env, i32, tl, tl)
+DEF_HELPER_FLAGS_5(osprey_on_store, TCG_CALL_NO_RWG, void, env, i32, tl, tl, tl)
+DEF_HELPER_4(osprey_call, void, tl, tl, tl, tl)
+DEF_HELPER_2(osprey_ret, void, tl, tl)
+
 #endif

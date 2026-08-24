@@ -42,6 +42,7 @@
 #include "../../tcg/symbolic/symbolic-instrumentation.h"
 
 #include "../../linux-user/provenance.h"
+#include "../../linux-user/osprey.h"
 
 /* Declared here so the provenance helper wrappers below can pass register
  * values as explicit helper args (env->regs may be stale inside helpers). */
@@ -58,6 +59,113 @@ static void gen_prov_invalidate_reg(int reg_idx, target_ulong pc) {
     gen_helper_prov_invalidate_reg(cpu_env, t_reg, t_pc);
     tcg_temp_free_i32(t_reg);
     tcg_temp_free(t_pc);
+}
+
+/* ---- OSPREY structural type-analysis emission ---- */
+
+static bool osprey_active(void) {
+    return osprey_collect_enabled != 0;
+}
+
+/* Default-kill for any architectural register write.  Emitted from the
+ * central register-write path (gen_op_mov_reg_v) so every write is
+ * either a sound transfer or an explicit invalidation. */
+static void gen_osprey_invalidate_reg(int reg_idx) {
+    if (!osprey_active()) return;
+    TCGv_i32 t_reg = tcg_const_i32(reg_idx);
+    gen_helper_osprey_invalidate_reg(cpu_env, t_reg);
+    tcg_temp_free_i32(t_reg);
+}
+
+/* Full-width register copy: transfer the origin with a runtime
+ * value-consistency check. */
+static void gen_osprey_reg_copy(int dst_idx, int src_idx) {
+    if (!osprey_active()) return;
+    TCGv_i32 t_dst = tcg_const_i32(dst_idx);
+    TCGv_i32 t_src = tcg_const_i32(src_idx);
+    gen_helper_osprey_reg_copy(cpu_env, t_dst, t_src,
+                               cpu_regs[src_idx], cpu_regs[dst_idx]);
+    tcg_temp_free_i32(t_dst);
+    tcg_temp_free_i32(t_src);
+}
+
+/* lea dst, [base + disp]: propagate the ADDRESS origin with the checked
+ * constant offset. */
+static void gen_osprey_reg_lea(int dst_idx, int base_idx, target_long disp) {
+    if (!osprey_active()) return;
+    TCGv_i32 t_dst = tcg_const_i32(dst_idx);
+    TCGv_i32 t_base = tcg_const_i32(base_idx);
+    TCGv t_disp = tcg_const_tl((target_ulong)disp);
+    gen_helper_osprey_reg_lea(cpu_env, t_dst, t_base, t_disp,
+                              cpu_regs[dst_idx], cpu_regs[base_idx]);
+    tcg_temp_free_i32(t_dst);
+    tcg_temp_free_i32(t_base);
+    tcg_temp_free(t_disp);
+}
+
+/* Effective-address metadata: emitted before a guest access (only in
+ * 64-bit modes without segment override), consumed after it succeeds.
+ * packed = valid<<31 | (base+1)<<16 | (index+1)<<8 | scale. */
+static void gen_osprey_set_ea(int base_reg, int index_reg, int scale,
+                              target_long disp, TCGv base_val,
+                              TCGv index_val) {
+    if (!osprey_active()) return;
+    uint32_t packed = 0x80000000u;
+    packed |= (uint32_t)(base_reg + 1) << 16;
+    packed |= (uint32_t)(index_reg + 1) << 8;
+    packed |= (uint32_t)scale;
+    TCGv_i32 t_packed = tcg_const_i32(packed);
+    TCGv_i32 t_disp = tcg_const_i32((uint32_t)(int32_t)disp);
+    TCGv t_base_val = base_val != NULL ? base_val : tcg_const_tl(0);
+    TCGv t_index_val = index_val != NULL ? index_val : tcg_const_tl(0);
+    gen_helper_osprey_set_ea(cpu_env, t_packed, t_disp, t_base_val,
+                             t_index_val);
+    tcg_temp_free_i32(t_packed);
+    tcg_temp_free_i32(t_disp);
+    if (base_val == NULL) tcg_temp_free(t_base_val);
+    if (index_val == NULL) tcg_temp_free(t_index_val);
+}
+
+/* Access fact + EA consumption: emitted after a successful load/store. */
+static void gen_osprey_mem_access(TCGv addr, TCGMemOp ot, target_ulong pc,
+                                  bool is_store) {
+    if (!osprey_active()) return;
+    TCGv t_size = tcg_const_tl(1 << ot);
+    TCGv t_pc = tcg_const_tl(pc);
+    TCGv_i32 t_store = tcg_const_i32(is_store ? 1 : 0);
+    gen_helper_osprey_mem_access(cpu_env, addr, t_size, t_pc, t_store);
+    tcg_temp_free(t_size);
+    tcg_temp_free(t_pc);
+    tcg_temp_free_i32(t_store);
+}
+
+/* Aligned native-width spill/reload shadow hooks. */
+static void gen_osprey_on_load(int dst_idx, TCGv t_addr, TCGMemOp ot) {
+    if (!osprey_active()) return;
+    TCGv_i32 t_dst = tcg_const_i32(dst_idx);
+    TCGv t_size = tcg_const_tl(1 << ot);
+    gen_helper_osprey_on_load(cpu_env, t_dst, t_addr, t_size);
+    tcg_temp_free_i32(t_dst);
+    tcg_temp_free(t_size);
+}
+
+static void gen_osprey_on_store(int src_idx, TCGv t_addr, TCGMemOp ot) {
+    if (!osprey_active()) return;
+    TCGv_i32 t_src = tcg_const_i32(src_idx);
+    TCGv t_size = tcg_const_tl(1 << ot);
+    if (src_idx >= 0 && src_idx < CPU_NB_REGS) {
+        gen_helper_osprey_on_store(cpu_env, t_src, t_addr, t_size,
+                                   cpu_regs[src_idx]);
+    } else {
+        /* OR_TMP0 (immediates, string stores): spill nothing; the
+         * helper invalidates the slot.  Pass a zero value. */
+        TCGv t_zero = tcg_const_tl(0);
+        gen_helper_osprey_on_store(cpu_env, t_src, t_addr, t_size,
+                                   t_zero);
+        tcg_temp_free(t_zero);
+    }
+    tcg_temp_free_i32(t_src);
+    tcg_temp_free(t_size);
 }
 
 static void gen_prov_mov_reg(int dst_idx, int src_idx, target_ulong pc) {
@@ -576,6 +684,8 @@ static void gen_op_mov_reg_v(DisasContext *s, TCGMemOp ot, int reg, TCGv t0)
             full_reg = reg - 4;
         }
         gen_prov_invalidate_reg(full_reg, s->pc_start);
+        /* OSPREY origin shadow: same default-kill. */
+        gen_osprey_invalidate_reg(full_reg);
     }
     s->prov_skip_invalidate = false;
 }
@@ -847,19 +957,28 @@ static void gen_check_io(DisasContext *s, TCGMemOp ot, target_ulong cur_eip,
 static inline void gen_movs(DisasContext *s, TCGMemOp ot)
 {
     gen_string_movl_A0_ESI(s);
-    if (s->aflag == MO_64 && s->override < 0)
+    if (s->aflag == MO_64 && s->override < 0) {
         gen_prov_set_ea(R_ESI, -1, 0, 0);
+        gen_osprey_set_ea(R_ESI, -1, 0, 0, cpu_regs[R_ESI], NULL);
+    }
     gen_op_ld_v(s, ot, s->T0, s->A0);
-    if (s->aflag == MO_64 && s->override < 0)
+    if (s->aflag == MO_64 && s->override < 0) {
         gen_prov_check_access(s->A0, ot, s->pc_start);
+        gen_osprey_mem_access(s->A0, ot, s->pc_start, false);
+    }
     gen_string_movl_A0_EDI(s);
-    if (s->aflag == MO_64 && s->override < 0)
+    if (s->aflag == MO_64 && s->override < 0) {
         gen_prov_set_ea(R_EDI, -1, 0, 0);
+        gen_osprey_set_ea(R_EDI, -1, 0, 0, cpu_regs[R_EDI], NULL);
+    }
     gen_op_st_v(s, ot, s->T0, s->A0);
-    /* Provenance: copied value — not known pointer → invalidate. */
+    /* Provenance: copied value — not A pointer → invalidate. */
     gen_prov_on_store(OR_TMP0, s->A0, ot);
-    if (s->aflag == MO_64 && s->override < 0)
+    gen_osprey_on_store(OR_TMP0, s->A0, ot);
+    if (s->aflag == MO_64 && s->override < 0) {
         gen_prov_check_access(s->A0, ot, s->pc_start);
+        gen_osprey_mem_access(s->A0, ot, s->pc_start, true);
+    }
     gen_op_movl_T0_Dshift(s, ot);
     gen_op_add_reg_T0(s, s->aflag, R_ESI);
     gen_op_add_reg_T0(s, s->aflag, R_EDI);
@@ -1289,13 +1408,18 @@ static inline void gen_stos(DisasContext *s, TCGMemOp ot)
 {
     gen_op_mov_v_reg(s, MO_32, s->T0, R_EAX);
     gen_string_movl_A0_EDI(s);
-    if (s->aflag == MO_64 && s->override < 0)
+    if (s->aflag == MO_64 && s->override < 0) {
         gen_prov_set_ea(R_EDI, -1, 0, 0);
+        gen_osprey_set_ea(R_EDI, -1, 0, 0, cpu_regs[R_EDI], NULL);
+    }
     gen_op_st_v(s, ot, s->T0, s->A0);
     /* Provenance: store value not known to be a pointer → invalidate. */
     gen_prov_on_store(OR_TMP0, s->A0, ot);
-    if (s->aflag == MO_64 && s->override < 0)
+    gen_osprey_on_store(OR_TMP0, s->A0, ot);
+    if (s->aflag == MO_64 && s->override < 0) {
         gen_prov_check_access(s->A0, ot, s->pc_start);
+        gen_osprey_mem_access(s->A0, ot, s->pc_start, true);
+    }
     gen_op_movl_T0_Dshift(s, ot);
     gen_op_add_reg_T0(s, s->aflag, R_EDI);
 }
@@ -1303,14 +1427,19 @@ static inline void gen_stos(DisasContext *s, TCGMemOp ot)
 static inline void gen_lods(DisasContext *s, TCGMemOp ot)
 {
     gen_string_movl_A0_ESI(s);
-    if (s->aflag == MO_64 && s->override < 0)
+    if (s->aflag == MO_64 && s->override < 0) {
         gen_prov_set_ea(R_ESI, -1, 0, 0);
+        gen_osprey_set_ea(R_ESI, -1, 0, 0, cpu_regs[R_ESI], NULL);
+    }
     gen_op_ld_v(s, ot, s->T0, s->A0);
     gen_op_mov_reg_v(s, ot, R_EAX, s->T0);
     /* Provenance: restore tag from shadow (value-consistency guarded). */
     gen_prov_on_load(R_EAX, s->A0, ot);
-    if (s->aflag == MO_64 && s->override < 0)
+    gen_osprey_on_load(R_EAX, s->A0, ot);
+    if (s->aflag == MO_64 && s->override < 0) {
         gen_prov_check_access(s->A0, ot, s->pc_start);
+        gen_osprey_mem_access(s->A0, ot, s->pc_start, false);
+    }
     gen_op_movl_T0_Dshift(s, ot);
     gen_op_add_reg_T0(s, s->aflag, R_ESI);
 }
@@ -1318,11 +1447,15 @@ static inline void gen_lods(DisasContext *s, TCGMemOp ot)
 static inline void gen_scas(DisasContext *s, TCGMemOp ot)
 {
     gen_string_movl_A0_EDI(s);
-    if (s->aflag == MO_64 && s->override < 0)
+    if (s->aflag == MO_64 && s->override < 0) {
         gen_prov_set_ea(R_EDI, -1, 0, 0);
+        gen_osprey_set_ea(R_EDI, -1, 0, 0, cpu_regs[R_EDI], NULL);
+    }
     gen_op_ld_v(s, ot, s->T1, s->A0);
-    if (s->aflag == MO_64 && s->override < 0)
+    if (s->aflag == MO_64 && s->override < 0) {
         gen_prov_check_access(s->A0, ot, s->pc_start);
+        gen_osprey_mem_access(s->A0, ot, s->pc_start, false);
+    }
     gen_op(s, OP_CMPL, ot, R_EAX);
     gen_op_movl_T0_Dshift(s, ot);
     gen_op_add_reg_T0(s, s->aflag, R_EDI);
@@ -1331,17 +1464,25 @@ static inline void gen_scas(DisasContext *s, TCGMemOp ot)
 static inline void gen_cmps(DisasContext *s, TCGMemOp ot)
 {
     gen_string_movl_A0_EDI(s);
-    if (s->aflag == MO_64 && s->override < 0)
+    if (s->aflag == MO_64 && s->override < 0) {
         gen_prov_set_ea(R_EDI, -1, 0, 0);
+        gen_osprey_set_ea(R_EDI, -1, 0, 0, cpu_regs[R_EDI], NULL);
+    }
     gen_op_ld_v(s, ot, s->T1, s->A0);
-    if (s->aflag == MO_64 && s->override < 0)
+    if (s->aflag == MO_64 && s->override < 0) {
         gen_prov_check_access(s->A0, ot, s->pc_start);
+        gen_osprey_mem_access(s->A0, ot, s->pc_start, false);
+    }
     gen_string_movl_A0_ESI(s);
-    if (s->aflag == MO_64 && s->override < 0)
+    if (s->aflag == MO_64 && s->override < 0) {
         gen_prov_set_ea(R_ESI, -1, 0, 0);
+        gen_osprey_set_ea(R_ESI, -1, 0, 0, cpu_regs[R_ESI], NULL);
+    }
     gen_op_ld_v(s, ot, s->T0, s->A0);
-    if (s->aflag == MO_64 && s->override < 0)
+    if (s->aflag == MO_64 && s->override < 0) {
         gen_prov_check_access(s->A0, ot, s->pc_start);
+        gen_osprey_mem_access(s->A0, ot, s->pc_start, false);
+    }
     gen_op(s, OP_CMPL, ot, OR_TMP0);
     gen_op_movl_T0_Dshift(s, ot);
     gen_op_add_reg_T0(s, s->aflag, R_ESI);
@@ -2396,15 +2537,19 @@ static void gen_ldst_modrm(CPUX86State *env, DisasContext *s, int modrm,
                 gen_op_mov_v_reg(s, ot, s->T0, reg);
             gen_op_mov_reg_v(s, ot, rm, s->T0);
             /* Sound provenance transfer for full-width reg→reg mov. */
-            if (reg != OR_TMP0 && ot == MO_64)
+            if (reg != OR_TMP0 && ot == MO_64) {
                 gen_prov_mov_reg(rm, reg, s->pc_start);
+                gen_osprey_reg_copy(rm, reg);
+            }
         } else {
             gen_op_mov_v_reg(s, ot, s->T0, rm);
             if (reg != OR_TMP0)
                 gen_op_mov_reg_v(s, ot, reg, s->T0);
             /* Sound provenance transfer for full-width reg→reg mov. */
-            if (reg != OR_TMP0 && ot == MO_64)
+            if (reg != OR_TMP0 && ot == MO_64) {
                 gen_prov_mov_reg(reg, rm, s->pc_start);
+                gen_osprey_reg_copy(reg, rm);
+            }
         }
     } else {
         AddressParts a = gen_lea_modrm_0(env, s, modrm);
@@ -2416,6 +2561,15 @@ static void gen_ldst_modrm(CPUX86State *env, DisasContext *s, int modrm,
          * guest load/store so a faulting access records nothing. */
         if (s->aflag == MO_64 && s->override < 0) {
             gen_prov_set_ea(a.base, a.index, a.scale, a.disp);
+            /* OSPREY: semantic EA decomposition for base-address facts. */
+            if (a.base >= 0) {
+                gen_osprey_set_ea(a.base, a.index, a.scale, a.disp,
+                                  cpu_regs[a.base],
+                                  a.index >= 0 ? cpu_regs[a.index] : NULL);
+            } else if (a.index >= 0) {
+                gen_osprey_set_ea(-1, a.index, a.scale, a.disp, NULL,
+                                  cpu_regs[a.index]);
+            }
         }
         if (is_store) {
             if (reg != OR_TMP0)
@@ -2424,8 +2578,13 @@ static void gen_ldst_modrm(CPUX86State *env, DisasContext *s, int modrm,
             /* Provenance: store source register's tag to memory shadow;
              * OR_TMP0 (immediate) → invalidate. */
             gen_prov_on_store(reg, s->A0, ot);
+            /* OSPREY: spill origin + store fact. */
+            if (reg != OR_TMP0) {
+                gen_osprey_on_store(reg, s->A0, ot);
+            }
             if (s->aflag == MO_64 && s->override < 0) {
                 gen_prov_check_access(s->A0, ot, s->pc_start);
+                gen_osprey_mem_access(s->A0, ot, s->pc_start, true);
             }
         } else {
             gen_op_ld_v(s, ot, s->T0, s->A0);
@@ -2434,8 +2593,13 @@ static void gen_ldst_modrm(CPUX86State *env, DisasContext *s, int modrm,
             /* Provenance: restore tag from memory shadow. */
             if (reg != OR_TMP0)
                 gen_prov_on_load(reg, s->A0, ot);
+            /* OSPREY: reload origin + load fact. */
+            if (reg != OR_TMP0) {
+                gen_osprey_on_load(reg, s->A0, ot);
+            }
             if (s->aflag == MO_64 && s->override < 0) {
                 gen_prov_check_access(s->A0, ot, s->pc_start);
+                gen_osprey_mem_access(s->A0, ot, s->pc_start, false);
             }
         }
     }
@@ -4979,6 +5143,14 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                      * nothing. */
                     if (s->aflag == MO_64 && s->override < 0) {
                         gen_prov_set_ea(a.base, a.index, a.scale, a.disp);
+                        if (a.base >= 0) {
+                            gen_osprey_set_ea(a.base, a.index, a.scale, a.disp,
+                                              cpu_regs[a.base],
+                                              a.index >= 0 ? cpu_regs[a.index] : NULL);
+                        } else if (a.index >= 0) {
+                            gen_osprey_set_ea(-1, a.index, a.scale, a.disp, NULL,
+                                              cpu_regs[a.index]);
+                        }
                     }
                     opreg = OR_TMP0;
                 } else if (op == OP_XORL && rm == reg) {
@@ -5002,6 +5174,7 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                 if (s->aflag == MO_64 && s->override < 0 &&
                     opreg == OR_TMP0) {
                     gen_prov_check_access(s->A0, ot, s->pc_start);
+                    gen_osprey_mem_access(s->A0, ot, s->pc_start, true);
                 }
                 /* reg-reg ADD/SUB provenance propagation (after write-back:
                  * gen_op invalidated dst; recompute delta from result). */
@@ -5024,10 +5197,19 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                      * the load, check after it. */
                     if (s->aflag == MO_64 && s->override < 0) {
                         gen_prov_set_ea(a.base, a.index, a.scale, a.disp);
+                        if (a.base >= 0) {
+                            gen_osprey_set_ea(a.base, a.index, a.scale, a.disp,
+                                              cpu_regs[a.base],
+                                              a.index >= 0 ? cpu_regs[a.index] : NULL);
+                        } else if (a.index >= 0) {
+                            gen_osprey_set_ea(-1, a.index, a.scale, a.disp, NULL,
+                                              cpu_regs[a.index]);
+                        }
                     }
                     gen_op_ld_v(s, ot, s->T1, s->A0);
                     if (s->aflag == MO_64 && s->override < 0) {
                         gen_prov_check_access(s->A0, ot, s->pc_start);
+                        gen_osprey_mem_access(s->A0, ot, s->pc_start, false);
                     }
                 } else if (op == OP_XORL && rm == reg) {
                     goto xor_zero;
@@ -5103,6 +5285,14 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                  * the memory op (load+store inside gen_op), check after. */
                 if (s->aflag == MO_64 && s->override < 0) {
                     gen_prov_set_ea(a.base, a.index, a.scale, a.disp);
+                    if (a.base >= 0) {
+                        gen_osprey_set_ea(a.base, a.index, a.scale, a.disp,
+                                          cpu_regs[a.base],
+                                          a.index >= 0 ? cpu_regs[a.index] : NULL);
+                    } else if (a.index >= 0) {
+                        gen_osprey_set_ea(-1, a.index, a.scale, a.disp, NULL,
+                                          cpu_regs[a.index]);
+                    }
                 }
                 opreg = OR_TMP0;
             } else {
@@ -5137,6 +5327,7 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
             if (s->aflag == MO_64 && s->override < 0 &&
                 opreg == OR_TMP0) {
                 gen_prov_check_access(s->A0, ot, s->pc_start);
+                gen_osprey_mem_access(s->A0, ot, s->pc_start, true);
             }
             /* Provenance: add/sub reg, imm preserves tag (offset += val).
              * OP_ADDL (op==0) and OP_SUBL (op==5) are pointer-preserving. */
@@ -5473,6 +5664,14 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
             tcg_temp_free(t_call_pc);
 #endif
 #endif
+
+            /* OSPREY: indirect call frame with the runtime target. */
+            if (osprey_active()) {
+                TCGv t_call_pc = tcg_const_tl(pc_start - s->cs_base);
+                gen_helper_osprey_call(t_call_pc, s->T1, s->T0,
+                                       cpu_regs[R_ESP]);
+                tcg_temp_free(t_call_pc);
+            }
 
             gen_push_v(s, s->T1);
             gen_op_jmp_v(s->T0);
@@ -5842,6 +6041,11 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
          * mode); passing s->dflag (MO_32) would make the helper see a
          * non-full-width store and invalidate the slot instead. */
         gen_prov_on_store((b & 7) | REX_B(s), s->A0, mo_pushpop(s, s->dflag));
+        /* OSPREY: push spills the register origin. */
+        if (osprey_active()) {
+            gen_osprey_on_store((b & 7) | REX_B(s), s->A0,
+                                mo_pushpop(s, s->dflag));
+        }
         break;
     case 0x58 ... 0x5f: /* pop */
         ot = gen_pop_T0(s);
@@ -5850,6 +6054,10 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
         gen_op_mov_reg_v(s, ot, (b & 7) | REX_B(s), s->T0);
         /* Provenance: pop restores tag from stack shadow. */
         gen_prov_on_load((b & 7) | REX_B(s), s->A0, ot);
+        /* OSPREY: pop reloads the origin from the stack shadow. */
+        if (osprey_active()) {
+            gen_osprey_on_load((b & 7) | REX_B(s), s->A0, ot);
+        }
         break;
     case 0x60: /* pusha */
         if (CODE64(s))
@@ -5969,6 +6177,14 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
              * store, check after it. */
             if (s->aflag == MO_64 && s->override < 0) {
                 gen_prov_set_ea(a.base, a.index, a.scale, a.disp);
+                if (a.base >= 0) {
+                    gen_osprey_set_ea(a.base, a.index, a.scale, a.disp,
+                                      cpu_regs[a.base],
+                                      a.index >= 0 ? cpu_regs[a.index] : NULL);
+                } else if (a.index >= 0) {
+                    gen_osprey_set_ea(-1, a.index, a.scale, a.disp, NULL,
+                                      cpu_regs[a.index]);
+                }
             }
         }
         val = insn_get(env, s, ot);
@@ -5979,6 +6195,7 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
             gen_prov_on_store(OR_TMP0, s->A0, ot);
             if (s->aflag == MO_64 && s->override < 0) {
                 gen_prov_check_access(s->A0, ot, s->pc_start);
+                gen_osprey_mem_access(s->A0, ot, s->pc_start, true);
             }
         } else {
             gen_op_mov_reg_v(s, ot, (modrm & 7) | REX_B(s), s->T0);
@@ -5993,8 +6210,10 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
         gen_ldst_modrm(env, s, modrm, ot, OR_TMP0, 0);
         gen_op_mov_reg_v(s, ot, reg, s->T0);
         /* Provenance: restore tag from memory shadow (spill reload). */
-        if ((modrm >> 6) != 3)
+        if ((modrm >> 6) != 3) {
             gen_prov_on_load(reg, s->A0, ot);
+            gen_osprey_on_load(reg, s->A0, ot);
+        }
         break;
     case 0x8e: /* mov seg, Gv */
         modrm = x86_ldub_code(env, s);
@@ -6075,11 +6294,21 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                  * the load, check after it. */
                 if (s->aflag == MO_64 && s->override < 0) {
                     gen_prov_set_ea(a.base, a.index, a.scale, a.disp);
+                    if (a.base >= 0) {
+                        gen_osprey_set_ea(a.base, a.index, a.scale, a.disp,
+                                          cpu_regs[a.base],
+                                          a.index >= 0 ? cpu_regs[a.index] : NULL);
+                    } else if (a.index >= 0) {
+                        gen_osprey_set_ea(-1, a.index, a.scale, a.disp, NULL,
+                                          cpu_regs[a.index]);
+                    }
                 }
                 gen_op_ld_v(s, s_ot, s->T0, s->A0);
                 gen_op_mov_reg_v(s, d_ot, reg, s->T0);
+                gen_osprey_on_load(reg, s->A0, s_ot);
                 if (s->aflag == MO_64 && s->override < 0) {
                     gen_prov_check_access(s->A0, s_ot, s->pc_start);
+                    gen_osprey_mem_access(s->A0, s_ot, s->pc_start, false);
                 }
             }
         }
@@ -6118,14 +6347,22 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                 a.base >= 0) {
                 if (a.index < 0) {
                     gen_prov_lea_imm(reg, a.base, a.disp, s->pc_start);
-                } else {
-                    gen_prov_lea_dyn(reg, a.base, s->pc_start,
-                                     prov_pre_base);
-                    tcg_temp_free(prov_pre_base);
-                }
+                                 } else {
+                     gen_prov_lea_dyn(reg, a.base, s->pc_start,
+                                      prov_pre_base);
+                     tcg_temp_free(prov_pre_base);
+                 }
+             }
+            /* OSPREY: lea propagates the ADDRESS origin with the checked
+             * constant offset.  Only the [base + disp] form is a sound
+             * constant-offset transfer; indexed forms invalidate (the
+             * runtime delta is not a compile-time offset). */
+            if (osprey_active() && dflag == MO_64 && a.base >= 0 &&
+                a.index < 0) {
+                gen_osprey_reg_lea(reg, a.base, a.disp);
             }
-        }
-        break;
+         }
+         break;
 
     case 0xa0: /* mov EAX, Ov */
     case 0xa1:
@@ -7040,6 +7277,11 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
 #endif
 #endif
 
+        /* OSPREY: return pops the current frame. */
+        if (osprey_active()) {
+            gen_helper_osprey_ret(s->T0, cpu_regs[R_ESP]);
+        }
+
         /* Note that gen_pop_T0 uses a zero-extending load.  */
         gen_op_jmp_v(s->T0);
         gen_bnd_jmp(s);
@@ -7054,6 +7296,11 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
         gen_helper_instrument_ret(s->T0, cpu_regs[R_ESP]);
 #endif
 #endif
+
+        /* OSPREY: return pops the current frame. */
+        if (osprey_active()) {
+            gen_helper_osprey_ret(s->T0, cpu_regs[R_ESP]);
+        }
 
         /* Note that gen_pop_T0 uses a zero-extending load.  */
         gen_op_jmp_v(s->T0);
@@ -7131,6 +7378,16 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
 #endif
 #endif
 
+            /* OSPREY: direct call with the static callee target. */
+            if (osprey_active()) {
+                TCGv t_call_pc = tcg_const_tl(pc_start - s->cs_base);
+                TCGv t_callee = tcg_const_tl(tval);
+                gen_helper_osprey_call(t_call_pc, s->T0, t_callee,
+                                       cpu_regs[R_ESP]);
+                tcg_temp_free(t_call_pc);
+                tcg_temp_free(t_callee);
+            }
+
             gen_push_v(s, s->T0);
             gen_bnd_jmp(s);
             gen_jmp(s, tval);
@@ -7188,6 +7445,23 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
         }
 #endif
 #endif
+        /* OSPREY: E9-relocated call — the callee target is the jump
+         * destination (tval); the frame is precise (same identity as the
+         * original direct call). */
+        if (osprey_active() && is_e9_relocated_call(pc_start - s->cs_base,
+                                                    NULL, NULL)) {
+            TCGv t_call_pc = tcg_const_tl(pc_start - s->cs_base);
+            TCGv t_ret_pc = tcg_const_tl(s->pc - s->cs_base);
+            TCGv t_callee = tcg_const_tl(tval);
+            TCGv t_sp = tcg_temp_new();
+            tcg_gen_mov_tl(t_sp, cpu_regs[R_ESP]);
+            tcg_gen_addi_tl(t_sp, t_sp, 8);
+            gen_helper_osprey_call(t_call_pc, t_ret_pc, t_callee, t_sp);
+            tcg_temp_free(t_call_pc);
+            tcg_temp_free(t_ret_pc);
+            tcg_temp_free(t_callee);
+            tcg_temp_free(t_sp);
+        }
         gen_bnd_jmp(s);
         gen_jmp(s, tval);
         break;

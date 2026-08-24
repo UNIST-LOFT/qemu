@@ -24,6 +24,7 @@
 
 #include "../tcg/symbolic/symbolic-instrumentation.h"
 #include "snapshot.h"
+#include "osprey.h"
 
 /* from personality.h */
 
@@ -2438,6 +2439,7 @@ static void load_elf_image(const char *image_name, int image_fd,
                         symbolic_start_code = vaddr;
                         load_image(basename(image_name), symbolic_start_code);
                     }
+                    osprey_set_image_base(symbolic_start_code);
 #endif
                 }
                 if (vaddr_ef > info->end_code) {
@@ -2867,12 +2869,16 @@ int load_elf_binary(struct linux_binprm *bprm, struct image_info *info)
                                   info->end_data - info->start_data,
                                   info->entry,
                                   ".data");
+        osprey_register_image_global(NULL, info->start_data,
+                                     info->end_data - info->start_data);
     }
     if (info->brk > info->end_data) {
         snapshot_trace_global_add(info->end_data,
                                   info->brk - info->end_data,
                                   info->entry,
                                   ".bss");
+        osprey_register_image_global(NULL, info->end_data,
+                                     info->brk - info->end_data);
     }
     if (interp_info.end_data > interp_info.start_data) {
         snapshot_trace_global_add(interp_info.start_data,
