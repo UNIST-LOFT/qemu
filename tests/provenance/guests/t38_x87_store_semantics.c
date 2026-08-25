@@ -19,6 +19,12 @@ static int any_nonzero(const unsigned char *p, unsigned long n) {
     return 0;
 }
 
+static unsigned x87_top(void) {
+    uint16_t status;
+    __asm__ volatile("fnstsw %0" : "=am"(status));
+    return (status >> 11) & 7;
+}
+
 int main(void) {
     struct env_image env = {{0}};
     struct save_image save = {{0}};
@@ -26,18 +32,22 @@ int main(void) {
     unsigned char bcd[10] = {0};
     double value = 12345.0;
 
-    __asm__ volatile("fld1; fnstenv %0" : "=m"(env) : : "memory");
+    __asm__ volatile("fninit; fld1; fnstenv %0" : "=m"(env) : : "memory");
     if (!any_nonzero(env.bytes, 28)) return 31;
 
-    __asm__ volatile("fld1; fstpt %0" : "=m"(*(long double *)ext) : : "memory");
+    __asm__ volatile("fninit; fld1; fstpt %0"
+                     : "=m"(*(long double *)ext) : : "memory");
     if (!any_nonzero(ext, 10)) return 32;
+    if (x87_top() != 0) return 37;
 
-    __asm__ volatile("fld1; fnsave %0" : "=m"(save) : : "memory");
+    __asm__ volatile("fninit; fld1; fnsave %0" : "=m"(save) : : "memory");
     if (!any_nonzero(save.bytes, 108)) return 33;
-    __asm__ volatile("fninit" : : : "memory");
+    if (x87_top() != 0) return 38;
 
-    __asm__ volatile("fldl %1; fbstp %0" : "=m"(bcd) : "m"(value) : "memory");
+    __asm__ volatile("fninit; fldl %1; fbstp %0"
+                     : "=m"(bcd) : "m"(value) : "memory");
     if (bcd[0] != 0x45 || bcd[1] != 0x23 || bcd[2] != 0x01) return 34;
+    if (x87_top() != 0) return 39;
 
     char *p = malloc(16);
     if (!p) return 35;
@@ -49,9 +59,10 @@ int main(void) {
     input.bytes[8] = 0;
     input.bytes[9] = 0;
     free(p);
-    __asm__ volatile("fldt %1; fstpt %0"
+    __asm__ volatile("fninit; fldt %1; fstpt %0"
                      : "=m"(output.value) : "m"(input.value) : "memory");
     if ((uintptr_t)output.pointer != expected) return 36;
+    if (x87_top() != 0) return 40;
     volatile char probe = ((char *)output.pointer)[0];
     (void)probe;
     return 0;

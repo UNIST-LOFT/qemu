@@ -6819,15 +6819,18 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                                     s->mem_index, MO_LEUW);
                 gen_helper_fldcw(cpu_env, s->tmp2_i32);
                 break;
+            case 0x0e: /* fnstenv m14/28 */
+                gen_helper_fstenv(cpu_env, s->A0, tcg_const_i32(dflag - 1));
                 /* Provenance: helper writes 14/28 bytes; invalidate. */
                 gen_prov_on_store(OR_TMP0, s->A0, MO_64);
                 tcg_gen_addi_tl(s->tmp0, s->A0, 8);
                 gen_prov_on_store(OR_TMP0, s->tmp0, MO_64);
-                tcg_gen_addi_tl(s->tmp0, s->A0, 16);
-                gen_prov_on_store(OR_TMP0, s->tmp0, MO_64);
-                tcg_gen_addi_tl(s->tmp0, s->A0, 24);
-                gen_prov_on_store(OR_TMP0, s->tmp0, MO_32);
-                break;
+                if (dflag != MO_16) {
+                    tcg_gen_addi_tl(s->tmp0, s->A0, 16);
+                    gen_prov_on_store(OR_TMP0, s->tmp0, MO_64);
+                    tcg_gen_addi_tl(s->tmp0, s->A0, 24);
+                    gen_prov_on_store(OR_TMP0, s->tmp0, MO_32);
+                }
                 break;
             case 0x0f: /* fnstcw mem */
                 gen_helper_fnstcw(s->tmp2_i32, cpu_env);
@@ -6839,17 +6842,21 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
             case 0x1d: /* fldt mem */
                 gen_helper_fldt_ST0(cpu_env, s->A0);
                 break;
+            case 0x1f: /* fstpt m80 */
+                gen_helper_fstt_ST0(cpu_env, s->A0);
                 /* Provenance: helper writes 10 bytes; invalidate. */
                 gen_prov_on_store(OR_TMP0, s->A0, MO_64);
                 tcg_gen_addi_tl(s->tmp0, s->A0, 8);
                 gen_prov_on_store(OR_TMP0, s->tmp0, MO_16);
-                break;
+                gen_helper_fpop(cpu_env);
                 break;
             case 0x2c: /* frstor mem */
                 gen_helper_frstor(cpu_env, s->A0, tcg_const_i32(dflag - 1));
                 break;
+            case 0x2e: /* fnsave m94/108 */
+                gen_helper_fsave(cpu_env, s->A0, tcg_const_i32(dflag - 1));
                 /* Provenance: helper writes env (14/28) + 8x10 ST bytes;
-                 * invalidate the full 108-byte range. */
+                 * invalidate exactly the overlapping pointer-shadow slots. */
                 gen_prov_on_store(OR_TMP0, s->A0, MO_64);
                 tcg_gen_addi_tl(s->tmp0, s->A0, 8);
                 gen_prov_on_store(OR_TMP0, s->tmp0, MO_64);
@@ -6873,34 +6880,36 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                 gen_prov_on_store(OR_TMP0, s->tmp0, MO_64);
                 tcg_gen_addi_tl(s->tmp0, s->A0, 88);
                 gen_prov_on_store(OR_TMP0, s->tmp0, MO_64);
-                tcg_gen_addi_tl(s->tmp0, s->A0, 96);
-                gen_prov_on_store(OR_TMP0, s->tmp0, MO_64);
-                tcg_gen_addi_tl(s->tmp0, s->A0, 104);
-                gen_prov_on_store(OR_TMP0, s->tmp0, MO_32);
+                if (dflag != MO_16) {
+                    tcg_gen_addi_tl(s->tmp0, s->A0, 96);
+                    gen_prov_on_store(OR_TMP0, s->tmp0, MO_64);
+                    tcg_gen_addi_tl(s->tmp0, s->A0, 104);
+                    gen_prov_on_store(OR_TMP0, s->tmp0, MO_32);
+                }
                 break;
-                break;
-            case 0x2f: /* fnstsw mem */
+            case 0x2f: /* fnstsw m */
                 gen_helper_fnstsw(s->tmp2_i32, cpu_env);
                 tcg_gen_qemu_st_i32(s->tmp2_i32, s->A0,
                                     s->mem_index, MO_LEUW);
                 /* Provenance: FPU status-word store — invalidate. */
                 gen_prov_on_store(OR_TMP0, s->A0, MO_16);
                 break;
-            case 0x3c: /* fbld */
+            case 0x3c: /* fbld m80 */
                 gen_helper_fbld_ST0(cpu_env, s->A0);
                 break;
+            case 0x3e: /* fbstp m80 */
+                gen_helper_fbst_ST0(cpu_env, s->A0);
                 /* Provenance: helper writes 10 bytes; invalidate. */
                 gen_prov_on_store(OR_TMP0, s->A0, MO_64);
                 tcg_gen_addi_tl(s->tmp0, s->A0, 8);
                 gen_prov_on_store(OR_TMP0, s->tmp0, MO_16);
+                gen_helper_fpop(cpu_env);
                 break;
-                break;
-            case 0x3d: /* fildll */
+            case 0x3d: /* fildll m64 */
                 tcg_gen_qemu_ld_i64(s->tmp1_i64, s->A0, s->mem_index, MO_LEQ);
                 gen_helper_fildll_ST0(cpu_env, s->tmp1_i64);
                 break;
-            case 0x3f: /* fistpll */
-                /* Provenance: FPU store — invalidate shadow. */
+            case 0x3f: /* fistpll m64 */
                 gen_helper_fistll_ST0(s->tmp1_i64, cpu_env);
                 tcg_gen_qemu_st_i64(s->tmp1_i64, s->A0, s->mem_index, MO_LEQ);
                 /* Provenance: FPU store — invalidate shadow. */
