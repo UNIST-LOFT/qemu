@@ -847,6 +847,22 @@ static void snapshot_exit_info_capture(SnapshotExitInfo *info, CPUArchState *env
     info->next_query = next_query;
 }
 
+static int64_t snapshot_query_cursor_index(const SnapshotExitInfo *info) {
+    return info != NULL && info->next_query != NULL && query_queue != NULL
+        ? (int64_t)(info->next_query - query_queue) : -1;
+}
+
+static int64_t snapshot_expr_cursor_index(const SnapshotExitInfo *info) {
+    return info != NULL && info->next_free_expr != NULL && pool != NULL
+        ? (int64_t)(info->next_free_expr - pool) : -1;
+}
+
+static void snapshot_log_cursor_indices(const SnapshotExitInfo *info) {
+    log_msg("[snapshot] [cursors] [query_cursor %ld] [expr_cursor %ld]\n",
+            snapshot_query_cursor_index(info),
+            snapshot_expr_cursor_index(info));
+}
+
 static void snapshot_exit_info_set_reason(SnapshotExitInfo *info, const char *reason) {
     if (!info) return;
     if (!reason) {
@@ -887,30 +903,34 @@ void snapshot_record_guest_normal_exit(CPUArchState *cpu_env, int exit_code, con
     /* Deferred provenance finding: finalize as a synthetic crash unless a
      * real crash already won the exit-info slot (deterministic precedence,
      * FIX_TRACER.md §8 / test 21). */
-    if (provenance_finalize_fault(cpu_env)) {
-        PendingProvenanceFault *fault = provenance_get_pending_fault();
-        const char *pf_reason = provenance_fault_reason();
-        /* Emit the structured finding exactly once, even when a real
-         * crash already won the exit-info slot: §8 requires preserving
-         * BOTH records (the pending provenance event and the real
-         * signal), with the real crash selecting the verdict. */
-        provenance_report_pending_finding();
+	if (provenance_finalize_fault(cpu_env)) {
+		ProvPublishedFinding fault;
+		if (!provenance_snapshot_pending_finding(&fault)) {
+			/* Finding disappeared between finalize and snapshot. */
+			return;
+		}
+		const char *pf_reason = provenance_fault_reason();
+		/* Emit the structured finding exactly once, even when a real
+		 * crash already won the exit-info slot: §8 requires preserving
+		 * BOTH records (the pending provenance event and the real
+		 * signal), with the real crash selecting the verdict. */
+		provenance_report_pending_finding();
 
-        SnapshotExitInfo *info = snapshot_exit_info_ptr();
-        if (info->valid && info->crashed) {
-            /* Real crash already recorded — keep it (real crash wins the
-             * verdict; the finding was preserved above). */
-            return;
-        }
-        snapshot_record_guest_crash(cpu_env, TARGET_SIGSEGV, 0,
-                                    SEGV_ACCERR, fault->access_pc, 0,
-                                    pf_reason);
-        /* Crash record stores fault_addr = guest_pc (code address).
-         * Re-expose the provenance access PC for diagnostics. */
-        info = snapshot_exit_info_ptr();
-        info->fault_addr = fault->access_pc;
-        return;
-    }
+		SnapshotExitInfo *info = snapshot_exit_info_ptr();
+		if (info->valid && info->crashed) {
+			/* Real crash already recorded — the earlier record wins the
+			 * verdict; the finding was preserved above. */
+			return;
+		}
+		snapshot_record_guest_crash(cpu_env, TARGET_SIGSEGV, 0,
+		                            SEGV_ACCERR, fault.payload.access_pc, 0,
+		                            pf_reason);
+		/* Crash record stores fault_addr = guest_pc (code address).
+		 * Re-expose the provenance access PC for diagnostics. */
+		info = snapshot_exit_info_ptr();
+		info->fault_addr = fault.payload.access_pc;
+		return;
+	}
 
     SnapshotExitInfo *info = snapshot_exit_info_ptr();
     if (!snapshot_exit_info_should_update(info, false)) return;
@@ -919,8 +939,9 @@ void snapshot_record_guest_normal_exit(CPUArchState *cpu_env, int exit_code, con
     info->exit_code = exit_code;
     snapshot_exit_info_capture(info, cpu_env);
     snapshot_exit_info_set_reason(info, reason ? reason : "normal_exit");
-    log_msg("[snapshot] [exit] [normal] [entrypoint-hit %lu]\n",
-              binradar_entrypoint_hit_count);
+	log_msg("[snapshot] [exit] [normal] [entrypoint-hit %lu]\n",
+	        binradar_entrypoint_hit_count);
+	snapshot_log_cursor_indices(info);
     if (binradar_manager) {
         int patch_id = binradar_manager_cur_patch_id(binradar_manager, -1);
         int iter = binradar_manager_cur_iter(binradar_manager, -1);
@@ -956,10 +977,11 @@ void snapshot_record_guest_crash(CPUArchState *cpu_env, int target_signal, int h
         g_snprintf(buffer, sizeof(buffer), "%s (host=%d, target=%d)", base, host_signal, target_signal);
     }
     snapshot_exit_info_set_reason(info, buffer);
-    log_msg("[snapshot] [exit] [crash] [entrypoint-hit %lu]\n",
-              binradar_entrypoint_hit_count);
-    log_msg("[snapshot] [crash] [hit-count %lu] [reason %s] [guest_pc %lx] [guest_cs_base %lx] [fault_addr %lx] [host_fault_addr %lx]\n",
-                binradar_entrypoint_hit_count, buffer, info->guest_pc, info->guest_cs_base, info->fault_addr, info->host_fault_addr);
+	log_msg("[snapshot] [exit] [crash] [entrypoint-hit %lu]\n",
+	        binradar_entrypoint_hit_count);
+	snapshot_log_cursor_indices(info);
+	log_msg("[snapshot] [crash] [hit-count %lu] [reason %s] [guest_pc %lx] [guest_cs_base %lx] [fault_addr %lx] [host_fault_addr %lx]\n",
+	            binradar_entrypoint_hit_count, buffer, info->guest_pc, info->guest_cs_base, info->fault_addr, info->host_fault_addr);
     if (binradar_manager) {
         int patch_id = binradar_manager_cur_patch_id(binradar_manager, -1);
         int iter = binradar_manager_cur_iter(binradar_manager, -1);
@@ -3085,8 +3107,13 @@ static int64_t forkserver_child_timeout_ms(void) {
  * in shared memory.  Returns true if a finding was reported. */
 static bool report_shared_prov_finding(uint32_t *status_out) {
     if (shared_trace_data == NULL) return false;
-    PendingProvenanceFault *fault = &shared_trace_data->prov_pending_fault;
-    if (!fault->detected) return false;
+    /* Acquire-load the shared publication state and copy the whole
+     * record once, so a promotion cannot be observed half-written. */
+    ProvPublishedFinding fault;
+    if (!provenance_snapshot_pending_finding(&fault)) {
+        return false;
+    }
+    ProvFindingRecord *f = &fault.payload;
     /* Emit the structured finding exactly once (dual-record policy). */
     provenance_report_pending_finding();
     /* Synthetic crash verdict (SIGSEGV) so the outer harness sees a crash
@@ -3096,9 +3123,9 @@ static bool report_shared_prov_finding(uint32_t *status_out) {
     }
     /* Publish the exit record with the child's final solver cursors
      * (shared pools are attached at the same addresses before fork, so
-     * the child's cursor values are valid in the parent).  The child was
+     * the child's cursor indices are valid in the parent).  The child was
      * killed before guest-exit finalization, so this is the only exit
-     * publication for the timeout path (§P1). */
+     * publication for the timeout path. */
     SnapshotExitInfo *info = snapshot_exit_info_ptr();
     if (info != NULL && !info->valid) {
         memset(info, 0, sizeof(*info));
@@ -3108,19 +3135,22 @@ static bool report_shared_prov_finding(uint32_t *status_out) {
         info->host_signal = 0;
         info->si_code = SEGV_ACCERR;
         info->exit_code = 139;
-        info->guest_pc = fault->access_pc;
+        info->guest_pc = f->access_pc;
         info->guest_cs_base = 0;
-        info->fault_addr = fault->access_pc;
+        info->fault_addr = f->access_pc;
         info->host_fault_addr = 0;
         info->guest_last_translation_block = last_translation_block;
-        info->next_query = (Query *)fault->next_query;
-        info->next_free_expr = (Expr *)fault->next_free_expr;
+        info->next_query = (fault.finding_query_idx >= 0 && query_queue)
+            ? query_queue + fault.finding_query_idx : next_query;
+        info->next_free_expr = (fault.finding_expr_idx >= 0 && pool)
+            ? pool + fault.finding_expr_idx : next_free_expr;
         const char *pf_reason = provenance_fault_reason();
         g_strlcpy(info->description,
                   pf_reason ? pf_reason : "memcheck: provenance finding",
                   SNAPSHOT_EXIT_DESC_LEN);
         log_msg("[snapshot] [exit] [crash] [entrypoint-hit %lu]\n",
                 binradar_entrypoint_hit_count);
+        snapshot_log_cursor_indices(info);
         log_msg("[snapshot] [crash] [hit-count %lu] [reason %s] [guest_pc %lx] [guest_cs_base %lx] [fault_addr %lx] [host_fault_addr %lx]\n",
                 binradar_entrypoint_hit_count,
                 info->description, info->guest_pc, info->guest_cs_base,

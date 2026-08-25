@@ -130,10 +130,8 @@ typedef enum {
     PROV_FINDING_TAGGED,       /* authoritative tagged identity */
 } ProvFindingQuality;
 
-/* Pending provenance fault (non-fatal, deferred crash). */
+/* Finding payload published across the forkserver child/parent boundary. */
 typedef struct {
-    bool            detected;
-    bool            reported;   /* structured finding line already emitted */
     ProvFindingQuality quality;
     target_ulong    access_pc;
     target_ulong    access_addr;
@@ -149,11 +147,28 @@ typedef struct {
     target_ulong    ea_base_reg_val;
     int             ea_base_reg;       /* -1 if unknown */
     bool            is_uaf;
-    /* Final solver cursors at finding time (child side, valid in the
-     * parent after fork because the pools are attached before fork at the
-     * same addresses).  Published by the timeout path (§P1). */
-    uintptr_t       next_query;
-    uintptr_t       next_free_expr;
+} ProvFindingRecord;
+
+/* One immutable publication slot.  The writer fills the cursors and payload,
+ * then release-publishes ready.  A ready slot is never overwritten. */
+typedef struct {
+    int32_t           ready;
+    int64_t           finding_query_idx; /* first unfilled query index */
+    int64_t           finding_expr_idx;  /* first free expression index */
+    ProvFindingRecord payload;
+} ProvPublishedFinding;
+
+/* Pending provenance fault (non-fatal, deferred crash).
+ *
+ * Separate immutable slots make fallback-to-tagged promotion safe when the
+ * timeout parent kills the child between ordinary payload stores and the
+ * release publication.  Readers prefer a ready tagged slot; otherwise they
+ * consume the previously committed fallback.  They can therefore never see
+ * a half-overwritten promotion. */
+typedef struct {
+    bool                 reported; /* finding line already emitted */
+    ProvPublishedFinding fallback;
+    ProvPublishedFinding tagged;
 } PendingProvenanceFault;
 
 /* ---- Initialization ---- */
@@ -234,7 +249,10 @@ void provenance_model_check_access(CPUArchState *env, target_ulong addr,
 /* Point the per-run pending fault at the shared-memory slot (called from
  * snapshot_init after the shared mmap exists). */
 void provenance_set_shared_fault_ptr(PendingProvenanceFault *ptr);
-PendingProvenanceFault *provenance_get_pending_fault(void);
+/* Snapshot the preferred committed finding into `out`; acquire semantics.
+ * A ready tagged publication wins over the committed fallback. */
+bool provenance_snapshot_pending_finding(ProvPublishedFinding *out);
+/* Reset the per-run pending fault (child side, before each iteration). */
 void provenance_clear_pending_fault(void);
 /* Returns true if a pending provenance fault should be exposed as a crash. */
 bool provenance_finalize_fault(CPUArchState *env);

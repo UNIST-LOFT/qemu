@@ -10,8 +10,9 @@
 #include "cpu.h"
 #include "snapshot.h"
 #include "provenance.h"
-#include "tcg/symbolic/symbolic-instrumentation.h"
+#include "tcg/symbolic/symbolic-struct.h"
 #include "exec/helper-head.h"
+#include "qemu/atomic.h"
 /* Declare helper prototypes for the DEF_HELPER-declared provenance
  * helpers in target/i386/helper.h.  We can't include exec/helper-proto.h
  * here because it pulls in target-specific helper.h.  Instead, declare
@@ -59,11 +60,14 @@ typedef struct {
 static GHashTable *prov_object_table = NULL;   /* ObjKey → ProvenanceObject* */
 static GHashTable *prov_live_by_base = NULL;   /* base → ObjKey* (LIVE only) */
 
-/* Solver pool cursors (shared/fork-inherited): captured at finding time
- * so the timeout path can publish final query/expr cursors.  The opaque
- * typedefs come from snapshot.h. */
+/* Solver pool cursors (shared/fork-inherited): captured as stable indices at
+ * finding time so the timeout path can reconstruct the finding boundary.
+ * Declarations come from symbolic-struct.h (included above); the code range
+ * comes from symbolic-instrumentation.h. */
 extern Query *next_query;
-extern Expr *next_free_expr;
+extern Query *query_queue;
+extern uint64_t symbolic_start_code;
+extern uint64_t symbolic_end_code;
 
 /* Per-run pending fault.  Stored inside SharedTraceData (the shared mmap)
  * so the parent can read it after waitpid even when the child was killed
@@ -549,35 +553,36 @@ void provenance_mem_invalidate(target_ulong addr, target_ulong size) {
 
 /* ---- Access checking ---- */
 
-/* Single publication point for pending findings.  The first tagged finding
- * is sticky.  A tagged finding may replace an UNKNOWN exact-bounds fallback
- * only when the access PC/address/width match (same instruction/access); an
- * unrelated later tagged finding must not displace an earlier fallback.
- * UNKNOWN never replaces tagged. */
-static bool prov_fault_publish(PendingProvenanceFault *pf,
-                               ProvFindingQuality quality,
-                               target_ulong pc, target_ulong addr,
-                               uint32_t size) {
-    if (!pf) {
-        return false;
+/* Publication policy.  A tagged finding is sticky.  It may promote a
+ * committed UNKNOWN fallback only for the same PC/address/width.  The two
+ * immutable slots ensure a timeout SIGKILL during promotion leaves the
+ * fallback intact and readable. */
+static ProvPublishedFinding *prov_fault_slot_for_publish(
+        PendingProvenanceFault *pf, ProvFindingQuality quality,
+        target_ulong pc, target_ulong addr, uint32_t size) {
+    if (pf == NULL || atomic_load_acquire(&pf->tagged.ready) != 0) {
+        return NULL;
     }
-    if (!pf->detected) {
-        return true;
+
+    bool fallback_ready =
+        atomic_load_acquire(&pf->fallback.ready) != 0;
+    if (!fallback_ready) {
+        return quality == PROV_FINDING_TAGGED
+            ? &pf->tagged : &pf->fallback;
     }
-    /* Already published: only a tagged finding may promote an UNKNOWN
-     * exact-bounds fallback, and only for the same access (instruction
-     * PC/address/width).  Tagged findings are sticky; UNKNOWN never
-     * replaces tagged. */
-    return quality == PROV_FINDING_TAGGED &&
-           pf->quality == PROV_FINDING_FALLBACK &&
-           pf->access_pc == pc &&
-           pf->access_addr == addr &&
-           pf->access_width == size;
+    if (quality != PROV_FINDING_TAGGED) {
+        return NULL;
+    }
+
+    const ProvFindingRecord *fallback = &pf->fallback.payload;
+    return fallback->access_pc == pc &&
+           fallback->access_addr == addr &&
+           fallback->access_width == size
+        ? &pf->tagged : NULL;
 }
 
-/* Fill the common fields of a pending provenance fault.  Captures the
- * last writer PC of the EA base register (shadow last_writer_pc) for
- * observability; 0 when the register is unknown. */
+/* Fill one immutable publication slot.  Captures the last writer PC of the
+ * tracked base register for observability; 0 when the register is unknown. */
 static void prov_fault_fill(PendingProvenanceFault *pf, CPUArchState *env,
                             target_ulong pc, target_ulong addr, uint32_t size,
                             uint64_t obj_id, uint32_t gen,
@@ -586,31 +591,46 @@ static void prov_fault_fill(PendingProvenanceFault *pf, CPUArchState *env,
                             PtrProducerKind producer_kind, int ea_base_reg,
                             target_ulong ea_base_reg_val, bool is_uaf,
                             ProvFindingQuality quality) {
-    if (!prov_fault_publish(pf, quality, pc, addr, size)) {
+    ProvPublishedFinding *slot = prov_fault_slot_for_publish(
+        pf, quality, pc, addr, size);
+    if (slot == NULL) {
         return;
     }
-    pf->detected = true;
-    pf->quality = quality;
-    pf->is_uaf = is_uaf;
-    pf->access_pc = pc;
-    pf->access_addr = addr;
-    pf->access_width = size;
-    pf->object_id = obj_id;
-    pf->generation = gen;
-    pf->object_base = obj_base;
-    pf->requested_size = obj_size;
-    pf->tracked_offset = offset;
-    pf->producer_pc = producer_pc;
-    pf->producer_kind = producer_kind;
-    pf->ea_base_reg = ea_base_reg;
-    pf->ea_base_reg_val = ea_base_reg_val;
-    pf->last_writer_pc = (ea_base_reg >= 0 && ea_base_reg < CPU_NB_REGS)
+
+    ProvFindingRecord *rec = &slot->payload;
+    rec->quality = quality;
+    rec->is_uaf = is_uaf;
+    rec->access_pc = pc;
+    rec->access_addr = addr;
+    rec->access_width = size;
+    rec->object_id = obj_id;
+    rec->generation = gen;
+    rec->object_base = obj_base;
+    rec->requested_size = obj_size;
+    rec->tracked_offset = offset;
+    rec->producer_pc = producer_pc;
+    rec->producer_kind = producer_kind;
+    rec->ea_base_reg = ea_base_reg;
+    rec->ea_base_reg_val = ea_base_reg_val;
+    rec->last_writer_pc = (ea_base_reg >= 0 && ea_base_reg < CPU_NB_REGS)
         ? provenance_get_reg_shadow(env)->last_writer_pc[ea_base_reg]
         : 0;
-    /* Final solver cursors: captured while the child is alive so the
-     * timeout path can publish them after SIGKILL (§P1). */
-    pf->next_query = (uintptr_t)next_query;
-    pf->next_free_expr = (uintptr_t)next_free_expr;
+
+    /* A matching tagged promotion describes the same first access and keeps
+     * its cursor boundary.  A direct first publication captures the current
+     * first-unfilled indices. */
+    if (slot == &pf->tagged &&
+        atomic_load_acquire(&pf->fallback.ready) != 0) {
+        slot->finding_query_idx = pf->fallback.finding_query_idx;
+        slot->finding_expr_idx = pf->fallback.finding_expr_idx;
+    } else {
+        slot->finding_query_idx = (next_query != NULL && query_queue != NULL)
+            ? (int64_t)(next_query - query_queue) : -1;
+        slot->finding_expr_idx = (next_free_expr != NULL && pool != NULL)
+            ? (int64_t)(next_free_expr - pool) : -1;
+    }
+
+    atomic_store_release(&slot->ready, 1);
 }
 
 MemcheckResult provenance_check_access(CPUArchState *env, target_ulong addr,
@@ -763,48 +783,73 @@ MemcheckResult provenance_check_access(CPUArchState *env, target_ulong addr,
     return MEMCHECK_OK;
 }
 
-/* ---- Pending fault ---- */
-
-PendingProvenanceFault *provenance_get_pending_fault(void) {
-    return prov_pending_fault;
+/* Snapshot the preferred committed finding.  Each slot is immutable after
+ * its release publication, so an acquire followed by a plain structure copy
+ * is sufficient.  A killed, half-written tagged promotion has ready == 0 and
+ * falls back to the previously committed UNKNOWN record. */
+bool provenance_snapshot_pending_finding(ProvPublishedFinding *out) {
+    if (prov_pending_fault == NULL || out == NULL) {
+        return false;
+    }
+    if (atomic_load_acquire(&prov_pending_fault->tagged.ready) != 0) {
+        *out = prov_pending_fault->tagged;
+        return true;
+    }
+    if (atomic_load_acquire(&prov_pending_fault->fallback.ready) != 0) {
+        *out = prov_pending_fault->fallback;
+        return true;
+    }
+    return false;
 }
 
 void provenance_clear_pending_fault(void) {
-    if (prov_pending_fault) {
+    if (prov_pending_fault != NULL) {
         memset(prov_pending_fault, 0, sizeof(*prov_pending_fault));
-        /* PROV_FINDING_FALLBACK == 0: memset already restores it. */
     }
 }
 
 /* ---- Deferred crash finalization ---- */
 
 bool provenance_finalize_fault(CPUArchState *env) {
+    ProvPublishedFinding finding;
     (void)env;
-    return prov_pending_fault && prov_pending_fault->detected;
+    return provenance_snapshot_pending_finding(&finding);
+}
+
+static const char *prov_fault_reason_for(const ProvFindingRecord *finding) {
+    return finding->is_uaf
+        ? "memcheck: heap-use-after-free (provenance)"
+        : "memcheck: heap-buffer-overflow (provenance)";
 }
 
 const char *provenance_fault_reason(void) {
-    if (!prov_pending_fault || !prov_pending_fault->detected) return NULL;
-    return prov_pending_fault->is_uaf
-        ? "memcheck: heap-use-after-free (provenance)"
-        : "memcheck: heap-buffer-overflow (provenance)";
+    ProvPublishedFinding finding;
+    return provenance_snapshot_pending_finding(&finding)
+        ? prov_fault_reason_for(&finding.payload) : NULL;
 }
 
 /* Emit the structured finding line exactly once (§8: preserve both the
  * pending provenance event and any real crash record; the real crash
  * selects the verdict).  Returns true if a finding was emitted. */
 bool provenance_report_pending_finding(void) {
-    if (!prov_pending_fault || !prov_pending_fault->detected) return false;
-    if (prov_pending_fault->reported) return true;
-    PendingProvenanceFault *fault = prov_pending_fault;
-    const char *pf_reason = provenance_fault_reason();
-    log_msg("[prov] [finalize] [finding] [reason %s] [access_pc %lx] [access_addr %lx] [width %u] [obj_id %lu] [gen %u] [obj_base %lx] [size %lx] [offset %ld] [producer_pc %lx] [kind %d] [last_writer %lx] [is_uaf %d] [ea_reg %d]\n",
-            pf_reason ? pf_reason : "?", fault->access_pc, fault->access_addr,
-            fault->access_width, fault->object_id, fault->generation,
-            fault->object_base, fault->requested_size, fault->tracked_offset,
-            fault->producer_pc, fault->producer_kind, fault->last_writer_pc,
-            fault->is_uaf, fault->ea_base_reg);
-    fault->reported = true;
+    ProvPublishedFinding finding;
+    if (prov_pending_fault == NULL ||
+        !provenance_snapshot_pending_finding(&finding)) {
+        return false;
+    }
+    if (prov_pending_fault->reported) {
+        return true;
+    }
+
+    const ProvFindingRecord *f = &finding.payload;
+    log_msg("[prov] [finalize] [finding] [reason %s] [access_pc %lx] [access_addr %lx] [width %u] [obj_id %lu] [gen %u] [obj_base %lx] [size %lx] [offset %ld] [producer_pc %lx] [kind %d] [last_writer %lx] [is_uaf %d] [ea_reg %d] [query_cursor %ld] [expr_cursor %ld]\n",
+            prov_fault_reason_for(f), f->access_pc, f->access_addr,
+            f->access_width, f->object_id, f->generation,
+            f->object_base, f->requested_size, f->tracked_offset,
+            f->producer_pc, f->producer_kind, f->last_writer_pc,
+            f->is_uaf, f->ea_base_reg, finding.finding_query_idx,
+            finding.finding_expr_idx);
+    prov_pending_fault->reported = true;
     return true;
 }
 

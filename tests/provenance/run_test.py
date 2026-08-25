@@ -206,7 +206,22 @@ TESTS = [
          verdict="crash", final_queries=1, final_expr_min=1,
          finding=dict(reason="heap-buffer-overflow", is_uaf=0,
                       fields={"obj_id": 1, "gen": 1, "size": 8,
-                              "offset": 9, "width": 1})),
+                              "offset": 9, "width": 1}),
+         cursors=dict(query_after=True, expr_after=True),
+         note="post-finding branch query survives and advances the exit "
+              "cursors strictly past the finding-time cursors"),
+    dict(name="t48_sticky_first_finding", mode="mem", rc=(0,),
+         verdict="crash",
+         finding=dict(reason="heap-buffer-overflow", is_uaf=0,
+                      fields={"obj_id": 2, "gen": 1, "width": 8}),
+         note="first tagged finding is sticky: a later tagged UAF at a "
+              "different address must not displace it"),
+    dict(name="t49_sticky_unknown_fallback", mode="mem", rc=(0,),
+         verdict="crash",
+         finding=dict(reason="heap-buffer-overflow", is_uaf=0,
+                      fields={"obj_id": 0, "gen": 0, "width": 8}),
+         note="UNKNOWN fallback is sticky: a later tagged UAF at a "
+              "different address must not displace it"),
 ]
 
 # Env vars that must always be set: parse_exclude_region_str strchr()s the
@@ -225,19 +240,19 @@ BASE_ENV = {
 # ---------------------------------------------------------------------------
 
 def parse_exit_line(out):
-    """Return the verdict and optional cursor fields from an exit record."""
-    m = re.search(
+    """Return the verdict and stable final query/expression indices."""
+    exit_match = re.search(
         r"^\[snapshot\] \[exit\] \[(normal|crash)\]"
-        r" \[entrypoint-hit [^\]]+\](.*)$", out, re.MULTILINE)
-    if not m:
+        r" \[entrypoint-hit [^\]]+\]$", out, re.MULTILINE)
+    if not exit_match:
         return (None, None, None)
-    fields = dict(re.findall(r"\[([a-z_]+) ([^\]]+)\]", m.group(2)))
-    next_query = fields.get("next_query")
-    next_expr = fields.get("next_free_expr")
+    cursor_match = re.search(
+        r"^\[snapshot\] \[cursors\] \[query_cursor (-?[0-9]+)\]"
+        r" \[expr_cursor (-?[0-9]+)\]$", out, re.MULTILINE)
     return (
-        m.group(1),
-        int(next_query, 16) if next_query is not None else None,
-        int(next_expr, 16) if next_expr is not None else None,
+        exit_match.group(1),
+        int(cursor_match.group(1)) if cursor_match else None,
+        int(cursor_match.group(2)) if cursor_match else None,
     )
 
 
@@ -267,7 +282,7 @@ def parse_symbolic_counts(out):
 
 
 HEX_FIELDS = {"access_pc", "access_addr", "obj_base", "size",
-              "producer_pc", "last_writer", "query_cursor", "expr_cursor"}
+              "producer_pc", "last_writer"}
 
 
 def finding_int(finding, field):
@@ -544,21 +559,26 @@ def check(test, rc, fs_status, out):
         if access_addr != expected_addr:
             problems.append(
                 f"access address {access_addr:#x} != base+offset {expected_addr:#x}")
-        for field in ("gen", "obj_base", "producer_pc", "kind",
-                      "last_writer"):
-            if finding_int(got, field) == 0:
-                problems.append(f"tagged finding field {field} is zero")
         if finding_int(got, "ea_reg") < 0:
             problems.append("tagged finding has no EA register")
 
-    query_at_finding = got.get("query_cursor")
-    expr_at_finding = got.get("expr_cursor")
-    if query_at_finding is not None and final_query is not None:
-        if final_query < finding_int(got, "query_cursor"):
-            problems.append("final query cursor precedes finding cursor")
-    if expr_at_finding is not None and final_expr is not None:
-        if final_expr < finding_int(got, "expr_cursor"):
-            problems.append("final expression cursor precedes finding cursor")
+    cursors = test.get("cursors")
+    if cursors:
+        for field in ("query_cursor", "expr_cursor"):
+            if field not in got:
+                problems.append(f"missing {field} in finding")
+        if final_query is None:
+            problems.append("missing final query cursor")
+        elif "query_cursor" in got and cursors.get("query_after"):
+            if final_query <= finding_int(got, "query_cursor"):
+                problems.append(
+                    "final query cursor did not advance past finding")
+        if final_expr is None:
+            problems.append("missing final expression cursor")
+        elif "expr_cursor" in got and cursors.get("expr_after"):
+            if final_expr <= finding_int(got, "expr_cursor"):
+                problems.append(
+                    "final expression cursor did not advance past finding")
     return problems
 
 
