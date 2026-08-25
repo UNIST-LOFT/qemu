@@ -1117,6 +1117,31 @@ static inline void add_void_call_4(void* f, TCGTemp* arg0, TCGTemp* arg1,
     if (op_out)
         *op_out = op;
 }
+// Same argument layout as add_void_call_3, but the call is inserted AFTER
+// the anchor op.  Used by the raw memcheck pass so a faulting guest memory
+// op raises before any finding can be recorded (§4/§9 exception ordering).
+static inline void add_void_call_3_after(void* f, TCGTemp* arg0, TCGTemp* arg1,
+                                         TCGTemp* arg2, TCGOp* op_in,
+                                         TCGOp** op_out, TCGContext* tcg_ctx)
+{
+    assert(arg0->temp_allocated);
+    assert(arg1->temp_allocated);
+    assert(arg2->temp_allocated);
+
+    // FixMe: check 32 bit, check other archs
+    TCGOpcode opc   = INDEX_op_call;
+    TCGOp*    op    = tcg_op_insert_after(tcg_ctx, op_in, opc);
+    op->args[0]     = temp_arg(arg0);
+    op->args[1]     = temp_arg(arg1);
+    op->args[2]     = temp_arg(arg2);
+    op->args[3]     = (uintptr_t)f;
+    op->args[4]     = 0; // flags
+    TCGOP_CALLI(op) = 3; // input args
+    TCGOP_CALLO(op) = 0; // ret args
+
+    if (op_out)
+        *op_out = op;
+}
 
 // see tcg_gen_callN in tgc.c
 static inline void add_void_call_5(void* f, TCGTemp* arg0, TCGTemp* arg1,
@@ -6487,13 +6512,13 @@ static void update_last_translation_block(uintptr_t pc) {
 }
 
 /* Lightweight TCG pass for non-symbolic mode: insert a helper call
- * BEFORE each qemu_ld/qemu_st to check heap bounds (QASAN-like).
+ * AFTER each qemu_ld/qemu_st to check heap bounds (QASAN-like).
  * Gated by binradar_memcheck_enabled.  Independent of symbolic_mode.
  *
- * Exception ordering (§4/§9): the check is inserted before the guest
- * memory op, so a faulting access never records a finding first.  The
- * helper records a non-fatal pending finding (deferred crash policy);
- * it never _exit()s.
+ * Exception ordering (§4/§9): the check is inserted after the guest
+ * memory op, so a faulting access raises before any finding can be
+ * recorded.  The helper records a non-fatal pending finding (deferred
+ * crash policy); it never _exit()s.
  *
  * Per-instruction PC: the guest instruction PC is tracked from the
  * INDEX_op_insn_start ops (op->args[0] holds the instruction offset),
@@ -6520,6 +6545,7 @@ void memcheck_instrument_tb(TranslationBlock *tb, TCGContext *tcg_ctx,
     memset(s->free_temps, 0, sizeof(s->free_temps));
     TCGTemp *t_size = tcg_temp_new_internal(TCG_TYPE_I64, false);
     TCGTemp *t_pc = tcg_temp_new_internal(TCG_TYPE_I64, false);
+    TCGTemp *t_addr_copy = tcg_temp_new_internal(TCG_TYPE_I64, false);
     memcpy(s->free_temps, saved_free, sizeof(saved_free));
 
     TCGOp *op;
@@ -6544,16 +6570,20 @@ void memcheck_instrument_tb(TranslationBlock *tb, TCGContext *tcg_ctx,
 
             tcg_movi(t_size, (uintptr_t)size, 0, op, NULL, tcg_ctx);
             tcg_movi(t_pc, (uintptr_t)pc, 0, op, NULL, tcg_ctx);
-
+            MARK_TEMP_AS_ALLOCATED(t_addr_copy);
             MARK_TEMP_AS_ALLOCATED(t_addr);
-            /* Insert BEFORE the memory op: the address temp is still
-             * live here (after the op it is dead and TCG liveness
-             * aborts).  The helper is non-fatal — it only records a
-             * pending finding — so a real fault on the access still
-             * occurs and wins the exit-info slot (§8 precedence). */
-            add_void_call_3(snapshot_memcheck_helper, t_addr, t_size, t_pc,
-                            op, NULL, tcg_ctx);
+            tcg_mov(t_addr_copy, t_addr, 0, 0, op, NULL, tcg_ctx);
             MARK_TEMP_AS_NOT_ALLOCATED(t_addr);
+
+            /* Exception ordering (§4/§9): check AFTER the guest memory op.
+             * A faulting access raises before any finding is recorded; the
+             * post-op check publishes the candidate only once the access has
+             * architecturally succeeded.  t_addr_copy stays live across the
+             * op because the op's own address temp is dead after it (TCG
+             * liveness). */
+            add_void_call_3_after(snapshot_memcheck_helper, t_addr_copy,
+                                  t_size, t_pc, op, NULL, tcg_ctx);
+            MARK_TEMP_AS_NOT_ALLOCATED(t_addr_copy);
             break;
         }
         default:

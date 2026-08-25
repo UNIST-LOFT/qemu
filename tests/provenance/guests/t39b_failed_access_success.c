@@ -1,0 +1,23 @@
+/* Successful-access control for t39: the same crossing eight-byte load must
+ * produce one OOB finding when the access architecturally succeeds.  The
+ * guard page is mapped readable (t39 marks it PROT_NONE), so the load
+ * succeeds while still crossing the tracked malloc-region boundary. */
+#include <stdint.h>
+#include <stdlib.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+int main(void) {
+    size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    char *p = malloc(page * 2);
+    if (!p) return 20;
+
+    size_t size = page - ((uintptr_t)p & (page - 1));
+    if (size < 32) size += page;
+    char *q = realloc(p, size);
+    if (!q || (((uintptr_t)q + size) & (page - 1)) != 0) return 21;
+    if (mprotect(q + size, page, PROT_READ) != 0) return 22;
+
+    __asm__ volatile("movq (%0), %%rax" : : "r"(q + size - 4) : "rax", "memory");
+    return 0;
+}

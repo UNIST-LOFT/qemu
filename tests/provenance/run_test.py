@@ -161,6 +161,12 @@ TESTS = [
          verdict="normal", finding=None),
     dict(name="t39_failed_access_ordering", mode="mem", rc=(-11, 139),
          verdict="crash", reason="unhandled_target_signal", finding=None),
+    dict(name="t39b_failed_access_success", mode="mem", rc=(0,),
+         verdict="crash",
+         finding=dict(reason="heap-buffer-overflow", is_uaf=0,
+                      fields={"obj_id": 2, "gen": 1, "width": 8}),
+         note="successful crossing load must publish the tagged realloc "
+              "identity, not the UNKNOWN fallback"),
     dict(name="t40_thread_inherit", mode="mem", rc=(0,), verdict="crash",
          finding=dict(reason="heap-use-after-free", is_uaf=1,
                       fields={"obj_id": 1, "gen": 1, "size": 16,

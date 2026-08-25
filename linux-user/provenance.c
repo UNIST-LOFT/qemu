@@ -548,6 +548,32 @@ void provenance_mem_invalidate(target_ulong addr, target_ulong size) {
 
 /* ---- Access checking ---- */
 
+/* Single publication point for pending findings.  The first tagged finding
+ * is sticky.  A tagged finding may replace an UNKNOWN exact-bounds fallback
+ * only when the access PC/address/width match (same instruction/access); an
+ * unrelated later tagged finding must not displace an earlier fallback.
+ * UNKNOWN never replaces tagged. */
+static bool prov_fault_publish(PendingProvenanceFault *pf,
+                               ProvFindingQuality quality,
+                               target_ulong pc, target_ulong addr,
+                               uint32_t size) {
+    if (!pf) {
+        return false;
+    }
+    if (!pf->detected) {
+        return true;
+    }
+    /* Already published: only a tagged finding may promote an UNKNOWN
+     * exact-bounds fallback, and only for the same access (instruction
+     * PC/address/width).  Tagged findings are sticky; UNKNOWN never
+     * replaces tagged. */
+    return quality == PROV_FINDING_TAGGED &&
+           pf->quality == PROV_FINDING_FALLBACK &&
+           pf->access_pc == pc &&
+           pf->access_addr == addr &&
+           pf->access_width == size;
+}
+
 /* Fill the common fields of a pending provenance fault.  Captures the
  * last writer PC of the EA base register (shadow last_writer_pc) for
  * observability; 0 when the register is unknown. */
@@ -557,8 +583,13 @@ static void prov_fault_fill(PendingProvenanceFault *pf, CPUArchState *env,
                             target_ulong obj_base, target_ulong obj_size,
                             int64_t offset, target_ulong producer_pc,
                             PtrProducerKind producer_kind, int ea_base_reg,
-                            target_ulong ea_base_reg_val, bool is_uaf) {
+                            target_ulong ea_base_reg_val, bool is_uaf,
+                            ProvFindingQuality quality) {
+    if (!prov_fault_publish(pf, quality, pc, addr, size)) {
+        return;
+    }
     pf->detected = true;
+    pf->quality = quality;
     pf->is_uaf = is_uaf;
     pf->access_pc = pc;
     pf->access_addr = addr;
@@ -627,14 +658,13 @@ MemcheckResult provenance_check_access(CPUArchState *env, target_ulong addr,
             if (obj->state == PROV_OBJ_FREED) {
                 /* UAF. */
                 PendingProvenanceFault *pf = prov_pending_fault;
-                if (pf && !pf->detected) {
-                    prov_fault_fill(pf, env, pc, addr, size,
-                                    obj->object_id, obj->generation,
-                                    obj->base, obj->requested_size,
-                                    ea_tag.concrete_offset,
-                                    ea_tag.producer_pc, ea_tag.producer_kind,
-                                    ea_base_reg, ea_base_reg_val, true);
-                }
+                prov_fault_fill(pf, env, pc, addr, size,
+                                obj->object_id, obj->generation,
+                                obj->base, obj->requested_size,
+                                ea_tag.concrete_offset,
+                                ea_tag.producer_pc, ea_tag.producer_kind,
+                                ea_base_reg, ea_base_reg_val, true,
+                                PROV_FINDING_TAGGED);
                 if (provenance_debug) {
                     log_msg("[prov] [uaf] [pc %lx] [addr %lx] [width %u] [obj_id %lu] [gen %u] [base %lx] [size %lx] [offset %ld]\n",
                             pc, addr, size, obj->object_id, obj->generation,
@@ -651,13 +681,12 @@ MemcheckResult provenance_check_access(CPUArchState *env, target_ulong addr,
                 (uint64_t)offset > obj->requested_size) {
                 /* OOB. */
                 PendingProvenanceFault *pf = prov_pending_fault;
-                if (pf && !pf->detected) {
-                    prov_fault_fill(pf, env, pc, addr, size,
-                                    obj->object_id, obj->generation,
-                                    obj->base, obj->requested_size, offset,
-                                    ea_tag.producer_pc, ea_tag.producer_kind,
-                                    ea_base_reg, ea_base_reg_val, false);
-                }
+                prov_fault_fill(pf, env, pc, addr, size,
+                                obj->object_id, obj->generation,
+                                obj->base, obj->requested_size, offset,
+                                ea_tag.producer_pc, ea_tag.producer_kind,
+                                ea_base_reg, ea_base_reg_val, false,
+                                PROV_FINDING_TAGGED);
                 if (provenance_debug) {
                     log_msg("[prov] [oob] [pc %lx] [addr %lx] [width %u] [obj_id %lu] [gen %u] [base %lx] [size %lx] [offset %ld]\n",
                             pc, addr, size, obj->object_id, obj->generation,
@@ -671,13 +700,12 @@ MemcheckResult provenance_check_access(CPUArchState *env, target_ulong addr,
             if ((uint64_t)size > remaining) {
                 /* OOB: access extends past object end. */
                 PendingProvenanceFault *pf = prov_pending_fault;
-                if (pf && !pf->detected) {
-                    prov_fault_fill(pf, env, pc, addr, size,
-                                    obj->object_id, obj->generation,
-                                    obj->base, obj->requested_size, offset,
-                                    ea_tag.producer_pc, ea_tag.producer_kind,
-                                    ea_base_reg, ea_base_reg_val, false);
-                }
+                prov_fault_fill(pf, env, pc, addr, size,
+                                obj->object_id, obj->generation,
+                                obj->base, obj->requested_size, offset,
+                                ea_tag.producer_pc, ea_tag.producer_kind,
+                                ea_base_reg, ea_base_reg_val, false,
+                                PROV_FINDING_TAGGED);
                 if (provenance_debug) {
                     log_msg("[prov] [oob] [pc %lx] [addr %lx] [width %u] [obj_id %lu] [gen %u] [base %lx] [size %lx] [offset %ld] [remaining %lu]\n",
                             pc, addr, size, obj->object_id, obj->generation,
@@ -715,13 +743,12 @@ MemcheckResult provenance_check_access(CPUArchState *env, target_ulong addr,
                     (uint64_t)size > (uint64_t)(region_end - addr)) {
                     /* Record non-fatal finding. */
                     PendingProvenanceFault *pf = prov_pending_fault;
-                    if (pf && !pf->detected) {
-                        prov_fault_fill(pf, env, pc, addr, size,
-                                        0, 0, mr->base, mr->size,
-                                        (int64_t)(addr - mr->base),
-                                        0, PROV_PRODUCER_NONE,
-                                        ea_base_reg, ea_base_reg_val, false);
-                    }
+                    prov_fault_fill(pf, env, pc, addr, size,
+                                    0, 0, mr->base, mr->size,
+                                    (int64_t)(addr - mr->base),
+                                    0, PROV_PRODUCER_NONE,
+                                    ea_base_reg, ea_base_reg_val, false,
+                                    PROV_FINDING_FALLBACK);
                     if (provenance_debug) {
                         log_msg("[prov] [oob-exact] [pc %lx] [addr %lx] [width %u] [base %lx] [size %lx]\n",
                                 pc, addr, size, mr->base, mr->size);
@@ -744,6 +771,7 @@ PendingProvenanceFault *provenance_get_pending_fault(void) {
 void provenance_clear_pending_fault(void) {
     if (prov_pending_fault) {
         memset(prov_pending_fault, 0, sizeof(*prov_pending_fault));
+        /* PROV_FINDING_FALLBACK == 0: memset already restores it. */
     }
 }
 

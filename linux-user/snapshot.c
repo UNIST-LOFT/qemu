@@ -1788,9 +1788,9 @@ MemcheckResult snapshot_memcheck_access(target_ulong addr, target_ulong size) {
  * Routes through the provenance checker with an UNKNOWN tag; the
  * provenance checker applies the exact-bounds fallback on LIVE objects
  * and records a non-fatal pending finding (deferred crash policy, §8).
- * This helper must NOT call _exit(): a raw-TCG-level check runs before the
- * guest memory op and must not terminate execution before a potential
- * real fault.  The finding is finalized at guest exit. */
+ * This helper must NOT call _exit(): the raw-TCG pass inserts it AFTER the
+ * guest memory op (so a real fault raises first, §4/§9), and it must not
+ * terminate execution itself.  The finding is finalized at guest exit. */
 void snapshot_memcheck_helper(target_ulong addr, target_ulong size, target_ulong pc) {
     if (!binradar_memcheck_enabled) return;
     if (symbolic_start_code > 0 && (pc < symbolic_start_code || pc >= symbolic_end_code)) {
@@ -1801,9 +1801,9 @@ void snapshot_memcheck_helper(target_ulong addr, target_ulong size, target_ulong
     if (!env) return;
     PtrTag unknown_tag = {0};
     /* The finding is recorded as non-fatal (pending).  Do not _exit here:
-     * the raw-TCG pass inserts this helper BEFORE the qemu_ld/st, so an
-     * immediate exit would violate exception ordering (§4/§9).  The
-     * deferred finalize path converts pending findings to synthetic
+     * the raw-TCG pass inserts this helper AFTER the qemu_ld/st, so a
+     * faulting access has already raised before this helper runs (§4/§9).
+     * The deferred finalize path converts pending findings to synthetic
      * crashes at guest exit. */
     provenance_check_access(env, addr, size, pc, unknown_tag, -1, 0);
 }

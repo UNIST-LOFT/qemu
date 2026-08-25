@@ -118,10 +118,16 @@ typedef struct PtrMemEntry {
     PtrTag        tag;
 } PtrMemEntry;
 
+typedef enum {
+    PROV_FINDING_FALLBACK = 0, /* UNKNOWN exact-bounds fallback (obj_id 0) */
+    PROV_FINDING_TAGGED,       /* authoritative tagged identity */
+} ProvFindingQuality;
+
 /* Pending provenance fault (non-fatal, deferred crash). */
 typedef struct {
     bool            detected;
     bool            reported;   /* structured finding line already emitted */
+    ProvFindingQuality quality;
     target_ulong    access_pc;
     target_ulong    access_addr;
     uint32_t        access_width;
