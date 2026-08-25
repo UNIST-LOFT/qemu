@@ -20,8 +20,8 @@ GUESTS    := $(CURDIR)/guests
 WORK      := $(CURDIR)/work
 
 CC        ?= gcc
-CFLAGS    := -O0 -g -fno-pie -no-pie -fno-stack-protector -U_FORTIFY_SOURCE -fno-builtin
-LDFLAGS   := -no-pie
+CFLAGS    := -O0 -g -fno-pie -no-pie -fno-stack-protector -U_FORTIFY_SOURCE -fno-builtin -pthread
+LDFLAGS   := -no-pie -pthread
 
 TESTS := t01_double_free t02_small_double_free t03_uaf_stack t04_uaf_heap \
          t05_off_oob t06_neg_off_oob t07_size_ext_oob t08_alloc_zero \
@@ -34,7 +34,9 @@ TESTS := t01_double_free t02_small_double_free t03_uaf_stack t04_uaf_heap \
          t28_unknown_no_uaf t29_push_pop_uaf t30_untagged_pop_unknown \
          t31_int_overwrite_clears t32_highbyte_clears t33_xchg_swap \
          t34_failed_malloc t35_same_addr_realloc t36_self_overwrite_load \
-         t37_atomic_rmw
+         t37_atomic_rmw t38_x87_store_semantics t39_failed_access_ordering \
+         t40_thread_inherit t41_cross_thread_shadow t42_mapping_reuse \
+         t43_syscall_output t44_simd_overlap t45_post_finding_query
 
 GUEST_BINS := $(addprefix $(WORK)/,$(TESTS))
 PLT_FILES  := $(addprefix $(WORK)/,$(addsuffix .plt,$(TESTS)))

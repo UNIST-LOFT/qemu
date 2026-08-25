@@ -47,6 +47,8 @@ import time
 #     driver's 12-byte status record.
 # reason: substring required in the [snapshot] [crash] reason field.
 # timeout: per-run timeout seconds (forkserver child timeout is separate).
+# final_queries: exact `Number of queries` summary expected from symbolic mode.
+# final_expr_min: minimum `Number of expressions` summary expected.
 TESTS = [
     # --- memcheck-only: no finding, normal exit ---------------------------
     dict(name="t01_double_free", mode="mem", rc=(0, -6, 134),
@@ -58,7 +60,7 @@ TESTS = [
     dict(name="t03_uaf_stack", mode="mem", rc=(0,), verdict="normal", finding=None),
     dict(name="t04_uaf_heap", mode="mem", rc=(0,), verdict="crash",
          finding=dict(reason="heap-use-after-free", is_uaf=1,
-                      fields={"obj_id": 1, "gen": 1, "size": 40, "offset": 0})),
+                      fields={"obj_id": 1, "gen": 1, "size": 64, "offset": 0})),
     dict(name="t05_off_oob", mode="mem", rc=(0,), verdict="crash",
          finding=dict(reason="heap-buffer-overflow", is_uaf=0,
                       fields={"obj_id": 1, "gen": 1, "size": 8, "offset": 8})),
@@ -112,7 +114,7 @@ TESTS = [
          finding=None),
     dict(name="t26_use_after_free_gen", mode="mem", rc=(0,), verdict="crash",
          finding=dict(reason="heap-use-after-free", is_uaf=1,
-                      fields={"obj_id": 1, "gen": 1, "size": 10, "offset": 0})),
+                      fields={"obj_id": 1, "gen": 1, "size": 16, "offset": 0})),
     dict(name="t27_timeout_crash", mode="fors", rc=(2,), fs_status=139,
          verdict="crash",
          finding=dict(reason="heap-use-after-free", is_uaf=1,
@@ -125,7 +127,7 @@ TESTS = [
          note="32-bit write kills tag; freed-address access must not be UAF"),
     dict(name="t29_push_pop_uaf", mode="mem", rc=(0,), verdict="crash",
          finding=dict(reason="heap-use-after-free", is_uaf=1,
-                      fields={"obj_id": 1, "gen": 1, "size": 10, "offset": 0}),
+                     fields={"obj_id": 1, "gen": 1, "size": 16, "offset": 0}),
          note="push/pop through stack shadow preserves the tag"),
     dict(name="t30_untagged_pop_unknown", mode="mem", rc=(0,), verdict="normal",
          finding=None,
@@ -138,14 +140,14 @@ TESTS = [
          note="AH write invalidates the full register; no numeric UAF"),
     dict(name="t33_xchg_swap", mode="mem", rc=(0,), verdict="crash",
          finding=dict(reason="heap-use-after-free", is_uaf=1,
-                      fields={"obj_id": 1, "gen": 1, "size": 10, "offset": 0}),
+                     fields={"obj_id": 1, "gen": 1, "size": 16, "offset": 0}),
          note="xchg swaps tags with values"),
     dict(name="t34_failed_malloc", mode="mem", rc=(0,), verdict="normal",
          finding=None,
          note="failed malloc creates no object; later allocs unaffected"),
     dict(name="t35_same_addr_realloc", mode="mem", rc=(0,), verdict="crash",
          finding=dict(reason="heap-use-after-free", is_uaf=1,
-                      fields={"obj_id": 1, "gen": 1, "size": 40, "offset": 0}),
+                      fields={"obj_id": 1, "gen": 1, "size": 64, "offset": 0}),
          note="same-address realloc retires the old identity"),
     dict(name="t36_self_overwrite_load", mode="mem", rc=(0,), verdict="crash",
          finding=dict(reason="heap-buffer-overflow", is_uaf=0,
@@ -155,6 +157,31 @@ TESTS = [
     dict(name="t37_atomic_rmw", mode="mem", rc=(0,), verdict="normal",
          finding=None,
          note="lock xorq RMW survives memcheck instrumentation (temp-reuse P0)"),
+    dict(name="t38_x87_store_semantics", mode="mem", rc=(0,),
+         verdict="normal", finding=None),
+    dict(name="t39_failed_access_ordering", mode="mem", rc=(-11, 139),
+         verdict="crash", reason="unhandled_target_signal", finding=None),
+    dict(name="t40_thread_inherit", mode="mem", rc=(0,), verdict="crash",
+         finding=dict(reason="heap-use-after-free", is_uaf=1,
+                      fields={"obj_id": 1, "gen": 1, "size": 16,
+                              "offset": 0, "width": 1})),
+    dict(name="t41_cross_thread_shadow", mode="mem", rc=(0,),
+         verdict="crash",
+         finding=dict(reason="heap-use-after-free", is_uaf=1,
+                      fields={"obj_id": 1, "gen": 1, "size": 24,
+                              "offset": 0, "width": 1})),
+    dict(name="t42_mapping_reuse", mode="mem", rc=(0,),
+         verdict="normal", finding=None,
+         note="MAP_FIXED file reuse clears same-value stale pointer shadow"),
+    dict(name="t43_syscall_output", mode="mem", rc=(0,),
+         verdict="normal", finding=None),
+    dict(name="t44_simd_overlap", mode="mem", rc=(0,),
+         verdict="normal", finding=None),
+    dict(name="t45_post_finding_query", mode="sym", rc=(0,),
+         verdict="crash", final_queries=1, final_expr_min=1,
+         finding=dict(reason="heap-buffer-overflow", is_uaf=0,
+                      fields={"obj_id": 1, "gen": 1, "size": 8,
+                              "offset": 9, "width": 1})),
 ]
 
 # Env vars that must always be set: parse_exclude_region_str strchr()s the
@@ -173,9 +200,20 @@ BASE_ENV = {
 # ---------------------------------------------------------------------------
 
 def parse_exit_line(out):
-    """Return ('normal'|'crash'|None) from the [snapshot] [exit] line."""
-    m = re.search(r"\[snapshot\] \[exit\] \[(normal|crash)\]", out)
-    return m.group(1) if m else None
+    """Return the verdict and optional cursor fields from an exit record."""
+    m = re.search(
+        r"^\[snapshot\] \[exit\] \[(normal|crash)\]"
+        r" \[entrypoint-hit [^\]]+\](.*)$", out, re.MULTILINE)
+    if not m:
+        return (None, None, None)
+    fields = dict(re.findall(r"\[([a-z_]+) ([^\]]+)\]", m.group(2)))
+    next_query = fields.get("next_query")
+    next_expr = fields.get("next_free_expr")
+    return (
+        m.group(1),
+        int(next_query, 16) if next_query is not None else None,
+        int(next_expr, 16) if next_expr is not None else None,
+    )
 
 
 def parse_crash_reason(out):
@@ -184,37 +222,36 @@ def parse_crash_reason(out):
 
 
 def parse_findings(out):
-    """Return list of dicts for each [prov] [finalize] [finding] line."""
+    """Parse finding records without rejecting unknown or missing fields."""
     findings = []
     for m in re.finditer(
-        r"\[prov\] \[finalize\] \[finding\] \[reason ([^\]]+)\]"
-        r" \[access_pc ([^\]]+)\] \[access_addr ([^\]]+)\] \[width ([^\]]+)\]"
-        r" \[obj_id ([^\]]+)\] \[gen ([^\]]+)\] \[obj_base ([^\]]+)\]"
-        r" \[size ([^\]]+)\] \[offset ([^\]]+)\] \[producer_pc ([^\]]+)\]"
-        r" \[kind ([^\]]+)\] \[last_writer ([^\]]+)\] \[is_uaf ([01])\]",
-        out,
-    ):
-        findings.append(
-            {
-                "reason": m.group(1),
-                "access_pc": m.group(2),
-                "access_addr": m.group(3),
-                "width": m.group(4),
-                "obj_id": m.group(5),
-                "gen": m.group(6),
-                "obj_base": m.group(7),
-                "size": m.group(8),
-                "offset": m.group(9),
-                "producer_pc": m.group(10),
-                "kind": m.group(11),
-                "last_writer": m.group(12),
-                "is_uaf": m.group(13),
-            }
-        )
+            r"^\[prov\] \[finalize\] \[finding\](.*)$", out,
+            re.MULTILINE):
+        findings.append(dict(re.findall(
+            r"\[([a-z_]+) ([^\]]+)\]", m.group(1))))
     return findings
 
 
+def parse_symbolic_counts(out):
+    query = re.search(r"^Number of queries: ([0-9]+)$", out, re.MULTILINE)
+    expr = re.search(r"^Number of expressions: ([0-9]+)$", out, re.MULTILINE)
+    return (
+        int(query.group(1)) if query else None,
+        int(expr.group(1)) if expr else None,
+    )
+
+
+HEX_FIELDS = {"access_pc", "access_addr", "obj_base", "size",
+              "producer_pc", "last_writer", "query_cursor", "expr_cursor"}
+
+
+def finding_int(finding, field):
+    return int(finding[field], 16 if field in HEX_FIELDS else 10)
+
+
 def rc_ok(rc, expect):
+    if expect is None:
+        return rc != 0
     if isinstance(expect, tuple):
         return rc in expect
     return rc == expect
@@ -391,7 +428,7 @@ def run_forkserver(test, guest, qemu, solver_bin, workdir):
 def run_test(test, guests_dir, workdir, qemu, solver):
     guest = os.path.join(workdir, test["name"])
     if not os.path.isfile(guest):
-        return (False, f"guest binary missing: {guest} (run 'make guests')")
+        raise FileNotFoundError(f"guest binary missing: {guest} (run 'make guests')")
     if test["mode"] == "mem":
         result = run_memcheck(test, guest, qemu, workdir)
         rc, stderr_text = result.returncode, result.stderr.decode(errors="replace")
@@ -411,41 +448,92 @@ def check(test, rc, fs_status, out):
     if not rc_ok(rc, test.get("rc", (0,))):
         problems.append(f"rc={rc} not in {test.get('rc')}")
     if test["mode"] == "fors":
-        want = test.get("fs_status")
-        if want is not None and fs_status != want:
-            problems.append(f"child status {fs_status} != {want}")
-    else:
-        verdict = parse_exit_line(out)
-        want = test["verdict"]
-        if verdict != want:
-            problems.append(f"exit verdict {verdict!r} != {want!r}")
-        reason = parse_crash_reason(out)
-        if test.get("reason") and reason is None:
-            problems.append("missing [snapshot] [crash] reason")
-        elif test.get("reason") and reason and test["reason"] not in reason:
-            problems.append(f"crash reason {reason!r} != {test['reason']!r}")
+        want_status = test.get("fs_status")
+        if want_status is not None and fs_status != want_status:
+            problems.append(f"child status {fs_status} != {want_status}")
+
+    verdict, final_query, final_expr = parse_exit_line(out)
+    want_verdict = test["verdict"]
+    if verdict != want_verdict:
+        problems.append(f"exit verdict {verdict!r} != {want_verdict!r}")
+    reason = parse_crash_reason(out)
+    if test.get("reason") and reason is None:
+        problems.append("missing [snapshot] [crash] reason")
+    elif test.get("reason") and test["reason"] not in reason:
+        problems.append(f"crash reason {reason!r} != {test['reason']!r}")
+
+    final_queries, final_expressions = parse_symbolic_counts(out)
+    if "final_queries" in test and final_queries != test["final_queries"]:
+        problems.append(
+            f"final query count {final_queries!r} != {test['final_queries']}")
+    if ("final_expr_min" in test and
+            (final_expressions is None or
+             final_expressions < test["final_expr_min"])):
+        problems.append(
+            f"final expression count {final_expressions!r} < "
+            f"{test['final_expr_min']}")
+
     findings = parse_findings(out)
     want = test.get("finding")
     if want is None:
         if findings:
-            problems.append(f"unexpected finding: {findings[0]['reason']}")
-    else:
-        if not findings:
-            problems.append("expected [prov] [finalize] [finding], none seen")
-        else:
-            got = findings[0]
-            if want["reason"] not in got["reason"]:
-                problems.append(f"finding reason {got['reason']!r} != {want['reason']!r}")
-            if got["is_uaf"] != str(want["is_uaf"]):
-                problems.append(f"is_uaf {got['is_uaf']} != {want['is_uaf']}")
-            # Exact structured-field assertions: object identity/generation,
-            # signed offset, access PC/address/width, producer and
-            # last-writer metadata.  These prove provenance was retained
-            # and checked, not merely that a finding fired.
-            for field, want_val in want.get("fields", {}).items():
-                if got[field] != str(want_val):
-                    problems.append(
-                        f"finding {field} {got[field]!r} != {want_val!r}")
+            problems.append(f"unexpected finding: {findings[0].get('reason', '?')}")
+        return problems
+
+    want_count = want.get("count", 1)
+    if len(findings) != want_count:
+        problems.append(f"finding count {len(findings)} != {want_count}")
+    if not findings:
+        return problems
+
+    got = findings[0]
+    required = {
+        "reason", "access_pc", "access_addr", "width", "obj_id", "gen",
+        "obj_base", "size", "offset", "producer_pc", "kind",
+        "last_writer", "is_uaf", "ea_reg",
+    }
+    missing = sorted(required - got.keys())
+    if missing:
+        problems.append("finding missing fields: " + ", ".join(missing))
+        return problems
+
+    if want["reason"] not in got["reason"]:
+        problems.append(f"finding reason {got['reason']!r} != {want['reason']!r}")
+    if finding_int(got, "is_uaf") != want["is_uaf"]:
+        problems.append(f"is_uaf {got['is_uaf']} != {want['is_uaf']}")
+    for field, want_val in want.get("fields", {}).items():
+        if finding_int(got, field) != want_val:
+            problems.append(
+                f"finding {field} {finding_int(got, field)!r} != {want_val!r}")
+
+    access_pc = finding_int(got, "access_pc")
+    access_addr = finding_int(got, "access_addr")
+    width = finding_int(got, "width")
+    obj_id = finding_int(got, "obj_id")
+    obj_base = finding_int(got, "obj_base")
+    offset = finding_int(got, "offset")
+    if access_pc == 0 or width == 0:
+        problems.append("access PC/width must be nonzero")
+    if obj_id != 0:
+        expected_addr = (obj_base + offset) & ((1 << 64) - 1)
+        if access_addr != expected_addr:
+            problems.append(
+                f"access address {access_addr:#x} != base+offset {expected_addr:#x}")
+        for field in ("gen", "obj_base", "producer_pc", "kind",
+                      "last_writer"):
+            if finding_int(got, field) == 0:
+                problems.append(f"tagged finding field {field} is zero")
+        if finding_int(got, "ea_reg") < 0:
+            problems.append("tagged finding has no EA register")
+
+    query_at_finding = got.get("query_cursor")
+    expr_at_finding = got.get("expr_cursor")
+    if query_at_finding is not None and final_query is not None:
+        if final_query < finding_int(got, "query_cursor"):
+            problems.append("final query cursor precedes finding cursor")
+    if expr_at_finding is not None and final_expr is not None:
+        if final_expr < finding_int(got, "expr_cursor"):
+            problems.append("final expression cursor precedes finding cursor")
     return problems
 
 
