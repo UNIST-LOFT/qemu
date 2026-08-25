@@ -35,12 +35,12 @@ void helper_prov_on_load(CPUArchState *env, uint32_t dst_idx,
                          target_ulong pc);
 void helper_prov_on_store(CPUArchState *env, uint32_t src_idx,
                           target_ulong addr, target_ulong size);
-void helper_prov_set_ea(CPUArchState *env, uint32_t base_reg,
-                        uint32_t index_reg, uint32_t scale,
-                        target_ulong disp);
 void helper_prov_set_pc(CPUArchState *env, target_ulong pc);
 void helper_prov_check_access(CPUArchState *env, target_ulong addr,
                               target_ulong size, target_ulong pc);
+void helper_prov_set_ea(CPUArchState *env, uint32_t base_reg,
+                        uint32_t index_reg, uint32_t scale,
+                        target_ulong disp, uint32_t mode);
 void helper_prov_addsub_reg(CPUArchState *env, uint32_t dst_idx,
                             uint32_t src_idx, target_ulong pc,
                             target_ulong dst_val, target_ulong src_val);
@@ -389,8 +389,15 @@ void provenance_addsub_imm(CPUArchState *env, int reg_idx, int64_t delta,
 /* ---- reg-reg ADD/SUB provenance propagation ----
  * Runs AFTER the ALU write-back (gen_op has already written dst and
  * invalidated its tag).  dst holds the result; src is unchanged.
- *   dst tagged, src untagged: dst = dst ± src → fold ±src_val.
- *   dst untagged, src tagged, ADD: dst = src + dst → delta = dst − src. */
+ * Only these sound forms propagate (§6):
+ *   dst tagged, src untagged: dst = dst ± src.  The exact target-width
+ *     result must match, and the tracked offset folds the signed source
+ *     value with checked overflow arithmetic.
+ *   dst untagged, src tagged, ADD: dst = src + dst.  The source value
+ *     must match its tag and the target-width delta is folded into the
+ *     offset with checked overflow arithmetic.
+ * Both tagged operands, or SUB of a pointer from a non-pointer, have no
+ * sound merge rule and invalidate. */
 void provenance_addsub_reg(CPUArchState *env, int dst_idx, int src_idx,
                            int is_sub, target_ulong pc,
                            target_ulong dst_val, target_ulong src_val) {
@@ -400,11 +407,14 @@ void provenance_addsub_reg(CPUArchState *env, int dst_idx, int src_idx,
     PtrTag dst_tag = shadow->gpr[dst_idx];
     PtrTag src_tag = shadow->gpr[src_idx];
     if (dst_tag.valid && !src_tag.valid) {
-        int64_t delta = is_sub ? -(int64_t)src_val : (int64_t)src_val;
-        int64_t expect;
-        if (__builtin_add_overflow((int64_t)dst_tag.concrete_value, delta,
-                                   &expect) ||
-            expect != (int64_t)dst_val) {
+        target_ulong expect = is_sub
+            ? dst_tag.concrete_value - src_val
+            : dst_tag.concrete_value + src_val;
+        int64_t signed_src = (int64_t)src_val;
+        int64_t delta = signed_src;
+        if (expect != dst_val ||
+            (is_sub && __builtin_sub_overflow((int64_t)0, signed_src,
+                                              &delta))) {
             shadow->gpr[dst_idx].valid = false;
             shadow->last_writer_pc[dst_idx] = pc;
             return;
@@ -426,16 +436,10 @@ void provenance_addsub_reg(CPUArchState *env, int dst_idx, int src_idx,
         return;
     }
     if (!dst_tag.valid && src_tag.valid && !is_sub) {
-        /* ADD with dst the untagged offset and src the pointer:
-         * result = src + dst; delta = new_dst − src_val. */
-        int64_t delta;
-        if (__builtin_sub_overflow((int64_t)dst_val, (int64_t)src_val,
-                                   &delta)) {
-            shadow->gpr[dst_idx].valid = false;
-            shadow->last_writer_pc[dst_idx] = pc;
-            return;
-        }
-        if ((int64_t)src_tag.concrete_value != (int64_t)src_val) {
+        /* ADD with dst the untagged offset and src the pointer. */
+        target_ulong delta_bits = dst_val - src_val;
+        int64_t delta = (int64_t)delta_bits;
+        if (src_tag.concrete_value != src_val) {
             shadow->gpr[dst_idx].valid = false;
             shadow->last_writer_pc[dst_idx] = pc;
             return;
@@ -849,15 +853,15 @@ void helper_prov_lea_imm(CPUArchState *env, uint32_t dst_idx,
      * helper_prov_set_pc (see gen_prov_lea_imm). */
     PtrRegShadow *shadow = provenance_get_reg_shadow(env);
     target_ulong pc = shadow->cur_pc;
-    provenance_lea_imm(env, dst_idx, base_idx,
-                       (int64_t)(int32_t)disp, pc, dst_val, base_val);
+    provenance_lea_imm(env, dst_idx, base_idx, (int64_t)disp, pc,
+                        dst_val, base_val);
 }
 
 void helper_prov_addsub_imm(CPUArchState *env, uint32_t reg_idx,
                             target_ulong delta, target_ulong pre_val,
                             target_ulong post_val, target_ulong pc) {
-    provenance_addsub_imm(env, reg_idx, (int64_t)(int64_t)delta, pc,
-                          pre_val, post_val);
+    provenance_addsub_imm(env, reg_idx, (int64_t)delta, pc, pre_val,
+                          post_val);
 }
 
 void helper_prov_addsub_reg(CPUArchState *env, uint32_t dst_idx,
@@ -950,15 +954,16 @@ void helper_prov_set_pc(CPUArchState *env, target_ulong pc) {
     PtrRegShadow *shadow = provenance_get_reg_shadow(env);
     shadow->cur_pc = pc;
 }
-
 void helper_prov_set_ea(CPUArchState *env, uint32_t base_reg,
                         uint32_t index_reg, uint32_t scale,
-                        target_ulong disp) {
+                        target_ulong disp, uint32_t mode) {
     PtrRegShadow *shadow = provenance_get_reg_shadow(env);
     shadow->ea_meta.base_reg = (int32_t)base_reg;
     shadow->ea_meta.index_reg = (int32_t)index_reg;
     shadow->ea_meta.scale = (int32_t)scale;
     shadow->ea_meta.disp = (target_long)disp;
+    shadow->ea_meta.aflags = mode & 0xff;
+    shadow->ea_meta.override = (int32_t)((mode >> 8) & 0x7fffffff) - 1;
     /* Snapshot the pre-access concrete values and tags.  The check runs
      * AFTER the guest load/store; a load whose destination overwrites its
      * own EA base/index register must not make the check observe the
@@ -997,6 +1002,8 @@ void helper_prov_check_access(CPUArchState *env, target_ulong addr,
     int index_reg = shadow->ea_meta.index_reg;
     int scale = shadow->ea_meta.scale;
     target_long disp = shadow->ea_meta.disp;
+    uint32_t aflags = shadow->ea_meta.aflags;
+    int override = shadow->ea_meta.override;
     /* Pre-access snapshots taken by helper_prov_set_ea (before the guest
      * load/store), so a self-overwriting load cannot corrupt them. */
     PtrTag base_tag = shadow->ea_meta.base_tag;
@@ -1005,21 +1012,29 @@ void helper_prov_check_access(CPUArchState *env, target_ulong addr,
     target_ulong index_val = shadow->ea_meta.index_val;
     shadow->ea_meta.valid = false;
     if (have_ea) {
-        /* Semantic EA propagation (§6).  Only these first-version forms
-         * carry identity:
-         *   [tagged_base + disp]: propagate base identity, offset += disp
-         *     (translation-time disp, value-consistency checked).
-         *   [tagged_index*1 + disp] with no base: propagate the index
-         *     identity, offset += disp.
-         * Everything else — two tagged inputs, scale != 1 on the tagged
-         * operand, truncating address modes, unmodeled segment bases —
-         * is UNKNOWN (exact-bounds fallback only).  No numeric delta
-         * reconstruction is performed. */
+        /* Semantic EA propagation (§6).  Identity requires a 64-bit
+         * address size with no segment override.  Constant displacement
+         * forms propagate directly.  For benchmark compatibility, a
+         * tagged base plus an untagged runtime index also propagates only
+         * after exact target-width EA reconstruction succeeds; two tagged
+         * inputs remain UNKNOWN.  Truncating address modes, unmodeled
+         * segment bases, and a tagged scaled index remain UNKNOWN and use
+         * exact-bounds fallback only. */
+        if (aflags != MO_64 || override >= 0) {
+            provenance_check_access(env, addr, size, pc, (PtrTag){0},
+                                    -1, 0);
+            return;
+        }
         if (base_reg >= 0 && base_reg < CPU_NB_REGS) {
             if (index_reg < 0 && base_tag.valid) {
                 /* [base + disp]: the access address must equal
-                 * base_val + disp (semantic, translation-time disp). */
-                target_ulong expect = (target_ulong)((int64_t)base_val + disp);
+                 * base_val + disp (semantic, translation-time disp).
+                 * x86 address arithmetic wraps mod 2^64, so the
+                 * expected address is computed with wrapping unsigned
+                 * arithmetic (a negative displacement is a full-width
+                 * sign-extended value, not an overflow); only the
+                 * tracked-offset fold below uses checked overflow. */
+                target_ulong expect = base_val + (target_ulong)disp;
                 if (expect == addr) {
                     int64_t new_offset;
                     if (__builtin_add_overflow(base_tag.concrete_offset,
@@ -1037,25 +1052,29 @@ void helper_prov_check_access(CPUArchState *env, target_ulong addr,
                                         ea_src_reg, ea_src_val);
                 return;
             }
-            /* base + index: two-register form.  If BOTH carry valid tags
-             * there is no sound merge rule — UNKNOWN.  If only the base
-             * is tagged, the index is a pure integer offset; the access
-             * address must equal base_val + index_val*scale + disp
-             * (semantic, no numeric reconstruction). */
             if (index_reg >= 0 && base_tag.valid) {
+                /* base + index: two-register form.  If BOTH carry valid
+                 * tags there is no sound merge rule — UNKNOWN.  If only
+                 * the base is tagged, the index is a pure integer
+                 * offset: the address must match the semantic
+                 * decomposition exactly (scale is the SIB shift 0..3),
+                 * and only then is the runtime delta addr - base_val
+                 * folded into the tracked offset with checked
+                 * arithmetic.  This is a verified arithmetic fold, not
+                 * a numeric proximity guess (§6). */
                 if (index_tag.valid) {
                     /* Two tagged inputs: no sound merge (§6). */
                     provenance_check_access(env, addr, size, pc,
                                             (PtrTag){0}, -1, 0);
                     return;
                 }
-                /* Untagged index: the address must match the semantic
-                 * decomposition exactly (scale is the SIB shift 0..3).
-                 * Only then fold the runtime delta addr - base_val into
-                 * the tracked offset, with checked arithmetic. */
-                int64_t idx_part = (int64_t)index_val << scale;
-                target_ulong expect = (target_ulong)((int64_t)base_val +
-                                                     idx_part + disp);
+                /* Untagged index: semantic exact-match, then fold the
+                 * runtime delta into the tracked offset (checked).
+                 * Expected-address arithmetic is wrapping (x86 mod
+                 * 2^64); only the offset fold is overflow-checked. */
+                target_ulong expect = base_val +
+                    ((target_ulong)index_val << scale) +
+                    (target_ulong)disp;
                 if (expect == addr) {
                     int64_t delta;
                     int64_t new_offset;
@@ -1080,9 +1099,9 @@ void helper_prov_check_access(CPUArchState *env, target_ulong addr,
         if (index_reg >= 0 && index_reg < CPU_NB_REGS) {
             /* Index carries the provenance and the base is untagged or
              * absent.  Only scale 1 is sound (§6): the address must
-             * equal index_val + disp. */
+             * equal index_val + disp (wrapping arithmetic). */
             if (index_tag.valid && scale == 0) {
-                target_ulong expect = (target_ulong)((int64_t)index_val + disp);
+                target_ulong expect = index_val + (target_ulong)disp;
                 if (expect == addr) {
                     int64_t new_offset;
                     if (__builtin_add_overflow(index_tag.concrete_offset,

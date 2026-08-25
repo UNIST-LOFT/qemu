@@ -202,14 +202,15 @@ static void gen_prov_lea_imm(int dst_idx, int base_idx, int64_t disp,
     tcg_temp_free_i32(t_base);
     tcg_temp_free(t_disp);
 }
-
 /* lea dst, [base + index*scale + disp]: the result is exactly
  * base_value + (index*scale + disp), so the pointer identity of base is
- * preserved with the runtime delta folded into the offset — same checked
- * arithmetic as provenance_lea_imm, with the delta computed at runtime
- * instead of translation time.  pre_base is the base register's value
- * BEFORE the instruction (required when dst == base: cpu_regs[base] is
- * the post-instruction value by the time the helper runs). */
+ * preserved with the runtime delta folded into the offset — the same
+ * checked arithmetic as provenance_lea_imm (base tag valid and
+ * concrete_value == pre_base verified inside the helper), with the
+ * delta computed at runtime instead of translation time.  pre_base is
+ * the base register's value BEFORE the instruction (required when
+ * dst == base: cpu_regs[base] is the post-instruction value by the time
+ * the helper runs). */
 static void gen_prov_lea_dyn(int dst_idx, int base_idx, target_ulong pc,
                              TCGv pre_base) {
     if (!binradar_memcheck_enabled) return;
@@ -271,7 +272,7 @@ static void gen_prov_on_load(int dst_idx, TCGv t_addr, TCGMemOp ot,
                              target_ulong pc) {
     if (!binradar_memcheck_enabled) return;
     TCGv_i32 t_dst = tcg_const_i32(dst_idx);
-    TCGv t_size = tcg_const_tl(1 << ot);
+    TCGv t_size = tcg_const_tl(1 << (ot & MO_SIZE));
     TCGv t_pc = tcg_const_tl(pc);
     gen_helper_prov_on_load(cpu_env, t_dst, t_addr, t_size, t_pc);
     tcg_temp_free_i32(t_dst);
@@ -282,7 +283,7 @@ static void gen_prov_on_load(int dst_idx, TCGv t_addr, TCGMemOp ot,
 static void gen_prov_on_store(int src_idx, TCGv t_addr, TCGMemOp ot) {
     if (!binradar_memcheck_enabled) return;
     TCGv_i32 t_src = tcg_const_i32(src_idx);
-    TCGv t_size = tcg_const_tl(1 << ot);
+    TCGv t_size = tcg_const_tl(1 << (ot & MO_SIZE));
     gen_helper_prov_on_store(cpu_env, t_src, t_addr, t_size);
     tcg_temp_free_i32(t_src);
     tcg_temp_free(t_size);
@@ -298,30 +299,12 @@ static void gen_prov_xchg_reg(int dst_idx, int src_idx) {
     tcg_temp_free_i32(t_src);
 }
 
-/* Effective-address provenance: store the semantic EA decomposition
- * (base, index, scale, displacement) into the per-CPU scratch BEFORE the
- * guest load/store, then run the check AFTER it (exception-safe: a
- * faulting access never records a finding). */
-static void gen_prov_set_ea(int base_reg, int index_reg, int scale,
-                            target_long disp) {
-    if (!binradar_memcheck_enabled) return;
-    TCGv_i32 t_base = tcg_const_i32(base_reg);
-    TCGv_i32 t_index = tcg_const_i32(index_reg);
-    TCGv_i32 t_scale = tcg_const_i32(scale);
-    TCGv t_disp = tcg_const_tl((target_ulong)disp);
-    gen_helper_prov_set_ea(cpu_env, t_base, t_index, t_scale, t_disp);
-    tcg_temp_free_i32(t_base);
-    tcg_temp_free_i32(t_index);
-    tcg_temp_free_i32(t_scale);
-    tcg_temp_free(t_disp);
-}
-
 /* Runtime access check.  Emitted AFTER the guest load/store; reads the
  * EA metadata previously stored by helper_prov_set_ea. */
 static void gen_prov_check_access(TCGv t_addr, TCGMemOp ot,
                                   target_ulong pc) {
     if (!binradar_memcheck_enabled) return;
-    TCGv t_size = tcg_const_tl(1 << ot);
+    TCGv t_size = tcg_const_tl(1 << (ot & MO_SIZE));
     TCGv t_pc = tcg_const_tl(pc);
     gen_helper_prov_check_access(cpu_env, t_addr, t_size, t_pc);
     tcg_temp_free(t_size);
@@ -441,6 +424,31 @@ typedef struct DisasContext {
 
     sigjmp_buf jmpbuf;
 } DisasContext;
+/* Effective-address provenance: store the semantic EA decomposition
+ * (base, index, scale, displacement, address width, segment state) into
+ * the per-CPU scratch BEFORE the guest load/store, then run the check
+ * AFTER it (exception-safe: a faulting access never records a finding). */
+static void gen_prov_set_ea(DisasContext *s, int base_reg, int index_reg,
+                            int scale, target_long disp) {
+    if (!binradar_memcheck_enabled) return;
+    TCGv_i32 t_base = tcg_const_i32(base_reg);
+    TCGv_i32 t_index = tcg_const_i32(index_reg);
+    TCGv_i32 t_scale = tcg_const_i32(scale);
+    TCGv t_disp = tcg_const_tl((target_ulong)disp);
+    /* Pack address-width and segment-override state into one argument:
+     * low 8 bits = TCGMemOp aflag, next bits = override + 1 (zero means
+     * no override). */
+    uint32_t mode = (uint32_t)s->aflag |
+                    (((uint32_t)s->override + 1) << 8);
+    TCGv_i32 t_mode = tcg_const_i32(mode);
+    gen_helper_prov_set_ea(cpu_env, t_base, t_index, t_scale, t_disp,
+                           t_mode);
+    tcg_temp_free_i32(t_base);
+    tcg_temp_free_i32(t_index);
+    tcg_temp_free_i32(t_scale);
+    tcg_temp_free(t_disp);
+    tcg_temp_free_i32(t_mode);
+}
 
 static void gen_eob(DisasContext *s);
 static void gen_jr(DisasContext *s, TCGv dest);
@@ -966,26 +974,26 @@ static void gen_check_io(DisasContext *s, TCGMemOp ot, target_ulong cur_eip,
 static inline void gen_movs(DisasContext *s, TCGMemOp ot)
 {
     gen_string_movl_A0_ESI(s);
+    gen_prov_set_ea(s, R_ESI, -1, 0, 0);
     if (s->aflag == MO_64 && s->override < 0) {
-        gen_prov_set_ea(R_ESI, -1, 0, 0);
         gen_osprey_set_ea(R_ESI, -1, 0, 0, cpu_regs[R_ESI], NULL);
     }
     gen_op_ld_v(s, ot, s->T0, s->A0);
+    gen_prov_check_access(s->A0, ot, s->pc_start);
     if (s->aflag == MO_64 && s->override < 0) {
-        gen_prov_check_access(s->A0, ot, s->pc_start);
         gen_osprey_mem_access(s->A0, ot, s->pc_start, false);
     }
     gen_string_movl_A0_EDI(s);
+    gen_prov_set_ea(s, R_EDI, -1, 0, 0);
     if (s->aflag == MO_64 && s->override < 0) {
-        gen_prov_set_ea(R_EDI, -1, 0, 0);
         gen_osprey_set_ea(R_EDI, -1, 0, 0, cpu_regs[R_EDI], NULL);
     }
     gen_op_st_v(s, ot, s->T0, s->A0);
     /* Provenance: copied value — not A pointer → invalidate. */
     gen_prov_on_store(OR_TMP0, s->A0, ot);
     gen_osprey_on_store(OR_TMP0, s->A0, ot);
+    gen_prov_check_access(s->A0, ot, s->pc_start);
     if (s->aflag == MO_64 && s->override < 0) {
-        gen_prov_check_access(s->A0, ot, s->pc_start);
         gen_osprey_mem_access(s->A0, ot, s->pc_start, true);
     }
     gen_op_movl_T0_Dshift(s, ot);
@@ -1417,16 +1425,16 @@ static inline void gen_stos(DisasContext *s, TCGMemOp ot)
 {
     gen_op_mov_v_reg(s, MO_32, s->T0, R_EAX);
     gen_string_movl_A0_EDI(s);
+    gen_prov_set_ea(s, R_EDI, -1, 0, 0);
     if (s->aflag == MO_64 && s->override < 0) {
-        gen_prov_set_ea(R_EDI, -1, 0, 0);
         gen_osprey_set_ea(R_EDI, -1, 0, 0, cpu_regs[R_EDI], NULL);
     }
     gen_op_st_v(s, ot, s->T0, s->A0);
     /* Provenance: store value not known to be a pointer → invalidate. */
     gen_prov_on_store(OR_TMP0, s->A0, ot);
     gen_osprey_on_store(OR_TMP0, s->A0, ot);
+    gen_prov_check_access(s->A0, ot, s->pc_start);
     if (s->aflag == MO_64 && s->override < 0) {
-        gen_prov_check_access(s->A0, ot, s->pc_start);
         gen_osprey_mem_access(s->A0, ot, s->pc_start, true);
     }
     gen_op_movl_T0_Dshift(s, ot);
@@ -1436,8 +1444,8 @@ static inline void gen_stos(DisasContext *s, TCGMemOp ot)
 static inline void gen_lods(DisasContext *s, TCGMemOp ot)
 {
     gen_string_movl_A0_ESI(s);
+    gen_prov_set_ea(s, R_ESI, -1, 0, 0);
     if (s->aflag == MO_64 && s->override < 0) {
-        gen_prov_set_ea(R_ESI, -1, 0, 0);
         gen_osprey_set_ea(R_ESI, -1, 0, 0, cpu_regs[R_ESI], NULL);
     }
     gen_op_ld_v(s, ot, s->T0, s->A0);
@@ -1445,8 +1453,8 @@ static inline void gen_lods(DisasContext *s, TCGMemOp ot)
     /* Provenance: restore tag from shadow (value-consistency guarded). */
     gen_prov_on_load(R_EAX, s->A0, ot, s->pc_start);
     gen_osprey_on_load(R_EAX, s->A0, ot);
+    gen_prov_check_access(s->A0, ot, s->pc_start);
     if (s->aflag == MO_64 && s->override < 0) {
-        gen_prov_check_access(s->A0, ot, s->pc_start);
         gen_osprey_mem_access(s->A0, ot, s->pc_start, false);
     }
     gen_op_movl_T0_Dshift(s, ot);
@@ -1456,13 +1464,13 @@ static inline void gen_lods(DisasContext *s, TCGMemOp ot)
 static inline void gen_scas(DisasContext *s, TCGMemOp ot)
 {
     gen_string_movl_A0_EDI(s);
+    gen_prov_set_ea(s, R_EDI, -1, 0, 0);
     if (s->aflag == MO_64 && s->override < 0) {
-        gen_prov_set_ea(R_EDI, -1, 0, 0);
         gen_osprey_set_ea(R_EDI, -1, 0, 0, cpu_regs[R_EDI], NULL);
     }
     gen_op_ld_v(s, ot, s->T1, s->A0);
+    gen_prov_check_access(s->A0, ot, s->pc_start);
     if (s->aflag == MO_64 && s->override < 0) {
-        gen_prov_check_access(s->A0, ot, s->pc_start);
         gen_osprey_mem_access(s->A0, ot, s->pc_start, false);
     }
     gen_op(s, OP_CMPL, ot, R_EAX);
@@ -1473,23 +1481,23 @@ static inline void gen_scas(DisasContext *s, TCGMemOp ot)
 static inline void gen_cmps(DisasContext *s, TCGMemOp ot)
 {
     gen_string_movl_A0_EDI(s);
+    gen_prov_set_ea(s, R_EDI, -1, 0, 0);
     if (s->aflag == MO_64 && s->override < 0) {
-        gen_prov_set_ea(R_EDI, -1, 0, 0);
         gen_osprey_set_ea(R_EDI, -1, 0, 0, cpu_regs[R_EDI], NULL);
     }
     gen_op_ld_v(s, ot, s->T1, s->A0);
+    gen_prov_check_access(s->A0, ot, s->pc_start);
     if (s->aflag == MO_64 && s->override < 0) {
-        gen_prov_check_access(s->A0, ot, s->pc_start);
         gen_osprey_mem_access(s->A0, ot, s->pc_start, false);
     }
     gen_string_movl_A0_ESI(s);
+    gen_prov_set_ea(s, R_ESI, -1, 0, 0);
     if (s->aflag == MO_64 && s->override < 0) {
-        gen_prov_set_ea(R_ESI, -1, 0, 0);
         gen_osprey_set_ea(R_ESI, -1, 0, 0, cpu_regs[R_ESI], NULL);
     }
     gen_op_ld_v(s, ot, s->T0, s->A0);
+    gen_prov_check_access(s->A0, ot, s->pc_start);
     if (s->aflag == MO_64 && s->override < 0) {
-        gen_prov_check_access(s->A0, ot, s->pc_start);
         gen_osprey_mem_access(s->A0, ot, s->pc_start, false);
     }
     gen_op(s, OP_CMPL, ot, OR_TMP0);
@@ -2580,12 +2588,11 @@ static void gen_ldst_modrm(CPUX86State *env, DisasContext *s, int modrm,
         AddressParts a = gen_lea_modrm_0(env, s, modrm);
         TCGv ea = gen_lea_modrm_1(s, a);
         gen_lea_v_seg(s, s->aflag, ea, a.def_seg, s->override);
-        /* Provenance access check (§6): 64-bit modes without segment
-         * override.  The semantic EA decomposition (base, index, scale,
-         * disp) is stored BEFORE the access; the check runs AFTER the
-         * guest load/store so a faulting access records nothing. */
+        /* Store the architectural EA before every supported memory op.
+         * The runtime helper turns truncating/segment forms into UNKNOWN,
+         * preserving exact-bounds fallback in symbolic mode. */
+        gen_prov_set_ea(s, a.base, a.index, a.scale, a.disp);
         if (s->aflag == MO_64 && s->override < 0) {
-            gen_prov_set_ea(a.base, a.index, a.scale, a.disp);
             /* OSPREY: semantic EA decomposition for base-address facts. */
             if (a.base >= 0) {
                 gen_osprey_set_ea(a.base, a.index, a.scale, a.disp,
@@ -2607,8 +2614,8 @@ static void gen_ldst_modrm(CPUX86State *env, DisasContext *s, int modrm,
             if (reg != OR_TMP0) {
                 gen_osprey_on_store(reg, s->A0, ot);
             }
+            gen_prov_check_access(s->A0, ot, s->pc_start);
             if (s->aflag == MO_64 && s->override < 0) {
-                gen_prov_check_access(s->A0, ot, s->pc_start);
                 gen_osprey_mem_access(s->A0, ot, s->pc_start, true);
             }
         } else {
@@ -2622,8 +2629,8 @@ static void gen_ldst_modrm(CPUX86State *env, DisasContext *s, int modrm,
             if (reg != OR_TMP0) {
                 gen_osprey_on_load(reg, s->A0, ot);
             }
+            gen_prov_check_access(s->A0, ot, s->pc_start);
             if (s->aflag == MO_64 && s->override < 0) {
-                gen_prov_check_access(s->A0, ot, s->pc_start);
                 gen_osprey_mem_access(s->A0, ot, s->pc_start, false);
             }
         }
@@ -5180,12 +5187,10 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                     AddressParts a = gen_lea_modrm_0(env, s, modrm);
                     TCGv ea = gen_lea_modrm_1(s, a);
                     gen_lea_v_seg(s, s->aflag, ea, a.def_seg, s->override);
-                    /* Provenance access check: semantic EA stored before
-                     * the memory op (load + store both inside gen_op);
-                     * check emitted after so a faulting access records
-                     * nothing. */
+                    /* Store every architectural EA; unsupported modes
+                     * become UNKNOWN in the runtime helper. */
+                    gen_prov_set_ea(s, a.base, a.index, a.scale, a.disp);
                     if (s->aflag == MO_64 && s->override < 0) {
-                        gen_prov_set_ea(a.base, a.index, a.scale, a.disp);
                         if (a.base >= 0) {
                             gen_osprey_set_ea(a.base, a.index, a.scale, a.disp,
                                               cpu_regs[a.base],
@@ -5214,10 +5219,11 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                 gen_op(s, op, ot, opreg);
                 /* Access check AFTER the memory op (load+store) completed,
                  * so a faulting access records nothing. */
-                if (s->aflag == MO_64 && s->override < 0 &&
-                    opreg == OR_TMP0) {
+                if (opreg == OR_TMP0) {
                     gen_prov_check_access(s->A0, ot, s->pc_start);
-                    gen_osprey_mem_access(s->A0, ot, s->pc_start, true);
+                    if (s->aflag == MO_64 && s->override < 0) {
+                        gen_osprey_mem_access(s->A0, ot, s->pc_start, true);
+                    }
                 }
                 /* reg-reg ADD/SUB provenance propagation (after write-back:
                  * gen_op invalidated dst; recompute delta from result). */
@@ -5236,10 +5242,10 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                     AddressParts a = gen_lea_modrm_0(env, s, modrm);
                     TCGv ea = gen_lea_modrm_1(s, a);
                     gen_lea_v_seg(s, s->aflag, ea, a.def_seg, s->override);
-                    /* Provenance access check: semantic EA stored before
-                     * the load, check after it. */
+                    /* Store every architectural EA; unsupported modes
+                     * become UNKNOWN in the runtime helper. */
+                    gen_prov_set_ea(s, a.base, a.index, a.scale, a.disp);
                     if (s->aflag == MO_64 && s->override < 0) {
-                        gen_prov_set_ea(a.base, a.index, a.scale, a.disp);
                         if (a.base >= 0) {
                             gen_osprey_set_ea(a.base, a.index, a.scale, a.disp,
                                               cpu_regs[a.base],
@@ -5250,8 +5256,8 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                         }
                     }
                     gen_op_ld_v(s, ot, s->T1, s->A0);
+                    gen_prov_check_access(s->A0, ot, s->pc_start);
                     if (s->aflag == MO_64 && s->override < 0) {
-                        gen_prov_check_access(s->A0, ot, s->pc_start);
                         gen_osprey_mem_access(s->A0, ot, s->pc_start, false);
                     }
                 } else if (op == OP_XORL && rm == reg) {
@@ -5289,7 +5295,8 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                 gen_op(s, op, ot, OR_EAX);
                 if (binradar_memcheck_enabled && ot == MO_64 &&
                     (op == OP_ADDL || op == OP_SUBL)) {
-                    int64_t delta = (op == OP_SUBL) ? -(int64_t)val : (int64_t)val;
+                    int64_t imm = (int64_t)(int32_t)(uint32_t)val;
+                    int64_t delta = (op == OP_SUBL) ? -imm : imm;
                     gen_prov_addsub_imm(OR_EAX, delta, s->prov_pre_snapshot,
                                         s->pc_start);
                     s->prov_pre_snapshot = NULL;
@@ -5324,10 +5331,10 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                 AddressParts a = gen_lea_modrm_0(env, s, modrm);
                 TCGv ea = gen_lea_modrm_1(s, a);
                 gen_lea_v_seg(s, s->aflag, ea, a.def_seg, s->override);
-                /* Provenance access check: semantic EA stored before
-                 * the memory op (load+store inside gen_op), check after. */
+                /* Store every architectural EA; unsupported modes become
+                 * UNKNOWN in the runtime helper. */
+                gen_prov_set_ea(s, a.base, a.index, a.scale, a.disp);
                 if (s->aflag == MO_64 && s->override < 0) {
-                    gen_prov_set_ea(a.base, a.index, a.scale, a.disp);
                     if (a.base >= 0) {
                         gen_osprey_set_ea(a.base, a.index, a.scale, a.disp,
                                           cpu_regs[a.base],
@@ -5367,16 +5374,18 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
             gen_op(s, op, ot, opreg);
             /* Access check AFTER the memory op (load+store) completed,
              * so a faulting access records nothing. */
-            if (s->aflag == MO_64 && s->override < 0 &&
-                opreg == OR_TMP0) {
+            if (opreg == OR_TMP0) {
                 gen_prov_check_access(s->A0, ot, s->pc_start);
-                gen_osprey_mem_access(s->A0, ot, s->pc_start, true);
+                if (s->aflag == MO_64 && s->override < 0) {
+                    gen_osprey_mem_access(s->A0, ot, s->pc_start, true);
+                }
             }
             /* Provenance: add/sub reg, imm preserves tag (offset += val).
              * OP_ADDL (op==0) and OP_SUBL (op==5) are pointer-preserving. */
             if (binradar_memcheck_enabled && mod == 3 && ot == MO_64 &&
                 (op == OP_ADDL || op == OP_SUBL)) {
-                int64_t delta = (op == OP_SUBL) ? -(int64_t)val : (int64_t)val;
+                int64_t imm = (int64_t)(int32_t)(uint32_t)val;
+                int64_t delta = (op == OP_SUBL) ? -imm : imm;
                 gen_prov_addsub_imm(opreg, delta, s->prov_pre_snapshot,
                                     s->pc_start);
                 s->prov_pre_snapshot = NULL;
@@ -6237,10 +6246,10 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
             AddressParts a = gen_lea_modrm_0(env, s, modrm);
             TCGv ea = gen_lea_modrm_1(s, a);
             gen_lea_v_seg(s, s->aflag, ea, a.def_seg, s->override);
-            /* Provenance access check: semantic EA stored before the
-             * store, check after it. */
+            /* Store every architectural EA; unsupported modes become
+             * UNKNOWN in the runtime helper. */
+            gen_prov_set_ea(s, a.base, a.index, a.scale, a.disp);
             if (s->aflag == MO_64 && s->override < 0) {
-                gen_prov_set_ea(a.base, a.index, a.scale, a.disp);
                 if (a.base >= 0) {
                     gen_osprey_set_ea(a.base, a.index, a.scale, a.disp,
                                       cpu_regs[a.base],
@@ -6257,8 +6266,8 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
             gen_op_st_v(s, ot, s->T0, s->A0);
             /* Provenance: immediate store → invalidate shadow slot. */
             gen_prov_on_store(OR_TMP0, s->A0, ot);
+            gen_prov_check_access(s->A0, ot, s->pc_start);
             if (s->aflag == MO_64 && s->override < 0) {
-                gen_prov_check_access(s->A0, ot, s->pc_start);
                 gen_osprey_mem_access(s->A0, ot, s->pc_start, true);
             }
         } else {
@@ -6354,10 +6363,10 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                 AddressParts a = gen_lea_modrm_0(env, s, modrm);
                 TCGv ea = gen_lea_modrm_1(s, a);
                 gen_lea_v_seg(s, s->aflag, ea, a.def_seg, s->override);
-                /* Provenance access check: semantic EA stored before
-                 * the load, check after it. */
+                /* Store every architectural EA; unsupported modes become
+                 * UNKNOWN in the runtime helper. */
+                gen_prov_set_ea(s, a.base, a.index, a.scale, a.disp);
                 if (s->aflag == MO_64 && s->override < 0) {
-                    gen_prov_set_ea(a.base, a.index, a.scale, a.disp);
                     if (a.base >= 0) {
                         gen_osprey_set_ea(a.base, a.index, a.scale, a.disp,
                                           cpu_regs[a.base],
@@ -6370,8 +6379,8 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                 gen_op_ld_v(s, s_ot, s->T0, s->A0);
                 gen_op_mov_reg_v(s, d_ot, reg, s->T0);
                 gen_osprey_on_load(reg, s->A0, s_ot);
+                gen_prov_check_access(s->A0, s_ot, s->pc_start);
                 if (s->aflag == MO_64 && s->override < 0) {
-                    gen_prov_check_access(s->A0, s_ot, s->pc_start);
                     gen_osprey_mem_access(s->A0, s_ot, s->pc_start, false);
                 }
             }
@@ -6388,11 +6397,15 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
             AddressParts a = gen_lea_modrm_0(env, s, modrm);
             TCGv ea = gen_lea_modrm_1(s, a);
             gen_lea_v_seg(s, s->aflag, ea, -1, -1);
-            /* Provenance: lea dst, [base + index*scale + disp] →
-             * propagate tag(base); suppress the write-back invalidation
-             * so the helper can read the pre-op dst tag.  Snapshot the
-             * base's pre-instruction value for the runtime delta when an
-             * index is present (dst == base overwrites cpu_regs[base]). */
+            /* Provenance: lea dst, [base + disp] propagates the base
+             * identity (checked constant offset).  Indexed forms
+             * [base + index*scale + disp] propagate the base identity
+             * with the verified runtime delta (index*scale + disp)
+             * folded into the offset — same checked arithmetic as
+             * provenance_lea_imm, delta computed at runtime.  The
+             * write-back invalidation is suppressed so the helper can
+             * read the pre-op dst tag; the base's pre-instruction value
+             * is snapshotted when dst == base. */
             TCGv prov_pre_base = NULL;
             if (binradar_memcheck_enabled && dflag == MO_64 &&
                 a.base >= 0) {
@@ -6403,20 +6416,16 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                 }
             }
             gen_op_mov_reg_v(s, dflag, reg, s->A0);
-            /* Provenance: lea dst, [base + disp] → propagate tag(base);
-             * lea dst, [base + index*scale + disp] → propagate tag(base)
-             * with the runtime delta (index*scale + disp) folded into the
-             * checked offset. */
             if (binradar_memcheck_enabled && dflag == MO_64 &&
                 a.base >= 0) {
                 if (a.index < 0) {
                     gen_prov_lea_imm(reg, a.base, a.disp, s->pc_start);
-                                 } else {
-                     gen_prov_lea_dyn(reg, a.base, s->pc_start,
-                                      prov_pre_base);
-                     tcg_temp_free(prov_pre_base);
-                 }
-             }
+                } else {
+                    gen_prov_lea_dyn(reg, a.base, s->pc_start,
+                                     prov_pre_base);
+                    tcg_temp_free(prov_pre_base);
+                }
+            }
             /* OSPREY: lea propagates the ADDRESS origin with the checked
              * constant offset.  Only the [base + disp] form is a sound
              * constant-offset transfer; indexed forms invalidate (the

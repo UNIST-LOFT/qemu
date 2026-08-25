@@ -98,12 +98,19 @@ typedef struct PtrRegShadow {
      * time (before the memory op).  A load whose destination overwrites
      * its own EA base/index register (e.g. `mov (%rax), %rax`) must not
      * make the post-access check observe the loaded value/tag instead of
-     * the address-producing state (§6). */
+     * the address-producing state (§6).
+     *
+     * aflags/override are the translator's address-size and segment state
+     * for this instruction.  Only aflags == MO_64 with no segment
+     * override is eligible for identity propagation; truncating
+     * address-size modes and unmodeled segment bases are UNKNOWN. */
     struct ProvEAMeta {
         int32_t      base_reg;   /* -1 if no base register              */
         int32_t      index_reg;  /* -1 if no index register             */
         int32_t      scale;      /* SIB scale: 0=*1 1=*2 2=*4 3=*8      */
         target_long  disp;       /* constant displacement               */
+        uint32_t     aflags;     /* TCGMemOp address size               */
+        int32_t      override;   /* segment override register, -1 none  */
         target_ulong base_val;   /* pre-access concrete base value      */
         target_ulong index_val;  /* pre-access concrete index value     */
         PtrTag       base_tag;   /* pre-access base register tag        */

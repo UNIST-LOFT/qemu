@@ -36,7 +36,9 @@ TESTS := t01_double_free t02_small_double_free t03_uaf_stack t04_uaf_heap \
          t34_failed_malloc t35_same_addr_realloc t36_self_overwrite_load \
          t37_atomic_rmw t38_x87_store_semantics t39_failed_access_ordering \
          t39b_failed_access_success t42_mapping_reuse t43_syscall_output \
-         t44_simd_overlap t45_post_finding_query
+         t44_simd_overlap t45_post_finding_query t46_ea_tagged_promotion \
+         t47_ea_index_scale t47_ea_seg_override t47_ea_addr32 \
+         t47_ea_negative_disp
 
 GUEST_BINS := $(addprefix $(WORK)/,$(TESTS))
 PLT_FILES  := $(addprefix $(WORK)/,$(addsuffix .plt,$(TESTS)))
