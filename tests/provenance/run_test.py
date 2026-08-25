@@ -30,6 +30,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from typing import Any
 
 # ---------------------------------------------------------------------------
 # Test configuration
@@ -49,7 +50,11 @@ import time
 # timeout: per-run timeout seconds (forkserver child timeout is separate).
 # final_queries: exact `Number of queries` summary expected from symbolic mode.
 # final_expr_min: minimum `Number of expressions` summary expected.
-TESTS = [
+# meta: dict of exact structured producer/writer assertions for the first
+#     finding.  Keys: producer_kind (int), producer_pc, last_writer,
+#     access_pc, ea_reg (int).  PC values are guest symbol names resolved
+#     with nm from the built ELF — never hard-coded absolute addresses.
+TESTS: list[dict[str, Any]] = [
     # --- memcheck-only: no finding, normal exit ---------------------------
     dict(name="t01_double_free", mode="mem", rc=(0, -6, 134),
          verdict="crash", reason="unhandled_target_signal",
@@ -335,6 +340,83 @@ BASE_ENV = {
 }
 
 # ---------------------------------------------------------------------------
+# Phase 5: store-width regressions and exact producer metadata
+# ---------------------------------------------------------------------------
+# t68-t73: each guest stores the freed pointer's own bytes back into the
+# shadow slot unchanged, then reloads the slot with an 8-byte load.  A
+# surviving shadow entry would pass the load-time value-consistency check
+# and restore the tag, making the freed-address access a UAF finding.  Only
+# the store's overlap invalidation can make the reload UNKNOWN, so these
+# tests prove shadow removal, not merely that concrete bytes changed.
+# t74-t78: named guest labels (prov_*_site) are resolved with nm; the
+# finding's producer_kind, producer_pc, last_writer, access_pc, and ea_reg
+# must match the exact instruction that created/transferred the tag.
+PHASE5_TESTS: list[dict[str, Any]] = [
+    dict(name="t68_store_width_1", mode="mem", rc=(0,), verdict="normal",
+         finding=None,
+         note="1-byte store of identical pointer bytes removes the shadow"),
+    dict(name="t69_store_width_2", mode="mem", rc=(0,), verdict="normal",
+         finding=None,
+         note="2-byte store of identical pointer bytes removes the shadow"),
+    dict(name="t70_store_width_4", mode="mem", rc=(0,), verdict="normal",
+         finding=None,
+         note="4-byte store of identical pointer bytes removes the shadow"),
+    dict(name="t71_store_unaligned_8", mode="mem", rc=(0,), verdict="normal",
+         finding=None,
+         note="unaligned 8-byte store of identical pointer bytes removes "
+              "the shadow"),
+    dict(name="t72_store_width_16", mode="mem", rc=(0,), verdict="normal",
+         finding=None,
+         note="16-byte SSE store of identical pointer bytes removes the "
+              "shadow across two pointer slots"),
+    dict(name="t73_store_atomic", mode="mem", rc=(0,), verdict="normal",
+         finding=None,
+         note="lock-prefixed atomic store of identical pointer bytes removes "
+              "the shadow"),
+    dict(name="t74_producer_malloc", mode="mem", rc=(0,), verdict="crash",
+         finding=dict(reason="heap-buffer-overflow", is_uaf=0,
+                      fields={"obj_id": 1, "gen": 1, "size": 8,
+                              "offset": 8, "width": 1}),
+         meta=dict(producer_kind=1, producer_pc="prov_alloc_site",
+                   last_writer="prov_alloc_site",
+                   access_pc="prov_access_site", ea_reg=0),
+         note="malloc-return tag: producer is the call return site"),
+    dict(name="t75_producer_mov", mode="mem", rc=(0,), verdict="crash",
+         finding=dict(reason="heap-buffer-overflow", is_uaf=0,
+                      fields={"obj_id": 1, "gen": 1, "size": 8,
+                              "offset": 8, "width": 1}),
+         meta=dict(producer_kind=4, producer_pc="prov_mov_site",
+                   last_writer="prov_mov_site",
+                   access_pc="prov_access_site", ea_reg=1),
+         note="mov transfer: producer is the mov instruction"),
+    dict(name="t76_producer_add", mode="mem", rc=(0,), verdict="crash",
+         finding=dict(reason="heap-buffer-overflow", is_uaf=0,
+                      fields={"obj_id": 1, "gen": 1, "size": 8,
+                              "offset": 8, "width": 1}),
+         meta=dict(producer_kind=6, producer_pc="prov_add_site",
+                   last_writer="prov_add_site",
+                   access_pc="prov_access_site", ea_reg=3),
+         note="add-immediate fold: producer is the add instruction"),
+    dict(name="t77_producer_pop", mode="mem", rc=(0,), verdict="crash",
+         finding=dict(reason="heap-buffer-overflow", is_uaf=0,
+                      fields={"obj_id": 1, "gen": 1, "size": 8,
+                              "offset": 8, "width": 1}),
+         meta=dict(producer_kind=8, producer_pc="prov_pop_site",
+                   last_writer="prov_pop_site",
+                   access_pc="prov_access_site", ea_reg=1),
+         note="stack-reload: producer is the pop instruction"),
+    dict(name="t78_producer_calloc", mode="mem", rc=(0,), verdict="crash",
+         finding=dict(reason="heap-buffer-overflow", is_uaf=0,
+                      fields={"obj_id": 1, "gen": 1, "size": 8,
+                              "offset": 8, "width": 1}),
+         meta=dict(producer_kind=2, producer_pc="prov_alloc_site",
+                   last_writer="prov_alloc_site",
+                   access_pc="prov_access_site", ea_reg=0),
+         note="calloc-return tag: producer is the call return site"),
+]
+TESTS += PHASE5_TESTS
+
+# ---------------------------------------------------------------------------
 # Log parsing
 # ---------------------------------------------------------------------------
 
@@ -408,6 +490,26 @@ def resolve_entrypoint(guest):
         if len(parts) == 3 and parts[1] == "T" and parts[2] == "main":
             return "0x" + parts[0]
     raise RuntimeError(f"no 'main' symbol in {guest}")
+
+
+def resolve_symbols(guest, names):
+    """Resolve named guest symbols to absolute addresses via nm.
+
+    The Phase 5 metadata tests express their PC contracts as named labels
+    (prov_*_site) in the guest source; the runner resolves them from the
+    built ELF so no hard-coded absolute PC can silently drift out of sync
+    with the guest code.
+    """
+    nm = subprocess.run(["nm", guest], capture_output=True, text=True)
+    addrs = {}
+    for line in nm.stdout.splitlines():
+        parts = line.split()
+        if len(parts) == 3 and parts[2] in names:
+            addrs[parts[2]] = int(parts[0], 16)
+    missing = sorted(names - addrs.keys())
+    if missing:
+        raise RuntimeError(f"missing symbols in {guest}: {', '.join(missing)}")
+    return addrs
 
 
 def run_tracer(cmd, env, timeout):
@@ -574,6 +676,10 @@ def run_test(test, guests_dir, workdir, qemu, solver):
     guest = os.path.join(workdir, test["name"])
     if not os.path.isfile(guest):
         raise FileNotFoundError(f"guest binary missing: {guest} (run 'make guests')")
+    if test.get("meta"):
+        sym_names = {v for k, v in test["meta"].items()
+                     if k in ("producer_pc", "last_writer", "access_pc")}
+        test["_symbols"] = resolve_symbols(guest, sym_names)
     if test["mode"] == "mem":
         result = run_memcheck(test, guest, qemu, workdir)
         rc, stderr_text = result.returncode, result.stderr.decode(errors="replace")
@@ -592,6 +698,18 @@ def check(test, rc, fs_status, out):
     problems = []
     if not rc_ok(rc, test.get("rc", (0,))):
         problems.append(f"rc={rc} not in {test.get('rc')}")
+    meta = test.get("meta")
+    if meta:
+        symbols = test.get("_symbols")
+        if symbols is None:
+            problems.append("meta test without resolved symbols")
+        else:
+            for field, want in meta.items():
+                if field in ("producer_pc", "last_writer", "access_pc"):
+                    if want not in symbols:
+                        problems.append(f"meta {field}: unknown symbol {want!r}")
+                elif field not in ("producer_kind", "ea_reg"):
+                    problems.append(f"meta: unknown field {field!r}")
     if test["mode"] == "fors":
         want_status = test.get("fs_status")
         if want_status is not None and fs_status != want_status:
@@ -648,6 +766,23 @@ def check(test, rc, fs_status, out):
     if missing:
         problems.append("finding missing fields: " + ", ".join(missing))
         return problems
+
+    if meta:
+        symbols = test.get("_symbols")
+        if symbols is not None:
+            if finding_int(got, "kind") != meta["producer_kind"]:
+                problems.append(
+                    f"producer kind {finding_int(got, 'kind')} != "
+                    f"{meta['producer_kind']}")
+            for field in ("producer_pc", "last_writer", "access_pc"):
+                want_addr = symbols[meta[field]]
+                if finding_int(got, field) != want_addr:
+                    problems.append(
+                        f"finding {field} {finding_int(got, field):#x} != "
+                        f"{meta[field]} {want_addr:#x}")
+            if finding_int(got, "ea_reg") != meta["ea_reg"]:
+                problems.append(
+                    f"ea_reg {finding_int(got, 'ea_reg')} != {meta['ea_reg']}")
 
     if want["reason"] not in got["reason"]:
         problems.append(f"finding reason {got['reason']!r} != {want['reason']!r}")

@@ -48,7 +48,10 @@ TESTS := t01_double_free t02_small_double_free t03_uaf_stack t04_uaf_heap \
          t61_recvfrom_addr_addrlen t62_recvmsg_payload_name_control \
          t63_recvmsg_header_fields t64_gettimeofday_timezone_untouched \
          t65_futex_wake_op_output t66_readv_iovec_overlap \
-         t67_recvmsg_partial_error
+         t67_recvmsg_partial_error t68_store_width_1 t69_store_width_2 \
+         t70_store_width_4 t71_store_unaligned_8 t72_store_width_16 \
+         t73_store_atomic t74_producer_malloc t75_producer_mov \
+         t76_producer_add t77_producer_pop t78_producer_calloc
 
 GUEST_BINS := $(addprefix $(WORK)/,$(TESTS))
 PLT_FILES  := $(addprefix $(WORK)/,$(addsuffix .plt,$(TESTS)))
