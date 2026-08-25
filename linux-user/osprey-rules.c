@@ -91,7 +91,7 @@ static void insertion_sort_i64(GArray *a) {
 /* Graph lifecycle                                                     */
 /* ------------------------------------------------------------------ */
 
-static OspreyGraph *graph_new(void) {
+OspreyGraph *osprey_graph_new(void) {
     OspreyGraph *g = g_new0(OspreyGraph, 1);
     g->vars = g_array_new(FALSE, FALSE, sizeof(OspreyVar));
     g->var_index = g_hash_table_new(g_direct_hash, g_direct_equal);
@@ -103,6 +103,28 @@ static OspreyGraph *graph_new(void) {
     g->uf_parent = NULL;
     g->uf_size = 0;
     return g;
+}
+
+/* Free a factor graph and everything it owns (Stage 0/1 ownership). */
+void osprey_graph_free(OspreyGraph *g) {
+    if (g == NULL) return;
+    if (g->factors != NULL) {
+        for (guint i = 0; i < g->factors->len; i++) {
+            OspreyFactor *f = g_array_index(g->factors, OspreyFactor *, i);
+            if (f != NULL) {
+                g_free(f->var_ids);
+                g_free(f);
+            }
+        }
+        g_array_free(g->factors, TRUE);
+    }
+    if (g->vars != NULL) g_array_free(g->vars, TRUE);
+    if (g->var_index != NULL) g_hash_table_destroy(g->var_index);
+    if (g->hints != NULL) g_array_free(g->hints, TRUE);
+    if (g->factor_index != NULL) g_hash_table_destroy(g->factor_index);
+    if (g->kind_region != NULL) g_hash_table_destroy(g->kind_region);
+    g_free(g->uf_parent);
+    g_free(g);
 }
 
 /* Canonical hash of a variable identity (kind + payload). */
@@ -1547,6 +1569,11 @@ OspreyStatus osprey_stage2_secondary(OspreyContext *ctx)
     g_hash_table_destroy(array_buckets);
     g_hash_table_destroy(scalar_buckets);
 
+    /* Propagate any limit/error status set during secondary
+     * instantiation (fail-closed transaction). */
+    if (ctx->last_status != OSPREY_OK) {
+        return ctx->last_status;
+    }
     OspreyGraph *g = ctx->graph;
     log_msg("[osprey] [graph] [stage secondary] [vars %u] [factors %u]\n",
             g->vars->len, g->factors->len);
@@ -1560,7 +1587,7 @@ OspreyStatus osprey_stage2_secondary(OspreyContext *ctx)
 OspreyStatus osprey_stage2_closure(OspreyContext *ctx) {
     if (ctx == NULL || !ctx->config.enabled) return OSPREY_DISABLED;
     if (ctx->graph == NULL) {
-        ctx->graph = graph_new();
+        ctx->graph = osprey_graph_new();
     }
     OspreyGraph *g = ctx->graph;
 
@@ -1600,6 +1627,11 @@ OspreyStatus osprey_stage2_closure(OspreyContext *ctx) {
     }
     g_hash_table_destroy(roots);
 
+    /* Propagate any limit/error status set during interning or factor
+     * instantiation (fail-closed transaction). */
+    if (ctx->last_status != OSPREY_OK) {
+        return ctx->last_status;
+    }
     log_msg("[osprey] [graph] [stage base] [vars %u] [factors %u] "
             "[components %u] [hints %llu] [cd04 %llu]\n",
             g->vars->len, g->factors->len, components,

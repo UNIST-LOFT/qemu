@@ -90,6 +90,7 @@ typedef enum OspreyStatus {
     OSPREY_EXACT_COMPONENT_TOO_LARGE,
     OSPREY_NON_CONVERGED,
     OSPREY_INVALID_MODEL,
+    OSPREY_UNSUPPORTED_EXECUTION,
 } OspreyStatus;
 
 typedef struct OspreyDecodedObject {
@@ -125,6 +126,9 @@ OspreyStatus osprey_parent_merge_sample(OspreyContext *ctx,
 /* Run deterministic closure, inference, and decoding. */
 OspreyStatus osprey_analyze(OspreyContext *ctx);
 
+/* The model usable by consumers: NULL unless the committed analysis
+ * transaction is OSPREY_OK.  Fail-closed: a rejected transaction never
+ * exposes a model, not even a previously installed one. */
 const OspreyModel *osprey_model(const OspreyContext *ctx);
 
 /* Decoded-object lookup by canonical chunk. */

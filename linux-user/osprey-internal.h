@@ -15,7 +15,6 @@
 
 #include "osprey.h"
 
-#include "qemu/thread.h"
 
 /* ------------------------------------------------------------------ */
 /* Canonical keys (used as open-addressing hashes, deterministic)      */
@@ -159,7 +158,7 @@ typedef struct OspreyCpuOriginState {
 /* Shared run (fixed layout, no pointers)                              */
 /* ------------------------------------------------------------------ */
 
-#define OSPREY_SHARED_VERSION 1u
+#define OSPREY_SHARED_VERSION 2u
 
 struct OspreySharedRun {
     uint32_t version;
@@ -171,6 +170,7 @@ struct OspreySharedRun {
     uint32_t overflow;           /* any table full */
     uint32_t bad_region;         /* access failed region resolution */
     uint32_t bad_arithmetic;     /* checked arithmetic failed */
+    uint32_t unsupported_execution; /* unsupported guest contract observed */
     uint32_t first_dropped_kind; /* fact kind of first dropped record */
     OspreyKey first_dropped_key;
 
@@ -225,6 +225,11 @@ bool osprey_region_instance_eq(const OspreyRegionInstance *a,
 /* Shared-run storage accessor (osprey.c). */
 uint8_t *osprey_run_table(OspreySharedRun *run, int table);
 
+/* Validate that a shared-run header describes exactly the layout derived
+ * from the active configuration before any table offset is trusted. */
+bool osprey_shared_run_layout_valid(const OspreyConfig *config,
+                                    const OspreySharedRun *run);
+
 /* Image normalization base (osprey.c). */
 target_ulong osprey_get_image_base(void);
 
@@ -259,6 +264,22 @@ struct OspreyContext {
     OspreySharedRun *shared;   /* attached in child; NULL in parent */
     QemuMutex shared_lock;     /* child-side insert mutex */
 
+    /* Analysis transaction state (parent side).  tx_status is sticky
+     * for the current baseline transaction: once non-OK it never
+     * returns to OK until the next complete baseline analysis, and no
+     * model is installed or exposed.  tx_stage names the first failing
+     * stage ("merge", "closure", "secondary", "infer", "decode"). */
+    OspreyStatus tx_status;
+    const char *tx_stage;
+    const char *tx_reason;
+    bool tx_model_ready;
+
+    /* Staged graph/model built off to the side by the current
+     * transaction; installed into ctx->graph/ctx->model only on
+     * OSPREY_OK.  Freed on rejection. */
+    OspreyGraph *staged_graph;
+    OspreyModel *staged_model;
+
     /* Committed parent-side aggregate tables (grown in memory). */
     GArray *access_facts;      /* OspreyAccessFact (dedup, merged) */
     GArray *base_facts;        /* OspreyBaseFact */
@@ -282,12 +303,12 @@ struct OspreyContext {
     target_ulong image_base;
     bool image_base_set;
 
-    /* Decoded model (installed after osprey_analyze). */
+    /* Committed model (installed only by a successful transaction). */
     OspreyModel *model;
     OspreyStatus last_status;
     uint64_t last_analyze_time_ms;
 
-    /* Stage-2 factor graph (parent side). */
+    /* Committed Stage-2 factor graph (parent side). */
     OspreyGraph *graph;
 };
 
@@ -306,12 +327,20 @@ bool osprey_region_of_addr(CPUArchState *env, target_ulong addr,
                            bool create);
 void osprey_log_sticky(const OspreySharedRun *run, const char *tag);
 
+/* Fail-closed transaction helpers (osprey-facts.c). */
+void osprey_tx_begin(OspreyContext *ctx);
+void osprey_tx_reject(OspreyContext *ctx, OspreyStatus st,
+                      const char *stage, const char *reason);
+bool osprey_tx_ok(const OspreyContext *ctx);
+OspreyStatus osprey_tx_status(const OspreyContext *ctx);
+const char *osprey_tx_stage(const OspreyContext *ctx);
+void osprey_tx_install(OspreyContext *ctx);
+void osprey_tx_abort(OspreyContext *ctx);
+
 /* Checked arithmetic (returns false on overflow and sets bad_arithmetic). */
 bool osprey_check_add(int64_t a, int64_t b, int64_t *out);
 bool osprey_check_mul(uint64_t a, uint64_t b, uint64_t *out);
 bool osprey_check_sub(int64_t a, int64_t b, int64_t *out);
-
-#endif /* BINRADAR_OSPREY_INTERNAL_H */
 
 /* Decoded object kinds (osprey.h references OspreyDecodedKind). */
 typedef enum OspreyDecodedKind {
@@ -427,7 +456,7 @@ typedef struct OspreyHint {
     uint64_t instances;            /* supporting fact-instances */
 } OspreyHint;
 
-typedef struct OspreyGraph {
+struct OspreyGraph {
     GArray *vars;                  /* OspreyVar */
     GHashTable *var_index;         /* OspreyKey → (var_id+1) */
     GArray *hints;                 /* OspreyHint (deduped) */
@@ -441,12 +470,18 @@ typedef struct OspreyGraph {
     uint64_t hint_instances;       /* total R10-R12 hint instances */
     uint64_t limit_rows;           /* [osprey] [limit] rows emitted */
     uint64_t cd04_extensions;      /* CD04 closure extensions */
-} OspreyGraph;
+};
 
 /* Stage 2 entry: deterministic closure (R01-R12), predicate interning,
  * bounded candidate generation, and static factor instantiation.
  * Does not solve anything. */
 OspreyStatus osprey_stage2_closure(OspreyContext *ctx);
+
+/* Ownership: free a factor graph or decoded model (osprey-rules.c /
+ * osprey-decode.c). */
+OspreyGraph *osprey_graph_new(void);
+void osprey_graph_free(OspreyGraph *g);
+void osprey_model_free(OspreyModel *m);
 
 /* Stage 3 entry: secondary deterministic rules (CB02-CB09, CC04/CC05,
  * CD07, CD08) whose preconditions are fact- or candidate-driven; adds
@@ -495,3 +530,5 @@ struct OspreyModel {
  * selection, one pointer target base, deterministic naming, posterior
  * on every declaration. */
 OspreyStatus osprey_decode(OspreyContext *ctx);
+
+#endif /* BINRADAR_OSPREY_INTERNAL_H */

@@ -182,6 +182,21 @@ size_t osprey_shared_run_size(const OspreyConfig *config) {
     return osprey_run_layout(config, caps, offs);
 }
 
+bool osprey_shared_run_layout_valid(const OspreyConfig *config,
+                                    const OspreySharedRun *run) {
+    if (config == NULL || run == NULL) return false;
+    uint32_t caps[OSPREY_TABLE_COUNT];
+    size_t offs[OSPREY_TABLE_COUNT];
+    osprey_run_layout(config, caps, offs);
+    return run->access_cap == caps[OSPREY_TABLE_ACCESS] &&
+           run->base_cap == caps[OSPREY_TABLE_BASE] &&
+           run->copy_cap == caps[OSPREY_TABLE_COPY] &&
+           run->points_cap == caps[OSPREY_TABLE_POINTS] &&
+           run->alloc_cap == caps[OSPREY_TABLE_ALLOC] &&
+           run->mayarray_cap == caps[OSPREY_TABLE_MAYARR] &&
+           run->region_cap == caps[OSPREY_TABLE_REGION];
+}
+
 /* Storage offset of a table, computed from the capacities stored in the
  * run (set by osprey_shared_run_reset). */
 static size_t run_table_offset(const OspreySharedRun *run, int table) {
@@ -250,11 +265,18 @@ OspreyContext *osprey_new(const OspreyConfig *config) {
                                         sizeof(OspreyRegionInstance));
     ctx->runtime_regions = g_array_new(FALSE, FALSE, sizeof(OspreyRuntimeRegion));
     ctx->last_status = OSPREY_DISABLED;
+    ctx->tx_status = OSPREY_DISABLED;
+    ctx->tx_stage = NULL;
+    ctx->tx_reason = NULL;
+    ctx->tx_model_ready = false;
+    ctx->staged_graph = NULL;
+    ctx->staged_model = NULL;
     return ctx;
 }
 
 void osprey_free(OspreyContext *ctx) {
     if (ctx == NULL) return;
+    osprey_tx_abort(ctx);
     g_array_free(ctx->access_facts, TRUE);
     g_array_free(ctx->base_facts, TRUE);
     g_array_free(ctx->copy_facts, TRUE);
@@ -262,9 +284,13 @@ void osprey_free(OspreyContext *ctx) {
     g_array_free(ctx->alloc_facts, TRUE);
     g_array_free(ctx->mayarray_facts, TRUE);
     g_array_free(ctx->runtime_regions, TRUE);
+    g_array_free(ctx->region_instances, TRUE);
     osprey_free_cpu_origins();
+    if (ctx->graph) {
+        osprey_graph_free(ctx->graph);
+    }
     if (ctx->model) {
-        g_free(ctx->model);
+        osprey_model_free(ctx->model);
     }
     qemu_mutex_destroy(&ctx->shared_lock);
     g_free(ctx);

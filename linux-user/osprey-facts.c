@@ -1000,9 +1000,11 @@ void osprey_on_mem_copy(CPUArchState *env, target_ulong src,
 void osprey_log_sticky(const OspreySharedRun *run, const char *tag) {
     if (run == NULL) return;
     log_msg("[osprey] [facts] [%s] [sample %u] [overflow %u] "
-            "[bad-region %u] [bad-arith %u] [first-kind %u] [first-key %lx]\n",
+            "[bad-region %u] [bad-arith %u] [unsupported %u] "
+            "[first-kind %u] [first-key %lx]\n",
             tag, run->sample_id, run->overflow, run->bad_region,
-            run->bad_arithmetic, run->first_dropped_kind,
+            run->bad_arithmetic, run->unsupported_execution,
+            run->first_dropped_kind,
             (unsigned long)run->first_dropped_key);
 }
 
@@ -1014,6 +1016,120 @@ void osprey_log_sticky(const OspreySharedRun *run, const char *tag) {
 /* Parent-side merge + analysis entry                                  */
 /* ------------------------------------------------------------------ */
 
+/* ------------------------------------------------------------------ */
+/* Fail-closed analysis transaction (Stage 0)                          */
+/* ------------------------------------------------------------------ */
+
+/* Begin a new baseline analysis transaction.  The status is sticky:
+ * once non-OK it never returns to OK until the next complete baseline
+ * analysis.  Staged graph/model pointers start NULL. */
+void osprey_tx_begin(OspreyContext *ctx) {
+    if (ctx == NULL) return;
+    osprey_tx_abort(ctx);
+    ctx->tx_status = OSPREY_OK;
+    ctx->tx_stage = NULL;
+    ctx->tx_reason = NULL;
+    ctx->tx_model_ready = false;
+    ctx->last_status = OSPREY_OK;
+}
+
+/* Reject the current transaction: record the first failure (status,
+ * stage, reason) and emit exactly one stable rejection row.  Later
+ * failures keep the first recorded status/stage. */
+void osprey_tx_reject(OspreyContext *ctx, OspreyStatus st,
+                      const char *stage, const char *reason) {
+    if (ctx == NULL) return;
+    if (ctx->tx_status == OSPREY_OK) {
+        ctx->tx_status = st;
+        ctx->tx_stage = stage;
+        ctx->tx_reason = reason;
+        ctx->tx_model_ready = false;
+        ctx->last_status = st;
+        log_msg("[osprey] [reject] [status %d] [stage %s] [reason %s]\n",
+                (int)st, stage != NULL ? stage : "?",
+                reason != NULL ? reason : "?");
+    }
+}
+
+bool osprey_tx_ok(const OspreyContext *ctx) {
+    return ctx != NULL && ctx->tx_status == OSPREY_OK;
+}
+
+OspreyStatus osprey_tx_status(const OspreyContext *ctx) {
+    return ctx != NULL ? ctx->tx_status : OSPREY_DISABLED;
+}
+
+const char *osprey_tx_stage(const OspreyContext *ctx) {
+    return ctx != NULL ? ctx->tx_stage : NULL;
+}
+
+/* Commit the staged graph and model.  Only called when the whole
+ * transaction is OSPREY_OK; the previous committed model is destroyed
+ * only after the new one is fully built and validated. */
+void osprey_tx_install(OspreyContext *ctx) {
+    if (ctx == NULL) return;
+    if (ctx->staged_graph != NULL) {
+        if (ctx->graph != NULL) {
+            osprey_graph_free(ctx->graph);
+        }
+        ctx->graph = ctx->staged_graph;
+        ctx->staged_graph = NULL;
+    }
+    if (ctx->staged_model != NULL) {
+        if (ctx->model != NULL) {
+            osprey_model_free(ctx->model);
+        }
+        ctx->model = ctx->staged_model;
+        ctx->staged_model = NULL;
+    }
+    ctx->tx_model_ready = ctx->graph != NULL && ctx->model != NULL;
+    ctx->last_status = OSPREY_OK;
+}
+
+/* Abort the current transaction: destroy staged state.  The committed
+ * graph/model are kept but hidden (osprey_model() returns NULL while
+ * tx_status is non-OK); they are replaced by the next successful
+ * transaction or freed by osprey_free().  Callers must detach
+ * ctx->graph from ctx->staged_graph before aborting. */
+void osprey_tx_abort(OspreyContext *ctx) {
+    if (ctx == NULL) return;
+    if (ctx->staged_graph != NULL) {
+        osprey_graph_free(ctx->staged_graph);
+        ctx->staged_graph = NULL;
+    }
+    if (ctx->staged_model != NULL) {
+        osprey_model_free(ctx->staged_model);
+        ctx->staged_model = NULL;
+    }
+    ctx->last_status = ctx->tx_status;
+}
+
+static bool osprey_run_population_valid(const OspreySharedRun *run) {
+    static const int tables[] = {
+        OSPREY_TABLE_ACCESS, OSPREY_TABLE_BASE, OSPREY_TABLE_COPY,
+        OSPREY_TABLE_POINTS, OSPREY_TABLE_ALLOC, OSPREY_TABLE_MAYARR,
+        OSPREY_TABLE_REGION,
+    };
+    const uint32_t used[] = {
+        run->access_used, run->base_used, run->copy_used,
+        run->points_used, run->alloc_used, run->mayarray_used,
+        run->region_used,
+    };
+    for (size_t i = 0; i < G_N_ELEMENTS(tables); i++) {
+        OspreyRunIter it;
+        const void *record;
+        uint32_t count = 0;
+        memset(&it, 0, sizeof(it));
+        it.run = run;
+        it.table = tables[i];
+        while (osprey_run_iter_next(&it, &record)) {
+            count++;
+        }
+        if (count != used[i]) return false;
+    }
+    return true;
+}
+
 /* Merge one completed sample (patch-0/iter-1 child run) into the
  * committed parent tables.  Duplicates merge support in place; the
  * merged record keeps the union of sample support.  Returns
@@ -1022,8 +1138,54 @@ void osprey_log_sticky(const OspreySharedRun *run, const char *tag) {
 OspreyStatus osprey_parent_merge_sample(OspreyContext *ctx,
                                          const OspreySharedRun *run) {
     if (ctx == NULL || run == NULL) return OSPREY_DISABLED;
+
+    /* The merge opens the analysis transaction: the status is sticky
+     * from here until the next complete baseline analysis. */
+    osprey_tx_begin(ctx);
+
+    /* Validate the whole run before appending anything: a malformed or
+     * overflowed sample must not leave a half-merged transaction. */
+    if (run->version != OSPREY_SHARED_VERSION) {
+        osprey_tx_reject(ctx, OSPREY_INCOMPLETE_FACTS, "merge",
+                         "shared-run version mismatch");
+        return OSPREY_INCOMPLETE_FACTS;
+    }
     if (run->overflow) {
         osprey_log_sticky(run, "incomplete");
+        osprey_tx_reject(ctx, OSPREY_INCOMPLETE_FACTS, "merge",
+                         "shared-table overflow");
+        return OSPREY_INCOMPLETE_FACTS;
+    }
+    if (run->bad_arithmetic) {
+        osprey_log_sticky(run, "bad-arithmetic");
+        osprey_tx_reject(ctx, OSPREY_INCOMPLETE_FACTS, "merge",
+                         "checked arithmetic failed");
+        return OSPREY_INCOMPLETE_FACTS;
+    }
+    if (run->unsupported_execution) {
+        osprey_tx_reject(ctx, OSPREY_UNSUPPORTED_EXECUTION, "merge",
+                         "unsupported guest execution");
+        return OSPREY_UNSUPPORTED_EXECUTION;
+    }
+    if (!osprey_shared_run_layout_valid(&ctx->config, run)) {
+        osprey_tx_reject(ctx, OSPREY_INCOMPLETE_FACTS, "merge",
+                         "shared-run capacity mismatch");
+        return OSPREY_INCOMPLETE_FACTS;
+    }
+    if (run->access_used > run->access_cap ||
+        run->base_used > run->base_cap ||
+        run->copy_used > run->copy_cap ||
+        run->points_used > run->points_cap ||
+        run->alloc_used > run->alloc_cap ||
+        run->mayarray_used > run->mayarray_cap ||
+        run->region_used > run->region_cap) {
+        osprey_tx_reject(ctx, OSPREY_INCOMPLETE_FACTS, "merge",
+                         "used exceeds capacity");
+        return OSPREY_INCOMPLETE_FACTS;
+    }
+    if (!osprey_run_population_valid(run)) {
+        osprey_tx_reject(ctx, OSPREY_INCOMPLETE_FACTS, "merge",
+                         "used count does not match table population");
         return OSPREY_INCOMPLETE_FACTS;
     }
 
@@ -1192,44 +1354,77 @@ OspreyStatus osprey_parent_merge_sample(OspreyContext *ctx,
  * inference and decoding. */
 OspreyStatus osprey_analyze(OspreyContext *ctx) {
     if (ctx == NULL || !ctx->config.enabled) return OSPREY_DISABLED;
+    /* Fail-closed transaction: every stage builds staged state; only a
+     * fully OSPREY_OK transaction installs the graph/model.  Any
+     * non-OK status rejects the transaction and leaves no model
+     * exposed (Stage 0). */
+    if (!osprey_tx_ok(ctx)) return osprey_tx_status(ctx);
+    ctx->tx_model_ready = false;
+
+    /* Fresh graph per transaction, built off to the side.  The
+     * committed graph is replaced only on success. */
+    OspreyGraph *old_graph = ctx->graph;
+    ctx->staged_graph = osprey_graph_new();
+    ctx->graph = ctx->staged_graph;
+
     OspreyStatus st = osprey_stage2_closure(ctx);
     if (st != OSPREY_OK && st != OSPREY_DISABLED) {
-        log_msg("[osprey] [done] [status %d] [stages closure]\n", st);
-        ctx->last_status = st;
-        return st;
+        osprey_tx_reject(ctx, st, "closure", "stage-2 closure failed");
+        goto fail;
     }
     /* Stage 3a: secondary deterministic rules (CB02-CB09, CC04/CC05,
      * CD07/CD08); CC07 folding happens after the first BP pass. */
     st = osprey_stage2_secondary(ctx);
     if (st != OSPREY_OK && st != OSPREY_DISABLED) {
-        log_msg("[osprey] [done] [status %d] [stages secondary]\n", st);
-        ctx->last_status = st;
-        return st;
+        osprey_tx_reject(ctx, st, "secondary", "stage-2 secondary failed");
+        goto fail;
     }
     /* Stage 3b: exact component solving + loopy BP + CC07 folding. */
     st = osprey_infer(ctx);
-    if (st != OSPREY_OK && st != OSPREY_DISABLED &&
-        st != OSPREY_NON_CONVERGED) {
-        log_msg("[osprey] [done] [status %d] [stages inference]\n", st);
-        ctx->last_status = st;
-        return st;
+    if (st != OSPREY_OK && st != OSPREY_DISABLED) {
+        osprey_tx_reject(ctx, st, "infer",
+                         st == OSPREY_NON_CONVERGED
+                             ? "belief propagation did not converge"
+                         : st == OSPREY_EXACT_COMPONENT_TOO_LARGE
+                             ? "exact component exceeds configured limit"
+                             : "inference failed");
+        goto fail;
     }
-    /* Stage 4: consistent decoding into the OspreyModel (also on
-     * non-convergence: retain the best damped iterate). */
-    OspreyStatus d = osprey_decode(ctx);
-    if (d != OSPREY_OK && d != OSPREY_DISABLED) {
-        log_msg("[osprey] [done] [status %d] [stages decode]\n", d);
-        ctx->last_status = d;
-        return d;
+    /* Stage 4: consistent decoding into the OspreyModel. */
+    st = osprey_decode(ctx);
+    if (st != OSPREY_OK && st != OSPREY_DISABLED) {
+        osprey_tx_reject(ctx, st, "decode", "decoder rejected model");
+        goto fail;
     }
+
+    /* Success: swap in the staged graph and model.  Detach the staged
+     * graph first so tx_install frees the old committed graph, not the
+     * staged one (ctx->graph aliased staged_graph during the build). */
+    ctx->graph = old_graph;
+    if (ctx->staged_graph == NULL || ctx->staged_model == NULL) {
+        osprey_tx_reject(ctx, OSPREY_INVALID_MODEL, "install",
+                         "missing staged graph or model");
+        st = OSPREY_INVALID_MODEL;
+        goto fail;
+    }
+    osprey_tx_install(ctx);
     log_msg("[osprey] [done] [status %d] [stages closure+secondary+infer+decode]\n",
             (int)st);
-    ctx->last_status = st;
+    return st;
+
+fail:
+    /* Detach the staged graph, then abort (frees staged graph/model). */
+    ctx->graph = old_graph;
+    osprey_tx_abort(ctx);
     return st;
 }
 
 const OspreyModel *osprey_model(const OspreyContext *ctx) {
-    return ctx ? ctx->model : NULL;
+    /* Fail-closed: consumers see a model only when the committed
+     * transaction is OSPREY_OK. */
+    if (ctx == NULL || ctx->tx_status != OSPREY_OK ||
+        !ctx->tx_model_ready) return NULL;
+    return ctx->model;
 }
 
 void helper_osprey_invalidate_reg(CPUArchState *env, uint32_t i) {

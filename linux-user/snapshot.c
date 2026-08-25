@@ -3383,10 +3383,21 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env, const ArgumentInf
         // Child process exit
         trace_mem_flush();
         /* OSPREY: the child has finished writing; merge its sample into
-         * the committed context tables (parent side). */
+         * the committed context tables (parent side).  Only the
+         * unmodified baseline sample (patch 0, iteration 1) is merged;
+         * later mutation runs are never merged.  A failed merge rejects
+         * the analysis transaction (Stage 0). */
         if (g_osprey_ctx != NULL && g_osprey_shared_run != NULL &&
-            g_osprey_ctx->config.enabled) {
-            osprey_parent_merge_sample(g_osprey_ctx, g_osprey_shared_run);
+            g_osprey_ctx->config.enabled &&
+            binradar_mode && binradar_iter == 1 && binradar_patch_id == 0) {
+            OspreyStatus mst = osprey_parent_merge_sample(
+                g_osprey_ctx, g_osprey_shared_run);
+            if (mst != OSPREY_OK && mst != OSPREY_DISABLED) {
+                /* The merge already rejected the transaction; do not
+                 * run analysis on incomplete facts. */
+                log_msg("[forkserver] [osprey] [merge-failed] [status %d]\n",
+                        (int)mst);
+            }
         }
         if (write_exact(binradar_forkserver_stat_w, status, sizeof(status)) < 0) exit_with_status(7);
 
@@ -3414,9 +3425,11 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env, const ArgumentInf
         if (binradar_mode) {
             if (binradar_iter == 1) {
                 /* OSPREY: baseline sample is merged; run the in-process
-                 * analysis (closure/inference in Stages 2-4). */
+                 * analysis (closure/inference in Stages 2-4) only when
+                 * the merge succeeded (fail-closed transaction). */
                 if (g_osprey_ctx != NULL &&
-                    g_osprey_ctx->config.enabled) {
+                    g_osprey_ctx->config.enabled &&
+                    osprey_tx_ok(g_osprey_ctx)) {
                     osprey_analyze(g_osprey_ctx);
                 }
                 remaining_mods = analyze_collected_data(arg_info, num_arg_regs);

@@ -184,6 +184,9 @@ static uint32_t exact_pass(OspreyContext *ctx) {
     g_hash_table_destroy(buckets);
     log_msg("[osprey] [infer] [exact] [components %u] [vars %u] "
             "[large %u]\n", exact_comps, solved_vars, large_comps);
+    if (large_comps != 0 && ctx->last_status == OSPREY_OK) {
+        ctx->last_status = OSPREY_EXACT_COMPONENT_TOO_LARGE;
+    }
     return exact_comps;
 }
 
@@ -463,6 +466,9 @@ OspreyStatus osprey_infer(OspreyContext *ctx) {
 
     /* 1. exact component solving */
     exact_pass(ctx);
+    if (ctx->last_status != OSPREY_OK) {
+        return ctx->last_status;
+    }
 
     /* 2. loopy BP with folding closure */
     uint32_t fold_rounds = 0;
@@ -491,6 +497,10 @@ OspreyStatus osprey_infer(OspreyContext *ctx) {
             "[best-delta %.3g] [belief>0.5 %u] [fold-rounds %u]\n",
             iters, converged ? 1 : 0, best_delta, above, fold_rounds);
 
-    ctx->last_status = converged ? OSPREY_OK : OSPREY_NON_CONVERGED;
-    return ctx->last_status;
+    /* A limit/error raised during folding closure wins over the
+     * convergence verdict (fail-closed transaction). */
+    if (ctx->last_status != OSPREY_OK) {
+        return ctx->last_status;
+    }
+    return converged ? OSPREY_OK : OSPREY_NON_CONVERGED;
 }

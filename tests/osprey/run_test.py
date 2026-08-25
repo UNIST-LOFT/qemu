@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""OSPREY (in-process type inference) test harness.
+"""OSPREY in-process analysis test harness.
 
-Verifies the full Stage 1-5 pipeline end to end by running a small
-guest under the tracer with BINRADAR_OSPREY_ENABLE=1 in binradar
-forkserver mode (patch shm + patch fd) and asserting on the structured
-`[osprey]`/`[inferred]` log rows emitted by the parent.
+Runs a small guest under the tracer with BINRADAR_OSPREY_ENABLE=1 in
+binradar forkserver mode (patch shm + patch fd). Stage 0 asserts that
+known-invalid graphs and injected limits reject atomically, expose no
+typed model, retain a generic mutation queue, and reach iteration 2.
 
 The driver replicates the binradar forkserver protocol: handshake,
 one baseline iteration, then the iteration-1 analyze barrier which
@@ -34,7 +34,7 @@ import time
 # mode: 'binradar' — forkserver driver with patch shm + BINRADAR_OSPREY_ENABLE
 # expect_rows: list of (tag, needle) pairs; a row matches when a line
 #     carries `[osprey] [<tag>]` and the needle substring.
-# expect_inferred: minimum number of `[inferred]` rows.
+# expect_inferred / expect_inferred_max: bounds for `[inferred]` rows.
 TESTS = [
     dict(
         name="osprey_deref",
@@ -46,12 +46,26 @@ TESTS = [
             ("facts", "[regions "),
             ("graph", "[stage base] [vars "),
             ("graph", "[stage secondary] [vars "),
-            ("infer", "[bp] [iters "),
-            ("infer", "[converged 1]"),
-            ("decode", "[objects "),
-            ("done", "[status 0] [stages closure+secondary+infer+decode]"),
+            ("infer", "[large "),
+            ("reject", "[stage infer]"),
         ],
-        expect_inferred=1,
+        expect_inferred=0,
+        expect_inferred_max=0,
+        expect_queue_min=1,
+        timeout=60,
+    ),
+    dict(
+        name="osprey_fail_closed",
+        guest="osprey_deref",
+        mode="binradar",
+        rc=(2,),
+        env={"BINRADAR_OSPREY_MAX_VARIABLES": "1"},
+        expect_rows=[
+            ("reject", "[stage closure]"),
+        ],
+        expect_inferred=0,
+        expect_inferred_max=0,
+        expect_queue_min=1,
         timeout=60,
     ),
 ]
@@ -139,6 +153,7 @@ def run_binradar(test, guest, qemu, solver_bin, workdir):
     run_dir = tempfile.mkdtemp(prefix="osprey-test-")
     env = dict(os.environ)
     env.update(BASE_ENV)
+    env.update(test.get("env", {}))
     env["BINRADAR_FORKSERVER_ENABLE"] = "1"
     env["BINRADAR_ENTRYPOINT"] = resolve_entrypoint(guest)
     env["PLT_INFO_FILE"] = guest + ".plt"
@@ -239,7 +254,7 @@ def run_binradar(test, guest, qemu, solver_bin, workdir):
 
 
 def run_test(test, workdir, qemu, solver):
-    guest = os.path.join(workdir, test["name"])
+    guest = os.path.join(workdir, test.get("guest", test["name"]))
     if not os.path.isfile(guest):
         return (None, f"guest binary missing: {guest} (run 'make guests')")
     if not os.path.isfile(guest + ".plt"):
@@ -259,6 +274,17 @@ def check(test, rc, out):
     got = count_inferred(out)
     if got < want:
         problems.append(f"[inferred] rows {got} < {want}")
+    max_inferred = test.get("expect_inferred_max")
+    if max_inferred is not None and got > max_inferred:
+        problems.append(f"[inferred] rows {got} > {max_inferred}")
+    queue_min = test.get("expect_queue_min")
+    if queue_min is not None:
+        lengths = [int(n) for n in re.findall(
+            r"\[analyze\] \[queue\] \[len (\d+)\]", out)]
+        if not lengths or max(lengths) < queue_min:
+            problems.append(
+                f"mutation queue max {max(lengths) if lengths else 'missing'} "
+                f"< {queue_min}")
     return problems
 
 
@@ -277,7 +303,7 @@ def main():
     if not os.path.isfile(args.solver):
         sys.exit(f"solver binary not found: {args.solver}")
 
-    failures = []
+    failures: list[str] = []
     ran = 0
     for spec in TESTS:
         if args.test and spec["name"] != args.test:
@@ -291,12 +317,12 @@ def main():
             else:
                 problems = check(spec, rc, out)
         except Exception as e:  # noqa: BLE001 — per-test isolation
-            failures.append(spec)
+            failures.append(str(spec["name"]))
             print(f"FAIL {spec['name']}: {e}")
             continue
         dt = time.time() - start
         if problems:
-            failures.append(spec)
+            failures.append(str(spec["name"]))
             print(f"FAIL {spec['name']} ({dt:.1f}s): " + "; ".join(problems))
             if not args.quiet:
                 print(out)
@@ -305,7 +331,7 @@ def main():
 
     print(f"\n{ran - len(failures)}/{ran} tests passed")
     if failures:
-        print("Failed: " + ", ".join(s["name"] for s in failures))
+        print("Failed: " + ", ".join(failures))
         return 1
     return 0
 

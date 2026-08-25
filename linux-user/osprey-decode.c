@@ -21,7 +21,6 @@
 #include "osprey.h"
 #include "osprey-internal.h"
 
-#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -106,7 +105,8 @@ static void region_name(const OspreyRegionId *r, char *buf, size_t n) {
 
 static OspreyStatus decode_graph(OspreyContext *ctx) {
     OspreyGraph *g = ctx->graph;
-    OspreyModel *m = ctx->model;
+    OspreyModel *m = ctx->staged_model;
+    if (m == NULL) return OSPREY_INVALID_MODEL;
     double thresh = ctx->config.report_threshold;
     /* Pass 1: primitives (with their chunk key) and pointers. */
     GHashTable *prim_by_chunk = g_hash_table_new(g_direct_hash,
@@ -216,7 +216,11 @@ static OspreyStatus decode_graph(OspreyContext *ctx) {
         }
         /* group by (region, stride) and run interval scheduling per
          * group; bounded by OSPREY_DECODE_MAX_ARRAYS_PER_SIDE. */
-        if (arrs->len <= OSPREY_DECODE_MAX_ARRAYS_PER_SIDE) {
+        if (arrs->len > OSPREY_DECODE_MAX_ARRAYS_PER_SIDE) {
+            g_array_free(arrs, TRUE);
+            return OSPREY_LIMIT_EXCEEDED;
+        }
+        {
             for (guint i = 0; i < arrs->len; i++) {
                 uint32_t id = g_array_index(arrs, uint32_t, i);
                 OspreyVar *v = &g_array_index(g->vars, OspreyVar, id);
@@ -237,7 +241,9 @@ static OspreyStatus decode_graph(OspreyContext *ctx) {
 
     /* Pass 3: struct bases — field groups per base with non-overlap. */
     {
-        GHashTable *bases = g_hash_table_new(g_direct_hash, g_direct_equal);
+        GHashTable *bases = g_hash_table_new_full(g_direct_hash,
+                                                  g_direct_equal,
+                                                  NULL, bucket_free);
         for (guint i = 0; i < g->vars->len; i++) {
             OspreyVar *v = &g_array_index(g->vars, OspreyVar, i);
             if (v->kind != OSPREY_PRED_FIELD_OF) continue;
@@ -258,7 +264,8 @@ static OspreyStatus decode_graph(OspreyContext *ctx) {
         while (g_hash_table_iter_next(&bit, &rk, &arr_ptr)) {
             GArray *fields = (GArray *)arr_ptr;
             if (fields->len > OSPREY_DECODE_MAX_FIELDS_PER_BASE) {
-                continue;
+                g_hash_table_destroy(bases);
+                return OSPREY_LIMIT_EXCEEDED;
             }
             /* sort by offset */
             uint32_t *ids = (uint32_t *)fields->data;
@@ -443,29 +450,41 @@ static OspreyStatus decode_graph(OspreyContext *ctx) {
     return OSPREY_OK;
 }
 
+/* Free a decoded model and everything it owns (Stage 0/1 ownership). */
+void osprey_model_free(OspreyModel *m) {
+    if (m == NULL) return;
+    if (m->by_chunk != NULL) g_hash_table_destroy(m->by_chunk);
+    if (m->fields_by_base != NULL) g_hash_table_destroy(m->fields_by_base);
+    if (m->ptr_by_chunk != NULL) g_hash_table_destroy(m->ptr_by_chunk);
+    if (m->objects != NULL) g_array_free(m->objects, TRUE);
+    if (m->raw_spans != NULL) g_array_free(m->raw_spans, TRUE);
+    if (m->type_names != NULL) {
+        for (guint i = 0; i < m->type_names->len; i++) {
+            g_free(g_array_index(m->type_names, char *, i));
+        }
+        g_array_free(m->type_names, TRUE);
+    }
+    g_free(m);
+}
+
 OspreyStatus osprey_decode(OspreyContext *ctx) {
     if (ctx == NULL || !ctx->config.enabled) return OSPREY_DISABLED;
     if (ctx->graph == NULL) return OSPREY_INCOMPLETE_FACTS;
-    if (ctx->model != NULL) {
-        /* replace the previous model */
-        g_hash_table_destroy(ctx->model->by_chunk);
-        g_hash_table_destroy(ctx->model->fields_by_base);
-        g_hash_table_destroy(ctx->model->ptr_by_chunk);
-        g_array_free(ctx->model->objects, TRUE);
-        g_array_free(ctx->model->raw_spans, TRUE);
-        for (guint i = 0; i < ctx->model->type_names->len; i++) {
-            g_free(g_array_index(ctx->model->type_names, char *, i));
-        }
-        g_array_free(ctx->model->type_names, TRUE);
-        g_free(ctx->model);
-    }
-    ctx->model = model_new();
+    /* Stage 0: build the new model off to the side.  The committed
+     * model is untouched until the whole transaction is OSPREY_OK and
+     * osprey_tx_install() swaps it in. */
+    OspreyModel *m = model_new();
+    OspreyModel *prev_staged = ctx->staged_model;
+    ctx->staged_model = m;
     OspreyStatus st = decode_graph(ctx);
-    if (st != OSPREY_OK) return st;
+    if (st != OSPREY_OK) {
+        ctx->staged_model = prev_staged;
+        osprey_model_free(m);
+        return st;
+    }
     log_msg("[osprey] [decode] [objects %u] [types %u] "
             "[raw-spans %u]\n",
-            ctx->model->objects->len, ctx->model->type_names->len,
-            ctx->model->raw_spans->len);
+            m->objects->len, m->type_names->len, m->raw_spans->len);
     return OSPREY_OK;
 }
 
