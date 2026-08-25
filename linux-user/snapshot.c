@@ -27,6 +27,13 @@
 #include <sys/shm.h>
 #include <unistd.h>
 
+/* Phase 4: exact syscall output sizes.  Verify the target ABI struct
+ * sizes at compile time so snapshot_syscall() can invalidate exactly the
+ * bytes the kernel wrote, replacing the old conservative 256-byte windows. */
+_Static_assert(sizeof(struct target_stat) == 144, "x86_64 target_stat ABI size");
+_Static_assert(sizeof(struct target_statfs) == 120, "x86_64 target_statfs ABI size");
+_Static_assert(sizeof(struct target_statx) == 256, "x86_64 target_statx ABI size");
+
 extern target_ulong target_brk;
 bool restoring_to_snapshot;
 target_ulong binradar_entrypoint = (target_ulong)-1;
@@ -2092,114 +2099,117 @@ void snapshot_syscall(uintptr_t syscall_no, uintptr_t syscall_arg0,
             snapshot_read_access(&mem_access);
         }
         break;
-#if defined(TARGET_NR_readv)
-    case TARGET_NR_readv: // readv(fd, iov, iovcnt)
-        // Kernel wrote into each iovec base.  The iovec array itself is
-        // guest memory: walk it and invalidate each written range.
-        if ((long)ret_val > 0) {
-            target_ulong iov = syscall_arg1;
-            target_ulong cnt = syscall_arg2;
-            target_ulong left = ret_val;
-            for (target_ulong i = 0; i < cnt && left > 0; i++) {
-                struct target_iovec {
-                    abi_ulong base;
-                    abi_ulong len;
-                } ent;
-                if (copy_from_user(&ent, iov + i * sizeof(ent),
-                                   sizeof(ent))) {
-                    break;
-                }
-                target_ulong n = ent.len < left ? ent.len : left;
-                if (n > 0) {
-                    provenance_on_modify_mem(ent.base, n);
-                    left -= n;
-                }
-            }
-        }
-        break;
-#endif
-#if defined(TARGET_NR_preadv)
-    case TARGET_NR_preadv: // preadv(fd, iov, iovcnt, pos)
-        if ((long)ret_val > 0) {
-            target_ulong iov = syscall_arg1;
-            target_ulong cnt = syscall_arg2;
-            target_ulong left = ret_val;
-            for (target_ulong i = 0; i < cnt && left > 0; i++) {
-                struct target_iovec {
-                    abi_ulong base;
-                    abi_ulong len;
-                } ent;
-                if (copy_from_user(&ent, iov + i * sizeof(ent),
-                                   sizeof(ent))) {
-                    break;
-                }
-                target_ulong n = ent.len < left ? ent.len : left;
-                if (n > 0) {
-                    provenance_on_modify_mem(ent.base, n);
-                    left -= n;
-                }
-            }
-        }
-        break;
-#endif
 #if defined(TARGET_NR_futex)
     case TARGET_NR_futex: // Fast user mutex
-        // futex(uaddr, op, val, timeout)
-        // snapshot_write_access(syscall_arg0, syscall_arg3);
-        // The futex word is modified by the kernel on some ops.
+        // futex(uaddr, op, val, timeout, uaddr2, val3)
+        // This QEMU version implements WAIT/WAKE/REQUEUE/CMP_REQUEUE and
+        // WAKE_OP only.  Of those, only WAKE_OP writes guest memory: its
+        // encoded atomic operation updates the 32-bit word at uaddr2.
         if ((long)ret_val >= 0) {
-            provenance_on_modify_mem(syscall_arg0, sizeof(target_ulong));
+            uint32_t op = (uint32_t)syscall_arg1 & FUTEX_CMD_MASK;
+            if (op == FUTEX_WAKE_OP) {
+                if (syscall_arg4) {
+                    provenance_on_modify_mem(syscall_arg4, sizeof(uint32_t));
+                }
+            }
         }
         break;
 #endif
 #if defined(TARGET_NR_newfstatat)
-    case TARGET_NR_newfstatat: // Return file status as stat
-        // newfstatat(dirfd, pathname, statbuf, flags)
-        // snapshot_write_access(syscall_arg2, 4096);
-        // Kernel wrote the stat struct: invalidate shadow (conservative
-        // 256-byte window covers x86-64 struct stat).
-        provenance_on_modify_mem(syscall_arg2, 256);
+    case TARGET_NR_newfstatat: // newfstatat(dirfd, pathname, statbuf, flags)
+        // Kernel wrote sizeof(struct target_stat) bytes on success only.
+        if ((long)ret_val == 0) {
+            provenance_on_modify_mem(syscall_arg2, sizeof(struct target_stat));
+        }
         break;
 #endif
 #if defined(TARGET_NR_fstatat64)
     case TARGET_NR_fstatat64:
-        // snapshot_write_access(syscall_arg2, 4096);
-        provenance_on_modify_mem(syscall_arg2, 256);
+        if ((long)ret_val == 0) {
+            provenance_on_modify_mem(syscall_arg2, sizeof(struct target_stat64));
+        }
         break;
 #endif
-    case TARGET_NR_statfs:
+#if defined(TARGET_NR_stat) || defined(TARGET_NR_lstat) || defined(TARGET_NR_fstat)
+    case TARGET_NR_stat:
+    case TARGET_NR_lstat:
     case TARGET_NR_fstat:
-    case TARGET_NR_fstatfs:
-        // fstat(fd, statbuf)
-        // snapshot_write_access(syscall_arg1, 4096);
-        // Kernel wrote the stat buffer (x86-64 statfs is ~120 bytes,
-        // stat is 144): invalidate conservatively.
-        provenance_on_modify_mem(syscall_arg1, 256);
+        // stat(pathname, statbuf) / lstat / fstat(fd, statbuf)
+        if ((long)ret_val == 0) {
+            provenance_on_modify_mem(syscall_arg1, sizeof(struct target_stat));
+        }
         break;
+#endif
+#if defined(TARGET_NR_statx)
+    case TARGET_NR_statx: // statx(dirfd, pathname, flags, mask, statxbuf)
+        if ((long)ret_val == 0) {
+            provenance_on_modify_mem(syscall_arg4, sizeof(struct target_statx));
+        }
+        break;
+#endif
+#if defined(TARGET_NR_statfs) || defined(TARGET_NR_fstatfs)
+    case TARGET_NR_statfs:
+    case TARGET_NR_fstatfs:
+        // statfs(path, buf) / fstatfs(fd, buf)
+        if ((long)ret_val == 0) {
+            provenance_on_modify_mem(syscall_arg1, sizeof(struct target_statfs));
+        }
+        break;
+#endif
+#if defined(TARGET_NR_readlink)
+    case TARGET_NR_readlink: // readlink(pathname, buf, bufsiz)
+        // Kernel wrote ret bytes (the link length, no NUL).
+        if ((long)ret_val > 0) {
+            provenance_on_modify_mem(syscall_arg1, ret_val);
+        }
+        break;
+#endif
+#if defined(TARGET_NR_readlinkat)
+    case TARGET_NR_readlinkat: // readlinkat(dirfd, pathname, buf, bufsiz)
+        if ((long)ret_val > 0) {
+            provenance_on_modify_mem(syscall_arg2, ret_val);
+        }
+        break;
+#endif
+#if defined(TARGET_NR_getrandom)
+    case TARGET_NR_getrandom: // getrandom(buf, buflen, flags)
+        if ((long)ret_val > 0) {
+            provenance_on_modify_mem(syscall_arg0, ret_val);
+        }
+        break;
+#endif
 #if defined(TARGET_NR_gettimeofday)
     case TARGET_NR_gettimeofday: // gettimeofday(tv, tz)
-        // Kernel wrote struct timeval (16 bytes) and timezone (8).
-        if ((long)ret_val >= 0) {
+        // QEMU's linux-user implementation writes only the timeval and
+        // deliberately passes NULL for the obsolete timezone argument.
+        if ((long)ret_val == 0) {
             if (syscall_arg0) {
-                provenance_on_modify_mem(syscall_arg0, 16);
-            }
-            if (syscall_arg1) {
-                provenance_on_modify_mem(syscall_arg1, 8);
+                provenance_on_modify_mem(syscall_arg0,
+                                         sizeof(struct target_timeval));
             }
         }
         break;
 #endif
 #if defined(TARGET_NR_clock_gettime)
     case TARGET_NR_clock_gettime: // clock_gettime(clockid, tp)
-        // Kernel wrote struct timespec (16 bytes).
-        if ((long)ret_val >= 0 && syscall_arg1) {
-            provenance_on_modify_mem(syscall_arg1, 16);
+        // Kernel wrote struct timespec on success only.
+        if ((long)ret_val == 0 && syscall_arg1) {
+            provenance_on_modify_mem(syscall_arg1,
+                                     sizeof(struct target_timespec));
+        }
+        break;
+#endif
+#if defined(TARGET_NR_clock_getres)
+    case TARGET_NR_clock_getres: // clock_getres(clockid, res)
+        if ((long)ret_val == 0 && syscall_arg1) {
+            provenance_on_modify_mem(syscall_arg1,
+                                     sizeof(struct target_timespec));
         }
         break;
 #endif
 #if defined(TARGET_NR_getdents)
     case TARGET_NR_getdents: // getdents(fd, dirp, count)
-        // Kernel wrote dirent records into dirp.
+        // Kernel wrote ret bytes of dirent records into dirp.
         if ((long)ret_val > 0) {
             provenance_on_modify_mem(syscall_arg1, ret_val);
         }
@@ -2207,6 +2217,7 @@ void snapshot_syscall(uintptr_t syscall_no, uintptr_t syscall_arg0,
 #endif
 #if defined(TARGET_NR_getdents64)
     case TARGET_NR_getdents64: // getdents64(fd, dirp, count)
+        // Kernel wrote ret bytes of dirent records into dirp.
         if ((long)ret_val > 0) {
             provenance_on_modify_mem(syscall_arg1, ret_val);
         }
@@ -2214,51 +2225,16 @@ void snapshot_syscall(uintptr_t syscall_no, uintptr_t syscall_arg0,
 #endif
 #if defined(TARGET_NR_recvfrom)
     case TARGET_NR_recvfrom: // recvfrom(fd, buf, len, flags, src_addr, addrlen)
-        // Kernel wrote the packet into buf (and optionally src_addr).
-        if ((long)ret_val > 0) {
-            provenance_on_modify_mem(syscall_arg1, ret_val);
-            if (syscall_arg4) {
-                provenance_on_modify_mem(syscall_arg4, 16);
-            }
-        }
+        // Handled exactly at the copy-out site in do_recvfrom() (payload,
+        // returned sockaddr, and the in/out addrlen word).  No-op here so
+        // the source hook is the single owner of socket invalidation.
         break;
 #endif
 #if defined(TARGET_NR_recvmsg)
     case TARGET_NR_recvmsg: // recvmsg(fd, msg, flags)
-        // Kernel wrote into msg_iov buffers and msg_name.  Walk the
-        // iovec array like readv.
-        if ((long)ret_val > 0) {
-            struct target_msghdr {
-                abi_ulong msg_name;
-                abi_ulong msg_namelen;
-                abi_ulong msg_iov;
-                abi_ulong msg_iovlen;
-                abi_ulong msg_control;
-                abi_ulong msg_controllen;
-                abi_ulong msg_flags;
-            } mh;
-            if (!copy_from_user(&mh, syscall_arg1, sizeof(mh))) {
-                if (mh.msg_name) {
-                    provenance_on_modify_mem(mh.msg_name, mh.msg_namelen);
-                }
-                target_ulong left = ret_val;
-                for (target_ulong i = 0; i < mh.msg_iovlen && left > 0; i++) {
-                    struct target_iovec {
-                        abi_ulong base;
-                        abi_ulong len;
-                    } ent;
-                    if (copy_from_user(&ent, mh.msg_iov + i * sizeof(ent),
-                                       sizeof(ent))) {
-                        break;
-                    }
-                    target_ulong n = ent.len < left ? ent.len : left;
-                    if (n > 0) {
-                        provenance_on_modify_mem(ent.base, n);
-                        left -= n;
-                    }
-                }
-            }
-        }
+        // Handled exactly at the copy-out site in do_sendrecvmsg_locked()
+        // (payload iovecs, msg_name, control data, and the returned
+        // msg_namelen/msg_controllen/msg_flags header fields).  No-op here.
         break;
 #endif
     case TARGET_NR_brk: // heap adjustment

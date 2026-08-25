@@ -250,6 +250,77 @@ TESTS = [
          verdict="normal", finding=None, final_queries=1, final_expr_min=1,
          note="lower-address overlapping memmove preserves the symbolic "
               "source byte across a 64-KiB shadow-leaf boundary"),
+    # --- Phase 4: exact syscall output invalidation ---------------------
+    dict(name="t57_syscall_failed_stat_tag_intact", mode="mem", rc=(0,),
+         verdict="crash",
+         finding=dict(reason="heap-use-after-free", is_uaf=1,
+                      fields={"obj_id": 1, "gen": 1, "size": 16,
+                              "offset": 0, "width": 1}),
+         note="failed stat() must not invalidate the pointer tag in its "
+              "output buffer (old code invalidated unconditionally)"),
+    dict(name="t58_stat_adjacent_untouched", mode="mem", rc=(0,),
+         verdict="crash",
+         finding=dict(reason="heap-use-after-free", is_uaf=1,
+                      fields={"obj_id": 1, "gen": 1, "size": 16,
+                              "offset": 0, "width": 1}),
+         note="stat invalidates exactly sizeof(target_stat)=144, not a "
+              "256-byte window: tag at buf+144 survives"),
+    dict(name="t59_partial_readv_exact", mode="mem", rc=(0,),
+         verdict="crash",
+         finding=dict(reason="heap-use-after-free", is_uaf=1,
+                      fields={"obj_id": 1, "gen": 1, "size": 16,
+                              "offset": 0, "width": 1}),
+         note="partial readv invalidates only the returned bytes: tag in "
+              "the second iovec survives"),
+    dict(name="t60_zero_len_recvfrom_metadata", mode="mem", rc=(0,),
+         verdict="crash", no_consistency=True,
+         finding=dict(reason="heap-use-after-free", is_uaf=1,
+                      fields={"obj_id": 1, "gen": 1, "size": 16,
+                              "offset": 0, "width": 1}),
+         note="zero-length recvfrom writes no payload (tag survives) but "
+              "still writes the addrlen word (tag invalidated); debug run "
+              "must show no consistency-mismatch"),
+    dict(name="t61_recvfrom_addr_addrlen", mode="mem", rc=(0,),
+         verdict="crash", no_consistency=True,
+         finding=dict(reason="heap-use-after-free", is_uaf=1,
+                      fields={"obj_id": 1, "gen": 1, "size": 16,
+                              "offset": 0, "width": 1}),
+         note="recvfrom invalidates exactly ret payload bytes, the "
+              "returned sockaddr, and the addrlen word; tags beyond each "
+              "range survive"),
+    dict(name="t62_recvmsg_payload_name_control", mode="mem", rc=(0,),
+         verdict="crash",
+         finding=dict(reason="heap-use-after-free", is_uaf=1,
+                      fields={"obj_id": 1, "gen": 1, "size": 16,
+                              "offset": 0, "width": 1}),
+         note="recvmsg invalidates exactly the payload iovecs, msg_name, "
+              "and control data; tags beyond each range survive"),
+    dict(name="t63_recvmsg_header_fields", mode="mem", rc=(0,),
+         verdict="crash", no_consistency=True,
+         finding=dict(reason="heap-use-after-free", is_uaf=1,
+                      fields={"obj_id": 1, "gen": 1, "size": 16,
+                              "offset": 0, "width": 1}),
+         note="recvmsg invalidates the returned msg_namelen and msg_flags "
+              "header fields; debug run must show no consistency-mismatch"),
+    dict(name="t64_gettimeofday_timezone_untouched", mode="mem", rc=(0,),
+         verdict="crash",
+         finding=dict(reason="heap-use-after-free", is_uaf=1,
+                      fields={"obj_id": 1, "gen": 1, "size": 16,
+                              "offset": 0, "width": 1}),
+         note="QEMU gettimeofday writes timeval only; the obsolete timezone "
+              "argument must retain its pointer tag"),
+    dict(name="t65_futex_wake_op_output", mode="mem", rc=(0,),
+         verdict="normal", finding=None, no_consistency=True,
+         note="successful FUTEX_WAKE_OP invalidates the 32-bit uaddr2 word "
+              "without relying on load-time consistency repair"),
+    dict(name="t66_readv_iovec_overlap", mode="mem", rc=(0,),
+         verdict="normal", finding=None,
+         note="readv invalidates from the pre-syscall locked vector when an "
+              "earlier output overwrites a later guest iovec descriptor"),
+    dict(name="t67_recvmsg_partial_error", mode="mem", rc=(0,),
+         verdict="normal", finding=None,
+         note="recvmsg payload invalidation commits before a later control "
+              "copyout EFAULT returns an error to the guest"),
 ]
 
 # Env vars that must always be set: parse_exclude_region_str strchr()s the
@@ -348,6 +419,12 @@ def run_memcheck(test, guest, qemu, workdir):
     env.update(BASE_ENV)
     env["BINRADAR_ENTRYPOINT"] = resolve_entrypoint(guest)
     env["PLT_INFO_FILE"] = guest + ".plt"
+    if test.get("no_consistency"):
+        # Phase 4: changed-byte syscall outputs must be invalidated by the
+        # hook, not silently dropped by the load-time value-consistency
+        # check.  With debug logging on, a missing hook shows up as a
+        # `[prov] [consistency]` line; the check() below rejects it.
+        env["BINRADAR_PROVENANCE_DEBUG"] = "1"
     cmd = [qemu, "-d", "page", guest]
     return run_tracer(cmd, env, test.get("timeout", 30))
 
@@ -543,6 +620,13 @@ def check(test, rc, fs_status, out):
 
     findings = parse_findings(out)
     want = test.get("finding")
+    if test.get("no_consistency"):
+        # A consistency-mismatch on a changed-byte syscall output means the
+        # invalidation hook was missing and only the value check dropped the
+        # tag — the test would pass for the wrong reason.
+        if re.search(r"^\[prov\] \[consistency\]", out, re.MULTILINE):
+            problems.append("consistency-mismatch log present: missing "
+                            "syscall output invalidation hook")
     if want is None:
         if findings:
             problems.append(f"unexpected finding: {findings[0].get('reason', '?')}")

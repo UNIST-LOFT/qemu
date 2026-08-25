@@ -42,7 +42,13 @@ TESTS := t01_double_free t02_small_double_free t03_uaf_stack t04_uaf_heap \
          t49_sticky_unknown_fallback t50_strcpy_model_oob \
          t51_strncpy_model_padding_oob t52_strcpy_fault_ordering \
          t53_memcpy_fault_ordering t54_zero_length_models \
-         t55_strcmp_exact_ranges t56_memmove_overlap_symbolic
+         t55_strcmp_exact_ranges t56_memmove_overlap_symbolic \
+         t57_syscall_failed_stat_tag_intact t58_stat_adjacent_untouched \
+         t59_partial_readv_exact t60_zero_len_recvfrom_metadata \
+         t61_recvfrom_addr_addrlen t62_recvmsg_payload_name_control \
+         t63_recvmsg_header_fields t64_gettimeofday_timezone_untouched \
+         t65_futex_wake_op_output t66_readv_iovec_overlap \
+         t67_recvmsg_partial_error
 
 GUEST_BINS := $(addprefix $(WORK)/,$(TESTS))
 PLT_FILES  := $(addprefix $(WORK)/,$(addsuffix .plt,$(TESTS)))

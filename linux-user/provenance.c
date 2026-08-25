@@ -951,6 +951,10 @@ void helper_prov_on_load(CPUArchState *env, uint32_t dst_idx,
             /* Value mismatch: the slot's bytes no longer match the saved
              * tag.  Remove the stale entry so a later coincidental byte
              * match cannot resurrect it (§5). */
+            if (provenance_debug) {
+                log_msg("[prov] [consistency] mem value mismatch [tag %lx] [mem %lx] [addr %lx] [pc %lx]\n",
+                        mem_tag.concrete_value, actual_val, addr, pc);
+            }
             provenance_mem_invalidate(addr, sizeof(target_ulong));
         }
     }
