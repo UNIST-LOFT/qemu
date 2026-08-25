@@ -125,21 +125,18 @@ static void prov_ensure_tables(void) {
 
 /* ---- Initialization ---- */
 
-/* Table synchronization (glib hash tables in process-global memory):
- * - Forkserver model: the tables live in the parent's address space before
- *   fork; each child gets a private COW copy, so there is no cross-process
- *   sharing and no locking is needed across children.
- * - linux-user TCG is single-threaded by construction: qemu_tcg_configure()
- *   (the only writer of mttcg_enabled) is softmmu-only (vl.c), so MTTCG is
- *   never enabled in linux-user mode.  Guest threads (clone) are serialized
- *   through start_exclusive()/end_exclusive() in the main thread, so all
- *   provenance helpers run on one host thread.  GLib hash tables therefore
- *   need no lock; this is an enforced invariant, not an assumption.
- * - If MTTCG is ever enabled for linux-user, every access to
- *   prov_object_table / prov_live_by_base / prov_mem_shadow /
- *   prov_reg_shadows and to the shared pending fault must be wrapped in a
- *   QemuMutex before that happens.  The per-CPU PtrRegShadow entries are
- *   keyed by env*, so they are naturally independent per vCPU. */
+/* Synchronization and support boundary:
+ * - Forkserver children have private COW copies of these tables, so there is
+ *   no cross-process sharing between iterations.
+ * - Provenance/memcheck is supported only for single-threaded guests, matching
+ *   Fuzzolic's concolic engine and the benchmark corpus.  QEMU linux-user can
+ *   execute CLONE_VM guests on multiple host threads, but these process-global
+ *   GLib tables are not synchronized and register shadows are not inherited
+ *   across clone.  Findings from multithreaded guests are therefore outside
+ *   the supported contract and must not be used as correctness evidence.
+ * - Supporting multithreaded guests in the future requires an explicit design
+ *   for register-shadow inheritance, shared-table synchronization, and atomic
+ *   finding publication before enabling that mode. */
 void provenance_init(void) {
     prov_ensure_tables();
     if (prov_pending_fault) {
