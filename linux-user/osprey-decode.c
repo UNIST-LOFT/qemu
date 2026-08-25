@@ -41,12 +41,16 @@ static void bucket_free(gpointer p) {
 static OspreyModel *model_new(void) {
     OspreyModel *m = g_new0(OspreyModel, 1);
     m->objects = g_array_new(FALSE, FALSE, sizeof(OspreyDecodedObject));
-    m->by_chunk = g_hash_table_new(g_direct_hash, g_direct_equal);
+    m->by_chunk = g_hash_table_new_full(osprey_key_hash, osprey_key_equal,
+                                        osprey_key_free, NULL);
     m->type_names = g_array_new(FALSE, FALSE, sizeof(char *));
     m->raw_spans = g_array_new(FALSE, FALSE, sizeof(OspRawSpan));
-    m->fields_by_base = g_hash_table_new_full(g_direct_hash, g_direct_equal,
-                                              NULL, bucket_free);
-    m->ptr_by_chunk = g_hash_table_new(g_direct_hash, g_direct_equal);
+    m->fields_by_base = g_hash_table_new_full(osprey_key_hash,
+                                              osprey_key_equal,
+                                              osprey_key_free, bucket_free);
+    m->ptr_by_chunk = g_hash_table_new_full(osprey_key_hash,
+                                            osprey_key_equal,
+                                            osprey_key_free, NULL);
     return m;
 }
 
@@ -64,7 +68,7 @@ static uint32_t model_add_type_name(OspreyModel *m, const char *name) {
 /* Insert or merge; returns the object index. */
 static uint32_t model_upsert(OspreyModel *m, const OspreyDecodedObject *o) {
     OspreyKey k = osprey_chunk_key(&o->chunk);
-    gpointer existing = g_hash_table_lookup(m->by_chunk, GSIZE_TO_POINTER(k));
+    gpointer existing = g_hash_table_lookup(m->by_chunk, &k);
     if (existing != NULL) {
         uint32_t idx = (uint32_t)(uintptr_t)existing - 1;
         OspreyDecodedObject *cur = &g_array_index(m->objects,
@@ -77,7 +81,7 @@ static uint32_t model_upsert(OspreyModel *m, const OspreyDecodedObject *o) {
     }
     g_array_append_val(m->objects, *o);
     uint32_t idx = m->objects->len - 1;
-    g_hash_table_insert(m->by_chunk, GSIZE_TO_POINTER(k),
+    g_hash_table_insert(m->by_chunk, osprey_key_new(&k),
                         GSIZE_TO_POINTER((gsize)idx + 1));
     return idx;
 }
@@ -109,18 +113,20 @@ static OspreyStatus decode_graph(OspreyContext *ctx) {
     if (m == NULL) return OSPREY_INVALID_MODEL;
     double thresh = ctx->config.report_threshold;
     /* Pass 1: primitives (with their chunk key) and pointers. */
-    GHashTable *prim_by_chunk = g_hash_table_new(g_direct_hash,
-                                                 g_direct_equal);
+    GHashTable *prim_by_chunk = g_hash_table_new_full(osprey_key_hash,
+                                                     osprey_key_equal,
+                                                     osprey_key_free, NULL);
     for (guint i = 0; i < g->vars->len; i++) {
         OspreyVar *v = &g_array_index(g->vars, OspreyVar, i);
         if (v->hard_false) continue;
         if (v->belief < thresh) continue;
         switch (v->kind) {
         case OSPREY_PRED_PRIMITIVE_VAR:
-            g_hash_table_insert(prim_by_chunk,
-                                GSIZE_TO_POINTER(
-                                    osprey_chunk_key(&v->payload.chunk)),
-                                GSIZE_TO_POINTER(v->id + 1));
+            {
+                OspreyKey ck = osprey_chunk_key(&v->payload.chunk);
+                g_hash_table_insert(prim_by_chunk, osprey_key_new(&ck),
+                                    GSIZE_TO_POINTER(v->id + 1));
+            }
             break;
         case OSPREY_PRED_POINTER:
             /* pointer: at most one target base per chunk (§10.5),
@@ -129,7 +135,7 @@ static OspreyStatus decode_graph(OspreyContext *ctx) {
             {
                 OspreyKey ck = osprey_chunk_key(&v->payload.attached.chunk);
                 gpointer cur = g_hash_table_lookup(m->ptr_by_chunk,
-                                                   GSIZE_TO_POINTER(ck));
+                                                   &ck);
                 OspreyDecodedObject o;
                 memset(&o, 0, sizeof(o));
                 o.chunk = v->payload.attached.chunk;
@@ -147,7 +153,7 @@ static OspreyStatus decode_graph(OspreyContext *ctx) {
                     uint32_t idx = m->objects->len;
                     g_array_append_val(m->objects, o);
                     g_hash_table_insert(m->ptr_by_chunk,
-                                        GSIZE_TO_POINTER(ck),
+                                        osprey_key_new(&ck),
                                         GSIZE_TO_POINTER((gsize)idx + 1));
                 }
             }
@@ -173,14 +179,14 @@ static OspreyStatus decode_graph(OspreyContext *ctx) {
                 o.parent_offset = v->payload.attached.base.offset;
                 uint32_t idx = model_upsert(m, &o);
                 /* index fields by base for the consumer */
-                OspreyKey bk = osprey_region_key(&o.parent_region) ^
-                    ((uint64_t)o.parent_offset << 1);
+                OspreyKey bk = osprey_base_key(&o.parent_region,
+                                               o.parent_offset);
                 GArray *list = g_hash_table_lookup(m->fields_by_base,
-                                                   GSIZE_TO_POINTER(bk));
+                                                   &bk);
                 if (list == NULL) {
                     list = g_array_new(FALSE, FALSE, sizeof(uint32_t));
                     g_hash_table_insert(m->fields_by_base,
-                                        GSIZE_TO_POINTER(bk), list);
+                                        osprey_key_new(&bk), list);
                 }
                 g_array_append_val(list, idx);
             }
@@ -241,19 +247,20 @@ static OspreyStatus decode_graph(OspreyContext *ctx) {
 
     /* Pass 3: struct bases — field groups per base with non-overlap. */
     {
-        GHashTable *bases = g_hash_table_new_full(g_direct_hash,
-                                                  g_direct_equal,
-                                                  NULL, bucket_free);
+        GHashTable *bases = g_hash_table_new_full(osprey_key_hash,
+                                                  osprey_key_equal,
+                                                  osprey_key_free,
+                                                  bucket_free);
         for (guint i = 0; i < g->vars->len; i++) {
             OspreyVar *v = &g_array_index(g->vars, OspreyVar, i);
             if (v->kind != OSPREY_PRED_FIELD_OF) continue;
             if (v->hard_false || v->belief < thresh) continue;
-            OspreyKey bk = osprey_region_key(&v->payload.attached.base.region)
-                ^ ((uint64_t)v->payload.attached.base.offset << 1);
-            GArray *fields = g_hash_table_lookup(bases, GSIZE_TO_POINTER(bk));
+            OspreyKey bk = osprey_base_key(&v->payload.attached.base.region,
+                                           v->payload.attached.base.offset);
+            GArray *fields = g_hash_table_lookup(bases, &bk);
             if (fields == NULL) {
                 fields = g_array_new(FALSE, FALSE, sizeof(uint32_t));
-                g_hash_table_insert(bases, GSIZE_TO_POINTER(bk), fields);
+                g_hash_table_insert(bases, osprey_key_new(&bk), fields);
             }
             uint32_t id = v->id;
             g_array_append_val(fields, id);
@@ -295,7 +302,7 @@ static OspreyStatus decode_graph(OspreyContext *ctx) {
                     OspreyKey ck = osprey_chunk_key(
                         &v->payload.attached.chunk);
                     gpointer cur = g_hash_table_lookup(m->by_chunk,
-                                                       GSIZE_TO_POINTER(ck));
+                                                       &ck);
                     if (cur != NULL) {
                         uint32_t idx = (uint32_t)(uintptr_t)cur - 1;
                         OspreyDecodedObject *cur_o = &g_array_index(
@@ -498,12 +505,12 @@ const OspreyDecodedObject *osprey_lookup_chunk(const OspreyModel *model,
     OspreyKey k = osprey_chunk_key(chunk);
     const OspreyDecodedObject *ptr_o = NULL;
     gpointer pcur = g_hash_table_lookup(model->ptr_by_chunk,
-                                        GSIZE_TO_POINTER(k));
+                                        &k);
     if (pcur != NULL) {
         uint32_t pidx = (uint32_t)(uintptr_t)pcur - 1;
         ptr_o = &g_array_index(model->objects, OspreyDecodedObject, pidx);
     }
-    gpointer cur = g_hash_table_lookup(model->by_chunk, GSIZE_TO_POINTER(k));
+    gpointer cur = g_hash_table_lookup(model->by_chunk, &k);
     const OspreyDecodedObject *o = NULL;
     if (cur != NULL) {
         uint32_t idx = (uint32_t)(uintptr_t)cur - 1;

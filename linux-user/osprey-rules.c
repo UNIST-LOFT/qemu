@@ -94,12 +94,15 @@ static void insertion_sort_i64(GArray *a) {
 OspreyGraph *osprey_graph_new(void) {
     OspreyGraph *g = g_new0(OspreyGraph, 1);
     g->vars = g_array_new(FALSE, FALSE, sizeof(OspreyVar));
-    g->var_index = g_hash_table_new(g_direct_hash, g_direct_equal);
+    g->var_index = g_hash_table_new_full(osprey_key_hash, osprey_key_equal,
+                                         osprey_key_free, NULL);
     g->hints = g_array_new(FALSE, FALSE, sizeof(OspreyHint));
     g->factors = g_array_new(FALSE, FALSE, sizeof(OspreyFactor *));
-    g->factor_index = g_hash_table_new(g_direct_hash, g_direct_equal);
-    g->kind_region = g_hash_table_new_full(g_direct_hash, g_direct_equal,
-                                           NULL, g_free);
+    g->factor_index = g_hash_table_new_full(osprey_factor_key_hash,
+                                            osprey_factor_key_equal,
+                                            g_free, NULL);
+    g->kind_region = g_hash_table_new_full(osprey_key_hash, osprey_key_equal,
+                                           osprey_key_free, g_free);
     g->uf_parent = NULL;
     g->uf_size = 0;
     return g;
@@ -127,37 +130,67 @@ void osprey_graph_free(OspreyGraph *g) {
     g_free(g);
 }
 
-/* Canonical hash of a variable identity (kind + payload). */
+/* Full-field variable identity key (kind + payload).  A hash is only a
+ * bucket selector; identity is the struct itself. */
 static OspreyKey var_key_of(uint8_t kind, const OspreyVarPayload *p) {
-    OspreyKey k = ((OspreyKey)kind) << 56;
+    OspreyKey k;
+    memset(&k, 0, sizeof(k));
+    k.tag = 0x564152ULL; /* "VAR" */
+    k.w[0] = kind;
     switch (kind) {
     case OSPREY_PRED_PRIMITIVE_VAR:
-    case OSPREY_PRED_SCALAR:
-        return k ^ osprey_chunk_key(&p->chunk);
-    case OSPREY_PRED_PRIMITIVE_ACCESS:
-        return k ^ osprey_chunk_key(&p->prim_access.chunk) ^
-               (p->prim_access.insn_pc << 1);
-    case OSPREY_PRED_UNFOLDABLE_HEAP:
-    case OSPREY_PRED_FOLDABLE_HEAP:
-        return k ^ osprey_region_key(&p->heap_fold.region) ^
-               (p->heap_fold.size << 1);
-    case OSPREY_PRED_HOMO_SEGMENT:
-    case OSPREY_PRED_ARRAY:
-        return k ^ osprey_region_key(&p->segment.a1.region) ^
-               ((uint64_t)p->segment.a1.offset << 1) ^
-               ((uint64_t)p->segment.a2.offset << 24) ^
-               ((uint64_t)p->segment.size << 40);
-    case OSPREY_PRED_ARRAY_START:
-        return k ^ osprey_region_key(&p->addr.region) ^
-               ((uint64_t)p->addr.offset << 1);
-    case OSPREY_PRED_FIELD_OF:
-    case OSPREY_PRED_POINTER:
-        return k ^ osprey_chunk_key(&p->attached.chunk) ^
-               osprey_region_key(&p->attached.base.region) ^
-               ((uint64_t)p->attached.base.offset << 1);
-    default:
-        return k;
+    case OSPREY_PRED_SCALAR: {
+        OspreyKey ck = osprey_chunk_key(&p->chunk);
+        k.w[1] = ck.w[0]; k.w[2] = ck.w[1]; k.w[3] = ck.w[2];
+        k.w[4] = ck.w[3]; k.w[5] = ck.w[4];
+        break;
     }
+    case OSPREY_PRED_PRIMITIVE_ACCESS: {
+        OspreyKey ck = osprey_chunk_key(&p->prim_access.chunk);
+        k.w[1] = ck.w[0]; k.w[2] = ck.w[1]; k.w[3] = ck.w[2];
+        k.w[4] = ck.w[3]; k.w[5] = ck.w[4];
+        k.w[6] = p->prim_access.insn_pc;
+        break;
+    }
+    case OSPREY_PRED_UNFOLDABLE_HEAP:
+    case OSPREY_PRED_FOLDABLE_HEAP: {
+        OspreyKey rk = osprey_region_key(&p->heap_fold.region);
+        k.w[1] = rk.w[0]; k.w[2] = rk.w[1]; k.w[3] = rk.w[2];
+        k.w[4] = p->heap_fold.size;
+        break;
+    }
+    case OSPREY_PRED_HOMO_SEGMENT:
+    case OSPREY_PRED_ARRAY: {
+        OspreyKey r1 = osprey_region_key(&p->segment.a1.region);
+        OspreyKey r2 = osprey_region_key(&p->segment.a2.region);
+        k.w[1] = r1.w[0]; k.w[2] = r1.w[1]; k.w[3] = r1.w[2];
+        k.w[4] = (uint64_t)p->segment.a1.offset;
+        k.w[5] = r2.w[0]; k.w[6] = r2.w[1]; k.w[7] = r2.w[2];
+        k.w[8] = (uint64_t)p->segment.a2.offset;
+        k.w[9] = (uint64_t)p->segment.size;
+        break;
+    }
+    case OSPREY_PRED_ARRAY_START: {
+        OspreyKey rk = osprey_region_key(&p->addr.region);
+        k.w[1] = rk.w[0]; k.w[2] = rk.w[1]; k.w[3] = rk.w[2];
+        k.w[4] = (uint64_t)p->addr.offset;
+        break;
+    }
+    case OSPREY_PRED_FIELD_OF:
+    case OSPREY_PRED_POINTER: {
+        OspreyKey ck = osprey_chunk_key(&p->attached.chunk);
+        OspreyKey rk = osprey_region_key(&p->attached.base.region);
+        k.w[1] = ck.w[0]; k.w[2] = ck.w[1]; k.w[3] = ck.w[2];
+        k.w[4] = ck.w[3]; k.w[5] = ck.w[4];
+        k.w[6] = rk.w[0]; k.w[7] = rk.w[1];
+        k.w[8] = rk.w[2];
+        k.w[9] = (uint64_t)p->attached.base.offset;
+        break;
+    }
+    default:
+        break;
+    }
+    return k;
 }
 
 /* Intern a predicate variable; returns UINT32_MAX on cap overflow. */
@@ -165,8 +198,7 @@ uint32_t osprey_intern_var(OspreyContext *ctx, uint8_t kind,
                            const OspreyVarPayload *payload) {
     OspreyGraph *g = ctx->graph;
     OspreyKey key = var_key_of(kind, payload);
-    gpointer existing = g_hash_table_lookup(g->var_index,
-                                            GSIZE_TO_POINTER(key));
+    gpointer existing = g_hash_table_lookup(g->var_index, &key);
     if (existing != NULL) {
         return (uint32_t)(uintptr_t)existing - 1;
     }
@@ -180,7 +212,7 @@ uint32_t osprey_intern_var(OspreyContext *ctx, uint8_t kind,
     v.kind = kind;
     v.payload = *payload;
     g_array_append_val(g->vars, v);
-    g_hash_table_insert(g->var_index, GSIZE_TO_POINTER(key),
+    g_hash_table_insert(g->var_index, osprey_key_new(&key),
                         GSIZE_TO_POINTER((gsize)v.id + 1));
     /* Grow the union-find parent array lazily. */
     if (g->uf_size <= v.id) {
@@ -223,11 +255,15 @@ void osprey_factor_add(OspreyContext *ctx, uint16_t rule, uint16_t head_idx,
         ctx->last_status = OSPREY_LIMIT_EXCEEDED;
         return;
     }
-    /* Deterministic factor identity: rule + sorted var ids. */
-    OspreyKey k = (OspreyKey)rule;
-    uint32_t sorted[8];
+    /* Deterministic factor identity: full-field key over rule, head,
+     * polarity, stage, probability, and the sorted variable set.  The
+     * head index is remapped after sorting so bidirectional rules
+     * (A→B and B→A) do not dedup-collapse. */
+    uint32_t sorted[8] = {0};
     if (num_vars > 8) num_vars = 8;
     for (uint32_t i = 0; i < num_vars; i++) sorted[i] = var_ids[i];
+    bool unary_prior = (head_idx == UINT16_MAX);
+    uint32_t head_id = unary_prior ? 0 : sorted[head_idx];
     for (uint32_t i = 1; i < num_vars; i++) {
         uint32_t v = sorted[i];
         uint32_t j = i;
@@ -237,29 +273,71 @@ void osprey_factor_add(OspreyContext *ctx, uint16_t rule, uint16_t head_idx,
         }
         sorted[j] = v;
     }
-    for (uint32_t i = 0; i < num_vars; i++) {
-        k ^= ((OspreyKey)sorted[i] + 1) * 0x9e3779b97f4a7c15ull;
+    uint32_t sorted_head = 0;
+    if (!unary_prior) {
+        for (uint32_t i = 0; i < num_vars; i++) {
+            if (sorted[i] == head_id) {
+                sorted_head = i;
+                break;
+            }
+        }
+    } else {
+        sorted_head = UINT16_MAX;
     }
-    if (g_hash_table_lookup(g->factor_index, GSIZE_TO_POINTER(k)) != NULL) {
+    OspreyFactorKey fk;
+    memset(&fk, 0, sizeof(fk));
+    fk.rule = rule;
+    fk.head_idx = (uint16_t)sorted_head;
+    fk.negative = negative ? 1 : 0;
+    fk.stage = 1;
+    memcpy(&fk.p_bits, &p, sizeof(fk.p_bits));
+    fk.num_vars = num_vars;
+    for (uint32_t i = 0; i < num_vars; i++) fk.var_ids[i] = sorted[i];
+    if (g_hash_table_lookup(g->factor_index, &fk) != NULL) {
         return; /* duplicate instance: deterministic merge keeps first */
     }
     OspreyFactor *f = g_new0(OspreyFactor, 1);
     f->id = g->factors->len;
     f->rule = rule;
-    f->head_idx = head_idx;
+    f->head_idx = (uint16_t)sorted_head;
     f->negative = negative ? 1 : 0;
     f->stage = 1;
     f->p = p;
     f->num_vars = num_vars;
     f->var_ids = g_memdup(sorted, num_vars * sizeof(uint32_t));
     g_array_append_val(g->factors, f);
-    g_hash_table_insert(g->factor_index, GSIZE_TO_POINTER(k),
+    OspreyFactorKey *fk_copy = g_memdup(&fk, sizeof(fk));
+    g_hash_table_insert(g->factor_index, fk_copy,
                         GSIZE_TO_POINTER((gsize)f->id + 1));
     for (uint32_t i = 0; i < num_vars; i++) {
         for (uint32_t j = i + 1; j < num_vars; j++) {
             uf_union(g, sorted[i], sorted[j]);
         }
     }
+}
+
+guint osprey_factor_key_hash(gconstpointer p) {
+    const OspreyFactorKey *k = p;
+    uint64_t h = ((uint64_t)k->rule << 48) ^ ((uint64_t)k->head_idx << 32) ^
+                 ((uint64_t)k->negative << 16) ^ ((uint64_t)k->stage << 8) ^
+                 k->p_bits;
+    for (uint32_t i = 0; i < k->num_vars; i++) {
+        h ^= (uint64_t)k->var_ids[i] + 0x9e3779b97f4a7c15ULL +
+             (h << 6) + (h >> 2);
+    }
+    return (guint)h;
+}
+
+gboolean osprey_factor_key_equal(gconstpointer a, gconstpointer b) {
+    const OspreyFactorKey *x = a;
+    const OspreyFactorKey *y = b;
+    if (x->rule != y->rule || x->head_idx != y->head_idx ||
+        x->negative != y->negative || x->stage != y->stage ||
+        x->p_bits != y->p_bits || x->num_vars != y->num_vars) {
+        return FALSE;
+    }
+    return memcmp(x->var_ids, y->var_ids,
+                  x->num_vars * sizeof(uint32_t)) == 0;
 }
 
 /* p_k per §7.2: distinct supporting samples over total sampled paths. */
@@ -278,12 +356,11 @@ static void kr_account(OspreyContext *ctx, uint8_t kind,
                        const OspreyRegionId *region, uint64_t kept,
                        uint64_t dropped) {
     OspreyGraph *g = ctx->graph;
-    OspreyKey ck = (((OspreyKey)kind) << 56) ^ osprey_region_key(region);
-    OspreyKindRegionCount *c = g_hash_table_lookup(g->kind_region,
-                                                   GSIZE_TO_POINTER(ck));
+    OspreyKey ck = osprey_kind_region_key(kind, region);
+    OspreyKindRegionCount *c = g_hash_table_lookup(g->kind_region, &ck);
     if (c == NULL) {
         c = g_new0(OspreyKindRegionCount, 1);
-        g_hash_table_insert(g->kind_region, GSIZE_TO_POINTER(ck), c);
+        g_hash_table_insert(g->kind_region, osprey_key_new(&ck), c);
     }
     c->kept += kept;
     c->dropped += dropped;
@@ -292,7 +369,7 @@ static void kr_account(OspreyContext *ctx, uint8_t kind,
         log_msg("[osprey] [limit] [kind %u] [region %llx] [kept %llu] "
                 "[dropped %llu]\n",
                 (unsigned)kind,
-                (unsigned long long)osprey_region_key(region),
+                (unsigned long long)region->site_offset,
                 (unsigned long long)c->kept, (unsigned long long)c->dropped);
     }
 }
@@ -300,9 +377,8 @@ static void kr_account(OspreyContext *ctx, uint8_t kind,
 static bool kr_has_space(OspreyContext *ctx, uint8_t kind,
                          const OspreyRegionId *region) {
     OspreyGraph *g = ctx->graph;
-    OspreyKey ck = (((OspreyKey)kind) << 56) ^ osprey_region_key(region);
-    OspreyKindRegionCount *c = g_hash_table_lookup(g->kind_region,
-                                                   GSIZE_TO_POINTER(ck));
+    OspreyKey ck = osprey_kind_region_key(kind, region);
+    OspreyKindRegionCount *c = g_hash_table_lookup(g->kind_region, &ck);
     if (c == NULL) return true;
     return c->kept < ctx->config.max_candidates_per_kind_region;
 }
@@ -745,15 +821,17 @@ static void instantiate_cb01(OspreyContext *ctx) {
 
 /* CC01/CC02: constant alloc size / alloc unit per heap site. */
 static void instantiate_cc01_cc02(OspreyContext *ctx) {
-    GHashTable *sites = g_hash_table_new(g_direct_hash, g_direct_equal);
+    GHashTable *sites = g_hash_table_new_full(g_direct_hash, g_direct_equal,
+                                              NULL, NULL);
     for (guint i = 0; i < ctx->alloc_facts->len; i++) {
         OspreyMallocFact *f = &g_array_index(ctx->alloc_facts,
                                              OspreyMallocFact, i);
         if (f->requested_size < 0) continue;
-        OspreyKey sk = (OspreyKey)f->site_pc;
-        if (g_hash_table_lookup(sites, GSIZE_TO_POINTER(sk)) != NULL)
+        if (g_hash_table_lookup(sites, GSIZE_TO_POINTER((gsize)f->site_pc)) !=
+            NULL)
             continue;
-        g_hash_table_insert(sites, GSIZE_TO_POINTER(sk), GSIZE_TO_POINTER(1));
+        g_hash_table_insert(sites, GSIZE_TO_POINTER((gsize)f->site_pc),
+                            GSIZE_TO_POINTER(1));
         OspreyRegionId h;
         h.kind = OSPREY_REGION_HEAP_SITE;
         h.code_image_id = 0;
@@ -1007,17 +1085,17 @@ static void bucket_free(gpointer p) {
 
 static GHashTable *bucket_new(void)
 {
-    return g_hash_table_new_full(g_direct_hash, g_direct_equal,
-                                 NULL, bucket_free);
+    return g_hash_table_new_full(osprey_key_hash, osprey_key_equal,
+                                 osprey_key_free, bucket_free);
 }
 
 static void bucket_add(GHashTable *b, const OspreyRegionId *r, uint32_t id)
 {
     OspreyKey k = osprey_region_key(r);
-    GArray *arr = g_hash_table_lookup(b, GSIZE_TO_POINTER(k));
+    GArray *arr = g_hash_table_lookup(b, &k);
     if (arr == NULL) {
         arr = g_array_new(FALSE, FALSE, sizeof(uint32_t));
-        g_hash_table_insert(b, GSIZE_TO_POINTER(k), arr);
+        g_hash_table_insert(b, osprey_key_new(&k), arr);
     }
     g_array_append_val(arr, id);
 }
@@ -1026,15 +1104,7 @@ static void bucket_region_arrays(GHashTable *b, const OspreyRegionId *r,
                                  GArray **out)
 {
     OspreyKey k = osprey_region_key(r);
-    *out = g_hash_table_lookup(b, GSIZE_TO_POINTER(k));
-}
-
-/* Decode a region key back to a region id (inverse of osprey_region_key). */
-static void key_to_region(OspreyKey k, OspreyRegionId *r)
-{
-    r->kind = (OspreyRegionKind)(k & 0x3);
-    r->code_image_id = (k >> 8) & 0xff;
-    r->site_offset = (k >> 16) & (((uint64_t)1 << 54) - 1);
+    *out = g_hash_table_lookup(b, &k);
 }
 
 /* Array var helpers: extract (lo, hi, stride) from the segment payload. */
@@ -1053,15 +1123,17 @@ static bool array_interval(const OspreyVar *v, const OspreyAddress **lo,
  * One factor per multi-chunk (insn, region); head is the Array var. */
 static void secondary_cb02(OspreyContext *ctx)
 {
-    GHashTable *groups = g_hash_table_new(g_direct_hash, g_direct_equal);
+    GHashTable *groups = g_hash_table_new_full(osprey_key_hash,
+                                               osprey_key_equal,
+                                               osprey_key_free, NULL);
     for (guint i = 0; i < ctx->access_facts->len; i++) {
         OspreyAccessFact *a = &g_array_index(ctx->access_facts,
                                              OspreyAccessFact, i);
-        OspreyKey gk = a->pc ^ (osprey_region_key(&a->chunk.address.region)
-                                * 0x9e3779b97f4a7c15ull);
-        if (g_hash_table_lookup(groups, GSIZE_TO_POINTER(gk)) != NULL)
+        OspreyKey gk = osprey_pc_region_key(a->pc,
+                                            &a->chunk.address.region);
+        if (g_hash_table_lookup(groups, &gk) != NULL)
             continue;
-        g_hash_table_insert(groups, GSIZE_TO_POINTER(gk), GSIZE_TO_POINTER(1));
+        g_hash_table_insert(groups, osprey_key_new(&gk), GSIZE_TO_POINTER(1));
         /* distinct chunks for (insn, region) */
         int64_t lo_off = 0, hi_end = 0;
         bool any = false;
@@ -1307,7 +1379,9 @@ static void cb05_scalars(OspreyContext *ctx, GArray *arrays, GArray *scalars)
 /* CB07/CB08: ArrayStart support from BaseAddr / most-frequent access. */
 static void cb07_cb08(OspreyContext *ctx)
 {
-    GHashTable *seen = g_hash_table_new(g_direct_hash, g_direct_equal);
+    GHashTable *seen = g_hash_table_new_full(osprey_key_hash,
+                                             osprey_key_equal,
+                                             osprey_key_free, NULL);
     /* CB07: BaseAddr(i,v,a) ∧ AccessMultiChunks(i,v.a.r) */
     for (guint i = 0; i < ctx->base_facts->len; i++) {
         OspreyBaseFact *b = &g_array_index(ctx->base_facts, OspreyBaseFact, i);
@@ -1361,12 +1435,11 @@ static void cb07_cb08(OspreyContext *ctx)
             }
         }
         if (distinct <= 1 || best == NULL) continue;
-        OspreyKey seen_key = best->pc ^
-            (osprey_region_key(&best->chunk.address.region)
-             * 0x9e3779b97f4a7c15ull);
-        if (g_hash_table_lookup(seen, GSIZE_TO_POINTER(seen_key)) != NULL)
+        OspreyKey seen_key = osprey_pc_region_key(
+            best->pc, &best->chunk.address.region);
+        if (g_hash_table_lookup(seen, &seen_key) != NULL)
             continue;
-        g_hash_table_insert(seen, GSIZE_TO_POINTER(seen_key),
+        g_hash_table_insert(seen, osprey_key_new(&seen_key),
                             GSIZE_TO_POINTER(1));
         OspreyVarPayload pa, ps;
         memset(&pa, 0, sizeof(pa));
@@ -1550,8 +1623,13 @@ OspreyStatus osprey_stage2_secondary(OspreyContext *ctx)
     }
     g_hash_table_iter_init(&bit, scalar_buckets);
     while (g_hash_table_iter_next(&bit, &rk, &arr_ptr)) {
+        /* The bucket key is the full region identity (struct key);
+         * decode it back to a region id for the cross-bucket lookup. */
+        const OspreyKey *rkp = rk;
         OspreyRegionId r0;
-        key_to_region((OspreyKey)(uintptr_t)rk, &r0);
+        r0.kind = (OspreyRegionKind)rkp->w[0];
+        r0.code_image_id = rkp->w[1];
+        r0.site_offset = rkp->w[2];
         GArray *scalars = (GArray *)arr_ptr;
         GArray *arrays = NULL;
         bucket_region_arrays(array_buckets, &r0, &arrays);

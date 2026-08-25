@@ -72,6 +72,9 @@ typedef struct OspreyConfig {
     uint64_t max_factors;
     uint64_t max_exact_clique_vars;
     double report_threshold;
+    char dump_file[512];        /* BINRADAR_OSPREY_DUMP_FILE: canonical
+                                 * fact dump written after each
+                                 * successful merge (empty = off) */
 } OspreyConfig;
 
 /* ------------------------------------------------------------------ */
@@ -168,10 +171,12 @@ void osprey_on_mem_access(CPUArchState *env, target_ulong addr,
  * A failed/overflowed allocation creates no heap region and no size
  * fact.  A successful zero-size return keeps a zero-size instance. */
 void osprey_on_alloc_success(CPUArchState *env, target_ulong base,
-                             target_ulong size, target_ulong site_pc);
+                             target_ulong size, target_ulong site_pc,
+                             uint64_t object_id, uint32_t generation);
 void osprey_on_alloc_failure(CPUArchState *env, target_ulong site_pc);
-void osprey_on_free(CPUArchState *env, target_ulong base,
-                    target_ulong site_pc);
+/* Identity-based retire (provenance-authoritative heap lifecycle). */
+void osprey_on_free_identity(CPUArchState *env, uint64_t object_id,
+                             uint32_t generation, target_ulong site_pc);
 
 /* Modeled byte-copy (memcpy/memmove/strcpy family) after the guest
  * access succeeded: source/destination are runtime addresses. */
@@ -193,11 +198,21 @@ void osprey_on_mem_store_origin(CPUArchState *env, uint32_t src_reg,
 void osprey_on_mem_load_origin(CPUArchState *env, uint32_t dst_reg,
                                target_ulong addr, target_ulong value);
 
-/* Call/return stack events; callee_pc is the runtime callee entry
- * (0 for synthetic/push frames, which are flagged imprecise). */
-void osprey_on_call(target_ulong call_pc, target_ulong ret_pc,
-                    target_ulong callee_pc, target_ulong sp);
-void osprey_on_ret(target_ulong pc, target_ulong sp);
+/* Call/return stack events.  The call hook fires AFTER the return-
+ * address push, so entry_sp is the precise callee-entry RSP; callee_pc
+ * is the runtime callee entry (out-of-image callees are flagged
+ * imprecise and never contribute facts).  The ret hook fires after the
+ * pop (post-pop RSP). */
+void osprey_on_call(CPUArchState *env, target_ulong callee_pc,
+                    target_ulong entry_sp);
+void osprey_on_ret(CPUArchState *env, target_ulong pc, target_ulong sp);
+/* RSP write (push/pop/add-sub imm): re-derive the RSP origin from the
+ * live frame stack; only in-image writes re-derive. */
+void osprey_on_rsp_update(CPUArchState *env, target_ulong new_sp,
+                          target_ulong pc);
+
+/* Mark the current sample unsupported (CLONE_VM multithreaded guest). */
+void osprey_mark_unsupported_execution(void);
 
 /* Collection enable flag (snapshot.c); read by the translator wrappers. */
 extern int osprey_collect_enabled;
@@ -207,5 +222,12 @@ void osprey_register_image_global(CPUArchState *env, target_ulong base,
                                   target_ulong size);
 /* Main image normalization base (== symbolic_load_base). */
 void osprey_set_image_base(target_ulong base);
+/* Final executable text interval, registered after all main-image LOAD
+ * segments have been processed. */
+void osprey_set_image_bounds(target_ulong start, target_ulong end);
+
+/* Canonical fact dump (osprey-facts.c): deterministic sorted dump of
+ * the merged facts, used for ASLR-invariance comparison. */
+void osprey_dump_canonical(OspreyContext *ctx, const char *path);
 
 #endif /* BINRADAR_OSPREY_H */

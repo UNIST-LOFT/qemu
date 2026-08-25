@@ -2863,6 +2863,10 @@ int load_elf_binary(struct linux_binprm *bprm, struct image_info *info)
         free(elf_interpreter);
     }
 
+    /* Final main-image text bounds make every OSPREY code identity
+     * image-relative and reject interpreter/library PCs exactly. */
+    osprey_set_image_bounds(info->start_code, info->end_code);
+
     /* Register writable global regions (.data/.bss) for snapshot tracking */
     if (info->end_data > info->start_data) {
         snapshot_trace_global_add(info->start_data,

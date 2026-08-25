@@ -17,6 +17,17 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Key allocation helpers (osprey-internal.h declares the struct). */
+OspreyKey *osprey_key_new(const OspreyKey *k) {
+    OspreyKey *copy = g_new(OspreyKey, 1);
+    *copy = *k;
+    return copy;
+}
+
+void osprey_key_free(gpointer p) {
+    g_free(p);
+}
+
 /* Collection enable flag read by the translator wrappers
  * (osprey_active() in translate.c).  Set from BINRADAR_OSPREY_ENABLE at
  * snapshot init; stays 0 in all other modes so translated code pays no
@@ -108,6 +119,11 @@ bool osprey_config_from_env(OspreyConfig *config) {
             return false;
         }
         config->report_threshold = d;
+    }
+
+    v = getenv("BINRADAR_OSPREY_DUMP_FILE");
+    if (v != NULL && v[0] != '\0') {
+        snprintf(config->dump_file, sizeof(config->dump_file), "%s", v);
     }
     return true;
 }
@@ -228,6 +244,7 @@ void osprey_shared_run_reset(OspreySharedRun *run, uint64_t sample_id,
     memset(run, 0, sizeof(*run));
     run->version = OSPREY_SHARED_VERSION;
     run->sample_id = (uint32_t)sample_id;
+    run->first_dropped_hash = 0;
 
     uint32_t caps[OSPREY_TABLE_COUNT];
     size_t offs[OSPREY_TABLE_COUNT];
@@ -255,6 +272,7 @@ OspreyContext *osprey_new(const OspreyConfig *config) {
     OspreyContext *ctx = g_new0(OspreyContext, 1);
     ctx->config = *config;
     qemu_mutex_init(&ctx->shared_lock);
+    ctx->global_ranges = g_array_new(FALSE, FALSE, sizeof(OspreyGlobalRange));
     ctx->access_facts = g_array_new(FALSE, FALSE, sizeof(OspreyAccessFact));
     ctx->base_facts = g_array_new(FALSE, FALSE, sizeof(OspreyBaseFact));
     ctx->copy_facts = g_array_new(FALSE, FALSE, sizeof(OspreyCopyFact));
@@ -271,12 +289,16 @@ OspreyContext *osprey_new(const OspreyConfig *config) {
     ctx->tx_model_ready = false;
     ctx->staged_graph = NULL;
     ctx->staged_model = NULL;
+    osprey_ctx_ref_set(ctx);
     return ctx;
 }
 
 void osprey_free(OspreyContext *ctx) {
     if (ctx == NULL) return;
     osprey_tx_abort(ctx);
+    if (ctx->global_ranges != NULL) {
+        g_array_free(ctx->global_ranges, TRUE);
+    }
     g_array_free(ctx->access_facts, TRUE);
     g_array_free(ctx->base_facts, TRUE);
     g_array_free(ctx->copy_facts, TRUE);
@@ -286,6 +308,7 @@ void osprey_free(OspreyContext *ctx) {
     g_array_free(ctx->runtime_regions, TRUE);
     g_array_free(ctx->region_instances, TRUE);
     osprey_free_cpu_origins();
+    osprey_free_runtime_regions();
     if (ctx->graph) {
         osprey_graph_free(ctx->graph);
     }
@@ -293,19 +316,111 @@ void osprey_free(OspreyContext *ctx) {
         osprey_model_free(ctx->model);
     }
     qemu_mutex_destroy(&ctx->shared_lock);
+    osprey_ctx_ref_set(NULL);
     g_free(ctx);
 }
 
+/* ------------------------------------------------------------------ */
+/* Main-image writable global ranges (merged interval set)             */
+/* ------------------------------------------------------------------ */
+
+/* Sorted by base; adjacent/overlapping ranges are merged.  Offsets are
+ * image-relative (base - image_base). */
+void global_ranges_add(OspreyContext *ctx, target_ulong base,
+                       uint64_t size) {
+    if (ctx == NULL || size == 0) return;
+    target_ulong image_base = osprey_get_image_base();
+    if (image_base == 0 || base < image_base ||
+        (uint64_t)(base - image_base) > INT64_MAX || size > INT64_MAX) {
+        return;
+    }
+    int64_t off = (int64_t)(base - image_base);
+    if (off > INT64_MAX - (int64_t)size) {
+        return;
+    }
+    OspreyGlobalRange r;
+    r.offset = off;
+    r.extent = size;
+    GArray *a = ctx->global_ranges;
+    /* Merge with every overlapping/adjacent range (a new range can
+     * bridge several existing ones), then insert at the sorted
+     * position. */
+    int64_t lo = r.offset;
+    int64_t hi = r.offset + (int64_t)r.extent;
+    guint i = 0;
+    while (i < a->len) {
+        OspreyGlobalRange *e = &g_array_index(a, OspreyGlobalRange, i);
+        int64_t e_hi = e->offset + (int64_t)e->extent;
+        if (hi < e->offset) break;          /* r entirely before e */
+        if (lo > e_hi) { i++; continue; }   /* r entirely after e */
+        /* overlap/adjacent: absorb e into r */
+        if (e->offset < lo) lo = e->offset;
+        if (e_hi > hi) hi = e_hi;
+        g_array_remove_index(a, i);
+    }
+    r.offset = lo;
+    r.extent = (uint64_t)(hi - lo);
+    guint j = 0;
+    while (j < a->len &&
+           g_array_index(a, OspreyGlobalRange, j).offset < r.offset) {
+        j++;
+    }
+    g_array_insert_val(a, j, r);
+}
+
+/* Resolve a runtime address into the main-image global region. */
+bool osprey_global_of_addr(target_ulong addr, OspreyRegionId *region,
+                           int64_t *offset) {
+    OspreyContext *ctx = osprey_ctx_ref();
+    if (ctx == NULL || ctx->global_ranges == NULL) return false;
+    target_ulong image_base = osprey_get_image_base();
+    if (image_base == 0 || addr < image_base ||
+        (uint64_t)(addr - image_base) > INT64_MAX) {
+        return false;
+    }
+    int64_t off = (int64_t)(addr - image_base);
+    for (guint i = 0; i < ctx->global_ranges->len; i++) {
+        const OspreyGlobalRange *e = &g_array_index(
+            ctx->global_ranges, OspreyGlobalRange, i);
+        if (off < e->offset) return false;
+        if (e->extent <= INT64_MAX &&
+            e->offset <= INT64_MAX - (int64_t)e->extent &&
+            off < e->offset + (int64_t)e->extent) {
+            region->kind = OSPREY_REGION_GLOBAL;
+            region->code_image_id = 0;
+            region->site_offset = 0;
+            *offset = off;
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Module-level context pointer for child-side helpers (set by
+ * osprey_child_use_shared_run; cleared on teardown). */
+static OspreyContext *g_osprey_ctx_ref = NULL;
+
+OspreyContext *osprey_ctx_ref(void) { return g_osprey_ctx_ref; }
+
+void osprey_ctx_ref_set(OspreyContext *ctx) { g_osprey_ctx_ref = ctx; }
+
 /* Module-level image base; set from elfload before the context exists. */
 static target_ulong osprey_image_base;
-static bool osprey_image_base_set;
+static target_ulong osprey_image_end;
 
 void osprey_set_image_base(target_ulong base) {
     osprey_image_base = base;
-    osprey_image_base_set = true;
+    osprey_image_end = 0;
 }
 
 target_ulong osprey_get_image_base(void) { return osprey_image_base; }
+
+void osprey_set_image_bounds(target_ulong start, target_ulong end) {
+    osprey_image_base = start;
+    osprey_image_end = end > start ? end : 0;
+}
+
+target_ulong osprey_get_image_end(void) { return osprey_image_end; }
 
 /* ------------------------------------------------------------------ */
 /* Origin shadows (per-CPU; module-level, single-threaded TCG)         */

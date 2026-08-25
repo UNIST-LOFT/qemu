@@ -9113,8 +9113,14 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
                     symbolic_trace_free(env->regs[R_EDI]);
                 }
                 snapshot_trace_free(env->regs[R_EDI], model_caller_addr);
+                ProvenanceObject *obj =
+                    provenance_lookup_live_by_base(env->regs[R_EDI]);
+                if (obj != NULL) {
+                    osprey_on_free_identity(env, obj->object_id,
+                                            obj->generation,
+                                            model_caller_addr);
+                }
                 provenance_retire_object(env->regs[R_EDI]);
-                osprey_on_free(env, env->regs[R_EDI], model_caller_addr);
             }
             if (symbolic_mode) {
                 clear_call_args_temps();
@@ -9391,9 +9397,13 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
                      * Retire the old object; create a zero-size object
                      * only if the guest libc returned a non-NULL pointer. */
                     if (pend.arg_ptr != 0) {
-                        provenance_retire_object(pend.arg_ptr);
                         snapshot_trace_free(pend.arg_ptr, pend.call_pc);
-                        osprey_on_free(env, pend.arg_ptr, pend.call_pc);
+                        if (pend.old_object_id != 0) {
+                            osprey_on_free_identity(
+                                env, pend.old_object_id,
+                                pend.old_generation, pend.call_pc);
+                        }
+                        provenance_retire_object(pend.arg_ptr);
                         if (symbolic_mode) {
                             symbolic_trace_free(pend.arg_ptr);
                         }
@@ -9404,7 +9414,9 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
                             PROV_PRODUCER_REALLOC_RETURN);
                         provenance_set_reg_tag(env, R_EAX, tag);
                         snapshot_trace_alloc(base, 0, pend.call_pc);
-                        osprey_on_alloc_success(env, base, 0, pend.call_pc);
+                        osprey_on_alloc_success(env, base, 0, pend.call_pc,
+                                                tag.object_id,
+                                                tag.generation);
                         if (symbolic_mode) {
                             SymbolicPendingAlloc sym_alloc =
                                 symbolic_trace_get_pending_alloc(pc);
@@ -9423,8 +9435,13 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
                      * stay LIVE until now) and create the new object, even
                      * when the numeric address is unchanged. */
                     if (pend.arg_ptr != 0) {
-                        provenance_retire_object(pend.arg_ptr);
                         snapshot_trace_free(pend.arg_ptr, pend.call_pc);
+                        if (pend.old_object_id != 0) {
+                            osprey_on_free_identity(
+                                env, pend.old_object_id,
+                                pend.old_generation, pend.call_pc);
+                        }
+                        provenance_retire_object(pend.arg_ptr);
                         if (symbolic_mode) {
                             symbolic_trace_free(pend.arg_ptr);
                         }
@@ -9435,7 +9452,8 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
                     provenance_set_reg_tag(env, R_EAX, tag);
                     snapshot_trace_alloc(base, pend.arg_size, pend.call_pc);
                     osprey_on_alloc_success(env, base, pend.arg_size,
-                                            pend.call_pc);
+                                            pend.call_pc, tag.object_id,
+                                            tag.generation);
                     if (symbolic_mode) {
                         SymbolicPendingAlloc sym_alloc =
                             symbolic_trace_get_pending_alloc(pc);
@@ -9475,7 +9493,8 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
                 provenance_set_reg_tag(env, R_EAX, tag);
                 snapshot_trace_alloc(base, pend.arg_size, pend.call_pc);
                 osprey_on_alloc_success(env, base, pend.arg_size,
-                                        pend.call_pc);
+                                        pend.call_pc, tag.object_id,
+                                        tag.generation);
                 if (symbolic_mode) {
                     SymbolicPendingAlloc sym_alloc =
                         symbolic_trace_get_pending_alloc(pc);

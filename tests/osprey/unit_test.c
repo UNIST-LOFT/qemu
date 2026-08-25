@@ -6,8 +6,8 @@
  * build against a small stub environment (log_msg, is_valid_address,
  * guest_base, qemu mutex primitives) and drives the public API:
  *
- *  - merge validation rejects overflow / bad arithmetic / unsupported
- *    execution / version or capacity mismatch / malformed population /
+ *  - merge validation rejects overflow / bad arithmetic / bad provenance
+ *    identity / unsupported execution / version or capacity mismatch / malformed population /
  *    used>cap before appending any committed fact;
  *  - a rejected merge leaves the transaction non-OK, emits exactly one
  *    [osprey] [reject] row, and exposes no model;
@@ -27,16 +27,34 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ucontext.h>
+#include <unistd.h>
 
 #include "osprey.h"
 #include "osprey-internal.h"
 #include "qemu/thread.h"
+#include "provenance.h"
+#include "tcg/symbolic/symbolic-struct.h"
 
 /* ------------------------------------------------------------------ */
 /* Stub environment                                                    */
 /* ------------------------------------------------------------------ */
 
 unsigned long guest_base = 0;
+
+/* Provenance module externs (provenance.o links against these). */
+int binradar_memcheck_enabled = 0;
+uint64_t symbolic_start_code = 0;
+uint64_t symbolic_end_code = 0;
+Expr *pool = NULL;
+Expr *next_free_expr = NULL;
+Query *query_queue = NULL;
+Query *next_query = NULL;
+
+SnapshotMemRegion *mr_manager_heap_search_pub(target_ulong addr)
+{
+    (void)addr;
+    return NULL;
+}
 
 static char g_test_log[1 << 20];
 static size_t g_test_log_len = 0;
@@ -204,6 +222,27 @@ static void test_bad_arithmetic_rejection(void)
     CHECK(strcmp(osprey_tx_stage(ctx), "merge") == 0, "bad-arith tx stage");
     CHECK(ctx->access_facts->len == 0, "bad-arith no partial merge");
     CHECK(g_reject_rows == 1, "bad-arith exactly one reject row");
+
+    osprey_free(ctx);
+    g_free(run);
+}
+
+static void test_bad_identity_rejection(void)
+{
+    reset_log();
+    OspreyConfig c = test_config();
+    OspreyContext *ctx = osprey_new(&c);
+    OspreySharedRun *run = new_run(&c);
+    run->bad_identity = 1;
+
+    OspreyStatus st = osprey_parent_merge_sample(ctx, run);
+    CHECK(st == OSPREY_INCOMPLETE_FACTS, "bad-identity merge status");
+    CHECK(osprey_tx_status(ctx) == OSPREY_INCOMPLETE_FACTS,
+          "bad-identity tx status");
+    CHECK(strcmp(osprey_tx_stage(ctx), "merge") == 0,
+          "bad-identity tx stage");
+    CHECK(ctx->access_facts->len == 0, "bad-identity no partial merge");
+    CHECK(g_reject_rows == 1, "bad-identity exactly one reject row");
 
     osprey_free(ctx);
     g_free(run);
@@ -497,11 +536,336 @@ static void test_decoder_cap_rejection(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* Stage-1 identity, normalization, lifecycle                          */
+/* ------------------------------------------------------------------ */
+
+/* Two chunks that collide under the old packed key scheme (site delta
+ * 2<<16 vs offset delta 1<<16 XOR-align) must be distinct under
+ * full-field keys. */
+static void test_key_collision_fixtures(void)
+{
+    OspreyChunk a, b;
+    memset(&a, 0, sizeof(a));
+    a.address.region.kind = OSPREY_REGION_GLOBAL;
+    a.address.region.site_offset = 0x10000;
+    a.address.offset = 0;
+    a.size = 8;
+    memset(&b, 0, sizeof(b));
+    b.address.region.kind = OSPREY_REGION_GLOBAL;
+    b.address.region.site_offset = 0x10002;
+    b.address.offset = 0x10000;
+    b.size = 8;
+
+    OspreyKey ka = osprey_chunk_key(&a);
+    OspreyKey kb = osprey_chunk_key(&b);
+    CHECK(!osprey_key_equal(&ka, &kb), "colliding chunks distinct keys");
+
+    OspreyConfig c = test_config();
+    OspreyContext *ctx = osprey_new(&c);
+    ctx->graph = osprey_graph_new();
+    OspreyVarPayload pa, pb;
+    memset(&pa, 0, sizeof(pa)); pa.chunk = a;
+    memset(&pb, 0, sizeof(pb)); pb.chunk = b;
+    uint32_t va = osprey_intern_var(ctx, OSPREY_PRED_PRIMITIVE_VAR, &pa);
+    uint32_t vb = osprey_intern_var(ctx, OSPREY_PRED_PRIMITIVE_VAR, &pb);
+    CHECK(va != UINT32_MAX && vb != UINT32_MAX, "intern both chunks");
+    CHECK(va != vb, "colliding chunks distinct vars");
+
+    /* Attached predicates must include the complete target/base region,
+     * not just its kind and image id. */
+    OspreyVarPayload fa, fb;
+    memset(&fa, 0, sizeof(fa));
+    fa.attached.chunk = a;
+    fa.attached.base.region.kind = OSPREY_REGION_HEAP_SITE;
+    fa.attached.base.region.site_offset = 0x111;
+    fa.attached.base.offset = 4;
+    fb = fa;
+    fb.attached.base.region.site_offset = 0x222;
+    uint32_t vfa = osprey_intern_var(ctx, OSPREY_PRED_FIELD_OF, &fa);
+    uint32_t vfb = osprey_intern_var(ctx, OSPREY_PRED_FIELD_OF, &fb);
+    CHECK(vfa != vfb, "field bases at different sites remain distinct");
+
+    /* HomoSegment identity includes both regions, not only a1 and the
+     * numeric a2 offset. */
+    OspreyVarPayload sa, sb;
+    memset(&sa, 0, sizeof(sa));
+    sa.segment.a1.region.kind = OSPREY_REGION_GLOBAL;
+    sa.segment.a1.offset = 0x10;
+    sa.segment.a2.region.kind = OSPREY_REGION_HEAP_SITE;
+    sa.segment.a2.region.site_offset = 0x333;
+    sa.segment.a2.offset = 0x20;
+    sa.segment.size = 8;
+    sb = sa;
+    sb.segment.a2.region.site_offset = 0x444;
+    uint32_t vsa = osprey_intern_var(ctx, OSPREY_PRED_HOMO_SEGMENT, &sa);
+    uint32_t vsb = osprey_intern_var(ctx, OSPREY_PRED_HOMO_SEGMENT, &sb);
+    CHECK(vsa != vsb, "segment partner regions remain distinct");
+    osprey_free(ctx);
+}
+
+/* Bidirectional rules (A→B and B→A) must not dedup-collapse; polarity
+ * and head index are part of the factor identity. */
+static void test_factor_key_bidirectional(void)
+{
+    OspreyConfig c = test_config();
+    OspreyContext *ctx = osprey_new(&c);
+    ctx->graph = osprey_graph_new();
+    OspreyVarPayload pa, pb;
+    memset(&pa, 0, sizeof(pa));
+    pa.chunk.address.region.kind = OSPREY_REGION_GLOBAL;
+    pa.chunk.address.offset = 0;
+    pa.chunk.size = 8;
+    memset(&pb, 0, sizeof(pb));
+    pb.chunk.address.region.kind = OSPREY_REGION_GLOBAL;
+    pb.chunk.address.offset = 8;
+    pb.chunk.size = 8;
+    uint32_t va = osprey_intern_var(ctx, OSPREY_PRED_PRIMITIVE_VAR, &pa);
+    uint32_t vb = osprey_intern_var(ctx, OSPREY_PRED_PRIMITIVE_VAR, &pb);
+    CHECK(va != UINT32_MAX && vb != UINT32_MAX, "intern factor vars");
+    uint32_t ids[2] = { vb, va };
+    osprey_factor_add(ctx, OSPREY_RULE_CA02, 0, false, 0.8, ids, 2);
+    osprey_factor_add(ctx, OSPREY_RULE_CA02, 1, false, 0.8, ids, 2);
+    CHECK(ctx->graph->factors->len == 2, "bidirectional factors distinct");
+    osprey_factor_add(ctx, OSPREY_RULE_CA02, 0, false, 0.8, ids, 2);
+    CHECK(ctx->graph->factors->len == 2, "duplicate factor deduped");
+    osprey_factor_add(ctx, OSPREY_RULE_CA02, 0, true, 0.8, ids, 2);
+    CHECK(ctx->graph->factors->len == 3, "polarity distinct");
+    /* 0.5 and 1.0 have identical low 32 mantissa bits on IEEE-754.
+     * Exact probability identity must retain all 64 bits. */
+    osprey_factor_add(ctx, OSPREY_RULE_CA02, 0, false, 0.5, ids, 2);
+    osprey_factor_add(ctx, OSPREY_RULE_CA02, 0, false, 1.0, ids, 2);
+    CHECK(ctx->graph->factors->len == 5, "full probability bits distinct");
+    osprey_free(ctx);
+}
+
+/* PC normalization at fact creation + merged global interval set with
+ * image-relative offsets. */
+static void test_pc_normalization_and_global_merge(void)
+{
+    reset_log();
+    OspreyConfig c = test_config();
+    OspreyContext *ctx = osprey_new(&c);
+    OspreySharedRun *run = new_run(&c);
+
+    osprey_set_image_bounds(0x400000, 0x401000);
+    osprey_register_image_global(NULL, 0x402000, 0x1000); /* .data */
+    osprey_register_image_global(NULL, 0x403000, 0x800);  /* .bss */
+    osprey_child_use_shared_run(ctx, run);
+
+    CPUArchState *env = g_malloc0(sizeof(CPUArchState));
+
+    /* in-image access: pc 0x400100 -> 0x100, addr in .data */
+    osprey_on_mem_access(env, 0x402008, 8, 0x400100, 0);
+    /* out-of-image access (libc): skipped entirely */
+    osprey_on_mem_access(env, 0x402010, 8, 0x7f0000001234, 0);
+    /* .bss access resolves to the same canonical G region */
+    osprey_on_mem_access(env, 0x403010, 4, 0x400200, 1);
+
+    OspreyRegionId r;
+    int64_t off;
+    CHECK(osprey_region_of_addr(env, 0x402008, &r, &off, false),
+          "data addr resolves");
+    CHECK(r.kind == OSPREY_REGION_GLOBAL && off == 0x2008,
+          "data addr image-relative offset");
+    CHECK(osprey_region_of_addr(env, 0x403010, &r, &off, false),
+          "bss addr resolves");
+    CHECK(r.kind == OSPREY_REGION_GLOBAL && off == 0x3010,
+          "bss addr image-relative offset");
+    CHECK(!osprey_region_of_addr(env, 0x7f0000000000, &r, &off, false),
+          "libc addr not resolved");
+
+    CHECK(osprey_parent_merge_sample(ctx, run) == OSPREY_OK, "merge ok");
+    CHECK(ctx->access_facts->len == 2, "only in-image accesses recorded");
+    OspreyAccessFact *f0 = &g_array_index(ctx->access_facts,
+                                          OspreyAccessFact, 0);
+    OspreyAccessFact *f1 = &g_array_index(ctx->access_facts,
+                                          OspreyAccessFact, 1);
+    CHECK(f0->pc == 0x100 && f1->pc == 0x200, "pcs normalized");
+    CHECK(f0->chunk.address.offset == 0x2008 &&
+          f1->chunk.address.offset == 0x3010, "offsets image-relative");
+    CHECK(f0->chunk.address.region.kind == OSPREY_REGION_GLOBAL &&
+          f1->chunk.address.region.kind == OSPREY_REGION_GLOBAL,
+          "both accesses in G");
+    CHECK(ctx->region_instances->len == 1, "one merged global instance");
+    OspreyRegionInstance *gi = &g_array_index(ctx->region_instances,
+                                              OspreyRegionInstance, 0);
+    CHECK(gi->raw_base == 0x400000, "global raw base = image base");
+    CHECK(gi->instance_id == 0, "global instance uses reserved id");
+    CHECK(gi->extent == 0x3800, "global span reaches highest image offset");
+
+    osprey_free(ctx);
+    g_free(run);
+    g_free(env);
+}
+
+/* Heap lifecycle: provenance identity, same-base reuse, retire by
+ * identity, stale-origin rejection. */
+static void test_heap_identity_lifecycle(void)
+{
+    reset_log();
+    OspreyConfig c = test_config();
+    OspreyContext *ctx = osprey_new(&c);
+    OspreySharedRun *run = new_run(&c);
+    osprey_set_image_bounds(0x400000, 0x401000);
+    osprey_child_use_shared_run(ctx, run);
+
+    CPUArchState *env = g_malloc0(sizeof(CPUArchState));
+    provenance_init();
+
+    PtrTag t1 = provenance_create_object(0x1000, 32, 0x400200,
+                                          PROV_PRODUCER_MALLOC_RETURN);
+    osprey_on_alloc_success(env, 0x1000, 32, 0x400200,
+                            t1.object_id, t1.generation);
+
+    /* same-base reuse: retire t1, allocate again at the same base */
+    osprey_on_free_identity(env, t1.object_id, t1.generation, 0x400300);
+    provenance_retire_object(0x1000);
+    PtrTag t2 = provenance_create_object(0x1000, 64, 0x400200,
+                                          PROV_PRODUCER_MALLOC_RETURN);
+    osprey_on_alloc_success(env, 0x1000, 64, 0x400200,
+                            t2.object_id, t2.generation);
+
+    CHECK(osprey_parent_merge_sample(ctx, run) == OSPREY_OK, "merge ok");
+    CHECK(ctx->region_instances->len == 2, "two instances at same base");
+    OspreyRegionInstance *h0 = &g_array_index(ctx->region_instances,
+                                              OspreyRegionInstance, 0);
+    OspreyRegionInstance *h1 = &g_array_index(ctx->region_instances,
+                                              OspreyRegionInstance, 1);
+    CHECK(h0->prov_object_id != h1->prov_object_id,
+          "instances carry distinct provenance ids");
+    CHECK(h0->instance_id != h1->instance_id,
+          "instances carry distinct runtime ids");
+
+    OspreyRegionId r;
+    int64_t off;
+    CHECK(osprey_region_of_addr(env, 0x1000, &r, &off, false),
+          "live instance resolves");
+    CHECK(r.kind == OSPREY_REGION_HEAP_SITE && off == 0,
+          "heap region + offset");
+
+    /* origin validation: freed identity rejected, live accepted */
+    OspreyRegOrigin o;
+    memset(&o, 0, sizeof(o));
+    o.prov_object_id = t1.object_id;
+    o.prov_generation = t1.generation;
+    o.concrete_value = 0x1000;
+    o.address.region.kind = OSPREY_REGION_HEAP_SITE;
+    o.address.region.site_offset = 0x200;
+    o.address.offset = 0;
+    CHECK(!osprey_origin_prov_live(&o), "freed identity rejected");
+    o.prov_object_id = t2.object_id;
+    o.prov_generation = t2.generation;
+    CHECK(osprey_origin_prov_live(&o), "live identity accepted");
+    o.concrete_value = 0x1000 + 64; /* past end */
+    CHECK(!osprey_origin_prov_live(&o), "out-of-bounds value rejected");
+
+    /* The lifecycle API accepts only the authoritative identity. */
+    osprey_on_free_identity(env, t2.object_id, t2.generation, 0x400400);
+    CHECK(!osprey_region_of_addr(env, 0x1000, &r, &off, false),
+          "freed instance no longer resolves");
+
+    osprey_free(ctx);
+    g_free(run);
+    g_free(env);
+}
+
+/* Stack frames: entry_sp convention, imprecise-frame exclusion, RSP
+ * origin seeding and re-derivation. */
+static void test_stack_frames_and_rsp_origin(void)
+{
+    reset_log();
+    OspreyConfig c = test_config();
+    OspreyContext *ctx = osprey_new(&c);
+    OspreySharedRun *run = new_run(&c);
+    osprey_set_image_bounds(0x400000, 0x401000);
+    osprey_child_use_shared_run(ctx, run);
+
+    CPUArchState *env = g_malloc0(sizeof(CPUArchState));
+    OspreyCpuOriginState *st = osprey_cpu_origin(env);
+
+    /* imprecise callee (libc) as the only frame: no seed, window not
+     * resolvable, ret pops it */
+    osprey_on_call(env, 0x7f0000000000, 0x7ffbfff8);
+    CHECK(!st->regs[R_ESP].valid, "imprecise call leaves rsp origin invalid");
+    OspreyRegionId r;
+    int64_t off;
+    CHECK(!osprey_region_of_addr(env, 0x7ffbff00, &r, &off, false),
+          "imprecise frame window not resolvable");
+    osprey_on_ret(env, 0x7f0000000001, 0x7ffc0000);
+    CHECK(!st->regs[R_ESP].valid, "no frames -> rsp origin invalid");
+
+    /* precise callee: entry_sp = 0x7ffc0000, origin at offset 0 */
+    osprey_on_call(env, 0x400500, 0x7ffc0000);
+    CHECK(st->regs[R_ESP].valid &&
+          st->regs[R_ESP].kind == OSPREY_ORIGIN_ADDRESS,
+          "rsp origin seeded at call");
+    CHECK(st->regs[R_ESP].address.offset == 0, "rsp origin offset 0");
+    CHECK(st->regs[R_ESP].address.region.site_offset == 0x500,
+          "rsp origin frame site");
+
+    /* rsp update below entry (prologue push): signed offset */
+    osprey_on_rsp_update(env, 0x7ffbfff0, 0x400501);
+    CHECK(st->regs[R_ESP].valid &&
+          st->regs[R_ESP].address.offset == -16,
+          "rsp update keeps frame origin with signed offset");
+    /* out-of-image rsp write invalidates */
+    osprey_on_rsp_update(env, 0x7ffbffe0, 0x7f0000001234);
+    CHECK(!st->regs[R_ESP].valid, "out-of-image rsp write invalidates");
+    osprey_on_rsp_update(env, 0x7ffbfff0, 0x400501);
+    CHECK(st->regs[R_ESP].valid, "in-image rsp write re-derives");
+
+    /* A stack pointer above a nested callee's entry belongs to the
+     * caller; the innermost frame must not claim the caller's range. */
+    osprey_on_call(env, 0x400600, 0x7ffbffe8);
+    osprey_on_rsp_update(env, 0x7ffbfff0, 0x400601);
+    CHECK(st->regs[R_ESP].valid &&
+          st->regs[R_ESP].address.region.site_offset == 0x500,
+          "rsp above nested entry resolves to caller");
+    osprey_on_ret(env, 0x400601, 0x7ffbfff0);
+
+    /* ret pops the frame; no frames left -> invalid */
+    osprey_on_ret(env, 0x400501, 0x7ffc0008);
+    CHECK(!st->regs[R_ESP].valid, "rsp origin invalid after final ret");
+
+    osprey_free(ctx);
+    g_free(run);
+    g_free(env);
+}
+
+/* Canonical dump: written after a successful merge, sorted rows. */
+static void test_canonical_dump(void)
+{
+    reset_log();
+    OspreyConfig c = test_config();
+    snprintf(c.dump_file, sizeof(c.dump_file), "/tmp/osprey_dump_test.txt");
+    unlink(c.dump_file);
+    OspreyContext *ctx = osprey_new(&c);
+    OspreySharedRun *run = new_run(&c);
+    fill_two_access_facts(run);
+    CHECK(osprey_parent_merge_sample(ctx, run) == OSPREY_OK, "dump merge ok");
+    FILE *f = fopen(c.dump_file, "r");
+    CHECK(f != NULL, "dump file written");
+    if (f != NULL) {
+        char line[256];
+        int access_rows = 0;
+        while (fgets(line, sizeof(line), f)) {
+            if (strncmp(line, "access ", 7) == 0) access_rows++;
+        }
+        fclose(f);
+        CHECK(access_rows == 2, "dump has two access rows");
+    }
+    unlink(c.dump_file);
+    osprey_free(ctx);
+    g_free(run);
+}
+
+/* ------------------------------------------------------------------ */
 
 int main(void)
 {
     test_overflow_rejection();
     test_bad_arithmetic_rejection();
+    test_bad_identity_rejection();
     test_version_mismatch_rejection();
     test_capacity_mismatch_rejection();
     test_used_exceeds_cap_rejection();
@@ -514,11 +878,17 @@ int main(void)
     test_empty_graph_rejection();
     test_exact_component_cap_rejection();
     test_decoder_cap_rejection();
+    test_key_collision_fixtures();
+    test_factor_key_bidirectional();
+    test_pc_normalization_and_global_merge();
+    test_heap_identity_lifecycle();
+    test_stack_frames_and_rsp_origin();
+    test_canonical_dump();
 
     if (failures != 0) {
         fprintf(stderr, "%d unit test check(s) FAILED\n", failures);
         return 1;
     }
-    printf("PASS osprey_unit (14/14)\n");
+    printf("PASS osprey_unit (21/21)\n");
     return 0;
 }

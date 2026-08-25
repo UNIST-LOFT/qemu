@@ -266,7 +266,8 @@ DEF_HELPER_FLAGS_4(osprey_mem_copy, TCG_CALL_NO_RWG, void, env, tl, tl, tl)
 DEF_HELPER_FLAGS_5(osprey_set_ea, TCG_CALL_NO_RWG, void, env, i32, i32, tl, tl)
 DEF_HELPER_FLAGS_4(osprey_on_load, TCG_CALL_NO_RWG, void, env, i32, tl, tl)
 DEF_HELPER_FLAGS_5(osprey_on_store, TCG_CALL_NO_RWG, void, env, i32, tl, tl, tl)
-DEF_HELPER_4(osprey_call, void, tl, tl, tl, tl)
-DEF_HELPER_2(osprey_ret, void, tl, tl)
+DEF_HELPER_3(osprey_call, void, env, tl, tl)
+DEF_HELPER_3(osprey_ret, void, env, tl, tl)
+DEF_HELPER_3(osprey_rsp_update, void, env, tl, tl)
 
 #endif

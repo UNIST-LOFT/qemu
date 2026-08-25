@@ -68,6 +68,40 @@ TESTS = [
         expect_queue_min=1,
         timeout=60,
     ),
+    dict(
+        name="t01_regions",
+        mode="dump_compare",
+        rc=(2,),
+        # Canonical rows asserted in the final dump (merged state).
+        dump_expect=[
+            "region 0 0 ",          # G: site 0
+            "region 1 ",            # H_site instances
+            "region 2 ",            # S_f frames
+            "alloc ",
+            "access ",
+        ],
+        # Structural assertions on the parsed dump (see check_dump).
+        dump_assert={
+            "global_rows": 1,          # one merged G instance
+            "recurse_frames": 4,       # recurse(3) -> 4 live frames
+            "same_site_alloc_min": 2,   # two allocations at one site
+            "same_base_reuse": True,    # free + realloc at same base
+            "realloc_same_base": True,  # realloc success at same base
+        },
+        timeout=60,
+    ),
+    dict(
+        name="t01_clone",
+        mode="binradar",
+        rc=(2,),
+        expect_rows=[
+            ("reject", "[stage merge] [reason unsupported guest execution]"),
+        ],
+        expect_inferred=0,
+        expect_inferred_max=0,
+        expect_queue_min=1,
+        timeout=60,
+    ),
 ]
 
 BASE_ENV = {
@@ -103,7 +137,7 @@ def count_inferred(out):
 
 
 def resolve_entrypoint(guest):
-    """main() address from nm — the binary is non-PIE."""
+    """main() symbol value from nm; elfload adds the PIE load bias."""
     nm = subprocess.run(["nm", guest], capture_output=True, text=True)
     for line in nm.stdout.splitlines():
         parts = line.split()
@@ -262,6 +296,101 @@ def run_test(test, workdir, qemu, solver):
     return run_binradar(test, guest, qemu, solver, workdir)
 
 
+def run_dump_compare(test, workdir, qemu, solver):
+    """Stage-1 canonical-dump gate: run the guest twice with
+    BINRADAR_OSPREY_DUMP_FILE set, require byte-identical dumps (PIE
+    determinism / ASLR invariance), then assert the expected canonical
+    rows.  Returns (tracer_rc, stderr_text)."""
+    guest = os.path.join(workdir, test.get("guest", test["name"]))
+    if not os.path.isfile(guest):
+        return (None, f"guest binary missing: {guest} (run 'make guests')")
+    if not os.path.isfile(guest + ".plt"):
+        return (None, f"plt file missing: {guest}.plt (run 'make plts')")
+    dumps = []
+    outs = []
+    rcs = []
+    for i in range(2):
+        dump_path = os.path.join(workdir, f"t01_dump_{i}.txt")
+        try:
+            os.unlink(dump_path)
+        except OSError:
+            pass
+        spec = dict(test)
+        spec["env"] = dict(test.get("env", {}))
+        spec["env"]["BINRADAR_OSPREY_DUMP_FILE"] = dump_path
+        rc, out = run_binradar(spec, guest, qemu, solver, workdir)
+        rcs.append(rc)
+        outs.append(out)
+        if not os.path.isfile(dump_path):
+            return (rc, out + f"\nmissing dump file: {dump_path}")
+        with open(dump_path, "r", errors="replace") as f:
+            dumps.append(f.read())
+    if dumps[0] != dumps[1]:
+        return (rcs[-1], outs[0] + "\nDUMP MISMATCH between runs")
+    problems = []
+    for needle in test.get("dump_expect", []):
+        if needle not in dumps[0]:
+            problems.append(f"dump missing row {needle!r}")
+    if problems:
+        return (rcs[-1], outs[0] + "\n" + "\n".join(problems))
+    problems = check_dump(test, dumps[0])
+    if problems:
+        return (rcs[-1], outs[0] + "\n" + "\n".join(problems))
+    if rcs[0] != rcs[1]:
+        return (rcs[-1], outs[0] +
+                f"\ntracer return codes differ: {rcs[0]} != {rcs[1]}")
+    return (rcs[-1], outs[0])
+
+
+def check_dump(test, dump):
+    """Structural assertions on the canonical dump (Stage-1 gate)."""
+    want = test.get("dump_assert", {})
+    if not want:
+        return []
+    problems = []
+    regions = [ln.split() for ln in dump.splitlines() if ln.startswith("region ")]
+    globals_rows = [r for r in regions if r[1] == "0"]
+    heap_rows = [r for r in regions if r[1] == "1"]
+    stack_rows = [r for r in regions if r[1] == "2"]
+
+    if "global_rows" in want and len(globals_rows) != want["global_rows"]:
+        problems.append(f"global rows {len(globals_rows)} != {want['global_rows']}")
+
+    if "recurse_frames" in want:
+        # deepest recursion: max count of stack rows sharing one site
+        from collections import Counter
+        sites = Counter(r[2] for r in stack_rows)
+        deepest = max(sites.values()) if sites else 0
+        if deepest < want["recurse_frames"]:
+            problems.append(
+                f"deepest frame site depth {deepest} < {want['recurse_frames']}")
+
+    if "same_site_alloc_min" in want:
+        from collections import Counter
+        sites = Counter(r[2] for r in heap_rows)
+        max_site = max(sites.values()) if sites else 0
+        if max_site < want["same_site_alloc_min"]:
+            problems.append(
+                f"max allocs at one site {max_site} < {want['same_site_alloc_min']}")
+
+    if want.get("same_base_reuse"):
+        raw_classes = Counter(r[4] for r in heap_rows)
+        reused = [b for b, n in raw_classes.items() if n >= 2]
+        if not reused:
+            problems.append("no same-base reuse observed")
+
+    if want.get("realloc_same_base"):
+        # realloc success: two heap instances at the same base with
+        # different extents (16 -> 64)
+        from collections import defaultdict
+        by_base = defaultdict(set)
+        for r in heap_rows:
+            by_base[r[4]].add(r[5])
+        if not any(len(exts) >= 2 for exts in by_base.values()):
+            problems.append("no realloc same-base extent change observed")
+    return problems
+
+
 def check(test, rc, out):
     problems = []
     if rc != test.get("rc", (0,)) and rc not in (
@@ -311,7 +440,11 @@ def main():
         ran += 1
         start = time.time()
         try:
-            rc, out = run_test(spec, args.work, args.qemu, args.solver)
+            if spec.get("mode") == "dump_compare":
+                rc, out = run_dump_compare(spec, args.work, args.qemu,
+                                           args.solver)
+            else:
+                rc, out = run_test(spec, args.work, args.qemu, args.solver)
             if rc is None:
                 problems = [out]
             else:

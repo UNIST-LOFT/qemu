@@ -103,6 +103,16 @@ static void gen_osprey_reg_lea(int dst_idx, int base_idx, target_long disp) {
     tcg_temp_free(t_disp);
 }
 
+/* RSP write (push/pop/add-sub imm/call): re-derive the RSP origin from
+ * the live frame stack (see osprey_on_rsp_update).  Only in-image
+ * writes re-derive; libc writes invalidate. */
+static void gen_osprey_rsp_update(TCGv new_sp, target_ulong pc) {
+    if (!osprey_active()) return;
+    TCGv t_pc = tcg_const_tl(pc);
+    gen_helper_osprey_rsp_update(cpu_env, new_sp, t_pc);
+    tcg_temp_free(t_pc);
+}
+
 /* Effective-address metadata: emitted before a guest access (only in
  * 64-bit modes without segment override), consumed after it succeeds.
  * packed = valid<<31 | (base+1)<<16 | (index+1)<<8 | scale. */
@@ -705,6 +715,12 @@ static void gen_op_mov_reg_v(DisasContext *s, TCGMemOp ot, int reg, TCGv t0)
         gen_osprey_invalidate_reg(full_reg);
     }
     s->prov_skip_invalidate = false;
+    /* Full-width RSP writes re-derive the origin from the live frame
+     * stack (push/pop/add-sub imm/mov rsp,x/leave).  Runs after the
+     * kill so the origin is always rebuilt from frame identity. */
+    if (reg == R_ESP && ot == MO_64) {
+        gen_osprey_rsp_update(cpu_regs[R_ESP], s->pc_start);
+    }
 }
 
 static inline
@@ -5721,15 +5737,17 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
 #endif
 #endif
 
-            /* OSPREY: indirect call frame with the runtime target. */
-            if (osprey_active()) {
-                TCGv t_call_pc = tcg_const_tl(pc_start - s->cs_base);
-                gen_helper_osprey_call(t_call_pc, s->T1, s->T0,
-                                       cpu_regs[R_ESP]);
-                tcg_temp_free(t_call_pc);
-            }
-
             gen_push_v(s, s->T1);
+            /* OSPREY: indirect call frame with the runtime target.
+             * Fires AFTER the return-address push so the passed RSP is
+             * the precise callee entry. */
+            if (osprey_active()) {
+                TCGv t_callee = tcg_const_tl(0);
+                tcg_gen_mov_tl(t_callee, s->T0);
+                gen_helper_osprey_call(cpu_env, t_callee,
+                                       cpu_regs[R_ESP]);
+                tcg_temp_free(t_callee);
+            }
             gen_op_jmp_v(s->T0);
             gen_bnd_jmp(s);
             gen_jr(s, s->T0);
@@ -7419,9 +7437,9 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
 #endif
 #endif
 
-        /* OSPREY: return pops the current frame. */
+        /* OSPREY: return pops the current frame (post-pop RSP). */
         if (osprey_active()) {
-            gen_helper_osprey_ret(s->T0, cpu_regs[R_ESP]);
+            gen_helper_osprey_ret(cpu_env, s->T0, cpu_regs[R_ESP]);
         }
 
         /* Note that gen_pop_T0 uses a zero-extending load.  */
@@ -7439,9 +7457,9 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
 #endif
 #endif
 
-        /* OSPREY: return pops the current frame. */
+        /* OSPREY: return pops the current frame (post-pop RSP). */
         if (osprey_active()) {
-            gen_helper_osprey_ret(s->T0, cpu_regs[R_ESP]);
+            gen_helper_osprey_ret(cpu_env, s->T0, cpu_regs[R_ESP]);
         }
 
         /* Note that gen_pop_T0 uses a zero-extending load.  */
@@ -7520,17 +7538,16 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
 #endif
 #endif
 
-            /* OSPREY: direct call with the static callee target. */
+            gen_push_v(s, s->T0);
+            /* OSPREY: direct call with the static callee target.
+             * Fires AFTER the return-address push so the passed RSP is
+             * the precise callee entry. */
             if (osprey_active()) {
-                TCGv t_call_pc = tcg_const_tl(pc_start - s->cs_base);
                 TCGv t_callee = tcg_const_tl(tval);
-                gen_helper_osprey_call(t_call_pc, s->T0, t_callee,
+                gen_helper_osprey_call(cpu_env, t_callee,
                                        cpu_regs[R_ESP]);
-                tcg_temp_free(t_call_pc);
                 tcg_temp_free(t_callee);
             }
-
-            gen_push_v(s, s->T0);
             gen_bnd_jmp(s);
             gen_jmp(s, tval);
         }
@@ -7589,20 +7606,13 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
 #endif
         /* OSPREY: E9-relocated call — the callee target is the jump
          * destination (tval); the frame is precise (same identity as the
-         * original direct call). */
+         * original direct call).  The stub already pushed the return
+         * address, so the current RSP is the precise callee entry. */
         if (osprey_active() && is_e9_relocated_call(pc_start - s->cs_base,
                                                     NULL, NULL)) {
-            TCGv t_call_pc = tcg_const_tl(pc_start - s->cs_base);
-            TCGv t_ret_pc = tcg_const_tl(s->pc - s->cs_base);
             TCGv t_callee = tcg_const_tl(tval);
-            TCGv t_sp = tcg_temp_new();
-            tcg_gen_mov_tl(t_sp, cpu_regs[R_ESP]);
-            tcg_gen_addi_tl(t_sp, t_sp, 8);
-            gen_helper_osprey_call(t_call_pc, t_ret_pc, t_callee, t_sp);
-            tcg_temp_free(t_call_pc);
-            tcg_temp_free(t_ret_pc);
+            gen_helper_osprey_call(cpu_env, t_callee, cpu_regs[R_ESP]);
             tcg_temp_free(t_callee);
-            tcg_temp_free(t_sp);
         }
         gen_bnd_jmp(s);
         gen_jmp(s, tval);

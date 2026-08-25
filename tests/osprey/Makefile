@@ -24,7 +24,8 @@ OSPREY_OBJS := ../../build/x86_64-linux-user/linux-user/osprey.o \
                ../../build/x86_64-linux-user/linux-user/osprey-facts.o \
                ../../build/x86_64-linux-user/linux-user/osprey-rules.o \
                ../../build/x86_64-linux-user/linux-user/osprey-infer.o \
-               ../../build/x86_64-linux-user/linux-user/osprey-decode.o
+               ../../build/x86_64-linux-user/linux-user/osprey-decode.o \
+               ../../build/x86_64-linux-user/linux-user/provenance.o
 UNIT_BIN   := $(WORK)/osprey_unit
 UNIT_ASAN_BIN := $(WORK)/osprey_unit_asan
 UNIT_CFLAGS := -iquote ../../build/linux-user -iquote ../../tcg \
@@ -43,7 +44,7 @@ CC        ?= gcc
 CFLAGS    := -O0 -g -fno-pie -no-pie -fno-stack-protector -U_FORTIFY_SOURCE -fno-builtin
 LDFLAGS   := -no-pie
 
-TESTS := osprey_deref
+TESTS := osprey_deref t01_regions t01_clone
 
 GUEST_BINS := $(addprefix $(WORK)/,$(TESTS))
 PLT_FILES  := $(addprefix $(WORK)/,$(addsuffix .plt,$(TESTS)))
@@ -61,6 +62,15 @@ plts: $(PLT_FILES)
 
 $(WORK)/%: $(GUESTS)/%.c | $(WORK)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<
+
+# Stage-1 ASLR gate: canonical facts from two independent PIE runs must
+# be byte-identical even though raw stack/heap/image addresses differ.
+$(WORK)/t01_regions: $(GUESTS)/t01_regions.c | $(WORK)
+	$(CC) -O0 -g -fPIE -pie -fno-stack-protector \
+		-U_FORTIFY_SOURCE -fno-builtin -o $@ $<
+
+$(WORK)/t01_clone: $(GUESTS)/t01_clone.c | $(WORK)
+	$(CC) $(CFLAGS) $(LDFLAGS) -pthread -o $@ $<
 
 $(WORK)/%.plt: $(WORK)/% $(GEN_PLT)
 	python3 $(GEN_PLT) -o $@ $<

@@ -17,27 +17,96 @@
 
 
 /* ------------------------------------------------------------------ */
-/* Canonical keys (used as open-addressing hashes, deterministic)      */
+/* Canonical keys (full-field equality; hashes are bucket selectors)  */
 /* ------------------------------------------------------------------ */
 
-typedef uint64_t OspreyKey; /* 64-bit canonical hash of the identity */
+/* Full equality-comparable key.  A hash value is only a bucket selector;
+ * object identity is the struct itself, compared field by field.  Never
+ * pack or XOR-compose identities into a scalar. */
+typedef struct OspreyKey {
+    uint64_t tag;   /* discriminates key kinds */
+    uint64_t w[10]; /* payload words (kind-specific layout) */
+} OspreyKey;
 
-/* Canonical hash of a region id: kind (2b) | image (8b) | site (54b). */
+static inline guint osprey_key_hash(gconstpointer p) {
+    const OspreyKey *k = p;
+    uint64_t h = k->tag;
+    for (int i = 0; i < 10; i++) {
+        h ^= k->w[i] + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+    }
+    return (guint)h;
+}
+
+static inline gboolean osprey_key_equal(gconstpointer p, gconstpointer q) {
+    return memcmp(p, q, sizeof(OspreyKey)) == 0;
+}
+
 static inline OspreyKey osprey_region_key(const OspreyRegionId *r) {
-    uint64_t k = (uint64_t)(uint32_t)r->kind;
-    k |= ((uint64_t)(r->code_image_id & 0xff)) << 8;
-    k |= ((uint64_t)(r->site_offset & (((uint64_t)1 << 54) - 1))) << 16;
+    OspreyKey k;
+    memset(&k, 0, sizeof(k));
+    k.tag = 0x524547ULL; /* "REG" */
+    k.w[0] = (uint64_t)r->kind;
+    k.w[1] = r->code_image_id;
+    k.w[2] = r->site_offset;
+    return k;
+}
+
+static inline OspreyKey osprey_addr_key(const OspreyAddress *a) {
+    OspreyKey k = osprey_region_key(&a->region);
+    k.tag = 0x414444ULL; /* "ADD" */
+    k.w[3] = (uint64_t)a->offset;
     return k;
 }
 
 static inline OspreyKey osprey_chunk_key(const OspreyChunk *c) {
-    /* region key | signed-offset (48b) | size (12b) */
-    uint64_t k = osprey_region_key(&c->address.region);
-    uint64_t off = (uint64_t)(c->address.offset & (((uint64_t)1 << 48) - 1));
-    k ^= off << 1;
-    k ^= (c->size & 0xfff) << 49;
+    OspreyKey k = osprey_region_key(&c->address.region);
+    k.tag = 0x43484BULL; /* "CHK" */
+    k.w[3] = (uint64_t)c->address.offset;
+    k.w[4] = c->size;
     return k;
 }
+
+/* (predicate kind, region) candidate-accounting key. */
+static inline OspreyKey osprey_kind_region_key(uint8_t kind,
+                                               const OspreyRegionId *r) {
+    OspreyKey k = osprey_region_key(r);
+    k.tag = 0x4B5247ULL; /* "KRG" */
+    k.w[3] = kind;
+    return k;
+}
+
+/* (instruction pc, region) pair key (CB02/CB08 grouping). */
+static inline OspreyKey osprey_pc_region_key(uint64_t pc,
+                                             const OspreyRegionId *r) {
+    OspreyKey k = osprey_region_key(r);
+    k.tag = 0x504352ULL; /* "PCR" */
+    k.w[3] = pc;
+    return k;
+}
+
+/* (region, offset) base key (decoder field grouping). */
+static inline OspreyKey osprey_base_key(const OspreyRegionId *r, int64_t off) {
+    OspreyKey k = osprey_region_key(r);
+    k.tag = 0x425345ULL; /* "BSE" */
+    k.w[3] = (uint64_t)off;
+    return k;
+}
+
+/* Factor identity key: full-field equality (rule, head, polarity,
+ * stage, probability, variable set).  A hash is only a bucket
+ * selector; identity is the struct itself. */
+typedef struct OspreyFactorKey {
+    uint16_t rule;
+    uint16_t head_idx;   /* index into var_ids (sorted) */
+    uint8_t negative;
+    uint8_t stage;
+    uint64_t p_bits;     /* exact double bits of p */
+    uint32_t num_vars;
+    uint32_t var_ids[8];
+} OspreyFactorKey;
+
+guint osprey_factor_key_hash(gconstpointer p);
+gboolean osprey_factor_key_equal(gconstpointer a, gconstpointer b);
 
 /* ------------------------------------------------------------------ */
 /* Fact records (child-written)                                        */
@@ -56,6 +125,8 @@ typedef struct OspreyBaseFact {
     uint64_t pc;
     OspreyChunk chunk;         /* accessed chunk */
     OspreyAddress base;        /* tracked base address (region+offset) */
+    uint64_t prov_object_id;   /* heap bases: provenance identity */
+    uint32_t prov_generation;
     uint32_t sample_support;
     uint32_t reserved;
 } OspreyBaseFact;
@@ -95,8 +166,11 @@ typedef struct OspreyMayArrayFact {
  * chunks (consumer cutover; Stage 4). */
 typedef struct OspreyRegionInstance {
     OspreyRegionId region;
+    uint64_t instance_id;      /* runtime identity within this process */
     uint64_t raw_base;
     uint64_t extent;
+    uint64_t prov_object_id;   /* heap: provenance identity */
+    uint32_t prov_generation;
     uint32_t sample_support;
     uint32_t reserved;
 } OspreyRegionInstance;
@@ -118,6 +192,10 @@ typedef struct OspreyRegOrigin {
     target_ulong concrete_value; /* value-consistency check */
     OspreyChunk chunk;           /* VALUE: source chunk */
     OspreyAddress address;       /* ADDRESS: base address */
+    uint64_t prov_object_id;     /* heap ADDRESS origins: provenance
+                                  * identity (object_id, generation) */
+    uint32_t prov_generation;
+    uint32_t reserved2;
     uint64_t producer_pc;
 } OspreyRegOrigin;
 
@@ -128,6 +206,9 @@ typedef struct OspreyMemSlotOrigin {
     OspreyChunk chunk;
     OspreyAddress address;
     target_ulong concrete_value;
+    uint64_t prov_object_id;
+    uint32_t prov_generation;
+    uint32_t reserved2;
 } OspreyMemSlotOrigin;
 
 #define OSPREY_SHADOW_ALIGN 8
@@ -158,7 +239,7 @@ typedef struct OspreyCpuOriginState {
 /* Shared run (fixed layout, no pointers)                              */
 /* ------------------------------------------------------------------ */
 
-#define OSPREY_SHARED_VERSION 2u
+#define OSPREY_SHARED_VERSION 4u
 
 struct OspreySharedRun {
     uint32_t version;
@@ -170,9 +251,10 @@ struct OspreySharedRun {
     uint32_t overflow;           /* any table full */
     uint32_t bad_region;         /* access failed region resolution */
     uint32_t bad_arithmetic;     /* checked arithmetic failed */
+    uint32_t bad_identity;       /* provenance/object contract mismatch */
     uint32_t unsupported_execution; /* unsupported guest contract observed */
     uint32_t first_dropped_kind; /* fact kind of first dropped record */
-    OspreyKey first_dropped_key;
+    uint64_t first_dropped_hash; /* hash of the first dropped record */
 
     /* Open-addressed fact tables. Capacities are derived from config at
      * reset time; a capacity of 0 disables the table. */
@@ -209,6 +291,8 @@ uint64_t osprey_access_hash(const OspreyAccessFact *f);
 bool osprey_access_eq(const OspreyAccessFact *a, const OspreyAccessFact *b);
 uint64_t osprey_base_hash(const OspreyBaseFact *f);
 bool osprey_base_eq(const OspreyBaseFact *a, const OspreyBaseFact *b);
+/* Provenance-authoritative heap origin check (osprey-facts.c). */
+bool osprey_origin_prov_live(const OspreyRegOrigin *o);
 uint64_t osprey_copy_hash(const OspreyCopyFact *f);
 bool osprey_copy_eq(const OspreyCopyFact *a, const OspreyCopyFact *b);
 uint64_t osprey_points_hash(const OspreyPointsToFact *f);
@@ -232,6 +316,29 @@ bool osprey_shared_run_layout_valid(const OspreyConfig *config,
 
 /* Image normalization base (osprey.c). */
 target_ulong osprey_get_image_base(void);
+target_ulong osprey_get_image_end(void);
+
+/* Key allocation helpers (osprey.c). */
+OspreyKey *osprey_key_new(const OspreyKey *k);
+void osprey_key_free(gpointer p);
+
+/* Main-image writable global range (merged interval set). */
+typedef struct OspreyGlobalRange {
+    int64_t offset;   /* image-relative */
+    uint64_t extent;
+} OspreyGlobalRange;
+
+/* Merge a writable main-image range into the interval set (osprey.c). */
+void global_ranges_add(OspreyContext *ctx, target_ulong base,
+                       uint64_t size);
+
+/* Resolve a runtime address into the main-image global region. */
+bool osprey_global_of_addr(target_ulong addr, OspreyRegionId *region,
+                           int64_t *offset);
+
+/* Module-level context pointer (child-side helpers). */
+OspreyContext *osprey_ctx_ref(void);
+void osprey_ctx_ref_set(OspreyContext *ctx);
 
 /* Open-addressing table helpers (osprey-facts.c).  Returns 1 on insert
  * or 0 on duplicate update; sets *dropped when the table is full. */
@@ -263,6 +370,9 @@ struct OspreyContext {
     OspreyConfig config;
     OspreySharedRun *shared;   /* attached in child; NULL in parent */
     QemuMutex shared_lock;     /* child-side insert mutex */
+
+    /* Main-image writable global ranges (merged interval set). */
+    GArray *global_ranges;     /* OspreyGlobalRange, sorted by offset */
 
     /* Analysis transaction state (parent side).  tx_status is sticky
      * for the current baseline transaction: once non-OK it never
@@ -325,6 +435,7 @@ OspreyCpuOriginState *osprey_cpu_origin(CPUArchState *env);
 bool osprey_region_of_addr(CPUArchState *env, target_ulong addr,
                            OspreyRegionId *region, int64_t *offset,
                            bool create);
+void osprey_free_runtime_regions(void);
 void osprey_log_sticky(const OspreySharedRun *run, const char *tag);
 
 /* Fail-closed transaction helpers (osprey-facts.c). */
@@ -458,12 +569,12 @@ typedef struct OspreyHint {
 
 struct OspreyGraph {
     GArray *vars;                  /* OspreyVar */
-    GHashTable *var_index;         /* OspreyKey → (var_id+1) */
+    GHashTable *var_index;         /* OspreyKey* → (var_id+1) */
     GArray *hints;                 /* OspreyHint (deduped) */
     GArray *factors;               /* OspreyFactor* */
-    GHashTable *factor_index;      /* OspreyKey → (factor_id+1) */
+    GHashTable *factor_index;      /* OspreyKey* → (factor_id+1) */
     /* per (kind, region-key) candidate accounting */
-    GHashTable *kind_region;       /* key → OspreyKindRegionCount* */
+    GHashTable *kind_region;       /* OspreyKey* → OspreyKindRegionCount* */
     /* union-find over vars (component partition for inference) */
     uint32_t *uf_parent;
     uint32_t uf_size;
@@ -515,11 +626,11 @@ typedef struct OspRawSpan {
 /* Decoded model (installed by osprey_decode; parent side). */
 struct OspreyModel {
     GArray *objects;       /* OspreyDecodedObject, insertion order */
-    GHashTable *by_chunk;  /* osprey_chunk_key -> (index+1) */
+    GHashTable *by_chunk;  /* OspreyKey* -> (index+1) */
     GArray *type_names;    /* char* type names (type_id = idx) */
     GArray *raw_spans;     /* OspRawSpan, sorted by raw_start */
-    GHashTable *fields_by_base; /* base key -> GArray(uint32 obj idx) */
-    GHashTable *ptr_by_chunk; /* osprey_chunk_key -> pointer obj (index+1);
+    GHashTable *fields_by_base; /* OspreyKey* -> GArray(uint32 obj idx) */
+    GHashTable *ptr_by_chunk; /* OspreyKey* -> pointer obj (index+1);
                                  independent of scalar/field exclusivity */
 };
 

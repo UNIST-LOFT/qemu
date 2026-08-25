@@ -22,6 +22,7 @@
 #include "qemu/path.h"
 #include "snapshot.h"
 #include "provenance.h"
+#include "osprey.h"
 #include <elf.h>
 #include <endian.h>
 #include <grp.h>
@@ -5870,6 +5871,11 @@ static int do_fork(CPUArchState *env, unsigned int flags, abi_ulong newsp,
             /* Wait for the child to initialize.  */
             pthread_cond_wait(&info.cond, &info.mutex);
             ret = info.tid;
+            /* Multithreaded guests are outside the supported contract.
+             * Mark only a successfully created shared-VM thread: an
+             * invalid or failed clone did not create concurrent state
+             * and must not reject an otherwise supported sample. */
+            osprey_mark_unsupported_execution();
         } else {
             ret = -1;
         }

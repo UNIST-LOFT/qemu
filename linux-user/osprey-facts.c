@@ -17,6 +17,7 @@
 
 #include "osprey.h"
 #include "osprey-internal.h"
+#include "provenance.h"
 /* Helper entry points (DEF_HELPER in target/i386/helper.h).  helper-proto.h
  * cannot be included here (it pulls in target-specific helper.h); declare
  * the prototypes manually to satisfy -Werror=missing-prototypes.  These are
@@ -40,14 +41,23 @@ void helper_osprey_on_load(CPUArchState *env, uint32_t dst_reg,
 void helper_osprey_on_store(CPUArchState *env, uint32_t src_reg,
                             target_ulong addr, target_ulong size,
                             target_ulong src_val);
-void helper_osprey_call(target_ulong call_pc, target_ulong ret_pc,
-                        target_ulong callee_pc, target_ulong sp);
-void helper_osprey_ret(target_ulong pc, target_ulong sp);
+void helper_osprey_call(CPUArchState *env, target_ulong callee_pc,
+                        target_ulong entry_sp);
+void helper_osprey_ret(CPUArchState *env, target_ulong pc,
+                       target_ulong sp);
+void helper_osprey_rsp_update(CPUArchState *env, target_ulong new_sp,
+                               target_ulong pc);
+
+/* Origin shadow register invalidation (defined below; used by the
+ * stack hooks above). */
+static void origin_invalidate_reg(CPUArchState *env, int reg);
 
 /* F04 points-to emission (defined below; called from the origin-shadow
  * spill/reload hooks). */
 static void record_points_to(CPUArchState *env, target_ulong addr,
-                             uint64_t size, target_ulong value);
+                             uint64_t size, target_ulong value,
+                             uint64_t prov_object_id,
+                             uint32_t prov_generation);
 
 #include "qemu/thread.h"
 #include "snapshot.h"
@@ -59,38 +69,27 @@ static void record_points_to(CPUArchState *env, target_ulong addr,
 /* Fact hashes and equality                                            */
 /* ------------------------------------------------------------------ */
 
-#define MIX64(h, v) do { \
-    h ^= (uint64_t)(v) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2); \
-} while (0)
-
-static uint64_t hash_chunk(const OspreyChunk *c) {
-    uint64_t h = osprey_chunk_key(c);
-    MIX64(h, c->size);
-    return h;
-}
-
-static uint64_t hash_addr(const OspreyAddress *a) {
-    uint64_t h = osprey_region_key(&a->region);
-    MIX64(h, a->offset);
-    return h;
-}
-
-static bool eq_chunk(const OspreyChunk *a, const OspreyChunk *b) {
-    return a->size == b->size && a->address.offset == b->address.offset &&
-           osprey_region_key(&a->address.region) ==
-               osprey_region_key(&b->address.region);
+/* Full-field equality: a hash is only a bucket selector; identity is the
+ * struct itself.  Never compare packed keys. */
+static bool eq_region(const OspreyRegionId *a, const OspreyRegionId *b) {
+    return a->kind == b->kind && a->code_image_id == b->code_image_id &&
+           a->site_offset == b->site_offset;
 }
 
 static bool eq_addr(const OspreyAddress *a, const OspreyAddress *b) {
-    return a->offset == b->offset &&
-           osprey_region_key(&a->region) == osprey_region_key(&b->region);
+    return a->offset == b->offset && eq_region(&a->region, &b->region);
+}
+
+static bool eq_chunk(const OspreyChunk *a, const OspreyChunk *b) {
+    return a->size == b->size && eq_addr(&a->address, &b->address);
 }
 
 uint64_t osprey_access_hash(const OspreyAccessFact *f) {
-    uint64_t h = f->pc;
-    MIX64(h, f->is_store);
-    MIX64(h, hash_chunk(&f->chunk));
-    return h;
+    OspreyKey k = osprey_chunk_key(&f->chunk);
+    k.tag = 0x414343ULL; /* "ACC" */
+    k.w[3] = f->pc;
+    k.w[4] = f->is_store;
+    return osprey_key_hash(&k);
 }
 bool osprey_access_eq(const OspreyAccessFact *a, const OspreyAccessFact *b) {
     return a->pc == b->pc && a->is_store == b->is_store &&
@@ -98,20 +97,30 @@ bool osprey_access_eq(const OspreyAccessFact *a, const OspreyAccessFact *b) {
 }
 
 uint64_t osprey_base_hash(const OspreyBaseFact *f) {
-    uint64_t h = f->pc;
-    MIX64(h, hash_chunk(&f->chunk));
-    MIX64(h, hash_addr(&f->base));
-    return h;
+    OspreyKey k = osprey_chunk_key(&f->chunk);
+    k.tag = 0x425345ULL; /* "BSE" */
+    k.w[3] = f->pc;
+    k.w[4] = (uint64_t)f->base.offset;
+    k.w[5] = (uint64_t)f->base.region.kind;
+    k.w[6] = f->base.region.site_offset;
+    k.w[7] = f->prov_object_id;
+    return osprey_key_hash(&k);
 }
 bool osprey_base_eq(const OspreyBaseFact *a, const OspreyBaseFact *b) {
     return a->pc == b->pc && eq_chunk(&a->chunk, &b->chunk) &&
-           eq_addr(&a->base, &b->base);
+           eq_addr(&a->base, &b->base) &&
+           a->prov_object_id == b->prov_object_id &&
+           a->prov_generation == b->prov_generation;
 }
 
 uint64_t osprey_copy_hash(const OspreyCopyFact *f) {
-    uint64_t h = hash_chunk(&f->source);
-    MIX64(h, hash_chunk(&f->destination));
-    return h;
+    OspreyKey k = osprey_chunk_key(&f->source);
+    k.tag = 0x435059ULL; /* "CPY" */
+    k.w[3] = (uint64_t)f->destination.address.offset;
+    k.w[4] = f->destination.size;
+    k.w[5] = (uint64_t)f->destination.address.region.kind;
+    k.w[6] = f->destination.address.region.site_offset;
+    return osprey_key_hash(&k);
 }
 bool osprey_copy_eq(const OspreyCopyFact *a, const OspreyCopyFact *b) {
     return eq_chunk(&a->source, &b->source) &&
@@ -119,9 +128,12 @@ bool osprey_copy_eq(const OspreyCopyFact *a, const OspreyCopyFact *b) {
 }
 
 uint64_t osprey_points_hash(const OspreyPointsToFact *f) {
-    uint64_t h = hash_chunk(&f->pointer_chunk);
-    MIX64(h, hash_addr(&f->target));
-    return h;
+    OspreyKey k = osprey_chunk_key(&f->pointer_chunk);
+    k.tag = 0x504E54ULL; /* "PNT" */
+    k.w[3] = (uint64_t)f->target.offset;
+    k.w[4] = (uint64_t)f->target.region.kind;
+    k.w[5] = f->target.region.site_offset;
+    return osprey_key_hash(&k);
 }
 bool osprey_points_eq(const OspreyPointsToFact *a, const OspreyPointsToFact *b) {
     return eq_chunk(&a->pointer_chunk, &b->pointer_chunk) &&
@@ -130,7 +142,8 @@ bool osprey_points_eq(const OspreyPointsToFact *a, const OspreyPointsToFact *b) 
 
 uint64_t osprey_alloc_hash(const OspreyMallocFact *f) {
     uint64_t h = f->site_pc;
-    MIX64(h, f->requested_size);
+    h ^= (uint64_t)f->requested_size + 0x9e3779b97f4a7c15ULL +
+         (h << 6) + (h >> 2);
     return h;
 }
 bool osprey_alloc_eq(const OspreyMallocFact *a, const OspreyMallocFact *b) {
@@ -138,24 +151,30 @@ bool osprey_alloc_eq(const OspreyMallocFact *a, const OspreyMallocFact *b) {
 }
 
 uint64_t osprey_region_instance_hash(const OspreyRegionInstance *f) {
-    uint64_t h = osprey_region_key(&f->region);
-    MIX64(h, f->raw_base);
-    return h;
+    OspreyKey k = osprey_region_key(&f->region);
+    k.tag = 0x524749ULL; /* "RGI" */
+    k.w[3] = f->instance_id;
+    k.w[4] = f->raw_base;
+    k.w[5] = f->prov_object_id;
+    k.w[6] = f->prov_generation;
+    return osprey_key_hash(&k);
 }
 bool osprey_region_instance_eq(const OspreyRegionInstance *a,
                                const OspreyRegionInstance *b) {
-    return a->raw_base == b->raw_base &&
-           a->region.kind == b->region.kind &&
-           a->region.code_image_id == b->region.code_image_id &&
-           a->region.site_offset == b->region.site_offset;
+    return a->instance_id == b->instance_id &&
+           a->raw_base == b->raw_base &&
+           eq_region(&a->region, &b->region) &&
+           a->prov_object_id == b->prov_object_id &&
+           a->prov_generation == b->prov_generation;
 }
 
 uint64_t osprey_mayarray_hash(const OspreyMayArrayFact *f) {
-    uint64_t h = hash_addr(&f->start);
-    MIX64(h, f->element_count);
-    MIX64(h, f->element_size);
-    MIX64(h, f->evidence_kind);
-    return h;
+    OspreyKey k = osprey_addr_key(&f->start);
+    k.tag = 0x4D4159ULL; /* "MAY" */
+    k.w[3] = f->element_count;
+    k.w[4] = f->element_size;
+    k.w[5] = f->evidence_kind;
+    return osprey_key_hash(&k);
 }
 bool osprey_mayarray_eq(const OspreyMayArrayFact *a,
                         const OspreyMayArrayFact *b) {
@@ -283,7 +302,7 @@ full:
     run->overflow = 1;
     if (run->first_dropped_kind == 0) {
         run->first_dropped_kind = (uint32_t)table + 1;
-        run->first_dropped_key = hash(rec);
+        run->first_dropped_hash = hash(rec);
     }
     return -1;
 }
@@ -357,29 +376,28 @@ int osprey_run_iter_next(OspreyRunIter *it, const void **record) {
  * instances are created on successful allocation returns; stack frames
  * on call/return hooks; the global region from elfload registration. */
 
-typedef struct OspreyGlobalRegion {
-    OspreyRegionId id;
-    target_ulong base;
-    uint64_t extent;
-} OspreyGlobalRegion;
-
-static OspreyGlobalRegion g_global;
-static bool g_global_set = false;
-
 typedef struct OspreyStackFrame {
     OspreyRegionId region;
     target_ulong entry_sp;
     target_ulong min_sp;
     bool precise;
+    uint64_t instance_id;   /* monotonic; distinguishes same-site frames */
 } OspreyStackFrame;
 
 static GArray *g_stack_frames = NULL; /* OspreyStackFrame */
+static uint64_t g_next_stack_instance = 1;
+
+/* Sentinel site offset for imprecise frames (callee PC outside the main
+ * image).  Such frames are excluded from structural factors. */
+#define OSPREY_STACK_IMPRECISE_SITE ((uint64_t)-1)
 
 typedef struct HeapInstance {
     OspreyRegionId region;   /* H_site */
     uint64_t instance_id;
     target_ulong base;
     uint64_t size;
+    uint64_t prov_object_id;   /* accepted provenance identity */
+    uint32_t prov_generation;
     bool live;
 } HeapInstance;
 
@@ -389,19 +407,21 @@ static uint64_t g_next_heap_instance = 1;
 /* Region-instance recorder (defined below with the allocation hooks;
  * used earlier by the image-global and stack-frame registration). */
 static void record_region_instance(const OspreyRegionId *region,
+                                   uint64_t instance_id,
                                    target_ulong raw_base,
-                                   uint64_t extent);
+                                   uint64_t extent,
+                                   uint64_t prov_object_id,
+                                   uint32_t prov_generation);
 
 void osprey_register_image_global(CPUArchState *env, target_ulong base,
                                   target_ulong size) {
     (void)env;
-    g_global.id.kind = OSPREY_REGION_GLOBAL;
-    g_global.id.code_image_id = 0;
-    g_global.id.site_offset = 0;
-    g_global.base = base;
-    g_global.extent = size;
-    g_global_set = true;
-    record_region_instance(&g_global.id, base, (uint64_t)size);
+    /* Merge into the main-image writable interval set (image-relative
+     * offsets); .data and .bss become one canonical G region. */
+    OspreyContext *ctx = osprey_ctx_ref();
+    if (ctx != NULL) {
+        global_ranges_add(ctx, base, (uint64_t)size);
+    }
 }
 
 /* Resolve a runtime address to a canonical region.  Returns false when
@@ -417,7 +437,7 @@ bool osprey_region_of_addr(CPUArchState *env, target_ulong addr,
         for (guint i = 0; i < g_heap_instances->len; i++) {
             HeapInstance *h = &g_array_index(g_heap_instances, HeapInstance, i);
             if (!h->live) continue;
-            if (addr >= h->base && addr < h->base + h->size) {
+            if (addr >= h->base && (uint64_t)(addr - h->base) < h->size) {
                 *region = h->region;
                 *offset = (int64_t)(addr - h->base);
                 return true;
@@ -425,10 +445,7 @@ bool osprey_region_of_addr(CPUArchState *env, target_ulong addr,
         }
     }
     /* 2. Main-image global data. */
-    if (g_global_set && addr >= g_global.base &&
-        addr < g_global.base + g_global.extent) {
-        *region = g_global.id;
-        *offset = (int64_t)(addr - g_global.base);
+    if (osprey_global_of_addr(addr, region, offset)) {
         return true;
     }
     /* 3. Stack frames: innermost live frame first.  Offsets are signed
@@ -439,6 +456,12 @@ bool osprey_region_of_addr(CPUArchState *env, target_ulong addr,
         for (guint i = g_stack_frames->len; i > 0; i--) {
             OspreyStackFrame *f = &g_array_index(g_stack_frames,
                                                  OspreyStackFrame, i - 1);
+            /* Imprecise frames (callee outside the main image) never
+             * contribute facts; skip them so no access resolves into
+             * their window. */
+            if (f->region.site_offset == OSPREY_STACK_IMPRECISE_SITE) {
+                continue;
+            }
             if (addr >= f->entry_sp) {
                 continue;
             }
@@ -448,7 +471,9 @@ bool osprey_region_of_addr(CPUArchState *env, target_ulong addr,
                 return true;
             }
             /* Access below min_sp: grow only within a bounded window. */
-            if (addr >= f->entry_sp - 0x100000) {
+            target_ulong low = f->entry_sp >= 0x100000
+                ? f->entry_sp - 0x100000 : 0;
+            if (addr >= low) {
                 f->min_sp = addr;
                 *region = f->region;
                 *offset = (int64_t)addr - (int64_t)f->entry_sp;
@@ -463,21 +488,20 @@ bool osprey_region_of_addr(CPUArchState *env, target_ulong addr,
  * offset, or return false when the PC is outside the image. */
 static bool osprey_normalize_pc(target_ulong pc, uint64_t *out) {
     target_ulong image_base = osprey_get_image_base();
+    target_ulong image_end = osprey_get_image_end();
     if (image_base == 0) {
         *out = (uint64_t)pc;
         return true;
     }
-    if (pc < image_base || pc - image_base > 0x7ffffffffULL) {
+    if (pc < image_base || (image_end != 0 && pc >= image_end)) {
         return false;
     }
     *out = (uint64_t)(pc - image_base);
     return true;
 }
 
-void osprey_on_call(target_ulong call_pc, target_ulong ret_pc,
-                    target_ulong callee_pc, target_ulong sp) {
-    (void)call_pc;
-    (void)ret_pc;
+void osprey_on_call(CPUArchState *env, target_ulong callee_pc,
+                    target_ulong entry_sp) {
     if (g_stack_frames == NULL) {
         g_stack_frames = g_array_new(FALSE, FALSE, sizeof(OspreyStackFrame));
     }
@@ -486,27 +510,130 @@ void osprey_on_call(target_ulong call_pc, target_ulong ret_pc,
     f.region.kind = OSPREY_REGION_STACK_FUNCTION;
     f.region.code_image_id = 0;
     f.precise = osprey_normalize_pc(callee_pc, &f.region.site_offset);
-    f.entry_sp = sp;
-    f.min_sp = sp >= sizeof(target_ulong) ? sp - sizeof(target_ulong) : 0;
+    if (!f.precise) {
+        f.region.site_offset = OSPREY_STACK_IMPRECISE_SITE;
+    }
+    /* entry_sp is the precise callee-entry RSP: the call hook fires
+     * after the return-address push (direct/indirect sites emit it
+     * after gen_push_v; the E9 site observes the stub's push), so the
+     * passed RSP is the callee entry. */
+    f.entry_sp = entry_sp;
+    f.min_sp = f.entry_sp;
+    f.instance_id = g_next_stack_instance++;
     g_array_append_val(g_stack_frames, f);
     /* Stack instance extent is dynamic; record the entry SP as the raw
-     * base with the observed span so the parent can map addresses. */
-    record_region_instance(&f.region, sp, 0x100000);
+     * base with the observed span so the parent can map addresses.
+     * Imprecise frames (callee outside the main image) are never
+     * recorded: no fact can reference them (their accesses are skipped
+     * at PC normalization) and they must not pollute the canonical
+     * region set. */
+    if (f.precise) {
+        record_region_instance(&f.region, f.instance_id, f.entry_sp,
+                               0x100000, 0, 0);
+    }
+    /* Seed the RSP origin: the register holds entry_sp (the hook fires
+     * after the return-address push), i.e. the new frame at offset 0.
+     * Precise callee entry only — imprecise frames never contribute
+     * facts. */
+    if (f.precise) {
+        OspreyCpuOriginState *st = osprey_cpu_origin(env);
+        OspreyRegOrigin *o = &st->regs[R_ESP];
+        memset(o, 0, sizeof(*o));
+        o->kind = OSPREY_ORIGIN_ADDRESS;
+        o->valid = 1;
+        o->concrete_value = entry_sp;
+        o->address.region = f.region;
+        o->address.offset = 0;
+        o->producer_pc = 0; /* synthetic: frame identity, not an insn */
+    }
 }
 
-void osprey_on_ret(target_ulong pc, target_ulong sp) {
+void osprey_on_ret(CPUArchState *env, target_ulong pc, target_ulong sp) {
     (void)pc;
     if (g_stack_frames == NULL || g_stack_frames->len == 0) {
+        origin_invalidate_reg(env, R_ESP);
         return;
     }
     OspreyStackFrame *top = &g_array_index(g_stack_frames, OspreyStackFrame,
                                            g_stack_frames->len - 1);
-    if (sp < top->entry_sp) {
-        /* Return below the frame entry: stack not unwound to entry; the
-         * frame is imprecise but is still the current frame. */
+    /* Real rets observe the post-pop RSP (== entry_sp); modeled-call
+     * returns observe the RSP with the return address still pushed
+     * (== entry_sp).  Both satisfy sp >= entry_sp, so one condition pops
+     * either.  A spurious pop is impossible: if no frame was pushed for
+     * the modeled call, the top frame's entry_sp is above the current
+     * RSP and the check fails. */
+    if (sp >= top->entry_sp) {
+        g_array_set_size(g_stack_frames, g_stack_frames->len - 1);
+    }
+    /* Re-seed the RSP origin to the caller frame (now top): after the
+     * pop, RSP is the call-site RSP (pre-push), i.e. the caller frame
+     * at a signed offset.  An imprecise caller (libc) never contributes
+     * facts: invalidate instead. */
+    if (g_stack_frames->len > 0) {
+        OspreyStackFrame *caller = &g_array_index(g_stack_frames,
+                                                  OspreyStackFrame,
+                                                  g_stack_frames->len - 1);
+        if (caller->precise) {
+            OspreyCpuOriginState *st = osprey_cpu_origin(env);
+            OspreyRegOrigin *o = &st->regs[R_ESP];
+            memset(o, 0, sizeof(*o));
+            o->kind = OSPREY_ORIGIN_ADDRESS;
+            o->valid = 1;
+            o->concrete_value = sp;
+            o->address.region = caller->region;
+            o->address.offset = (int64_t)sp - (int64_t)caller->entry_sp;
+            o->producer_pc = 0;
+        } else {
+            origin_invalidate_reg(env, R_ESP);
+        }
+    } else {
+        origin_invalidate_reg(env, R_ESP);
+    }
+}
+
+/* RSP update (push/pop/add/sub imm, call): re-derive the RSP origin
+ * from the live frame stack.  The innermost precise frame whose entry
+ * SP is at or below the new RSP owns the register; offset is signed
+ * relative to that entry.  No frame (or only imprecise frames) →
+ * invalidate.  This runs after the write-back kill, so the origin is
+ * always rebuilt from frame identity, never adjusted incrementally. */
+void osprey_on_rsp_update(CPUArchState *env, target_ulong new_sp,
+                          target_ulong pc) {
+    OspreyCpuOriginState *st = osprey_cpu_origin(env);
+    OspreyRegOrigin *o = &st->regs[R_ESP];
+    /* Only in-image RSP writes re-derive the origin: libc frames are
+     * imprecise and must never claim a precise frame's identity. */
+    uint64_t norm_pc = 0;
+    if (!osprey_normalize_pc(pc, &norm_pc)) {
+        origin_invalidate_reg(env, R_ESP);
         return;
     }
-    g_array_set_size(g_stack_frames, g_stack_frames->len - 1);
+    if (g_stack_frames != NULL) {
+        for (guint i = g_stack_frames->len; i > 0; i--) {
+            OspreyStackFrame *f = &g_array_index(g_stack_frames,
+                                                 OspreyStackFrame, i - 1);
+            if (f->region.site_offset == OSPREY_STACK_IMPRECISE_SITE) {
+                continue;
+            }
+            /* The frame owns RSP from its entry down to its observed
+             * window (prologue pushes/sub allocations move RSP below
+             * entry_sp; offsets are signed).  Above entry_sp the
+             * register belongs to the caller frame. */
+            target_ulong low = f->entry_sp >= 0x100000
+                ? f->entry_sp - 0x100000 : 0;
+            if (new_sp >= low && new_sp <= f->entry_sp) {
+                memset(o, 0, sizeof(*o));
+                o->kind = OSPREY_ORIGIN_ADDRESS;
+                o->valid = 1;
+                o->concrete_value = new_sp;
+                o->address.region = f->region;
+                o->address.offset = (int64_t)new_sp - (int64_t)f->entry_sp;
+                o->producer_pc = 0; /* synthetic: frame identity */
+                return;
+            }
+        }
+    }
+    origin_invalidate_reg(env, R_ESP);
 }
 
 /* ------------------------------------------------------------------ */
@@ -541,6 +668,8 @@ static void origin_store_mem(CPUArchState *env, target_ulong addr,
         slot->chunk = src->chunk;
         slot->address = src->address;
         slot->concrete_value = src->concrete_value;
+        slot->prov_object_id = src->prov_object_id;
+        slot->prov_generation = src->prov_generation;
     }
     g_hash_table_replace(st->mem_slots, GSIZE_TO_POINTER(addr), slot);
 }
@@ -563,6 +692,8 @@ static bool origin_load_slot(CPUArchState *env, target_ulong addr,
     dst->chunk = slot->chunk;
     dst->address = slot->address;
     dst->concrete_value = value;
+    dst->prov_object_id = slot->prov_object_id;
+    dst->prov_generation = slot->prov_generation;
     return slot->kind == OSPREY_ORIGIN_ADDRESS;
 }
 
@@ -629,7 +760,8 @@ void osprey_on_mem_store_origin(CPUArchState *env, uint32_t src_reg,
     if (s != NULL && s->valid && s->concrete_value == src_val) {
         tmp = *s;
         if (s->kind == OSPREY_ORIGIN_ADDRESS && size == OSPREY_SHADOW_ALIGN) {
-            record_points_to(env, addr, size, src_val);
+            record_points_to(env, addr, size, src_val,
+                             s->prov_object_id, s->prov_generation);
         }
     }
     origin_store_mem(env, addr, size, &tmp);
@@ -643,8 +775,43 @@ void osprey_on_mem_load_origin(CPUArchState *env, uint32_t dst_reg,
         /* F04 load-side: a pointer-width slot holding an ADDRESS origin
          * is points-to evidence: the loaded value points at that
          * canonical address. */
-        record_points_to(env, addr, 8, value);
+        OspreyCpuOriginState *st = osprey_cpu_origin(env);
+        OspreyRegOrigin *dst = &st->regs[dst_reg];
+        record_points_to(env, addr, 8, value,
+                         dst->prov_object_id, dst->prov_generation);
     }
+}
+
+/* Provenance-authoritative heap origin check: the origin's identity must
+ * reference a LIVE object whose base matches the origin's concrete
+ * value.  Used before F02/F04 emission for heap ADDRESS origins. */
+bool osprey_origin_prov_live(const OspreyRegOrigin *o) {
+    if (o->prov_object_id == 0) {
+        return true; /* non-heap or legacy origin: numeric resolution */
+    }
+    ProvenanceObject *obj =
+        provenance_lookup_object(o->prov_object_id, o->prov_generation);
+    if (obj == NULL || obj->state != PROV_OBJ_LIVE) {
+        return false;
+    }
+    /* The concrete value and canonical offset must identify the same
+     * byte in the live object.  Subtraction after the lower-bound check
+     * avoids base+size wraparound. */
+    if (o->concrete_value < obj->base) {
+        return false;
+    }
+    uint64_t delta = (uint64_t)(o->concrete_value - obj->base);
+    if (delta >= obj->requested_size || delta > INT64_MAX ||
+        o->address.offset != (int64_t)delta) {
+        return false;
+    }
+    uint64_t site = 0;
+    if (!osprey_normalize_pc(obj->alloc_pc, &site) ||
+        o->address.region.kind != OSPREY_REGION_HEAP_SITE ||
+        o->address.region.site_offset != site) {
+        return false;
+    }
+    return true;
 }
 
 /* ------------------------------------------------------------------ */
@@ -662,6 +829,20 @@ static void osprey_ensure_mutex(void) {
     }
 }
 
+void osprey_free_runtime_regions(void) {
+    if (g_stack_frames != NULL) {
+        g_array_free(g_stack_frames, TRUE);
+        g_stack_frames = NULL;
+    }
+    if (g_heap_instances != NULL) {
+        g_array_free(g_heap_instances, TRUE);
+        g_heap_instances = NULL;
+    }
+    g_next_stack_instance = 1;
+    g_next_heap_instance = 1;
+    g_shared_run = NULL;
+}
+
 /* Re-record the live runtime region catalog into a freshly reset
  * shared run: frames/heaps that predate the per-sample reset (e.g. the
  * entrypoint's own frame) never re-fire their hooks, so the parent
@@ -673,7 +854,11 @@ static void osprey_backfill_instances(void) {
         for (guint i = 0; i < g_stack_frames->len; i++) {
             const OspreyStackFrame *f = &g_array_index(
                 g_stack_frames, OspreyStackFrame, i);
-            record_region_instance(&f->region, f->entry_sp, 0x100000);
+            if (f->region.site_offset == OSPREY_STACK_IMPRECISE_SITE) {
+                continue; /* imprecise frames never contribute facts */
+            }
+            record_region_instance(&f->region, f->instance_id, f->entry_sp,
+                                   0x100000, 0, 0);
         }
     }
     if (g_heap_instances != NULL) {
@@ -681,13 +866,41 @@ static void osprey_backfill_instances(void) {
             const HeapInstance *h = &g_array_index(
                 g_heap_instances, HeapInstance, i);
             if (h->live) {
-                record_region_instance(&h->region, h->base, h->size);
+                record_region_instance(&h->region, h->instance_id,
+                                       h->base, h->size,
+                                       h->prov_object_id,
+                                       h->prov_generation);
+        }
+            }
+    }
+    /* Global region: ONE merged instance per sample with the union
+     * span, raw_base = image base so raw_base + image-relative offset
+     * maps back to the runtime address. */
+    OspreyContext *ctx = osprey_ctx_ref();
+    if (ctx != NULL && ctx->global_ranges != NULL &&
+        ctx->global_ranges->len > 0) {
+        int64_t hi = 0;
+        for (guint i = 0; i < ctx->global_ranges->len; i++) {
+            const OspreyGlobalRange *e = &g_array_index(
+                ctx->global_ranges, OspreyGlobalRange, i);
+            if (e->extent > INT64_MAX || e->offset < 0 ||
+                e->offset > INT64_MAX - (int64_t)e->extent) {
+                run->bad_arithmetic = 1;
+                return;
+            }
+            int64_t end = e->offset + (int64_t)e->extent;
+            if (end > hi) {
+                hi = end;
             }
         }
-    }
-    if (g_global_set) {
-        record_region_instance(&g_global.id, g_global.base,
-                               g_global.extent);
+        if (hi > 0) {
+            OspreyRegionId gid;
+            gid.kind = OSPREY_REGION_GLOBAL;
+            gid.code_image_id = 0;
+            gid.site_offset = 0;
+            record_region_instance(&gid, 0, osprey_get_image_base(),
+                                   (uint64_t)hi, 0, 0);
+        }
     }
 }
 
@@ -698,18 +911,37 @@ void osprey_child_use_shared_run(OspreyContext *ctx, OspreySharedRun *run) {
     osprey_backfill_instances();
 }
 
+/* Mark the current sample as unsupported (multithreaded guest via
+ * CLONE_VM).  The parent rejects the merge; no facts are trusted. */
+void osprey_mark_unsupported_execution(void) {
+    OspreySharedRun *run = g_shared_run;
+    if (run != NULL) {
+        run->unsupported_execution = 1;
+    }
+    /* do_fork marks this while the new host thread is still blocked on
+     * clone_lock, after the parallel-execution TB flush.  Disable new
+     * OSPREY instrumentation before either guest thread resumes. */
+    osprey_collect_enabled = 0;
+}
+
 /* Record one live canonical region instance into the shared run
  * (parent needs the raw base to map mutation addresses). */
 static void record_region_instance(const OspreyRegionId *region,
+                                   uint64_t instance_id,
                                    target_ulong raw_base,
-                                   uint64_t extent) {
+                                   uint64_t extent,
+                                   uint64_t prov_object_id,
+                                   uint32_t prov_generation) {
     OspreySharedRun *run = g_shared_run;
     if (run == NULL) return;
     OspreyRegionInstance f;
     memset(&f, 0, sizeof(f));
     f.region = *region;
+    f.instance_id = instance_id;
     f.raw_base = (uint64_t)raw_base;
     f.extent = extent;
+    f.prov_object_id = prov_object_id;
+    f.prov_generation = prov_generation;
     f.sample_support = 1;
     qemu_mutex_lock(&g_shared_mutex);
     osprey_table_insert_region(run, &f);
@@ -717,8 +949,23 @@ static void record_region_instance(const OspreyRegionId *region,
 }
 
 void osprey_on_alloc_success(CPUArchState *env, target_ulong base,
-                             target_ulong size, target_ulong site_pc) {
+                             target_ulong size, target_ulong site_pc,
+                             uint64_t object_id, uint32_t generation) {
     if (base == 0 && size != 0) return; /* failure: no object */
+    uint64_t norm_pc = 0;
+    if (!osprey_normalize_pc(site_pc, &norm_pc)) {
+        /* Allocation from out-of-image code (libc-internal): the site
+         * is not part of the main image; record nothing. */
+        return;
+    }
+    ProvenanceObject *obj = provenance_lookup_object(object_id, generation);
+    if (obj == NULL || obj->state != PROV_OBJ_LIVE || obj->base != base ||
+        obj->requested_size != size || obj->alloc_pc != site_pc) {
+        if (g_shared_run != NULL) {
+            g_shared_run->bad_identity = 1;
+        }
+        return;
+    }
     if (g_heap_instances == NULL) {
         g_heap_instances = g_array_new(FALSE, FALSE, sizeof(HeapInstance));
     }
@@ -727,21 +974,24 @@ void osprey_on_alloc_success(CPUArchState *env, target_ulong base,
     memset(&h, 0, sizeof(h));
     h.region.kind = OSPREY_REGION_HEAP_SITE;
     h.region.code_image_id = 0;
-    h.region.site_offset = (uint64_t)site_pc;
+    h.region.site_offset = norm_pc;
     h.instance_id = g_next_heap_instance++;
     h.base = base;
     h.size = size;
+    h.prov_object_id = object_id;
+    h.prov_generation = generation;
     h.live = true;
     g_array_append_val(g_heap_instances, h);
 
-    record_region_instance(&h.region, base, (uint64_t)size);
+    record_region_instance(&h.region, h.instance_id, base, (uint64_t)size,
+                           h.prov_object_id, h.prov_generation);
 
     /* F05: successful-return requested size. */
     OspreySharedRun *run = g_shared_run;
     if (run != NULL) {
         OspreyMallocFact fact;
         memset(&fact, 0, sizeof(fact));
-        fact.site_pc = (uint64_t)site_pc;
+        fact.site_pc = norm_pc;
         fact.requested_size = (int64_t)size;
         fact.sample_support = 1;
         qemu_mutex_lock(&g_shared_mutex);
@@ -762,7 +1012,9 @@ void osprey_on_alloc_success(CPUArchState *env, target_ulong base,
         o->concrete_value = base;
         o->address.region = h.region;
         o->address.offset = 0;
-        o->producer_pc = (uint64_t)site_pc;
+        o->producer_pc = norm_pc;
+        o->prov_object_id = object_id;
+        o->prov_generation = generation;
     }
 
     /* F06 MayArray: the allocation-argument heuristic records the
@@ -788,11 +1040,15 @@ void osprey_on_alloc_success(CPUArchState *env, target_ulong base,
 
 void osprey_on_alloc_failure(CPUArchState *env, target_ulong site_pc) {
     (void)env;
+    uint64_t norm_pc = 0;
+    if (!osprey_normalize_pc(site_pc, &norm_pc)) {
+        return;
+    }
     OspreySharedRun *run = g_shared_run;
     if (run != NULL) {
         OspreyMallocFact fact;
         memset(&fact, 0, sizeof(fact));
-        fact.site_pc = (uint64_t)site_pc;
+        fact.site_pc = norm_pc;
         fact.requested_size = -1; /* explicit failure state */
         fact.sample_support = 1;
         qemu_mutex_lock(&g_shared_mutex);
@@ -801,18 +1057,26 @@ void osprey_on_alloc_failure(CPUArchState *env, target_ulong site_pc) {
     }
 }
 
-void osprey_on_free(CPUArchState *env, target_ulong base,
-                    target_ulong site_pc) {
-    (void)env;
-    (void)site_pc;
-    if (base == 0 || g_heap_instances == NULL) return;
+/* Retire the heap instance whose provenance identity matches.  Returns
+ * true when an instance was retired. */
+static bool heap_retire_by_identity(uint64_t object_id, uint32_t generation) {
+    if (g_heap_instances == NULL) return false;
     for (guint i = 0; i < g_heap_instances->len; i++) {
         HeapInstance *h = &g_array_index(g_heap_instances, HeapInstance, i);
-        if (h->live && h->base == base) {
+        if (h->live && h->prov_object_id == object_id &&
+            h->prov_generation == generation) {
             h->live = false;
-            return;
+            return true;
         }
     }
+    return false;
+}
+
+void osprey_on_free_identity(CPUArchState *env, uint64_t object_id,
+                             uint32_t generation, target_ulong site_pc) {
+    (void)env;
+    (void)site_pc;
+    heap_retire_by_identity(object_id, generation);
 }
 
 /* ------------------------------------------------------------------ */
@@ -840,7 +1104,9 @@ static void record_access_fact(OspreySharedRun *run, uint64_t pc,
  * to canonical regions; a target outside every modeled region records
  * nothing (never guessed from proximity). */
 static void record_points_to(CPUArchState *env, target_ulong addr,
-                             uint64_t size, target_ulong value) {
+                             uint64_t size, target_ulong value,
+                             uint64_t prov_object_id,
+                             uint32_t prov_generation) {
     OspreySharedRun *run = g_shared_run;
     if (run == NULL) return;
     OspreyRegionId preg, treg;
@@ -848,6 +1114,21 @@ static void record_points_to(CPUArchState *env, target_ulong addr,
     if (!osprey_region_of_addr(env, addr, &preg, &poff, false)) {
         run->bad_region = 1;
         return;
+    }
+    /* Provenance-authoritative heap targets: the origin identity must
+     * still reference a LIVE object whose base matches the concrete
+     * value; a stale identity (freed/reused) records nothing. */
+    if (prov_object_id != 0) {
+        ProvenanceObject *obj =
+            provenance_lookup_object(prov_object_id, prov_generation);
+        if (obj == NULL || obj->state != PROV_OBJ_LIVE) {
+            return;
+        }
+        /* The pointer value must lie inside the live object. */
+        if (value < obj->base ||
+            (uint64_t)(value - obj->base) >= obj->requested_size) {
+            return;
+        }
     }
     if (!osprey_region_of_addr(env, value, &treg, &toff, false)) {
         return; /* pointer target not in a modeled region */
@@ -894,6 +1175,18 @@ void osprey_on_mem_access(CPUArchState *env, target_ulong addr,
     OspreySharedRun *run = g_shared_run;
     if (run == NULL) return;
 
+    /* Normalize the PC against the main image base; facts from
+     * out-of-image code (libraries, interpreter) are not part of the
+     * main-image model and are skipped entirely. */
+    uint64_t norm_pc = 0;
+    if (!osprey_normalize_pc(pc, &norm_pc)) {
+        /* Consume (clear) the EA metadata even when skipping: a stale
+         * record must never be misread by a later in-image access. */
+        st->ea_valid = false;
+        return;
+    }
+    pc = norm_pc;
+
     /* Consume the EA metadata: copy into locals, then clear so a stale
      * record can never be misread by a later instruction. */
     bool have_ea = st->ea_valid;
@@ -926,30 +1219,49 @@ void osprey_on_mem_access(CPUArchState *env, target_ulong addr,
             OspreyRegOrigin *b = &st->ea_base_origin;
             if (b->valid && b->kind == OSPREY_ORIGIN_ADDRESS &&
                 b->concrete_value == base_val) {
-                OspreyBaseFact bf;
-                memset(&bf, 0, sizeof(bf));
-                bf.pc = pc;
-                bf.chunk = chunk;
-                bf.base = b->address;
-                bf.sample_support = 1;
-                qemu_mutex_lock(&g_shared_mutex);
-                osprey_table_insert_base(run, &bf);
-                qemu_mutex_unlock(&g_shared_mutex);
+                /* Provenance-authoritative heap bases: the origin must
+                 * still reference a LIVE object with a matching base;
+                 * a stale identity (freed/reused) emits nothing. */
+                bool prov_ok = true;
+                if (b->address.region.kind == OSPREY_REGION_HEAP_SITE) {
+                    prov_ok = osprey_origin_prov_live(b);
+                }
+                if (prov_ok) {
+                    OspreyBaseFact bf;
+                    memset(&bf, 0, sizeof(bf));
+                    bf.pc = pc;
+                    bf.chunk = chunk;
+                    bf.base = b->address;
+                    bf.prov_object_id = b->prov_object_id;
+                    bf.prov_generation = b->prov_generation;
+                    bf.sample_support = 1;
+                    qemu_mutex_lock(&g_shared_mutex);
+                    osprey_table_insert_base(run, &bf);
+                    qemu_mutex_unlock(&g_shared_mutex);
+                }
             }
         } else if (have_ea && index_reg >= 0 && index_reg < CPU_NB_REGS &&
                    scale == 1) {
             OspreyRegOrigin *ix = &st->ea_index_origin;
             if (ix->valid && ix->kind == OSPREY_ORIGIN_ADDRESS &&
                 ix->concrete_value == index_val) {
-                OspreyBaseFact bf;
-                memset(&bf, 0, sizeof(bf));
-                bf.pc = pc;
-                bf.chunk = chunk;
-                bf.base = ix->address;
-                bf.sample_support = 1;
-                qemu_mutex_lock(&g_shared_mutex);
-                osprey_table_insert_base(run, &bf);
-                qemu_mutex_unlock(&g_shared_mutex);
+                bool prov_ok = true;
+                if (ix->address.region.kind == OSPREY_REGION_HEAP_SITE) {
+                    prov_ok = osprey_origin_prov_live(ix);
+                }
+                if (prov_ok) {
+                    OspreyBaseFact bf;
+                    memset(&bf, 0, sizeof(bf));
+                    bf.pc = pc;
+                    bf.chunk = chunk;
+                    bf.base = ix->address;
+                    bf.prov_object_id = ix->prov_object_id;
+                    bf.prov_generation = ix->prov_generation;
+                    bf.sample_support = 1;
+                    qemu_mutex_lock(&g_shared_mutex);
+                    osprey_table_insert_base(run, &bf);
+                    qemu_mutex_unlock(&g_shared_mutex);
+                }
             }
         }
     } else {
@@ -1000,12 +1312,14 @@ void osprey_on_mem_copy(CPUArchState *env, target_ulong src,
 void osprey_log_sticky(const OspreySharedRun *run, const char *tag) {
     if (run == NULL) return;
     log_msg("[osprey] [facts] [%s] [sample %u] [overflow %u] "
-            "[bad-region %u] [bad-arith %u] [unsupported %u] "
-            "[first-kind %u] [first-key %lx]\n",
+            "[bad-region %u] [bad-arith %u] [bad-identity %u] "
+            "[unsupported %u] "
+            "[first-kind %u] [first-hash %lx]\n",
             tag, run->sample_id, run->overflow, run->bad_region,
-            run->bad_arithmetic, run->unsupported_execution,
+            run->bad_arithmetic, run->bad_identity,
+            run->unsupported_execution,
             run->first_dropped_kind,
-            (unsigned long)run->first_dropped_key);
+            (unsigned long)run->first_dropped_hash);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1160,6 +1474,12 @@ OspreyStatus osprey_parent_merge_sample(OspreyContext *ctx,
         osprey_log_sticky(run, "bad-arithmetic");
         osprey_tx_reject(ctx, OSPREY_INCOMPLETE_FACTS, "merge",
                          "checked arithmetic failed");
+        return OSPREY_INCOMPLETE_FACTS;
+    }
+    if (run->bad_identity) {
+        osprey_log_sticky(run, "bad-identity");
+        osprey_tx_reject(ctx, OSPREY_INCOMPLETE_FACTS, "merge",
+                         "provenance identity mismatch");
         return OSPREY_INCOMPLETE_FACTS;
     }
     if (run->unsupported_execution) {
@@ -1347,7 +1667,226 @@ OspreyStatus osprey_parent_merge_sample(OspreyContext *ctx,
             ctx->alloc_facts->len, ctx->mayarray_facts->len,
             ctx->region_instances->len,
             (unsigned long long)ctx->total_dynamic_observations);
+
+    /* Canonical dump: written after every successful merge so a harness
+     * can compare runs byte-identically (ASLR invariance). */
+    if (ctx->config.dump_file[0] != '\0') {
+        osprey_dump_canonical(ctx, ctx->config.dump_file);
+    }
     return OSPREY_OK;
+}
+
+/* ------------------------------------------------------------------ */
+/* Canonical fact dump                                                 */
+/* ------------------------------------------------------------------ */
+
+/* Deterministic, sorted, full-key canonical dump.  Every line is a
+ * stable function of the merged facts only: no raw addresses, no
+ * pointer values, no hash iteration order.  Used by the t01_regions
+ * harness to assert byte-identical output across ASLR/PIE runs. */
+void osprey_dump_canonical(OspreyContext *ctx, const char *path) {
+    if (ctx == NULL || path == NULL) return;
+    FILE *f = fopen(path, "w");
+    if (f == NULL) return;
+
+    /* Region instances: sorted by canonical identity and creation
+     * ordinal.  Raw addresses are represented only by an equivalence-
+     * class ordinal, preserving reuse relationships without leaking
+     * ASLR-dependent values into the canonical dump. */
+    {
+        GArray *rows = g_array_new(FALSE, FALSE, sizeof(OspreyRegionInstance));
+        for (guint i = 0; i < ctx->region_instances->len; i++) {
+            OspreyRegionInstance *r = &g_array_index(
+                ctx->region_instances, OspreyRegionInstance, i);
+            g_array_append_val(rows, *r);
+        }
+        for (guint i = 1; i < rows->len; i++) {
+            OspreyRegionInstance key = g_array_index(rows,
+                                                     OspreyRegionInstance, i);
+            guint j = i;
+            while (j > 0) {
+                OspreyRegionInstance *prev = &g_array_index(
+                    rows, OspreyRegionInstance, j - 1);
+                if (prev->region.kind < key.region.kind ||
+                    (prev->region.kind == key.region.kind &&
+                     prev->region.site_offset < key.region.site_offset) ||
+                    (prev->region.kind == key.region.kind &&
+                     prev->region.site_offset == key.region.site_offset &&
+                     prev->instance_id < key.instance_id)) {
+                    break;
+                }
+                g_array_index(rows, OspreyRegionInstance, j) = *prev;
+                j--;
+            }
+            g_array_index(rows, OspreyRegionInstance, j) = key;
+        }
+        for (guint i = 0; i < rows->len; i++) {
+            OspreyRegionInstance *r = &g_array_index(rows,
+                                                     OspreyRegionInstance, i);
+            guint raw_class = i + 1;
+            for (guint j = 0; j < i; j++) {
+                OspreyRegionInstance *prev = &g_array_index(
+                    rows, OspreyRegionInstance, j);
+                if (prev->raw_base == r->raw_base) {
+                    raw_class = j + 1;
+                    break;
+                }
+            }
+            fprintf(f, "region %u %llx %llu %u %llx\n",
+                    (unsigned)r->region.kind,
+                    (unsigned long long)r->region.site_offset,
+                    (unsigned long long)r->instance_id,
+                    raw_class,
+                    (unsigned long long)r->extent);
+        }
+        g_array_free(rows, TRUE);
+    }
+
+    /* Access facts: sorted by (pc, is_store, region, offset, size). */
+    {
+        GArray *rows = g_array_new(FALSE, FALSE, sizeof(OspreyAccessFact));
+        for (guint i = 0; i < ctx->access_facts->len; i++) {
+            OspreyAccessFact *a = &g_array_index(ctx->access_facts,
+                                                 OspreyAccessFact, i);
+            g_array_append_val(rows, *a);
+        }
+        for (guint i = 1; i < rows->len; i++) {
+            OspreyAccessFact key = g_array_index(rows, OspreyAccessFact, i);
+            guint j = i;
+            while (j > 0) {
+                OspreyAccessFact *prev = &g_array_index(rows,
+                                                        OspreyAccessFact, j - 1);
+                if (prev->pc < key.pc ||
+                    (prev->pc == key.pc && prev->is_store < key.is_store) ||
+                    (prev->pc == key.pc && prev->is_store == key.is_store &&
+                     prev->chunk.address.region.kind <
+                         key.chunk.address.region.kind) ||
+                    (prev->pc == key.pc && prev->is_store == key.is_store &&
+                     prev->chunk.address.region.kind ==
+                         key.chunk.address.region.kind &&
+                     prev->chunk.address.region.site_offset <
+                         key.chunk.address.region.site_offset) ||
+                    (prev->pc == key.pc && prev->is_store == key.is_store &&
+                     prev->chunk.address.region.kind ==
+                         key.chunk.address.region.kind &&
+                     prev->chunk.address.region.site_offset ==
+                         key.chunk.address.region.site_offset &&
+                     prev->chunk.address.offset < key.chunk.address.offset) ||
+                    (prev->pc == key.pc && prev->is_store == key.is_store &&
+                     prev->chunk.address.region.kind ==
+                         key.chunk.address.region.kind &&
+                     prev->chunk.address.region.site_offset ==
+                         key.chunk.address.region.site_offset &&
+                     prev->chunk.address.offset == key.chunk.address.offset &&
+                     prev->chunk.size < key.chunk.size)) {
+                    break;
+                }
+                g_array_index(rows, OspreyAccessFact, j) = *prev;
+                j--;
+            }
+            g_array_index(rows, OspreyAccessFact, j) = key;
+        }
+        for (guint i = 0; i < rows->len; i++) {
+            OspreyAccessFact *a = &g_array_index(rows, OspreyAccessFact, i);
+            fprintf(f, "access %llx %u %u %llx %llx %llu %u\n",
+                    (unsigned long long)a->pc, (unsigned)a->is_store,
+                    (unsigned)a->chunk.address.region.kind,
+                    (unsigned long long)a->chunk.address.region.site_offset,
+                    (unsigned long long)a->chunk.address.offset,
+                    (unsigned long long)a->chunk.size,
+                    (unsigned)a->sample_support);
+        }
+        g_array_free(rows, TRUE);
+    }
+
+    /* Base facts: sorted by (pc, region, offset, prov id). */
+    {
+        GArray *rows = g_array_new(FALSE, FALSE, sizeof(OspreyBaseFact));
+        for (guint i = 0; i < ctx->base_facts->len; i++) {
+            OspreyBaseFact *b = &g_array_index(ctx->base_facts,
+                                               OspreyBaseFact, i);
+            g_array_append_val(rows, *b);
+        }
+        for (guint i = 1; i < rows->len; i++) {
+            OspreyBaseFact key = g_array_index(rows, OspreyBaseFact, i);
+            guint j = i;
+            while (j > 0) {
+                OspreyBaseFact *prev = &g_array_index(rows,
+                                                      OspreyBaseFact, j - 1);
+                if (prev->pc < key.pc ||
+                    (prev->pc == key.pc &&
+                     prev->base.region.kind < key.base.region.kind) ||
+                    (prev->pc == key.pc &&
+                     prev->base.region.kind == key.base.region.kind &&
+                     prev->base.region.site_offset <
+                         key.base.region.site_offset) ||
+                    (prev->pc == key.pc &&
+                     prev->base.region.kind == key.base.region.kind &&
+                     prev->base.region.site_offset ==
+                         key.base.region.site_offset &&
+                     prev->base.offset < key.base.offset) ||
+                    (prev->pc == key.pc &&
+                     prev->base.region.kind == key.base.region.kind &&
+                     prev->base.region.site_offset ==
+                         key.base.region.site_offset &&
+                     prev->base.offset == key.base.offset &&
+                     prev->prov_object_id < key.prov_object_id)) {
+                    break;
+                }
+                g_array_index(rows, OspreyBaseFact, j) = *prev;
+                j--;
+            }
+            g_array_index(rows, OspreyBaseFact, j) = key;
+        }
+        for (guint i = 0; i < rows->len; i++) {
+            OspreyBaseFact *b = &g_array_index(rows, OspreyBaseFact, i);
+            fprintf(f, "base %llx %u %llx %llx %llx %u %u\n",
+                    (unsigned long long)b->pc,
+                    (unsigned)b->chunk.address.region.kind,
+                    (unsigned long long)b->chunk.address.region.site_offset,
+                    (unsigned long long)b->chunk.address.offset,
+                    (unsigned long long)b->base.offset,
+                    (unsigned)b->prov_object_id,
+                    (unsigned)b->prov_generation);
+        }
+        g_array_free(rows, TRUE);
+    }
+
+    /* Alloc facts: sorted by (site_pc, requested_size). */
+    {
+        GArray *rows = g_array_new(FALSE, FALSE, sizeof(OspreyMallocFact));
+        for (guint i = 0; i < ctx->alloc_facts->len; i++) {
+            OspreyMallocFact *a = &g_array_index(ctx->alloc_facts,
+                                                 OspreyMallocFact, i);
+            g_array_append_val(rows, *a);
+        }
+        for (guint i = 1; i < rows->len; i++) {
+            OspreyMallocFact key = g_array_index(rows, OspreyMallocFact, i);
+            guint j = i;
+            while (j > 0) {
+                OspreyMallocFact *prev = &g_array_index(rows,
+                                                        OspreyMallocFact, j - 1);
+                if (prev->site_pc < key.site_pc ||
+                    (prev->site_pc == key.site_pc &&
+                     prev->requested_size < key.requested_size)) {
+                    break;
+                }
+                g_array_index(rows, OspreyMallocFact, j) = *prev;
+                j--;
+            }
+            g_array_index(rows, OspreyMallocFact, j) = key;
+        }
+        for (guint i = 0; i < rows->len; i++) {
+            OspreyMallocFact *a = &g_array_index(rows, OspreyMallocFact, i);
+            fprintf(f, "alloc %llx %lld %u\n",
+                    (unsigned long long)a->site_pc,
+                    (long long)a->requested_size,
+                    (unsigned)a->sample_support);
+        }
+        g_array_free(rows, TRUE);
+    }
+
+    fclose(f);
 }
 
 /* Analyze entry: Stage 2 deterministic closure, then (later stages)
@@ -1459,13 +1998,19 @@ void helper_osprey_mem_copy(CPUArchState *env, target_ulong src,
     osprey_on_mem_copy(env, src, dst, size);
 }
 
-void helper_osprey_call(target_ulong call_pc, target_ulong ret_pc,
-                        target_ulong callee_pc, target_ulong sp) {
-    osprey_on_call(call_pc, ret_pc, callee_pc, sp);
+void helper_osprey_call(CPUArchState *env, target_ulong callee_pc,
+                        target_ulong entry_sp) {
+    osprey_on_call(env, callee_pc, entry_sp);
 }
 
-void helper_osprey_ret(target_ulong pc, target_ulong sp) {
-    osprey_on_ret(pc, sp);
+void helper_osprey_ret(CPUArchState *env, target_ulong pc,
+                       target_ulong sp) {
+    osprey_on_ret(env, pc, sp);
+}
+
+void helper_osprey_rsp_update(CPUArchState *env, target_ulong new_sp,
+                               target_ulong pc) {
+    osprey_on_rsp_update(env, new_sp, pc);
 }
 
 void helper_osprey_on_load(CPUArchState *env, uint32_t dst_reg,
