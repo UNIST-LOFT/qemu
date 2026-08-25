@@ -545,6 +545,30 @@ void symbolic_clear_mem(uintptr_t addr, uintptr_t size)
 
 static inline void qemu_memmove(CPUArchState *cpu_env, uintptr_t src, uintptr_t dst, uintptr_t size)
 {
+    if (size == 0) {
+        return;
+    }
+    if (src == dst) {
+        return;
+    }
+    /* get_expr_addr() exposes one 64-KiB symbolic-memory leaf at a time.
+     * The ordinary overflow recursion processes the tail first, which is
+     * incorrect for an overlapping move toward a lower address: a tail write
+     * can destroy a source expression needed by the head.  Resolve overlap
+     * one byte at a time in memmove direction; non-overlapping bulk copies
+     * retain the fast leaf-wise path below. */
+    if (dst > src && dst - src < size) {
+        for (size_t i = size; i > 0; i--) {
+            qemu_memmove(cpu_env, src + i - 1, dst + i - 1, 1);
+        }
+        return;
+    }
+    if (src > dst && src - dst < size) {
+        for (size_t i = 0; i < size; i++) {
+            qemu_memmove(cpu_env, src + i, dst + i, 1);
+        }
+        return;
+    }
     size_t overflow_n_bytes = 0;
     // printf("A overflow_n_bytes: %lu\n", overflow_n_bytes);
     Expr** src_exprs =
@@ -624,17 +648,12 @@ static inline void qemu_memmove(CPUArchState *cpu_env, uintptr_t src, uintptr_t 
         dst_exprs = get_expr_addr((uintptr_t)dst, size, 1, &overflow_n_bytes);
     }
 
-#if 0
-    printf("[+] Memmove from=%lx to=%lx size=%lu\n", src, dst, size);
-#endif
     for (size_t i = 0; i < size; i++) {
         dst_exprs[i] = src_exprs[i];
-        // print_expr(dst_exprs[i]);
-
 #if DEBUG_EXPR_CONSISTENCY
         if (src_exprs[i]) {
-            // printf("MEMMOVE: index=%lu src=%lx dst=%lx val=%p\n", i, src + i, dst + i, src_exprs[i]);
-            add_consistency_check_addr(src_exprs[i], src + i, 1, SYMBOLIC_LOAD);
+            add_consistency_check_addr(src_exprs[i], src + i, 1,
+                                       SYMBOLIC_LOAD);
         }
 #endif
     }
@@ -642,6 +661,9 @@ static inline void qemu_memmove(CPUArchState *cpu_env, uintptr_t src, uintptr_t 
 
 static inline void qemu_memset(Expr* value, uintptr_t dst, uintptr_t size)
 {
+    if (size == 0) {
+        return;
+    }
     size_t overflow_n_bytes = 0;
     Expr** dst_exprs =
         get_expr_addr((uintptr_t)dst, size, 0, &overflow_n_bytes);

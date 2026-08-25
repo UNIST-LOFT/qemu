@@ -9031,24 +9031,34 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
         // printf("Executing LIB MODEL %d at %lx\n", model, pc);
         if (model == STRCMP) {
             // printf("[0x%lx] strcmp(%s, %s)\n", model_caller_addr, (char *)(uintptr_t)env->regs[R_EDI], (char *)(uintptr_t)env->regs[R_ESI]);
-            mode = model_strcmp(env, model_caller_addr, 0);
-            clear_call_args_temps();
-            clear_xmm_regs(env);
+            mode = model_strcmp(env, model_caller_addr, 0, false);
+            if (mode != 0) {
+                clear_call_args_temps();
+                clear_xmm_regs(env);
+            }
         } else if (model == STRNCMP) {
             // printf("[0x%lx] strncmp(%s, %s, %lu)\n", model_caller_addr, (char *)(uintptr_t)env->regs[R_EDI], (char *)(uintptr_t)env->regs[R_ESI], (uintptr_t)env->regs[R_EDX]);
-            mode = model_strcmp(env, model_caller_addr, env->regs[R_EDX]);
-            clear_call_args_temps();
-            clear_xmm_regs(env);
+            mode = model_strcmp(env, model_caller_addr, env->regs[R_EDX],
+                                true);
+            if (mode != 0) {
+                clear_call_args_temps();
+                clear_xmm_regs(env);
+            }
         } else if (model == STRLEN) {
             // printf("[0x%lx] strlen(%s)\n", model_caller_addr, (char *)(uintptr_t)env->regs[R_EDI]);
-            mode = model_strlen(env, model_caller_addr, 0);
-            clear_call_args_temps();
-            clear_xmm_regs(env);
+            mode = model_strlen(env, model_caller_addr, 0, false, R_EDI);
+            if (mode != 0) {
+                clear_call_args_temps();
+                clear_xmm_regs(env);
+            }
         } else if (model == STRNLEN) {
             // printf("[0x%lx] strnlen(%s, %lu)\n", model_caller_addr, (char *)(uintptr_t)env->regs[R_EDI], (uintptr_t)env->regs[R_ESI]);
-            mode = model_strlen(env, model_caller_addr, env->regs[R_ESI]);
-            clear_call_args_temps();
-            clear_xmm_regs(env);
+            mode = model_strlen(env, model_caller_addr, env->regs[R_ESI],
+                                true, R_EDI);
+            if (mode != 0) {
+                clear_call_args_temps();
+                clear_xmm_regs(env);
+            }
         } else if (model == MALLOC) {
             if (symbolic_mode) {
                 model_alloc(env, model_caller_addr, R_EDI);
@@ -9158,92 +9168,150 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
         } else if (model == MEMCHR) {
             // printf("[0x%lx] memchr(%p, %c, %lu)\n", model_caller_addr, (char *)(uintptr_t)env->regs[R_EDI], (int)(uintptr_t)env->regs[R_ESI], (uintptr_t)env->regs[R_EDX]);
             mode = model_memchr(env, model_caller_addr);
-            clear_call_args_temps();
-            clear_xmm_regs(env);
+            if (mode != 0) {
+                clear_call_args_temps();
+                clear_xmm_regs(env);
+            }
         } else if (model == MEMCMP) {
             // printf("[0x%lx] memcmp(%p, %p, %lu)\n", model_caller_addr, (char *)(uintptr_t)env->regs[R_EDI], (char*)(uintptr_t)env->regs[R_ESI], (uintptr_t)env->regs[R_EDX]);
             mode = model_memcmp(env, model_caller_addr);
-            clear_call_args_temps();
-            clear_xmm_regs(env);
+            if (mode != 0) {
+                clear_call_args_temps();
+                clear_xmm_regs(env);
+            }
         } else if (model == MEMMOVE || model == MEMCPY) {
             // printf("[0x%lx] %s(%p, %p, %lu)\n", model_caller_addr, model == MEMMOVE ? "memmove" : "memcpy", (char *)(uintptr_t)env->regs[R_EDI], (char*)(uintptr_t)env->regs[R_ESI], (uintptr_t)env->regs[R_EDX]);
-            // FixMe: memmove may overlap!
-            qemu_memmove(env, (uintptr_t)env->regs[R_ESI], (uintptr_t)env->regs[R_EDI], (uintptr_t)env->regs[R_EDX]);
-            /* memcheck-only: libc bodies are outside the symbolic window, so
-             * per-instruction checks can't see this range. Validate the full
-             * copy interval here (access pc = caller), carrying the dst/src
-             * register tags so tagged underruns/overruns are detected. */
-            if (binradar_memcheck_enabled) {
-                /* The model wrote raw bytes into the destination: stale
-                 * pointer shadow entries there must not be reloaded. */
-                provenance_on_modify_mem((target_ulong)env->regs[R_EDI],
-                                         (target_ulong)env->regs[R_EDX]);
-                provenance_model_check_access(env,
-                                         (target_ulong)env->regs[R_EDI],
-                                         (target_ulong)env->regs[R_EDX],
-                                         model_caller_addr, R_EDI);
-                provenance_model_check_access(env,
-                                         (target_ulong)env->regs[R_ESI],
-                                         (target_ulong)env->regs[R_EDX],
-                                         model_caller_addr, R_ESI);
+            /* Phase 3 ordering: the real libc call must be able to
+             * complete before the model touches guest memory. Only then
+             * are the shadow invalidation and access checks legitimate;
+             * an unreachable copy keeps the real libc fault instead. */
+            target_ulong len = (target_ulong)env->regs[R_EDX];
+            if (len == 0 ||
+                (prov_range_readable((target_ulong)env->regs[R_ESI], len) &&
+                 prov_range_writable((target_ulong)env->regs[R_EDI], len))) {
+                if (len != 0) {
+                    qemu_memmove(env, (uintptr_t)env->regs[R_ESI],
+                                 (uintptr_t)env->regs[R_EDI], len);
+                }
+                /* memcheck: libc bodies are outside the symbolic window,
+                 * so per-instruction checks can't see this range. Validate
+                 * the full copy interval here (access pc = caller),
+                 * carrying the dst/src register tags so tagged
+                 * underruns/overruns are detected. */
+                if (binradar_memcheck_enabled && len != 0) {
+                    /* The model wrote raw bytes into the destination:
+                     * stale pointer shadow entries there must not be
+                     * reloaded. */
+                    provenance_on_modify_mem((target_ulong)env->regs[R_EDI],
+                                             len);
+                    provenance_model_check_access(env,
+                                             (target_ulong)env->regs[R_EDI],
+                                             len,
+                                             model_caller_addr, R_EDI);
+                    provenance_model_check_access(env,
+                                             (target_ulong)env->regs[R_ESI],
+                                             len,
+                                             model_caller_addr, R_ESI);
+                }
+                mode = 2;
+                clear_call_args_temps();
+                clear_xmm_regs(env);
             }
-            mode = 2;
-            clear_call_args_temps();
-            clear_xmm_regs(env);
         } else if (model == MEMSET) {
             // printf("[0x%lx] memset(%p, %lx, %lu)\n", model_caller_addr, (char *)(uintptr_t)env->regs[R_EDI], (uintptr_t)env->regs[R_ESI], (uintptr_t)env->regs[R_EDX]);
-            Expr* value = s_temps[temp_idx(tcg_find_temp_arch_reg(tcg_ctx, "rsi"))];
-            qemu_memset(value, (uintptr_t)env->regs[R_EDI], (uintptr_t)env->regs[R_EDX]);
-            /* memcheck-only: validate the full fill interval (see above). */
-            if (binradar_memcheck_enabled) {
-                /* The model wrote raw bytes into the destination: stale
-                 * pointer shadow entries there must not be reloaded. */
-                provenance_on_modify_mem((target_ulong)env->regs[R_EDI],
-                                         (target_ulong)env->regs[R_EDX]);
-                provenance_model_check_access(env,
-                                         (target_ulong)env->regs[R_EDI],
-                                         (target_ulong)env->regs[R_EDX],
-                                         model_caller_addr, R_EDI);
+            /* Phase 3 ordering: probe the full fill interval first. */
+            target_ulong len = (target_ulong)env->regs[R_EDX];
+            if (len == 0 ||
+                prov_range_writable((target_ulong)env->regs[R_EDI], len)) {
+                if (len != 0) {
+                    Expr* value = s_temps[temp_idx(
+                        tcg_find_temp_arch_reg(tcg_ctx, "rsi"))];
+                    qemu_memset(value, (uintptr_t)env->regs[R_EDI], len);
+                }
+                /* memcheck-only: validate the full fill interval (see
+                 * above). */
+                if (binradar_memcheck_enabled && len != 0) {
+                    /* The model wrote the pattern into the destination:
+                     * stale pointer shadow entries must not be reloaded. */
+                    provenance_on_modify_mem((target_ulong)env->regs[R_EDI],
+                                             len);
+                    provenance_model_check_access(env,
+                                             (target_ulong)env->regs[R_EDI],
+                                             len,
+                                             model_caller_addr, R_EDI);
+                }
+                mode = 2;
+                clear_call_args_temps();
+                clear_xmm_regs(env);
             }
-            mode = 2;
-            clear_call_args_temps();
-            clear_xmm_regs(env);
         } else if (model == STRCPY) {
             // printf("[0x%lx] strcpy(%p, %p)\n", model_caller_addr, (char *)(uintptr_t)env->regs[R_EDI], (char*)(uintptr_t)env->regs[R_ESI]);
-            uintptr_t len = strlen((char*)(uintptr_t)env->regs[R_ESI]);
-            mode = model_strlen(env, model_caller_addr, 0);
-            qemu_memmove(env, (uintptr_t)env->regs[R_ESI], (uintptr_t)env->regs[R_EDI], len + 1);
-            /* memcheck-only: the model wrote raw bytes into the
-             * destination; stale pointer shadow must not be reloaded. */
-            if (binradar_memcheck_enabled) {
-                provenance_on_modify_mem((target_ulong)env->regs[R_EDI],
-                                         (target_ulong)len + 1);
-                provenance_model_check_access(env,
-                                         (target_ulong)env->regs[R_EDI],
-                                         (target_ulong)len + 1,
-                                         model_caller_addr, R_EDI);
+            /* Scan the source before changing metadata, then prove the full
+             * destination interval writable.  A failed probe leaves mode 0
+             * so the real libc call owns the target fault. */
+            bool src_ok = false;
+            size_t src_len =
+                prov_str_scan((const char *)(uintptr_t)env->regs[R_ESI],
+                              0, false, &src_ok);
+            target_ulong len = (target_ulong)src_len + 1;
+            if (src_ok &&
+                prov_range_writable((target_ulong)env->regs[R_EDI], len)) {
+                mode = model_strlen(env, model_caller_addr, 0, false, R_ESI);
+                if (mode != 0) {
+                    qemu_memmove(env, (uintptr_t)env->regs[R_ESI],
+                                 (uintptr_t)env->regs[R_EDI], len);
+                    /* The full successful destination write invalidates
+                     * stale pointer shadow; the length model checks the
+                     * source with its actual RSI provenance. */
+                    if (binradar_memcheck_enabled) {
+                        provenance_on_modify_mem(
+                            (target_ulong)env->regs[R_EDI], len);
+                        provenance_model_check_access(
+                            env, (target_ulong)env->regs[R_EDI], len,
+                            model_caller_addr, R_EDI);
+                    }
+                    clear_call_args_temps();
+                    clear_xmm_regs(env);
+                }
             }
-            clear_call_args_temps();
-            clear_xmm_regs(env);
         } else if (model == STRNCPY) {
             // printf("[0x%lx] strncpy(%p, %p, %lu)\n", model_caller_addr, (char *)(uintptr_t)env->regs[R_EDI], (char*)(uintptr_t)env->regs[R_ESI], (uintptr_t)env->regs[R_EDX]);
-            uintptr_t n = (uintptr_t)env->regs[R_EDX];
-            mode = model_strlen(env, model_caller_addr, n);
-            uintptr_t len = strnlen((char*)(uintptr_t)env->regs[R_ESI], n);
-            if (len < n) len += 1;
-            qemu_memmove(env, (uintptr_t)env->regs[R_ESI], (uintptr_t)env->regs[R_EDI], len);
-            /* memcheck-only: the model wrote raw bytes into the
-             * destination; stale pointer shadow must not be reloaded. */
-            if (binradar_memcheck_enabled) {
-                provenance_on_modify_mem((target_ulong)env->regs[R_EDI],
-                                         (target_ulong)len);
-                provenance_model_check_access(env,
-                                         (target_ulong)env->regs[R_EDI],
-                                         (target_ulong)len,
-                                         model_caller_addr, R_EDI);
+            target_ulong n = (target_ulong)env->regs[R_EDX];
+            bool src_ok = n == 0;
+            size_t src_len = 0;
+            if (n != 0) {
+                src_len = prov_str_scan(
+                    (const char *)(uintptr_t)env->regs[R_ESI], n, true,
+                    &src_ok);
             }
-            clear_call_args_temps();
-            clear_xmm_regs(env);
+            if (src_ok &&
+                (n == 0 || prov_range_writable(
+                    (target_ulong)env->regs[R_EDI], n))) {
+                mode = model_strlen(env, model_caller_addr, n, true, R_ESI);
+                if (mode != 0 && n != 0) {
+                    target_ulong copied = src_len < n ? src_len + 1 : n;
+                    qemu_memmove(env, (uintptr_t)env->regs[R_ESI],
+                                 (uintptr_t)env->regs[R_EDI], copied);
+                    if (copied < n) {
+                        qemu_memset(NULL,
+                                   (uintptr_t)env->regs[R_EDI] + copied,
+                                   n - copied);
+                    }
+                    /* strncpy always writes exactly n bytes, including
+                     * zero padding after an early source terminator. */
+                    if (binradar_memcheck_enabled) {
+                        provenance_on_modify_mem(
+                            (target_ulong)env->regs[R_EDI], n);
+                        provenance_model_check_access(
+                            env, (target_ulong)env->regs[R_EDI], n,
+                            model_caller_addr, R_EDI);
+                    }
+                }
+                if (mode != 0) {
+                    clear_call_args_temps();
+                    clear_xmm_regs(env);
+                }
+            }
         }  else if (model == FPUTC) {
             // printf("[0x%lx] fputc(%c, ...)\n", model_caller_addr, (char)(uintptr_t)env->regs[R_EDI]);
             mode = 2;
@@ -9279,6 +9347,12 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
             clear_xmm_regs(env);
         } 
         // printf("Return address is %lx [%lx]\n", model_caller_addr, rsp);
+        if (mode == 0) {
+            /* A preflight failure declined the model.  The real libc body
+             * will execute and own any target fault; no return hook or stale
+             * caller address remains armed. */
+            model_caller_addr = 0;
+        }
         if (mode == 2) {
             return 1; // switch code cache
         } else {

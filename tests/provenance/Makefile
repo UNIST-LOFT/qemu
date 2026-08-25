@@ -39,7 +39,10 @@ TESTS := t01_double_free t02_small_double_free t03_uaf_stack t04_uaf_heap \
          t44_simd_overlap t45_post_finding_query t46_ea_tagged_promotion \
          t47_ea_index_scale t47_ea_seg_override t47_ea_addr32 \
          t47_ea_negative_disp t48_sticky_first_finding \
-         t49_sticky_unknown_fallback
+         t49_sticky_unknown_fallback t50_strcpy_model_oob \
+         t51_strncpy_model_padding_oob t52_strcpy_fault_ordering \
+         t53_memcpy_fault_ordering t54_zero_length_models \
+         t55_strcmp_exact_ranges t56_memmove_overlap_symbolic
 
 GUEST_BINS := $(addprefix $(WORK)/,$(TESTS))
 PLT_FILES  := $(addprefix $(WORK)/,$(addsuffix .plt,$(TESTS)))
