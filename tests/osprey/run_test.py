@@ -111,6 +111,42 @@ TESTS = [
         expect_queue_min=1,
         timeout=60,
     ),
+    dict(
+        name="t02_chunk_widths",
+        mode="dump_compare",
+        # Exercise the OSPREY consumer without provenance.  The shared
+        # translator dispatch must not depend on memcheck being enabled.
+        memcheck=0,
+        dump_stem="t02_dump",
+        expected="t02_chunk_widths.expected",
+        rc=(2,),
+        # Exact canonical rows asserted against the checked-in dump
+        # (t02_chunk_widths.expected), byte-identical across three PIE
+        # load biases.  The current fixture exercises representative F01
+        # store paths; the Stage 2.2 audit records the still-missing classes:
+        # integer b/w/l/q stores, LOCK xadd/cmpxchg (4/8), non-lock
+        # cmpxchg8b (8), movsd (8), movaps (16), fstl (8), fstpt/fbstp
+        # (10), fnstenv (28) and fnsave (108) on the 64-bit build.
+        # Width assertions below own the cross-row invariants.
+        dump_assert={
+            "access_symbols_absent": ["t02_fault_store"],
+            "access_widths_allowed": [
+                1, 2, 4, 8, 10, 16, 28, 108,
+            ],
+            "access_widths_min": {
+                1: 1,    # byte store
+                2: 1,    # word store
+                4: 3,    # dword store + lock xadd + lock cmpxchg
+                8: 4,    # qword store, lock xadd/cmpxchg qword,
+                         # cmpxchg8b, movsd, fstl
+                10: 2,   # fstpt + fbstp
+                16: 1,   # movaps 128-bit
+                28: 1,   # fnstenv (64-bit operand)
+                108: 1,  # fnsave (64-bit operand)
+            },
+        },
+        timeout=60,
+    ),
 ]
 
 BASE_ENV = {
@@ -145,14 +181,19 @@ def count_inferred(out):
 # ---------------------------------------------------------------------------
 
 
-def resolve_entrypoint(guest):
-    """main() symbol value from nm; elfload adds the PIE load bias."""
+def resolve_symbol(guest, symbol):
+    """Return a linked symbol value; PIE values are image-relative."""
     nm = subprocess.run(["nm", guest], capture_output=True, text=True)
     for line in nm.stdout.splitlines():
         parts = line.split()
-        if len(parts) == 3 and parts[1] == "T" and parts[2] == "main":
-            return "0x" + parts[0]
-    raise RuntimeError(f"no 'main' symbol in {guest}")
+        if len(parts) == 3 and parts[2] == symbol:
+            return int(parts[0], 16)
+    raise RuntimeError(f"no {symbol!r} symbol in {guest}")
+
+
+def resolve_entrypoint(guest):
+    """main() symbol value from nm; elfload adds the PIE load bias."""
+    return hex(resolve_symbol(guest, "main"))
 
 
 def run_solver(solver_bin, env, run_dir, timeout):
@@ -201,7 +242,7 @@ def run_binradar(test, guest, qemu, solver_bin, workdir):
     env["BINRADAR_ENTRYPOINT"] = resolve_entrypoint(guest)
     env["PLT_INFO_FILE"] = guest + ".plt"
     env["BINRADAR_FORKSERVER_CHILD_TIMEOUT"] = "4"
-    env["BINRADAR_MEMCHECK_ENABLE"] = "1"
+    env["BINRADAR_MEMCHECK_ENABLE"] = str(test.get("memcheck", 1))
     env["BINRADAR_PATCH_CNT"] = "1"
     env["BINRADAR_PATCH_FILTER_FILE"] = ""
     env["BINRADAR_PATCH_SHM_KEY"] = hex(random.getrandbits(32))
@@ -323,12 +364,13 @@ def run_dump_compare(test, workdir, qemu, solver):
     with open(expected_path, "r", errors="replace") as f:
         expected = f.read()
     biases = [None, "0x4100000000", "0x4200000000"]
+    dump_stem = test.get("dump_stem", "t01_dump")
     dumps = []
     outs = []
     rcs = []
     observed_biases = []
     for i, bias in enumerate(biases):
-        dump_path = os.path.join(workdir, f"t01_dump_{i}.txt")
+        dump_path = os.path.join(workdir, f"{dump_stem}_{i}.txt")
         try:
             os.unlink(dump_path)
         except OSError:
@@ -362,7 +404,7 @@ def run_dump_compare(test, workdir, qemu, solver):
                 f"\nPIE load biases were not distinct: {observed_biases}")
     if dumps[0] != expected:
         return (None, outs[0] + "\nDUMP MISMATCH vs checked-in expected")
-    problems = check_dump(test, dumps[0])
+    problems = check_dump(test, dumps[0], guest)
     if problems:
         return (None, outs[0] + "\n" + "\n".join(problems))
     if len(set(rcs)) != 1:
@@ -371,8 +413,8 @@ def run_dump_compare(test, workdir, qemu, solver):
     return (rcs[-1], outs[0])
 
 
-def check_dump(test, dump):
-    """Structural assertions on the canonical dump (Stage-1 gate)."""
+def check_dump(test, dump, guest):
+    """Structural assertions on the canonical dump."""
     want = test.get("dump_assert", {})
     if not want:
         return []
@@ -435,6 +477,37 @@ def check_dump(test, dump):
         zero = any(r[5] == "0" for r in heap_rows)
         if not zero:
             problems.append("no zero-size non-NULL instance observed")
+
+    if "access_widths_allowed" in want or "access_widths_min" in want:
+        # F01 access facts: every recorded width must be one of the
+        # canonical opcode widths (a width like 3 or 5 means a chunk was
+        # mis-sized), and each width exercised by this fixture must appear.
+        # access <pc> <is_store> <kind> <site> <offset> <size> <support>
+        widths = [int(a[6]) for a in
+                  (ln.split() for ln in dump.splitlines()
+                   if ln.startswith("access "))]
+        allowed = set(want.get("access_widths_allowed", []))
+        for w in widths:
+            if allowed and w not in allowed:
+                problems.append(f"access fact width {w} not in "
+                                f"{sorted(allowed)}")
+        from collections import Counter
+        got = Counter(widths)
+        for w, n in want.get("access_widths_min", {}).items():
+            if got[w] < n:
+                problems.append(
+                    f"access facts of width {w}: {got[w]} < {n}")
+
+    access_pcs = {
+        int(fields[1], 16)
+        for fields in (ln.split() for ln in dump.splitlines())
+        if fields and fields[0] == "access"
+    }
+    for symbol in want.get("access_symbols_absent", []):
+        pc = resolve_symbol(guest, symbol)
+        if pc in access_pcs:
+            problems.append(
+                f"faulting access symbol {symbol} unexpectedly recorded at {pc:x}")
     return problems
 
 

@@ -234,6 +234,12 @@ typedef struct OspreyCpuOriginState {
     int64_t ea_disp;
     target_ulong ea_base_val;
     target_ulong ea_index_val;
+    /* Address-mode state of the current instruction (aflags | (override
+     * + 1) << 8) recorded by helper_sem_set_ea / helper_sem_mem_access.
+     * The F01 eligibility gate (aflag == MO_64 && override < 0) is
+     * consumer-side policy in helper_sem_mem_access; push/pop emit no
+     * set_ea, so the mem-access event carries the mode itself. */
+    uint32_t ea_mode;
     /* Origin snapshots taken at set_ea time: the base/index register may
      * be overwritten between set_ea and mem_access (e.g. mov (%rax),%rax
      * kills RAX); the F02 BaseAddr decision must use the pre-access

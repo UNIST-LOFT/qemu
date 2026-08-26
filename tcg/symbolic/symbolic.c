@@ -14,6 +14,7 @@
 #include "symbolic-instrumentation.h"
 #include "../../linux-user/snapshot.h"
 #include "../../linux-user/provenance.h"
+#include "../../linux-user/sem-events.h"
 #include "../../linux-user/osprey.h"
 
 #define DEBUG_CONSISTENCY_CHECK 0
@@ -8672,11 +8673,14 @@ int        parse_translation_block(TranslationBlock* tb, uintptr_t tb_pc,
                         const char* helper_whitelist[] = {
                             "lookup_tb_ptr", "rechecking_single_step",
                             "instrument_call", "instrument_ret",
-                            "osprey_invalidate_reg", "osprey_reg_copy",
-                            "osprey_reg_lea", "osprey_set_ea",
-                            "osprey_mem_access", "osprey_mem_copy",
-                            "osprey_on_load", "osprey_on_store",
-                            "osprey_call", "osprey_ret"};
+                            "sem_reg_invalidate", "sem_reg_copy",
+                            "sem_reg_lea", "sem_reg_lea_dyn",
+                            "sem_reg_addsub_imm", "sem_reg_addsub_reg",
+                            "sem_reg_xchg", "sem_clobber_caller_saved",
+                            "sem_set_pc", "sem_set_ea", "sem_set_ea_vals",
+                            "sem_set_ea_mode", "sem_mem_access",
+                            "sem_on_load", "sem_on_store", "sem_call",
+                            "sem_ret", "sem_rsp_update"};
 
                         int helper_is_whitelisted = 0;
                         for (size_t i = 0;
@@ -9213,20 +9217,17 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
                  * the full copy interval here (access pc = caller),
                  * carrying the dst/src register tags so tagged
                  * underruns/overruns are detected. */
-                if (binradar_memcheck_enabled && len != 0) {
-                    /* The model wrote raw bytes into the destination:
-                     * stale pointer shadow entries there must not be
-                     * reloaded. */
-                    provenance_on_modify_mem((target_ulong)env->regs[R_EDI],
-                                             len);
-                    provenance_model_check_access(env,
-                                             (target_ulong)env->regs[R_EDI],
-                                             len,
-                                             model_caller_addr, R_EDI);
-                    provenance_model_check_access(env,
-                                             (target_ulong)env->regs[R_ESI],
-                                             len,
-                                             model_caller_addr, R_ESI);
+                if (len != 0) {
+                    sem_mem_overwrite((target_ulong)env->regs[R_EDI], len,
+                                      SEM_OP_LIBC_MODEL);
+                    if (binradar_memcheck_enabled) {
+                        provenance_model_check_access(
+                            env, (target_ulong)env->regs[R_EDI], len,
+                            model_caller_addr, R_EDI);
+                        provenance_model_check_access(
+                            env, (target_ulong)env->regs[R_ESI], len,
+                            model_caller_addr, R_ESI);
+                    }
                 }
                 mode = 2;
                 clear_call_args_temps();
@@ -9245,15 +9246,14 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
                 }
                 /* memcheck-only: validate the full fill interval (see
                  * above). */
-                if (binradar_memcheck_enabled && len != 0) {
-                    /* The model wrote the pattern into the destination:
-                     * stale pointer shadow entries must not be reloaded. */
-                    provenance_on_modify_mem((target_ulong)env->regs[R_EDI],
-                                             len);
-                    provenance_model_check_access(env,
-                                             (target_ulong)env->regs[R_EDI],
-                                             len,
-                                             model_caller_addr, R_EDI);
+                if (len != 0) {
+                    sem_mem_overwrite((target_ulong)env->regs[R_EDI], len,
+                                      SEM_OP_LIBC_MODEL);
+                    if (binradar_memcheck_enabled) {
+                        provenance_model_check_access(
+                            env, (target_ulong)env->regs[R_EDI], len,
+                            model_caller_addr, R_EDI);
+                    }
                 }
                 mode = 2;
                 clear_call_args_temps();
@@ -9278,9 +9278,9 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
                     /* The full successful destination write invalidates
                      * stale pointer shadow; the length model checks the
                      * source with its actual RSI provenance. */
+                    sem_mem_overwrite((target_ulong)env->regs[R_EDI], len,
+                                      SEM_OP_LIBC_MODEL);
                     if (binradar_memcheck_enabled) {
-                        provenance_on_modify_mem(
-                            (target_ulong)env->regs[R_EDI], len);
                         provenance_model_check_access(
                             env, (target_ulong)env->regs[R_EDI], len,
                             model_caller_addr, R_EDI);
@@ -9314,9 +9314,9 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
                     }
                     /* strncpy always writes exactly n bytes, including
                      * zero padding after an early source terminator. */
+                    sem_mem_overwrite((target_ulong)env->regs[R_EDI], n,
+                                      SEM_OP_LIBC_MODEL);
                     if (binradar_memcheck_enabled) {
-                        provenance_on_modify_mem(
-                            (target_ulong)env->regs[R_EDI], n);
                         provenance_model_check_access(
                             env, (target_ulong)env->regs[R_EDI], n,
                             model_caller_addr, R_EDI);
@@ -9394,7 +9394,7 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
          * callee instructions.  Invalidate caller-saved registers (RAX,
          * RCX, RDX, RSI, RDI, R8-R11) before installing the modeled
          * return; the pending-alloc return tag (below) re-tags RAX. */
-        provenance_clobber_caller_saved(env);
+        sem_clobber_caller_saved(env);
         PendingAlloc alloc = snapshot_trace_get_pending_allocs(pc);
         target_ulong base = env->regs[R_EAX];
         ProvenancePending pend = provenance_get_pending(env, pc);

@@ -33,6 +33,7 @@
 #include "osprey-internal.h"
 #include "qemu/thread.h"
 #include "provenance.h"
+#include "sem-events.h"
 #include "tcg/symbolic/symbolic-struct.h"
 
 /* ------------------------------------------------------------------ */
@@ -111,6 +112,9 @@ void qemu_mutex_unlock_impl(QemuMutex *m, const char *file, const int line)
 
 QemuMutexLockFunc qemu_mutex_lock_func = qemu_mutex_lock_impl;
 QemuMutexTrylockFunc qemu_mutex_trylock_func = NULL;
+
+static void test_sem_manifest_integrity(void);
+static void test_sem_overwrite_fail_closed(void);
 
 /* ------------------------------------------------------------------ */
 /* Harness                                                             */
@@ -1749,11 +1753,141 @@ int main(void)
     test_mutation_run_isolated();
     test_pre_sample_fatal();
     test_canonical_dump();
+    test_sem_manifest_integrity();
+    test_sem_overwrite_fail_closed();
 
     if (failures != 0) {
         fprintf(stderr, "%d unit test check(s) FAILED\n", failures);
         return 1;
     }
-    printf("PASS osprey_unit (33/33)\n");
+    printf("PASS osprey_unit (35/35)\n");
     return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Semantic-event manifest (Stage 2.2)                                 */
+/* ------------------------------------------------------------------ */
+
+static void test_sem_manifest_integrity(void)
+{
+    /* Every class has a name; every name is non-empty. */
+    for (int i = 0; i < SEM_OP_CLASS_COUNT; i++) {
+        CHECK(sem_op_class_name[i] != NULL, "class name present");
+        CHECK(sem_op_class_name[i][0] != '\0', "class name non-empty");
+    }
+    /* Only UNKNOWN is invalid (fail-closed fallback). */
+    CHECK(!sem_op_class_valid[SEM_OP_UNKNOWN], "UNKNOWN invalid");
+    int valid_count = 0;
+    for (int i = 0; i < SEM_OP_CLASS_COUNT; i++) {
+        if (sem_op_class_valid[i]) valid_count++;
+    }
+    CHECK(valid_count == SEM_OP_CLASS_COUNT - 1, "exactly one invalid");
+
+    /* The classified and emittable helper sets must be an exact,
+     * duplicate-free match. */
+    int n_helpers = 0;
+    for (const SemHelperClass *h = sem_helper_class_table;
+         h->helper_name != NULL; h++, n_helpers++) {
+        CHECK(h->helper_name[0] != '\0', "helper name non-empty");
+        CHECK((unsigned int)h->op_class < SEM_OP_CLASS_COUNT,
+              "helper class in range");
+        CHECK(sem_op_class_valid[(unsigned int)h->op_class],
+              "helper class valid");
+        int matches = 0;
+        for (const char *const *e = sem_emittable_helpers; *e != NULL; e++) {
+            if (strcmp(*e, h->helper_name) == 0) {
+                matches++;
+            }
+        }
+        CHECK(matches == 1, "classified helper appears once in emit set");
+    }
+    CHECK(n_helpers == 18, "exact semantic helper count");
+
+    int n_emittable = 0;
+    for (const char *const *e = sem_emittable_helpers; *e != NULL; e++) {
+        int matches = 0;
+        for (const SemHelperClass *h = sem_helper_class_table;
+             h->helper_name != NULL; h++) {
+            if (strcmp(*e, h->helper_name) == 0) {
+                matches++;
+            }
+        }
+        CHECK(matches == 1, "emittable helper appears once in class set");
+        n_emittable++;
+    }
+    CHECK(n_emittable == n_helpers, "semantic helper sets have equal size");
+}
+
+static void test_sem_overwrite_fail_closed(void)
+{
+    CPUArchState env;
+    PtrTag tag;
+    memset(&env, 0, sizeof(env));
+    memset(&tag, 0, sizeof(tag));
+    tag.valid = true;
+    tag.concrete_value = 0x1000;
+
+    OspreyCpuOriginState *ost = osprey_cpu_origin(&env);
+    ost->regs[R_EAX].valid = 1;
+    ost->regs[R_EAX].kind = OSPREY_ORIGIN_ADDRESS;
+    provenance_set_reg_tag(&env, R_EAX, tag);
+    provenance_mem_store_tag(0x1000, tag);
+
+    /* Inactive consumers retain their private state. */
+    binradar_memcheck_enabled = 0;
+    osprey_collect_enabled = 0;
+    sem_reg_overwrite(&env, R_EAX, SEM_OP_SNAPSHOT);
+    sem_mem_overwrite(0x1000, 8, SEM_OP_SNAPSHOT);
+    CHECK(provenance_get_reg_tag(&env, R_EAX).valid,
+          "inactive provenance register unchanged");
+    CHECK(provenance_mem_load_tag(0x1000).valid,
+          "inactive provenance memory unchanged");
+    CHECK(ost->regs[R_EAX].valid,
+          "inactive OSPREY register unchanged");
+
+    /* Invalid class values are bounds-safe and still fail closed for an
+     * active consumer by invalidating, never by preserving metadata. */
+    binradar_memcheck_enabled = 1;
+    sem_reg_overwrite(&env, R_EAX, (SemOpClass)SEM_OP_CLASS_COUNT);
+    sem_mem_overwrite(0x1000, 8, (SemOpClass)-1);
+    CHECK(!provenance_get_reg_tag(&env, R_EAX).valid,
+          "invalid class kills provenance register");
+    CHECK(!provenance_mem_load_tag(0x1000).valid,
+          "negative class kills provenance memory");
+
+    /* OSPREY register/context overwrites kill origins and consume any
+     * fault-left EA record without requiring provenance to be active. */
+    binradar_memcheck_enabled = 0;
+    osprey_collect_enabled = 1;
+    ost->regs[R_EAX].valid = 1;
+    ost->regs[R_EAX].kind = OSPREY_ORIGIN_ADDRESS;
+    sem_reg_overwrite(&env, R_EAX, SEM_OP_UNKNOWN);
+    CHECK(!ost->regs[R_EAX].valid, "OSPREY register overwrite invalidates");
+
+    for (int i = 0; i < CPU_NB_REGS; i++) {
+        ost->regs[i].valid = 1;
+        ost->regs[i].kind = OSPREY_ORIGIN_ADDRESS;
+    }
+    ost->ea_valid = true;
+    ost->ea_mode = MO_64;
+    ost->ea_base_origin.valid = 1;
+    ost->ea_index_origin.valid = 1;
+    sem_context_replace(&env);
+    for (int i = 0; i < CPU_NB_REGS; i++) {
+        CHECK(!ost->regs[i].valid, "context replacement kills OSPREY reg");
+    }
+    CHECK(!ost->ea_valid && ost->ea_mode == 0,
+          "context replacement consumes EA metadata");
+    CHECK(!ost->ea_base_origin.valid && !ost->ea_index_origin.valid,
+          "context replacement clears EA origins");
+
+    ost->regs[R_EAX].valid = 1;
+    ost->regs[R_EBX].valid = 1;
+    sem_clobber_caller_saved(&env);
+    CHECK(!ost->regs[R_EAX].valid, "modeled call kills caller-saved origin");
+    CHECK(ost->regs[R_EBX].valid, "modeled call keeps callee-saved origin");
+
+    sem_reg_overwrite(NULL, 0, SEM_OP_UNKNOWN);
+    sem_context_replace(NULL);
+    osprey_collect_enabled = 0;
 }

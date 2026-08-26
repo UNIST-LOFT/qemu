@@ -237,37 +237,30 @@ DEF_HELPER_3(instrument_call, void, tl, tl, tl)
 DEF_HELPER_2(instrument_ret, void, tl, tl)
 #endif
 
-/* Provenance helpers for heap OOB/UAF detection.
- * These have side effects (modify provenance shadow state) and read/write
- * global state, so they must NOT use TCG_CALL_NO_RWG_SE (the default for
- * DEF_HELPER_N).  Use TCG_CALL_NO_RWG to prevent the TCG optimizer from
- * reordering or eliminating them. */
-DEF_HELPER_FLAGS_3(prov_invalidate_reg, TCG_CALL_NO_RWG, void, env, i32, tl)
-DEF_HELPER_FLAGS_6(prov_mov_reg, TCG_CALL_NO_RWG, void, env, i32, i32, tl, tl, tl)
-DEF_HELPER_FLAGS_6(prov_lea_imm, TCG_CALL_NO_RWG, void, env, i32, i32, tl, tl, tl)
-DEF_HELPER_FLAGS_6(prov_addsub_imm, TCG_CALL_NO_RWG, void, env, i32, tl, tl, tl, tl)
-DEF_HELPER_FLAGS_6(prov_addsub_reg, TCG_CALL_NO_RWG, void, env, i32, i32, tl, tl, tl)
-DEF_HELPER_FLAGS_1(prov_clobber_caller_saved, TCG_CALL_NO_RWG, void, env)
-DEF_HELPER_FLAGS_3(prov_xchg_reg, TCG_CALL_NO_RWG, void, env, i32, i32)
-DEF_HELPER_FLAGS_5(prov_on_load, TCG_CALL_NO_RWG, void, env, i32, tl, tl, tl)
-DEF_HELPER_FLAGS_4(prov_on_store, TCG_CALL_NO_RWG, void, env, i32, tl, tl)
-DEF_HELPER_FLAGS_2(prov_set_pc, TCG_CALL_NO_RWG, void, env, tl)
-DEF_HELPER_FLAGS_4(prov_check_access, TCG_CALL_NO_RWG, void, env, tl, tl, tl)
-DEF_HELPER_FLAGS_6(prov_set_ea, TCG_CALL_NO_RWG, void, env, i32, i32, i32, tl, i32)
-
-/* OSPREY structural type-analysis hooks (in-process replacement for the
- * external Python analyzer).  Same side-effect discipline as the
- * provenance helpers: TCG_CALL_NO_RWG prevents elimination/reordering. */
-DEF_HELPER_FLAGS_2(osprey_invalidate_reg, TCG_CALL_NO_RWG, void, env, i32)
-DEF_HELPER_FLAGS_5(osprey_reg_copy, TCG_CALL_NO_RWG, void, env, i32, i32, tl, tl)
-DEF_HELPER_FLAGS_6(osprey_reg_lea, TCG_CALL_NO_RWG, void, env, i32, i32, tl, tl, tl)
-DEF_HELPER_FLAGS_5(osprey_mem_access, TCG_CALL_NO_RWG, void, env, tl, tl, tl, i32)
-DEF_HELPER_FLAGS_4(osprey_mem_copy, TCG_CALL_NO_RWG, void, env, tl, tl, tl)
-DEF_HELPER_FLAGS_5(osprey_set_ea, TCG_CALL_NO_RWG, void, env, i32, i32, tl, tl)
-DEF_HELPER_FLAGS_4(osprey_on_load, TCG_CALL_NO_RWG, void, env, i32, tl, tl)
-DEF_HELPER_FLAGS_5(osprey_on_store, TCG_CALL_NO_RWG, void, env, i32, tl, tl, tl)
-DEF_HELPER_3(osprey_call, void, env, tl, tl)
-DEF_HELPER_3(osprey_ret, void, env, tl, tl)
-DEF_HELPER_3(osprey_rsp_update, void, env, tl, tl)
+/* Shared semantic-event helpers (Stage 2.2).  One neutral event API
+ * replacing the parallel provenance/OSPREY coverage; the helper bodies
+ * in linux-user/sem-events.c fan out to both consumers with per-consumer
+ * gates.  These have side effects (modify shadow state) and read/write
+ * global state, so they must NOT use TCG_CALL_NO_RWG_SE (the default
+ * for DEF_HELPER_N).  Use TCG_CALL_NO_RWG to prevent the TCG optimizer
+ * from reordering or eliminating them. */
+DEF_HELPER_FLAGS_3(sem_reg_invalidate, TCG_CALL_NO_RWG, void, env, i32, tl)
+DEF_HELPER_FLAGS_6(sem_reg_copy, TCG_CALL_NO_RWG, void, env, i32, i32, tl, tl, tl)
+DEF_HELPER_FLAGS_6(sem_reg_lea, TCG_CALL_NO_RWG, void, env, i32, i32, tl, tl, tl)
+DEF_HELPER_FLAGS_6(sem_reg_lea_dyn, TCG_CALL_NO_RWG, void, env, i32, i32, tl, tl, tl)
+DEF_HELPER_FLAGS_6(sem_reg_addsub_imm, TCG_CALL_NO_RWG, void, env, i32, tl, tl, tl, tl)
+DEF_HELPER_FLAGS_6(sem_reg_addsub_reg, TCG_CALL_NO_RWG, void, env, i32, i32, tl, tl, tl)
+DEF_HELPER_FLAGS_1(sem_clobber_caller_saved, TCG_CALL_NO_RWG, void, env)
+DEF_HELPER_FLAGS_3(sem_reg_xchg, TCG_CALL_NO_RWG, void, env, i32, i32)
+DEF_HELPER_FLAGS_5(sem_on_load, TCG_CALL_NO_RWG, void, env, i32, tl, tl, tl)
+DEF_HELPER_FLAGS_5(sem_on_store, TCG_CALL_NO_RWG, void, env, i32, tl, tl, tl)
+DEF_HELPER_FLAGS_2(sem_set_pc, TCG_CALL_NO_RWG, void, env, tl)
+DEF_HELPER_FLAGS_5(sem_mem_access, TCG_CALL_NO_RWG, void, env, tl, tl, tl, i32)
+DEF_HELPER_FLAGS_6(sem_set_ea, TCG_CALL_NO_RWG, void, env, i32, i32, i32, tl, i32)
+DEF_HELPER_FLAGS_3(sem_set_ea_vals, TCG_CALL_NO_RWG, void, env, tl, tl)
+DEF_HELPER_FLAGS_2(sem_set_ea_mode, TCG_CALL_NO_RWG, void, env, i32)
+DEF_HELPER_3(sem_call, void, env, tl, tl)
+DEF_HELPER_3(sem_ret, void, env, tl, tl)
+DEF_HELPER_3(sem_rsp_update, void, env, tl, tl)
 
 #endif

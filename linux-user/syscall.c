@@ -21,7 +21,7 @@
 #include "qemu/cutils.h"
 #include "qemu/path.h"
 #include "snapshot.h"
-#include "provenance.h"
+#include "sem-events.h"
 #include "osprey.h"
 #include <elf.h>
 #include <endian.h>
@@ -2254,20 +2254,17 @@ set_timeout:
 }
 
 /* do_getsockopt() Must return target values and target errnos. */
-/* Provenance: invalidate the exact getsockopt output ranges (Phase 4).
+/* Shared event for the exact getsockopt output ranges.
  * optval_bytes is the number of bytes QEMU actually wrote to optval; the
  * 4-byte optlen word is always written back on success. */
-static inline void prov_invalidate_getsockopt(abi_ulong optval_addr,
+static inline void sem_overwrite_getsockopt(abi_ulong optval_addr,
                                               abi_ulong optlen_addr,
                                               abi_ulong optval_bytes)
 {
-    if (!binradar_memcheck_enabled) {
-        return;
-    }
     if (optval_bytes > 0) {
-        provenance_on_modify_mem(optval_addr, optval_bytes);
+        sem_mem_overwrite(optval_addr, optval_bytes, SEM_OP_SYSCALL);
     }
-    provenance_on_modify_mem(optlen_addr, sizeof(uint32_t));
+    sem_mem_overwrite(optlen_addr, sizeof(uint32_t), SEM_OP_SYSCALL);
 }
 
 static abi_long do_getsockopt(int sockfd, int level, int optname,
@@ -2317,7 +2314,7 @@ static abi_long do_getsockopt(int sockfd, int level, int optname,
             if (put_user_u32(len, optlen)) {
                 return -TARGET_EFAULT;
             }
-            prov_invalidate_getsockopt(optval_addr, optlen,
+            sem_overwrite_getsockopt(optval_addr, optlen,
                                         sizeof(struct target_ucred));
             break;
         }
@@ -2352,7 +2349,7 @@ static abi_long do_getsockopt(int sockfd, int level, int optname,
             if (put_user_u32(len, optlen)) {
                 return -TARGET_EFAULT;
             }
-            prov_invalidate_getsockopt(optval_addr, optlen,
+            sem_overwrite_getsockopt(optval_addr, optlen,
                                         sizeof(struct target_linger));
             break;
         }
@@ -2444,7 +2441,7 @@ static abi_long do_getsockopt(int sockfd, int level, int optname,
         }
         if (put_user_u32(len, optlen))
             return -TARGET_EFAULT;
-        prov_invalidate_getsockopt(optval_addr, optlen,
+        sem_overwrite_getsockopt(optval_addr, optlen,
                                     (abi_ulong)(len == 4 ? 4 : 1));
         break;
     case SOL_IP:
@@ -2477,14 +2474,14 @@ static abi_long do_getsockopt(int sockfd, int level, int optname,
                 if (put_user_u32(len, optlen)
                     || put_user_u8(val, optval_addr))
                     return -TARGET_EFAULT;
-                prov_invalidate_getsockopt(optval_addr, optlen, 1);
+                sem_overwrite_getsockopt(optval_addr, optlen, 1);
             } else {
                 if (len > sizeof(int))
                     len = sizeof(int);
                 if (put_user_u32(len, optlen)
                     || put_user_u32(val, optval_addr))
                     return -TARGET_EFAULT;
-                prov_invalidate_getsockopt(optval_addr, optlen, 4);
+                sem_overwrite_getsockopt(optval_addr, optlen, 4);
             }
             break;
         default:
@@ -2540,14 +2537,14 @@ static abi_long do_getsockopt(int sockfd, int level, int optname,
                 if (put_user_u32(len, optlen)
                     || put_user_u8(val, optval_addr))
                     return -TARGET_EFAULT;
-                prov_invalidate_getsockopt(optval_addr, optlen, 1);
+                sem_overwrite_getsockopt(optval_addr, optlen, 1);
             } else {
                 if (len > sizeof(int))
                     len = sizeof(int);
                 if (put_user_u32(len, optlen)
                     || put_user_u32(val, optval_addr))
                     return -TARGET_EFAULT;
-                prov_invalidate_getsockopt(optval_addr, optlen, 4);
+                sem_overwrite_getsockopt(optval_addr, optlen, 4);
             }
             break;
         default:
@@ -2690,17 +2687,17 @@ static void unlock_iovec(struct iovec *vec, abi_ulong count, int copy)
     g_free(vec);
 }
 
-/* Invalidate from the locked host vector captured before the syscall.  The
- * guest iovec array may overlap an output buffer and be overwritten by a
- * successful read, so reconstructing destinations from it afterward is not
- * correct. */
-static void provenance_on_modify_iovec(struct iovec *vec, abi_ulong count,
+/* Emit overwrite events from the locked host vector captured before the
+ * syscall.  The guest iovec array may overlap an output buffer and be
+ * overwritten by a successful read, so reconstructing destinations from it
+ * afterward is not correct. */
+static void sem_overwrite_iovec(struct iovec *vec, abi_ulong count,
                                        abi_long written)
 {
     abi_ulong *guest_bases;
     target_ulong left;
 
-    if (!binradar_memcheck_enabled || written <= 0) {
+    if (written <= 0) {
         return;
     }
 
@@ -2713,7 +2710,7 @@ static void provenance_on_modify_iovec(struct iovec *vec, abi_ulong count,
             n = left;
         }
         if (n > 0) {
-            provenance_on_modify_mem(guest_bases[i], n);
+            sem_mem_overwrite(guest_bases[i], n, SEM_OP_SYSCALL);
             left -= n;
         }
     }
@@ -2946,48 +2943,44 @@ static abi_long do_sendrecvmsg_locked(int fd, abi_ulong target_msg,
              * target ancillary/name conversion can fail.  Invalidate from
              * the pre-syscall locked vector immediately so an EFAULT during
              * those conversions cannot leave stale payload provenance. */
-            provenance_on_modify_iovec(vec, count, len);
+            sem_overwrite_iovec(vec, count, len);
             if (fd_trans_host_to_target_data(fd)) {
                 ret = fd_trans_host_to_target_data(fd)(msg.msg_iov->iov_base,
                                                MIN(msg.msg_iov->iov_len, len));
             } else {
                 ret = host_to_target_cmsg(msgp, &msg);
-                if (!is_error(ret) && binradar_memcheck_enabled) {
+                if (!is_error(ret)) {
                     target_ulong ctrl = tswapal(msgp->msg_controllen);
 
                     if (ctrl > 0) {
-                        provenance_on_modify_mem(
-                            tswapal(msgp->msg_control), ctrl);
+                        sem_mem_overwrite(
+                            tswapal(msgp->msg_control), ctrl, SEM_OP_SYSCALL);
                     }
-                    provenance_on_modify_mem(
+                    sem_mem_overwrite(
                         target_msg + offsetof(struct target_msghdr,
                                               msg_controllen),
-                        sizeof(abi_long));
+                        sizeof(abi_long), SEM_OP_SYSCALL);
                 }
             }
             if (!is_error(ret)) {
                 msgp->msg_namelen = tswap32(msg.msg_namelen);
                 msgp->msg_flags = tswap32(msg.msg_flags);
-                if (binradar_memcheck_enabled) {
-                    provenance_on_modify_mem(
-                        target_msg + offsetof(struct target_msghdr,
-                                              msg_namelen),
-                        sizeof(int));
-                    provenance_on_modify_mem(
-                        target_msg + offsetof(struct target_msghdr,
-                                              msg_flags),
-                        sizeof(unsigned int));
-                }
+                sem_mem_overwrite(
+                    target_msg + offsetof(struct target_msghdr,
+                                          msg_namelen),
+                    sizeof(int), SEM_OP_SYSCALL);
+                sem_mem_overwrite(
+                    target_msg + offsetof(struct target_msghdr,
+                                          msg_flags),
+                    sizeof(unsigned int), SEM_OP_SYSCALL);
                 if (msg.msg_name != NULL && msg.msg_name != (void *)-1) {
                     ret = host_to_target_sockaddr(tswapal(msgp->msg_name),
                                     msg.msg_name, msg.msg_namelen);
                     if (ret) {
                         goto out;
                     }
-                    if (binradar_memcheck_enabled) {
-                        provenance_on_modify_mem(tswapal(msgp->msg_name),
-                                                 msg.msg_namelen);
-                    }
+                    sem_mem_overwrite(tswapal(msgp->msg_name),
+                                      msg.msg_namelen, SEM_OP_SYSCALL);
                 }
 
                 ret = len;
@@ -3282,16 +3275,14 @@ static abi_long do_recvfrom(int fd, abi_ulong msg, size_t len, int flags,
          * returned sockaddr (MIN(addrlen, ret_addrlen) bytes), and the
          * in/out addrlen word.  Invalidate exactly those ranges so stale
          * pointer-shadow entries are not reloaded (Phase 4). */
-        if (binradar_memcheck_enabled) {
-            if (ret > 0) {
-                provenance_on_modify_mem(msg, ret);
-            }
-            if (target_addr) {
-                provenance_on_modify_mem(target_addr,
-                                         MIN(addrlen, ret_addrlen));
-                provenance_on_modify_mem(target_addrlen,
-                                         sizeof(uint32_t));
-            }
+        if (ret > 0) {
+            sem_mem_overwrite(msg, ret, SEM_OP_SYSCALL);
+        }
+        if (target_addr) {
+            sem_mem_overwrite(target_addr, MIN(addrlen, ret_addrlen),
+                              SEM_OP_SYSCALL);
+            sem_mem_overwrite(target_addrlen, sizeof(uint32_t),
+                              SEM_OP_SYSCALL);
         }
         unlock_user(host_msg, msg, len);
     } else {
@@ -9745,7 +9736,7 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
             struct iovec *vec = lock_iovec(VERIFY_WRITE, arg2, arg3, 0);
             if (vec != NULL) {
                 ret = get_errno(safe_readv(arg1, vec, arg3));
-                provenance_on_modify_iovec(vec, arg3, ret);
+                sem_overwrite_iovec(vec, arg3, ret);
                 unlock_iovec(vec, arg3, 1);
             } else {
                 ret = -host_to_target_errno(errno);
@@ -9772,7 +9763,7 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
 
                 target_to_host_low_high(arg4, arg5, &low, &high);
                 ret = get_errno(safe_preadv(arg1, vec, arg3, low, high));
-                provenance_on_modify_iovec(vec, arg3, ret);
+                sem_overwrite_iovec(vec, arg3, ret);
                 unlock_iovec(vec, arg3, 1);
             } else {
                 ret = -host_to_target_errno(errno);

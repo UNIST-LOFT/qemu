@@ -43,282 +43,224 @@
 
 #include "../../linux-user/provenance.h"
 #include "../../linux-user/osprey.h"
+#include "../../linux-user/sem-events.h"
 
 /* Declared here so the provenance helper wrappers below can pass register
  * values as explicit helper args (env->regs may be stale inside helpers). */
 static TCGv cpu_regs[CPU_NB_REGS];
 
-/* Provenance helper wrappers — the DEF_HELPER system generates
- * gen_helper_prov_* functions.  These update pointer-provenance shadow
- * state at runtime.  Side-effect-only w.r.t. guest values and symbolic state. */
+/* Shared semantic-event wrappers (Stage 2.2).  One neutral dispatch
+ * point per semantic operation: the single gen_sem_* wrapper emits one
+ * DEF_HELPER-declared helper (linux-user/sem-events.c) that fans out to
+ * the provenance and OSPREY consumers with per-consumer gates.  The
+ * parallel gen_prov_* / gen_osprey_* call-site lists are gone. */
 
-static void gen_prov_invalidate_reg(int reg_idx, target_ulong pc) {
-    if (!binradar_memcheck_enabled) return;
+static void gen_sem_reg_invalidate(int reg_idx, target_ulong pc) {
+    if (!sem_events_active()) return;
     TCGv_i32 t_reg = tcg_const_i32(reg_idx);
     TCGv t_pc = tcg_const_tl(pc);
-    gen_helper_prov_invalidate_reg(cpu_env, t_reg, t_pc);
+    gen_helper_sem_reg_invalidate(cpu_env, t_reg, t_pc);
     tcg_temp_free_i32(t_reg);
     tcg_temp_free(t_pc);
-}
-
-/* ---- OSPREY structural type-analysis emission ---- */
-
-static bool osprey_active(void) {
-    return osprey_collect_enabled != 0;
-}
-
-/* Default-kill for any architectural register write.  Emitted from the
- * central register-write path (gen_op_mov_reg_v) so every write is
- * either a sound transfer or an explicit invalidation. */
-static void gen_osprey_invalidate_reg(int reg_idx) {
-    if (!osprey_active()) return;
-    TCGv_i32 t_reg = tcg_const_i32(reg_idx);
-    gen_helper_osprey_invalidate_reg(cpu_env, t_reg);
-    tcg_temp_free_i32(t_reg);
 }
 
 /* Full-width register copy: transfer the origin with a runtime
  * value-consistency check. */
-static void gen_osprey_reg_copy(int dst_idx, int src_idx) {
-    if (!osprey_active()) return;
-    TCGv_i32 t_dst = tcg_const_i32(dst_idx);
-    TCGv_i32 t_src = tcg_const_i32(src_idx);
-    gen_helper_osprey_reg_copy(cpu_env, t_dst, t_src,
-                               cpu_regs[src_idx], cpu_regs[dst_idx]);
-    tcg_temp_free_i32(t_dst);
-    tcg_temp_free_i32(t_src);
-}
-
-/* lea dst, [base + disp]: propagate the ADDRESS origin with the checked
- * constant offset. */
-static void gen_osprey_reg_lea(int dst_idx, int base_idx, target_long disp) {
-    if (!osprey_active()) return;
-    TCGv_i32 t_dst = tcg_const_i32(dst_idx);
-    TCGv_i32 t_base = tcg_const_i32(base_idx);
-    TCGv t_disp = tcg_const_tl((target_ulong)disp);
-    gen_helper_osprey_reg_lea(cpu_env, t_dst, t_base, t_disp,
-                              cpu_regs[dst_idx], cpu_regs[base_idx]);
-    tcg_temp_free_i32(t_dst);
-    tcg_temp_free_i32(t_base);
-    tcg_temp_free(t_disp);
-}
-
-/* RSP write (push/pop/add-sub imm/call): re-derive the RSP origin from
- * the live frame stack (see osprey_on_rsp_update).  Only in-image
- * writes re-derive; libc writes invalidate. */
-static void gen_osprey_rsp_update(TCGv new_sp, target_ulong pc) {
-    if (!osprey_active()) return;
-    TCGv t_pc = tcg_const_tl(pc);
-    gen_helper_osprey_rsp_update(cpu_env, new_sp, t_pc);
-    tcg_temp_free(t_pc);
-}
-
-/* Effective-address metadata: emitted before a guest access (only in
- * 64-bit modes without segment override), consumed after it succeeds.
- * packed = valid<<31 | (base+1)<<16 | (index+1)<<8 | scale. */
-static void gen_osprey_set_ea(int base_reg, int index_reg, int scale,
-                              target_long disp, TCGv base_val,
-                              TCGv index_val) {
-    if (!osprey_active()) return;
-    uint32_t packed = 0x80000000u;
-    packed |= (uint32_t)(base_reg + 1) << 16;
-    packed |= (uint32_t)(index_reg + 1) << 8;
-    packed |= (uint32_t)scale;
-    TCGv_i32 t_packed = tcg_const_i32(packed);
-    TCGv_i32 t_disp = tcg_const_i32((uint32_t)(int32_t)disp);
-    TCGv t_base_val = base_val != NULL ? base_val : tcg_const_tl(0);
-    TCGv t_index_val = index_val != NULL ? index_val : tcg_const_tl(0);
-    gen_helper_osprey_set_ea(cpu_env, t_packed, t_disp, t_base_val,
-                             t_index_val);
-    tcg_temp_free_i32(t_packed);
-    tcg_temp_free_i32(t_disp);
-    if (base_val == NULL) tcg_temp_free(t_base_val);
-    if (index_val == NULL) tcg_temp_free(t_index_val);
-}
-
-/* Access fact + EA consumption: emitted after a successful load/store. */
-static void gen_osprey_mem_access(TCGv addr, TCGMemOp ot, target_ulong pc,
-                                  bool is_store) {
-    if (!osprey_active()) return;
-    TCGv t_size = tcg_const_tl(1 << ot);
-    TCGv t_pc = tcg_const_tl(pc);
-    TCGv_i32 t_store = tcg_const_i32(is_store ? 1 : 0);
-    gen_helper_osprey_mem_access(cpu_env, addr, t_size, t_pc, t_store);
-    tcg_temp_free(t_size);
-    tcg_temp_free(t_pc);
-    tcg_temp_free_i32(t_store);
-}
-
-/* Aligned native-width spill/reload shadow hooks. */
-static void gen_osprey_on_load(int dst_idx, TCGv t_addr, TCGMemOp ot) {
-    if (!osprey_active()) return;
-    TCGv_i32 t_dst = tcg_const_i32(dst_idx);
-    TCGv t_size = tcg_const_tl(1 << ot);
-    gen_helper_osprey_on_load(cpu_env, t_dst, t_addr, t_size);
-    tcg_temp_free_i32(t_dst);
-    tcg_temp_free(t_size);
-}
-
-static void gen_osprey_on_store(int src_idx, TCGv t_addr, TCGMemOp ot) {
-    if (!osprey_active()) return;
-    TCGv_i32 t_src = tcg_const_i32(src_idx);
-    TCGv t_size = tcg_const_tl(1 << ot);
-    if (src_idx >= 0 && src_idx < CPU_NB_REGS) {
-        gen_helper_osprey_on_store(cpu_env, t_src, t_addr, t_size,
-                                   cpu_regs[src_idx]);
-    } else {
-        /* OR_TMP0 (immediates, string stores): spill nothing; the
-         * helper invalidates the slot.  Pass a zero value. */
-        TCGv t_zero = tcg_const_tl(0);
-        gen_helper_osprey_on_store(cpu_env, t_src, t_addr, t_size,
-                                   t_zero);
-        tcg_temp_free(t_zero);
-    }
-    tcg_temp_free_i32(t_src);
-    tcg_temp_free(t_size);
-}
-
-static void gen_prov_mov_reg(int dst_idx, int src_idx, target_ulong pc) {
-    if (!binradar_memcheck_enabled) return;
+static void gen_sem_reg_copy(int dst_idx, int src_idx, target_ulong pc) {
+    if (!sem_events_active()) return;
     TCGv_i32 t_dst = tcg_const_i32(dst_idx);
     TCGv_i32 t_src = tcg_const_i32(src_idx);
     TCGv t_pc = tcg_const_tl(pc);
-    /* Pass register values as explicit args (see gen_prov_addsub_reg:
-     * env->regs may be stale in the helper). */
-    gen_helper_prov_mov_reg(cpu_env, t_dst, t_src,
+    /* Pass register values as explicit args (env->regs may be stale
+     * inside the helper). */
+    gen_helper_sem_reg_copy(cpu_env, t_dst, t_src,
                             cpu_regs[src_idx], cpu_regs[dst_idx], t_pc);
     tcg_temp_free_i32(t_dst);
     tcg_temp_free_i32(t_src);
     tcg_temp_free(t_pc);
 }
 
-static void gen_prov_lea_imm(int dst_idx, int base_idx, int64_t disp,
-                             target_ulong pc) {
-    if (!binradar_memcheck_enabled) return;
-    /* Arity is full (env + 5); record the exact instruction PC in the
-     * per-CPU scratch (helper_prov_set_pc) so producer metadata carries
-     * the full guest PC, not a truncated low-16-bits approximation. */
+/* lea dst, [base + disp] (translation-time disp).  The exact insn PC is
+ * recorded in the provenance scratch via sem_set_pc first (arity is
+ * full: env + 5 args). */
+static void gen_sem_reg_lea(int dst_idx, int base_idx, int64_t disp,
+                            target_ulong pc) {
+    if (!sem_events_active()) return;
     TCGv t_pc = tcg_const_tl(pc);
-    gen_helper_prov_set_pc(cpu_env, t_pc);
+    gen_helper_sem_set_pc(cpu_env, t_pc);
     tcg_temp_free(t_pc);
     TCGv_i32 t_dst = tcg_const_i32(dst_idx);
     TCGv_i32 t_base = tcg_const_i32(base_idx);
     TCGv t_disp = tcg_const_tl((target_ulong)disp);
-    /* Pass the post-instruction register value as explicit arg (env->regs
-     * may be stale inside the helper). */
-    gen_helper_prov_lea_imm(cpu_env, t_dst, t_base, t_disp,
-                            cpu_regs[dst_idx], cpu_regs[base_idx]);
+    gen_helper_sem_reg_lea(cpu_env, t_dst, t_base, t_disp,
+                           cpu_regs[dst_idx], cpu_regs[base_idx]);
     tcg_temp_free_i32(t_dst);
     tcg_temp_free_i32(t_base);
     tcg_temp_free(t_disp);
 }
-/* lea dst, [base + index*scale + disp]: the result is exactly
- * base_value + (index*scale + disp), so the pointer identity of base is
- * preserved with the runtime delta folded into the offset — the same
- * checked arithmetic as provenance_lea_imm (base tag valid and
- * concrete_value == pre_base verified inside the helper), with the
- * delta computed at runtime instead of translation time.  pre_base is
- * the base register's value BEFORE the instruction (required when
- * dst == base: cpu_regs[base] is the post-instruction value by the time
- * the helper runs). */
-static void gen_prov_lea_dyn(int dst_idx, int base_idx, target_ulong pc,
-                             TCGv pre_base) {
-    if (!binradar_memcheck_enabled) return;
+
+/* lea dst, [base + index*scale + disp]: runtime delta variant.  The
+ * delta (dst_val - pre_base) is computed at translation time via TCG;
+ * the OSPREY consumer is a documented no-op (indexed lea has no
+ * constant offset; preserves today's stale-origin behavior).  pre_base
+ * is the base register's value BEFORE the instruction (required when
+ * dst == base). */
+static void gen_sem_reg_lea_dyn(int dst_idx, int base_idx, target_ulong pc,
+                                TCGv pre_base) {
+    if (!sem_events_active()) return;
     TCGv t_pc = tcg_const_tl(pc);
-    gen_helper_prov_set_pc(cpu_env, t_pc);
+    gen_helper_sem_set_pc(cpu_env, t_pc);
     tcg_temp_free(t_pc);
     TCGv_i32 t_dst = tcg_const_i32(dst_idx);
     TCGv_i32 t_base = tcg_const_i32(base_idx);
     TCGv t_delta = tcg_temp_new();
     tcg_gen_sub_tl(t_delta, cpu_regs[dst_idx], pre_base);
-    gen_helper_prov_lea_imm(cpu_env, t_dst, t_base, t_delta,
-                            cpu_regs[dst_idx], pre_base);
+    gen_helper_sem_reg_lea_dyn(cpu_env, t_dst, t_base, t_delta,
+                               cpu_regs[dst_idx], pre_base);
     tcg_temp_free_i32(t_dst);
     tcg_temp_free_i32(t_base);
     tcg_temp_free(t_delta);
 }
 
-static void gen_prov_addsub_imm(int reg_idx, int64_t delta, TCGv pre,
-                                target_ulong pc) {
-    if (!binradar_memcheck_enabled) return;
+static void gen_sem_reg_addsub_imm(int reg_idx, int64_t delta, TCGv pre,
+                                   target_ulong pc) {
+    if (!sem_events_active()) return;
     TCGv_i32 t_reg = tcg_const_i32(reg_idx);
     TCGv t_delta = tcg_const_tl((target_ulong)delta);
     TCGv t_pc = tcg_const_tl(pc);
     /* pre was snapshotted BEFORE gen_op's write-back (pre-op value);
-     * cpu_regs[reg_idx] is the post-op value.  Passing both as explicit
-     * args avoids stale env->regs reads inside the helper. */
-    gen_helper_prov_addsub_imm(cpu_env, t_reg, t_delta, pre,
-                               cpu_regs[reg_idx], t_pc);
+     * cpu_regs[reg_idx] is the post-op value. */
+    gen_helper_sem_reg_addsub_imm(cpu_env, t_reg, t_delta, pre,
+                                  cpu_regs[reg_idx], t_pc);
     tcg_temp_free_i32(t_reg);
     tcg_temp_free(t_delta);
     tcg_temp_free(t_pc);
     tcg_temp_free(pre);
 }
 
-/* reg-reg ADD/SUB provenance: fold the untagged operand's concrete value
- * into the tagged operand's offset (see provenance_addsub_reg). */
-static void gen_prov_addsub_reg(int dst_idx, int src_idx, int is_sub,
-                                target_ulong pc) {
-    if (!binradar_memcheck_enabled) return;
+/* reg-reg ADD/SUB: fold the untagged operand's concrete value into the
+ * tagged operand's offset (see provenance_addsub_reg). */
+static void gen_sem_reg_addsub_reg(int dst_idx, int src_idx, int is_sub,
+                                   target_ulong pc) {
+    if (!sem_events_active()) return;
     TCGv_i32 t_dst = tcg_const_i32(dst_idx | (is_sub << 16));
     TCGv_i32 t_src = tcg_const_i32(src_idx);
     TCGv t_pc = tcg_const_tl(pc);
-    /* Pass post-instruction register values as explicit args: the helper
-     * must not read env->regs directly, since TCG may eliminate the
-     * dead store of the just-written global (stale value observed). */
-    gen_helper_prov_addsub_reg(cpu_env, t_dst, t_src, t_pc,
-                               cpu_regs[dst_idx], cpu_regs[src_idx]);
+    gen_helper_sem_reg_addsub_reg(cpu_env, t_dst, t_src, t_pc,
+                                  cpu_regs[dst_idx], cpu_regs[src_idx]);
     tcg_temp_free_i32(t_dst);
     tcg_temp_free_i32(t_src);
     tcg_temp_free(t_pc);
 }
 
-static void __attribute__((unused)) gen_prov_clobber_caller_saved(void) {
-    if (!binradar_memcheck_enabled) return;
-    gen_helper_prov_clobber_caller_saved(cpu_env);
+static void __attribute__((unused)) gen_sem_clobber_caller_saved(void) {
+    if (!sem_events_active()) return;
+    gen_helper_sem_clobber_caller_saved(cpu_env);
 }
 
-static void gen_prov_on_load(int dst_idx, TCGv t_addr, TCGMemOp ot,
-                             target_ulong pc) {
-    if (!binradar_memcheck_enabled) return;
+static void gen_sem_on_load(int dst_idx, TCGv t_addr, TCGMemOp ot,
+                            target_ulong pc) {
+    if (!sem_events_active()) return;
     TCGv_i32 t_dst = tcg_const_i32(dst_idx);
     TCGv t_size = tcg_const_tl(1 << (ot & MO_SIZE));
     TCGv t_pc = tcg_const_tl(pc);
-    gen_helper_prov_on_load(cpu_env, t_dst, t_addr, t_size, t_pc);
+    gen_helper_sem_on_load(cpu_env, t_dst, t_addr, t_size, t_pc);
     tcg_temp_free_i32(t_dst);
     tcg_temp_free(t_size);
     tcg_temp_free(t_pc);
 }
 
-static void gen_prov_on_store(int src_idx, TCGv t_addr, TCGMemOp ot) {
-    if (!binradar_memcheck_enabled) return;
+/* Store spill/invalidate event.  src_idx == OR_TMP0 means an
+ * immediate/unknown source: both consumers invalidate the shadow slot
+ * (uniform rule; see helper_sem_on_store in sem-events.c). */
+static void gen_sem_on_store(int src_idx, TCGv t_addr, TCGMemOp ot) {
+    if (!sem_events_active()) return;
     TCGv_i32 t_src = tcg_const_i32(src_idx);
     TCGv t_size = tcg_const_tl(1 << (ot & MO_SIZE));
-    gen_helper_prov_on_store(cpu_env, t_src, t_addr, t_size);
+    if (src_idx >= 0 && src_idx < CPU_NB_REGS) {
+        gen_helper_sem_on_store(cpu_env, t_src, t_addr, t_size,
+                                cpu_regs[src_idx]);
+    } else {
+        /* OR_TMP0: the helper invalidates the slot; pass zero value. */
+        TCGv t_zero = tcg_const_tl(0);
+        gen_helper_sem_on_store(cpu_env, t_src, t_addr, t_size, t_zero);
+        tcg_temp_free(t_zero);
+    }
     tcg_temp_free_i32(t_src);
     tcg_temp_free(t_size);
 }
 
 /* Full-width register xchg: swap the two registers' provenance tags. */
-static void gen_prov_xchg_reg(int dst_idx, int src_idx) {
-    if (!binradar_memcheck_enabled) return;
+static void gen_sem_reg_xchg(int dst_idx, int src_idx) {
+    if (!sem_events_active()) return;
     TCGv_i32 t_dst = tcg_const_i32(dst_idx);
     TCGv_i32 t_src = tcg_const_i32(src_idx);
-    gen_helper_prov_xchg_reg(cpu_env, t_dst, t_src);
+    gen_helper_sem_reg_xchg(cpu_env, t_dst, t_src);
     tcg_temp_free_i32(t_dst);
     tcg_temp_free_i32(t_src);
 }
 
-/* Runtime access check.  Emitted AFTER the guest load/store; reads the
- * EA metadata previously stored by helper_prov_set_ea. */
-static void gen_prov_check_access(TCGv t_addr, TCGMemOp ot,
-                                  target_ulong pc) {
-    if (!binradar_memcheck_enabled) return;
+/* Runtime access check + access fact.  Emitted AFTER the guest
+ * load/store; reads the EA metadata previously stored by sem_set_ea.
+ * flags: bit0 = is_store, bit1 = provenance check (only EA-decomposed
+ * sites that ran it historically set this). */
+static void gen_sem_mem_access_flags(TCGv t_addr, TCGMemOp ot,
+                                     target_ulong pc, uint32_t flags) {
+    if (!sem_events_active()) return;
     TCGv t_size = tcg_const_tl(1 << (ot & MO_SIZE));
     TCGv t_pc = tcg_const_tl(pc);
-    gen_helper_prov_check_access(cpu_env, t_addr, t_size, t_pc);
+    TCGv_i32 t_flags = tcg_const_i32(flags);
+    gen_helper_sem_mem_access(cpu_env, t_addr, t_size, t_pc, t_flags);
     tcg_temp_free(t_size);
     tcg_temp_free(t_pc);
+    tcg_temp_free_i32(t_flags);
+}
+
+/* EA-decomposed access: provenance check + F01 access fact. */
+static void gen_sem_mem_access(TCGv t_addr, TCGMemOp ot,
+                               target_ulong pc, bool is_store) {
+    gen_sem_mem_access_flags(t_addr, ot, pc,
+                             (is_store ? 1 : 0) | 2);
+}
+
+/* Raw-size variant for non-power-of-two x87 helper intervals
+ * (fstenv 14/28, fsave 94/108, fstpt/fbstp 10). */
+static void gen_sem_mem_access_f01_raw(TCGv t_addr, target_ulong size,
+                                       target_ulong pc, bool is_store) {
+    if (!sem_events_active()) return;
+    TCGv t_size = tcg_const_tl(size);
+    TCGv t_pc = tcg_const_tl(pc);
+    TCGv_i32 t_flags = tcg_const_i32(is_store ? 1 : 0);
+    gen_helper_sem_mem_access(cpu_env, t_addr, t_size, t_pc, t_flags);
+    tcg_temp_free(t_size);
+    tcg_temp_free(t_pc);
+    tcg_temp_free_i32(t_flags);
+}
+
+/* F01-only access fact: no provenance access check (SIMD/x87/atomic/
+ * paired stores). */
+static void gen_sem_mem_access_f01(TCGv t_addr, TCGMemOp ot,
+                                   target_ulong pc, bool is_store) {
+    gen_sem_mem_access_f01_raw(t_addr, 1 << (ot & MO_SIZE), pc, is_store);
+}
+
+/* RSP write (push/pop/add-sub imm/call): re-derive the RSP origin from
+ * the live frame stack (OSPREY-only consumer; provenance no-op). */
+static void gen_sem_rsp_update(TCGv new_sp, target_ulong pc) {
+    if (!sem_events_active()) return;
+    TCGv t_pc = tcg_const_tl(pc);
+    gen_helper_sem_rsp_update(cpu_env, new_sp, t_pc);
+    tcg_temp_free(t_pc);
+}
+
+static void gen_sem_call(TCGv callee_pc) {
+    if (!sem_events_active()) return;
+    gen_helper_sem_call(cpu_env, callee_pc, cpu_regs[R_ESP]);
+}
+
+static void gen_sem_ret(TCGv pc) {
+    if (!sem_events_active()) return;
+    gen_helper_sem_ret(cpu_env, pc, cpu_regs[R_ESP]);
 }
 
 #ifdef TARGET_X86_64
@@ -414,15 +356,16 @@ typedef struct DisasContext {
     TCGv T0;
     TCGv T1;
 
-    /* provenance: suppress the reg write-back invalidation for one
-     * instruction so gen_prov_addsub_reg (emitted after gen_op) can read
+    /* Sem layer: suppress the reg write-back invalidation for one
+     * instruction so the addsub helper (emitted after gen_op) can read
      * the pre-op tag and fold the post-op delta. */
     bool prov_skip_invalidate;
-    /* RET updates RSP before the explicit OSPREY return hook.  Suppress
-     * the generic RSP-resynchronization helper for that one write so the
-     * return hook owns the activation pop exactly once (including ret imm). */
+    /* Sem layer: RET updates RSP before the explicit return hook.
+     * Suppress the generic RSP-resynchronization helper for that one
+     * write so the return hook owns the activation pop exactly once
+     * (including ret imm). */
     bool osprey_skip_rsp_update;
-    /* provenance: pre-instruction register value snapshot for the
+    /* Sem layer: pre-instruction register value snapshot for the
      * add/sub-imm helper's consistency check (freed by the helper
      * wrapper after emission). */
     TCGv prov_pre_snapshot;
@@ -438,13 +381,24 @@ typedef struct DisasContext {
 
     sigjmp_buf jmpbuf;
 } DisasContext;
-/* Effective-address provenance: store the semantic EA decomposition
- * (base, index, scale, displacement, address width, segment state) into
- * the per-CPU scratch BEFORE the guest load/store, then run the check
- * AFTER it (exception-safe: a faulting access never records a finding). */
-static void gen_prov_set_ea(DisasContext *s, int base_reg, int index_reg,
-                            int scale, target_long disp) {
-    if (!binradar_memcheck_enabled) return;
+
+/* Mode-only EA record for F01-only sites (no provenance EA record, no
+ * OSPREY base facts): records aflags/override for the OSPREY F01 gate. */
+static void gen_sem_set_ea_mode(DisasContext *s) {
+    if (!sem_events_active()) return;
+    uint32_t mode = (uint32_t)s->aflag |
+                    (((uint32_t)s->override + 1) << 8);
+    TCGv_i32 t_mode = tcg_const_i32(mode);
+    gen_helper_sem_set_ea_mode(cpu_env, t_mode);
+    tcg_temp_free_i32(t_mode);
+}
+
+/* Effective-address metadata: emitted before a guest access, consumed
+ * after it succeeds (mode carries aflags/override; the OSPREY F01 gate
+ * is consumer-side policy). */
+static void gen_sem_set_ea(DisasContext *s, int base_reg, int index_reg,
+                           int scale, target_long disp) {
+    if (!sem_events_active()) return;
     TCGv_i32 t_base = tcg_const_i32(base_reg);
     TCGv_i32 t_index = tcg_const_i32(index_reg);
     TCGv_i32 t_scale = tcg_const_i32(scale);
@@ -455,13 +409,26 @@ static void gen_prov_set_ea(DisasContext *s, int base_reg, int index_reg,
     uint32_t mode = (uint32_t)s->aflag |
                     (((uint32_t)s->override + 1) << 8);
     TCGv_i32 t_mode = tcg_const_i32(mode);
-    gen_helper_prov_set_ea(cpu_env, t_base, t_index, t_scale, t_disp,
-                           t_mode);
+    gen_helper_sem_set_ea(cpu_env, t_base, t_index, t_scale, t_disp,
+                          t_mode);
     tcg_temp_free_i32(t_base);
     tcg_temp_free_i32(t_index);
     tcg_temp_free_i32(t_scale);
     tcg_temp_free(t_disp);
     tcg_temp_free_i32(t_mode);
+    /* Explicit base/index concrete values for the OSPREY EA record
+     * (env->regs may be stale inside helpers). */
+    TCGv t_base_val = tcg_const_tl(0);
+    TCGv t_index_val = tcg_const_tl(0);
+    if (base_reg >= 0 && base_reg < CPU_NB_REGS) {
+        tcg_gen_mov_tl(t_base_val, cpu_regs[base_reg]);
+    }
+    if (index_reg >= 0 && index_reg < CPU_NB_REGS) {
+        tcg_gen_mov_tl(t_index_val, cpu_regs[index_reg]);
+    }
+    gen_helper_sem_set_ea_vals(cpu_env, t_base_val, t_index_val);
+    tcg_temp_free(t_base_val);
+    tcg_temp_free(t_index_val);
 }
 
 static void gen_eob(DisasContext *s);
@@ -704,26 +671,25 @@ static void gen_op_mov_reg_v(DisasContext *s, TCGMemOp ot, int reg, TCGv t0)
     default:
         tcg_abort();
     }
-    /* Default: invalidate the destination register's provenance tag,
-     * unless suppressed (reg-reg ADD/SUB propagation).  For high-byte
-     * writes (AH/CH/DH/BH in 32-bit mode) the architectural full register
-     * is reg - 4, not reg: byte_reg_is_xH writes cpu_regs[reg - 4], so
-     * the shadow slot to invalidate is reg - 4 as well. */
+    /* Default: invalidate the destination register's provenance tag and
+     * OSPREY origin, unless suppressed (reg-reg ADD/SUB propagation,
+     * lea).  For high-byte writes (AH/CH/DH/BH in 32-bit mode) the
+     * architectural full register is reg - 4, not reg: byte_reg_is_xH
+     * writes cpu_regs[reg - 4], so the shadow slot to invalidate is
+     * reg - 4 as well. */
     if (!s->prov_skip_invalidate) {
         int full_reg = reg;
         if (ot == MO_8 && byte_reg_is_xH(s, reg)) {
             full_reg = reg - 4;
         }
-        gen_prov_invalidate_reg(full_reg, s->pc_start);
-        /* OSPREY origin shadow: same default-kill. */
-        gen_osprey_invalidate_reg(full_reg);
+        gen_sem_reg_invalidate(full_reg, s->pc_start);
     }
     s->prov_skip_invalidate = false;
     /* Full-width RSP writes re-derive the origin from the live frame
      * stack (push/pop/add-sub imm/mov rsp,x/leave).  Runs after the
      * kill so the origin is always rebuilt from frame identity. */
     if (reg == R_ESP && ot == MO_64 && !s->osprey_skip_rsp_update) {
-        gen_osprey_rsp_update(cpu_regs[R_ESP], s->pc_start);
+        gen_sem_rsp_update(cpu_regs[R_ESP], s->pc_start);
     }
 }
 
@@ -771,13 +737,14 @@ static inline void gen_op_ld_v(DisasContext *s, int idx, TCGv t0, TCGv a0)
 static inline void gen_op_st_v(DisasContext *s, int idx, TCGv t0, TCGv a0)
 {
     tcg_gen_qemu_st_tl(t0, a0, s->mem_index, idx | MO_LE);
-    /* Provenance: every store invalidates overlapping pointer-shadow
+    /* Shared store event: every store invalidates overlapping shadow
      * entries by default; pointer-tagging store sites (push, reg mov
-     * stores, string stores) emit gen_prov_on_store AFTER this call to
+     * stores, string stores) emit gen_sem_on_store AFTER this call to
      * re-install a valid tag.  This guarantees unsupported stores (ALU
      * results, immediate stores, SIMD/atomic paths routed through here)
-     * cannot leave stale shadow metadata. */
-    gen_prov_on_store(OR_TMP0, a0, idx);
+     * cannot leave stale shadow metadata.  OR_TMP0 source → both
+     * consumers invalidate the slot (uniform rule). */
+    gen_sem_on_store(OR_TMP0, a0, idx);
 }
 
 static inline void gen_op_st_rm_T0_A0(DisasContext *s, int idx, int d)
@@ -994,28 +961,15 @@ static void gen_check_io(DisasContext *s, TCGMemOp ot, target_ulong cur_eip,
 static inline void gen_movs(DisasContext *s, TCGMemOp ot)
 {
     gen_string_movl_A0_ESI(s);
-    gen_prov_set_ea(s, R_ESI, -1, 0, 0);
-    if (s->aflag == MO_64 && s->override < 0) {
-        gen_osprey_set_ea(R_ESI, -1, 0, 0, cpu_regs[R_ESI], NULL);
-    }
+    gen_sem_set_ea(s, R_ESI, -1, 0, 0);
     gen_op_ld_v(s, ot, s->T0, s->A0);
-    gen_prov_check_access(s->A0, ot, s->pc_start);
-    if (s->aflag == MO_64 && s->override < 0) {
-        gen_osprey_mem_access(s->A0, ot, s->pc_start, false);
-    }
+    gen_sem_mem_access(s->A0, ot, s->pc_start, false);
     gen_string_movl_A0_EDI(s);
-    gen_prov_set_ea(s, R_EDI, -1, 0, 0);
-    if (s->aflag == MO_64 && s->override < 0) {
-        gen_osprey_set_ea(R_EDI, -1, 0, 0, cpu_regs[R_EDI], NULL);
-    }
+    gen_sem_set_ea(s, R_EDI, -1, 0, 0);
     gen_op_st_v(s, ot, s->T0, s->A0);
-    /* Provenance: copied value — not A pointer → invalidate. */
-    gen_prov_on_store(OR_TMP0, s->A0, ot);
-    gen_osprey_on_store(OR_TMP0, s->A0, ot);
-    gen_prov_check_access(s->A0, ot, s->pc_start);
-    if (s->aflag == MO_64 && s->override < 0) {
-        gen_osprey_mem_access(s->A0, ot, s->pc_start, true);
-    }
+    /* The store event was emitted by gen_op_st_v (OR_TMP0 source → both
+     * consumers invalidate the slot).  The F01 store access follows. */
+    gen_sem_mem_access(s->A0, ot, s->pc_start, true);
     gen_op_movl_T0_Dshift(s, ot);
     gen_op_add_reg_T0(s, s->aflag, R_ESI);
     gen_op_add_reg_T0(s, s->aflag, R_EDI);
@@ -1445,18 +1399,11 @@ static inline void gen_stos(DisasContext *s, TCGMemOp ot)
 {
     gen_op_mov_v_reg(s, MO_32, s->T0, R_EAX);
     gen_string_movl_A0_EDI(s);
-    gen_prov_set_ea(s, R_EDI, -1, 0, 0);
-    if (s->aflag == MO_64 && s->override < 0) {
-        gen_osprey_set_ea(R_EDI, -1, 0, 0, cpu_regs[R_EDI], NULL);
-    }
+    gen_sem_set_ea(s, R_EDI, -1, 0, 0);
     gen_op_st_v(s, ot, s->T0, s->A0);
-    /* Provenance: store value not known to be a pointer → invalidate. */
-    gen_prov_on_store(OR_TMP0, s->A0, ot);
-    gen_osprey_on_store(OR_TMP0, s->A0, ot);
-    gen_prov_check_access(s->A0, ot, s->pc_start);
-    if (s->aflag == MO_64 && s->override < 0) {
-        gen_osprey_mem_access(s->A0, ot, s->pc_start, true);
-    }
+    /* The store event was emitted by gen_op_st_v (OR_TMP0 → both
+     * consumers invalidate the slot).  The F01 store access follows. */
+    gen_sem_mem_access(s->A0, ot, s->pc_start, true);
     gen_op_movl_T0_Dshift(s, ot);
     gen_op_add_reg_T0(s, s->aflag, R_EDI);
 }
@@ -1464,19 +1411,13 @@ static inline void gen_stos(DisasContext *s, TCGMemOp ot)
 static inline void gen_lods(DisasContext *s, TCGMemOp ot)
 {
     gen_string_movl_A0_ESI(s);
-    gen_prov_set_ea(s, R_ESI, -1, 0, 0);
-    if (s->aflag == MO_64 && s->override < 0) {
-        gen_osprey_set_ea(R_ESI, -1, 0, 0, cpu_regs[R_ESI], NULL);
-    }
+    gen_sem_set_ea(s, R_ESI, -1, 0, 0);
     gen_op_ld_v(s, ot, s->T0, s->A0);
     gen_op_mov_reg_v(s, ot, R_EAX, s->T0);
-    /* Provenance: restore tag from shadow (value-consistency guarded). */
-    gen_prov_on_load(R_EAX, s->A0, ot, s->pc_start);
-    gen_osprey_on_load(R_EAX, s->A0, ot);
-    gen_prov_check_access(s->A0, ot, s->pc_start);
-    if (s->aflag == MO_64 && s->override < 0) {
-        gen_osprey_mem_access(s->A0, ot, s->pc_start, false);
-    }
+    /* Provenance: restore tag from shadow (value-consistency guarded);
+     * OSPREY: reload the origin from the stack shadow. */
+    gen_sem_on_load(R_EAX, s->A0, ot, s->pc_start);
+    gen_sem_mem_access(s->A0, ot, s->pc_start, false);
     gen_op_movl_T0_Dshift(s, ot);
     gen_op_add_reg_T0(s, s->aflag, R_ESI);
 }
@@ -1484,15 +1425,9 @@ static inline void gen_lods(DisasContext *s, TCGMemOp ot)
 static inline void gen_scas(DisasContext *s, TCGMemOp ot)
 {
     gen_string_movl_A0_EDI(s);
-    gen_prov_set_ea(s, R_EDI, -1, 0, 0);
-    if (s->aflag == MO_64 && s->override < 0) {
-        gen_osprey_set_ea(R_EDI, -1, 0, 0, cpu_regs[R_EDI], NULL);
-    }
+    gen_sem_set_ea(s, R_EDI, -1, 0, 0);
     gen_op_ld_v(s, ot, s->T1, s->A0);
-    gen_prov_check_access(s->A0, ot, s->pc_start);
-    if (s->aflag == MO_64 && s->override < 0) {
-        gen_osprey_mem_access(s->A0, ot, s->pc_start, false);
-    }
+    gen_sem_mem_access(s->A0, ot, s->pc_start, false);
     gen_op(s, OP_CMPL, ot, R_EAX);
     gen_op_movl_T0_Dshift(s, ot);
     gen_op_add_reg_T0(s, s->aflag, R_EDI);
@@ -1501,25 +1436,13 @@ static inline void gen_scas(DisasContext *s, TCGMemOp ot)
 static inline void gen_cmps(DisasContext *s, TCGMemOp ot)
 {
     gen_string_movl_A0_EDI(s);
-    gen_prov_set_ea(s, R_EDI, -1, 0, 0);
-    if (s->aflag == MO_64 && s->override < 0) {
-        gen_osprey_set_ea(R_EDI, -1, 0, 0, cpu_regs[R_EDI], NULL);
-    }
+    gen_sem_set_ea(s, R_EDI, -1, 0, 0);
     gen_op_ld_v(s, ot, s->T1, s->A0);
-    gen_prov_check_access(s->A0, ot, s->pc_start);
-    if (s->aflag == MO_64 && s->override < 0) {
-        gen_osprey_mem_access(s->A0, ot, s->pc_start, false);
-    }
+    gen_sem_mem_access(s->A0, ot, s->pc_start, false);
     gen_string_movl_A0_ESI(s);
-    gen_prov_set_ea(s, R_ESI, -1, 0, 0);
-    if (s->aflag == MO_64 && s->override < 0) {
-        gen_osprey_set_ea(R_ESI, -1, 0, 0, cpu_regs[R_ESI], NULL);
-    }
+    gen_sem_set_ea(s, R_ESI, -1, 0, 0);
     gen_op_ld_v(s, ot, s->T0, s->A0);
-    gen_prov_check_access(s->A0, ot, s->pc_start);
-    if (s->aflag == MO_64 && s->override < 0) {
-        gen_osprey_mem_access(s->A0, ot, s->pc_start, false);
-    }
+    gen_sem_mem_access(s->A0, ot, s->pc_start, false);
     gen_op(s, OP_CMPL, ot, OR_TMP0);
     gen_op_movl_T0_Dshift(s, ot);
     gen_op_add_reg_T0(s, s->aflag, R_ESI);
@@ -1717,7 +1640,7 @@ static void gen_op(DisasContext *s1, int op, TCGMemOp ot, int d)
             tcg_gen_atomic_add_fetch_tl(s1->T0, s1->A0, s1->T0,
                                         s1->mem_index, ot | MO_LE);
             /* LOCKed RMW: atomic store bypasses gen_op_st_v; invalidate. */
-            gen_prov_on_store(OR_TMP0, s1->A0, ot);
+            gen_sem_on_store(OR_TMP0, s1->A0, ot);
         } else {
             tcg_gen_add_tl(s1->T0, s1->T0, s1->T1);
             tcg_gen_add_tl(s1->T0, s1->T0, s1->tmp4);
@@ -1734,7 +1657,7 @@ static void gen_op(DisasContext *s1, int op, TCGMemOp ot, int d)
             tcg_gen_atomic_add_fetch_tl(s1->T0, s1->A0, s1->T0,
                                         s1->mem_index, ot | MO_LE);
             /* LOCKed RMW: atomic store bypasses gen_op_st_v; invalidate. */
-            gen_prov_on_store(OR_TMP0, s1->A0, ot);
+            gen_sem_on_store(OR_TMP0, s1->A0, ot);
         } else {
             tcg_gen_sub_tl(s1->T0, s1->T0, s1->T1);
             tcg_gen_sub_tl(s1->T0, s1->T0, s1->tmp4);
@@ -1748,7 +1671,7 @@ static void gen_op(DisasContext *s1, int op, TCGMemOp ot, int d)
             tcg_gen_atomic_add_fetch_tl(s1->T0, s1->A0, s1->T1,
                                         s1->mem_index, ot | MO_LE);
             /* LOCKed RMW: atomic store bypasses gen_op_st_v; invalidate. */
-            gen_prov_on_store(OR_TMP0, s1->A0, ot);
+            gen_sem_on_store(OR_TMP0, s1->A0, ot);
         } else {
             tcg_gen_add_tl(s1->T0, s1->T0, s1->T1);
             gen_op_st_rm_T0_A0(s1, ot, d);
@@ -1763,7 +1686,7 @@ static void gen_op(DisasContext *s1, int op, TCGMemOp ot, int d)
                                         s1->mem_index, ot | MO_LE);
             tcg_gen_sub_tl(s1->T0, s1->cc_srcT, s1->T1);
             /* LOCKed RMW: atomic store bypasses gen_op_st_v; invalidate. */
-            gen_prov_on_store(OR_TMP0, s1->A0, ot);
+            gen_sem_on_store(OR_TMP0, s1->A0, ot);
         } else {
             tcg_gen_mov_tl(s1->cc_srcT, s1->T0);
             tcg_gen_sub_tl(s1->T0, s1->T0, s1->T1);
@@ -1778,7 +1701,7 @@ static void gen_op(DisasContext *s1, int op, TCGMemOp ot, int d)
             tcg_gen_atomic_and_fetch_tl(s1->T0, s1->A0, s1->T1,
                                         s1->mem_index, ot | MO_LE);
             /* LOCKed RMW: atomic store bypasses gen_op_st_v; invalidate. */
-            gen_prov_on_store(OR_TMP0, s1->A0, ot);
+            gen_sem_on_store(OR_TMP0, s1->A0, ot);
         } else {
             tcg_gen_and_tl(s1->T0, s1->T0, s1->T1);
             gen_op_st_rm_T0_A0(s1, ot, d);
@@ -1791,7 +1714,7 @@ static void gen_op(DisasContext *s1, int op, TCGMemOp ot, int d)
             tcg_gen_atomic_or_fetch_tl(s1->T0, s1->A0, s1->T1,
                                        s1->mem_index, ot | MO_LE);
             /* LOCKed RMW: atomic store bypasses gen_op_st_v; invalidate. */
-            gen_prov_on_store(OR_TMP0, s1->A0, ot);
+            gen_sem_on_store(OR_TMP0, s1->A0, ot);
         } else {
             tcg_gen_or_tl(s1->T0, s1->T0, s1->T1);
             gen_op_st_rm_T0_A0(s1, ot, d);
@@ -1804,7 +1727,7 @@ static void gen_op(DisasContext *s1, int op, TCGMemOp ot, int d)
             tcg_gen_atomic_xor_fetch_tl(s1->T0, s1->A0, s1->T1,
                                         s1->mem_index, ot | MO_LE);
             /* LOCKed RMW: atomic store bypasses gen_op_st_v; invalidate. */
-            gen_prov_on_store(OR_TMP0, s1->A0, ot);
+            gen_sem_on_store(OR_TMP0, s1->A0, ot);
         } else {
             tcg_gen_xor_tl(s1->T0, s1->T0, s1->T1);
             gen_op_st_rm_T0_A0(s1, ot, d);
@@ -1834,7 +1757,7 @@ static void gen_inc(DisasContext *s1, TCGMemOp ot, int d, int c)
         tcg_gen_atomic_add_fetch_tl(s1->T0, s1->A0, s1->T0,
                                     s1->mem_index, ot | MO_LE);
         /* LOCKed RMW: atomic store bypasses gen_op_st_v; invalidate. */
-        gen_prov_on_store(OR_TMP0, s1->A0, ot);
+        gen_sem_on_store(OR_TMP0, s1->A0, ot);
     } else {
         if (d != OR_TMP0) {
             gen_op_mov_v_reg(s1, ot, s1->T0, d);
@@ -2589,19 +2512,18 @@ static void gen_ldst_modrm(CPUX86State *env, DisasContext *s, int modrm,
             if (reg != OR_TMP0)
                 gen_op_mov_v_reg(s, ot, s->T0, reg);
             gen_op_mov_reg_v(s, ot, rm, s->T0);
-            /* Sound provenance transfer for full-width reg→reg mov. */
+            /* Sound full-width reg→reg mov (shared event: provenance
+             * transfer + OSPREY origin copy). */
             if (reg != OR_TMP0 && ot == MO_64) {
-                gen_prov_mov_reg(rm, reg, s->pc_start);
-                gen_osprey_reg_copy(rm, reg);
+                gen_sem_reg_copy(rm, reg, s->pc_start);
             }
         } else {
             gen_op_mov_v_reg(s, ot, s->T0, rm);
             if (reg != OR_TMP0)
                 gen_op_mov_reg_v(s, ot, reg, s->T0);
-            /* Sound provenance transfer for full-width reg→reg mov. */
+            /* Sound full-width reg→reg mov. */
             if (reg != OR_TMP0 && ot == MO_64) {
-                gen_prov_mov_reg(reg, rm, s->pc_start);
-                gen_osprey_reg_copy(reg, rm);
+                gen_sem_reg_copy(reg, rm, s->pc_start);
             }
         }
     } else {
@@ -2611,48 +2533,26 @@ static void gen_ldst_modrm(CPUX86State *env, DisasContext *s, int modrm,
         /* Store the architectural EA before every supported memory op.
          * The runtime helper turns truncating/segment forms into UNKNOWN,
          * preserving exact-bounds fallback in symbolic mode. */
-        gen_prov_set_ea(s, a.base, a.index, a.scale, a.disp);
-        if (s->aflag == MO_64 && s->override < 0) {
-            /* OSPREY: semantic EA decomposition for base-address facts. */
-            if (a.base >= 0) {
-                gen_osprey_set_ea(a.base, a.index, a.scale, a.disp,
-                                  cpu_regs[a.base],
-                                  a.index >= 0 ? cpu_regs[a.index] : NULL);
-            } else if (a.index >= 0) {
-                gen_osprey_set_ea(-1, a.index, a.scale, a.disp, NULL,
-                                  cpu_regs[a.index]);
-            }
-        }
+        gen_sem_set_ea(s, a.base, a.index, a.scale, a.disp);
         if (is_store) {
             if (reg != OR_TMP0)
                 gen_op_mov_v_reg(s, ot, s->T0, reg);
             gen_op_st_v(s, ot, s->T0, s->A0);
-            /* Provenance: store source register's tag to memory shadow;
-             * OR_TMP0 (immediate) → invalidate. */
-            gen_prov_on_store(reg, s->A0, ot);
-            /* OSPREY: spill origin + store fact. */
-            if (reg != OR_TMP0) {
-                gen_osprey_on_store(reg, s->A0, ot);
-            }
-            gen_prov_check_access(s->A0, ot, s->pc_start);
-            if (s->aflag == MO_64 && s->override < 0) {
-                gen_osprey_mem_access(s->A0, ot, s->pc_start, true);
-            }
+            /* Store source register's tag to memory shadow; OR_TMP0
+             * (immediate) → invalidate (both consumers; uniform rule). */
+            gen_sem_on_store(reg, s->A0, ot);
+            gen_sem_mem_access(s->A0, ot, s->pc_start, true);
         } else {
             gen_op_ld_v(s, ot, s->T0, s->A0);
             if (reg != OR_TMP0)
                 gen_op_mov_reg_v(s, ot, reg, s->T0);
-            /* Provenance: restore tag from memory shadow. */
-            if (reg != OR_TMP0)
-                gen_prov_on_load(reg, s->A0, ot, s->pc_start);
-            /* OSPREY: reload origin + load fact. */
+            /* Provenance: restore tag from memory shadow; OSPREY: reload
+             * origin.  OR_TMP0 (crc32/bextr reads) skips the spill
+             * reload; the F01 access fact still fires. */
             if (reg != OR_TMP0) {
-                gen_osprey_on_load(reg, s->A0, ot);
+                gen_sem_on_load(reg, s->A0, ot, s->pc_start);
             }
-            gen_prov_check_access(s->A0, ot, s->pc_start);
-            if (s->aflag == MO_64 && s->override < 0) {
-                gen_osprey_mem_access(s->A0, ot, s->pc_start, false);
-            }
+            gen_sem_mem_access(s->A0, ot, s->pc_start, false);
         }
     }
 }
@@ -3140,9 +3040,12 @@ static inline void gen_stq_env_A0(DisasContext *s, int offset)
 {
     tcg_gen_ld_i64(s->tmp1_i64, cpu_env, offset);
     tcg_gen_qemu_st_i64(s->tmp1_i64, s->A0, s->mem_index, MO_LEQ);
-    /* Provenance: SSE scalar store — not a modeled pointer spill;
-     * invalidate the overlapping shadow slot. */
-    gen_prov_on_store(OR_TMP0, s->A0, MO_64);
+    /* SSE scalar store: not a modeled pointer spill — invalidate the
+     * shadow slot, then record the F01 access fact (after the store so
+     * a fault records nothing). */
+    gen_sem_set_ea_mode(s);
+    gen_sem_on_store(OR_TMP0, s->A0, MO_64);
+    gen_sem_mem_access_f01(s->A0, MO_64, s->pc_start, true);
 }
 
 static inline void gen_ldo_env_A0(DisasContext *s, int offset)
@@ -3160,14 +3063,17 @@ static inline void gen_sto_env_A0(DisasContext *s, int offset)
     int mem_index = s->mem_index;
     tcg_gen_ld_i64(s->tmp1_i64, cpu_env, offset + offsetof(ZMMReg, ZMM_Q(0)));
     tcg_gen_qemu_st_i64(s->tmp1_i64, s->A0, mem_index, MO_LEQ);
-    /* Provenance: invalidate after each constituent store so a fault on
-     * a later store cannot leave stale metadata from an earlier one. */
-    gen_prov_on_store(OR_TMP0, s->A0, MO_64);
+    /* Invalidate after each constituent store so a fault on a later
+     * store cannot leave stale metadata from an earlier one.  The 128-bit
+     * store is ONE F01 event (16 bytes) emitted after BOTH qemu halves
+     * complete: a fault on the second half records nothing. */
+    gen_sem_set_ea_mode(s);
+    gen_sem_on_store(OR_TMP0, s->A0, MO_64);
     tcg_gen_addi_tl(s->tmp0, s->A0, 8);
     tcg_gen_ld_i64(s->tmp1_i64, cpu_env, offset + offsetof(ZMMReg, ZMM_Q(1)));
     tcg_gen_qemu_st_i64(s->tmp1_i64, s->tmp0, mem_index, MO_LEQ);
-    /* Provenance: 128-bit SSE store — invalidate both shadow slots. */
-    gen_prov_on_store(OR_TMP0, s->tmp0, MO_64);
+    gen_sem_on_store(OR_TMP0, s->tmp0, MO_64);
+    gen_sem_mem_access_f01_raw(s->A0, 16, s->pc_start, true);
 }
 
 static inline void gen_op_movo(DisasContext *s, int d_offset, int s_offset)
@@ -3983,7 +3889,7 @@ static void gen_sse(CPUX86State *env, DisasContext *s, int b,
             gen_helper_movmskps(s->tmp2_i32, cpu_env, s->ptr0);
             tcg_gen_extu_i32_tl(cpu_regs[reg], s->tmp2_i32);
             /* movmskps writes the GPR directly; default-kill. */
-            gen_prov_invalidate_reg(reg, s->pc_start);
+            gen_sem_reg_invalidate(reg, s->pc_start);
             break;
         case 0x150: /* movmskpd */
             rm = (modrm & 7) | REX_B(s);
@@ -3992,7 +3898,7 @@ static void gen_sse(CPUX86State *env, DisasContext *s, int b,
             gen_helper_movmskpd(s->tmp2_i32, cpu_env, s->ptr0);
             tcg_gen_extu_i32_tl(cpu_regs[reg], s->tmp2_i32);
             /* movmskpd writes the GPR directly; default-kill. */
-            gen_prov_invalidate_reg(reg, s->pc_start);
+            gen_sem_reg_invalidate(reg, s->pc_start);
             break;
         case 0x02a: /* cvtpi2ps */
         case 0x12a: /* cvtpi2pd */
@@ -4183,7 +4089,7 @@ static void gen_sse(CPUX86State *env, DisasContext *s, int b,
             reg = ((modrm >> 3) & 7) | rex_r;
             tcg_gen_extu_i32_tl(cpu_regs[reg], s->tmp2_i32);
             /* pmovmskb writes the GPR directly; default-kill. */
-            gen_prov_invalidate_reg(reg, s->pc_start);
+            gen_sem_reg_invalidate(reg, s->pc_start);
             break;
 
         case 0x138:
@@ -4324,9 +4230,12 @@ static void gen_sse(CPUX86State *env, DisasContext *s, int b,
                 } else {
                     tcg_gen_qemu_st_tl(cpu_regs[reg], s->A0,
                                        s->mem_index, ot | MO_BE);
-                    /* Provenance: byte-swapped store — the bytes are not
-                     * the register's native value; invalidate the slot. */
-                    gen_prov_on_store(OR_TMP0, s->A0, ot);
+                    /* Byte-swapped store — the bytes are not the
+                     * register's native value; invalidate the slot and
+                     * record the F01 access fact. */
+                    gen_sem_set_ea_mode(s);
+                    gen_sem_on_store(OR_TMP0, s->A0, ot);
+                    gen_sem_mem_access_f01(s->A0, ot, s->pc_start, true);
                 }
                 break;
             case 0x0f2: /* andn Gy, By, Ey */
@@ -4436,8 +4345,8 @@ static void gen_sse(CPUX86State *env, DisasContext *s, int b,
 #endif
                 }
                 /* mulx writes vex_v and reg directly; default-kill both. */
-                gen_prov_invalidate_reg(s->vex_v, s->pc_start);
-                gen_prov_invalidate_reg(reg, s->pc_start);
+                gen_sem_reg_invalidate(s->vex_v, s->pc_start);
+                gen_sem_reg_invalidate(reg, s->pc_start);
                 break;
 
             case 0x3f5: /* pdep Gy, By, Ey */
@@ -4457,7 +4366,7 @@ static void gen_sse(CPUX86State *env, DisasContext *s, int b,
                 }
                 gen_helper_pdep(cpu_regs[reg], s->T0, s->T1);
                 /* pdep writes reg directly; default-kill. */
-                gen_prov_invalidate_reg(reg, s->pc_start);
+                gen_sem_reg_invalidate(reg, s->pc_start);
                 break;
 
             case 0x2f5: /* pext Gy, By, Ey */
@@ -4477,7 +4386,7 @@ static void gen_sse(CPUX86State *env, DisasContext *s, int b,
                 }
                 gen_helper_pext(cpu_regs[reg], s->T0, s->T1);
                 /* pext writes reg directly; default-kill. */
-                gen_prov_invalidate_reg(reg, s->pc_start);
+                gen_sem_reg_invalidate(reg, s->pc_start);
                 break;
 
             case 0x1f6: /* adcx Gy, Ey */
@@ -4557,7 +4466,7 @@ static void gen_sse(CPUX86State *env, DisasContext *s, int b,
                     set_cc_op(s, end_op);
                 }
                 /* adcx/adox writes reg directly; default-kill. */
-                gen_prov_invalidate_reg(reg, s->pc_start);
+                gen_sem_reg_invalidate(reg, s->pc_start);
                 break;
 
             case 0x1f7: /* shlx Gy, Ey, By */
@@ -4666,8 +4575,11 @@ static void gen_sse(CPUX86State *env, DisasContext *s, int b,
                     } else {
                         tcg_gen_qemu_st_tl(s->T0, s->A0,
                                            s->mem_index, MO_UB);
-                        /* Provenance: SIMD extract store — invalidate. */
-                        gen_prov_on_store(OR_TMP0, s->A0, MO_8);
+                        /* SIMD extract store — invalidate + F01. */
+                        gen_sem_set_ea_mode(s);
+                        gen_sem_on_store(OR_TMP0, s->A0, MO_8);
+                        gen_sem_mem_access_f01(s->A0, MO_8, s->pc_start,
+                                               true);
                     }
                     break;
                 case 0x15: /* pextrw */
@@ -4678,8 +4590,11 @@ static void gen_sse(CPUX86State *env, DisasContext *s, int b,
                     } else {
                         tcg_gen_qemu_st_tl(s->T0, s->A0,
                                            s->mem_index, MO_LEUW);
-                        /* Provenance: SIMD extract store — invalidate. */
-                        gen_prov_on_store(OR_TMP0, s->A0, MO_16);
+                        /* SIMD extract store — invalidate + F01. */
+                        gen_sem_set_ea_mode(s);
+                        gen_sem_on_store(OR_TMP0, s->A0, MO_16);
+                        gen_sem_mem_access_f01(s->A0, MO_16, s->pc_start,
+                                               true);
                     }
                     break;
                 case 0x16:
@@ -4692,8 +4607,11 @@ static void gen_sse(CPUX86State *env, DisasContext *s, int b,
                         } else {
                             tcg_gen_qemu_st_i32(s->tmp2_i32, s->A0,
                                                 s->mem_index, MO_LEUL);
-                            /* Provenance: SIMD extract store — invalidate. */
-                            gen_prov_on_store(OR_TMP0, s->A0, MO_32);
+                            /* SIMD extract store — invalidate + F01. */
+                            gen_sem_set_ea_mode(s);
+                            gen_sem_on_store(OR_TMP0, s->A0, MO_32);
+                            gen_sem_mem_access_f01(s->A0, MO_32,
+                                                   s->pc_start, true);
                         }
                     } else { /* pextrq */
 #ifdef TARGET_X86_64
@@ -4705,8 +4623,11 @@ static void gen_sse(CPUX86State *env, DisasContext *s, int b,
                         } else {
                             tcg_gen_qemu_st_i64(s->tmp1_i64, s->A0,
                                                 s->mem_index, MO_LEQ);
-                            /* Provenance: SIMD extract store — invalidate. */
-                            gen_prov_on_store(OR_TMP0, s->A0, MO_64);
+                            /* SIMD extract store — invalidate + F01. */
+                            gen_sem_set_ea_mode(s);
+                            gen_sem_on_store(OR_TMP0, s->A0, MO_64);
+                            gen_sem_mem_access_f01(s->A0, MO_64,
+                                                   s->pc_start, true);
                         }
 #else
                         goto illegal_op;
@@ -4714,7 +4635,7 @@ static void gen_sse(CPUX86State *env, DisasContext *s, int b,
                     }
                     /* pextrd/pextrq writes the GPR directly; default-kill. */
                     if (mod == 3) {
-                        gen_prov_invalidate_reg(rm, s->pc_start);
+                        gen_sem_reg_invalidate(rm, s->pc_start);
                     }
                     break;
                 case 0x17: /* extractps */
@@ -4725,8 +4646,11 @@ static void gen_sse(CPUX86State *env, DisasContext *s, int b,
                     } else {
                         tcg_gen_qemu_st_tl(s->T0, s->A0,
                                            s->mem_index, MO_LEUL);
-                        /* Provenance: SIMD extract store — invalidate. */
-                        gen_prov_on_store(OR_TMP0, s->A0, MO_32);
+                        /* SIMD extract store — invalidate + F01. */
+                        gen_sem_set_ea_mode(s);
+                        gen_sem_on_store(OR_TMP0, s->A0, MO_32);
+                        gen_sem_mem_access_f01(s->A0, MO_32, s->pc_start,
+                                               true);
                     }
                     break;
                     if (mod == 3) {
@@ -5209,17 +5133,7 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                     gen_lea_v_seg(s, s->aflag, ea, a.def_seg, s->override);
                     /* Store every architectural EA; unsupported modes
                      * become UNKNOWN in the runtime helper. */
-                    gen_prov_set_ea(s, a.base, a.index, a.scale, a.disp);
-                    if (s->aflag == MO_64 && s->override < 0) {
-                        if (a.base >= 0) {
-                            gen_osprey_set_ea(a.base, a.index, a.scale, a.disp,
-                                              cpu_regs[a.base],
-                                              a.index >= 0 ? cpu_regs[a.index] : NULL);
-                        } else if (a.index >= 0) {
-                            gen_osprey_set_ea(-1, a.index, a.scale, a.disp, NULL,
-                                              cpu_regs[a.index]);
-                        }
-                    }
+                    gen_sem_set_ea(s, a.base, a.index, a.scale, a.disp);
                     opreg = OR_TMP0;
                 } else if (op == OP_XORL && rm == reg) {
                 xor_zero:
@@ -5232,7 +5146,7 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                     opreg = rm;
                 }
                 gen_op_mov_v_reg(s, ot, s->T1, reg);
-                if (binradar_memcheck_enabled && opreg != OR_TMP0 &&
+                if (sem_events_active() && opreg != OR_TMP0 &&
                     (op == OP_ADDL || op == OP_SUBL)) {
                     s->prov_skip_invalidate = true;
                 }
@@ -5240,17 +5154,14 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                 /* Access check AFTER the memory op (load+store) completed,
                  * so a faulting access records nothing. */
                 if (opreg == OR_TMP0) {
-                    gen_prov_check_access(s->A0, ot, s->pc_start);
-                    if (s->aflag == MO_64 && s->override < 0) {
-                        gen_osprey_mem_access(s->A0, ot, s->pc_start, true);
-                    }
+                    gen_sem_mem_access(s->A0, ot, s->pc_start, true);
                 }
                 /* reg-reg ADD/SUB provenance propagation (after write-back:
                  * gen_op invalidated dst; recompute delta from result). */
-                if (binradar_memcheck_enabled && opreg != OR_TMP0 &&
+                if (sem_events_active() && opreg != OR_TMP0 &&
                     (op == OP_ADDL || op == OP_SUBL)) {
-                    gen_prov_addsub_reg(opreg, reg, op == OP_SUBL,
-                                        s->pc_start);
+                    gen_sem_reg_addsub_reg(opreg, reg, op == OP_SUBL,
+                                           s->pc_start);
                 }
                 break;
             case 1: /* OP Gv, Ev */
@@ -5264,28 +5175,15 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                     gen_lea_v_seg(s, s->aflag, ea, a.def_seg, s->override);
                     /* Store every architectural EA; unsupported modes
                      * become UNKNOWN in the runtime helper. */
-                    gen_prov_set_ea(s, a.base, a.index, a.scale, a.disp);
-                    if (s->aflag == MO_64 && s->override < 0) {
-                        if (a.base >= 0) {
-                            gen_osprey_set_ea(a.base, a.index, a.scale, a.disp,
-                                              cpu_regs[a.base],
-                                              a.index >= 0 ? cpu_regs[a.index] : NULL);
-                        } else if (a.index >= 0) {
-                            gen_osprey_set_ea(-1, a.index, a.scale, a.disp, NULL,
-                                              cpu_regs[a.index]);
-                        }
-                    }
+                    gen_sem_set_ea(s, a.base, a.index, a.scale, a.disp);
                     gen_op_ld_v(s, ot, s->T1, s->A0);
-                    gen_prov_check_access(s->A0, ot, s->pc_start);
-                    if (s->aflag == MO_64 && s->override < 0) {
-                        gen_osprey_mem_access(s->A0, ot, s->pc_start, false);
-                    }
+                    gen_sem_mem_access(s->A0, ot, s->pc_start, false);
                 } else if (op == OP_XORL && rm == reg) {
                     goto xor_zero;
                 } else {
                     gen_op_mov_v_reg(s, ot, s->T1, rm);
                 }
-                if (binradar_memcheck_enabled && mod == 3 &&
+                if (sem_events_active() && mod == 3 &&
                     (op == OP_ADDL || op == OP_SUBL)) {
                     s->prov_skip_invalidate = true;
                 }
@@ -5293,10 +5191,10 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                 /* reg-reg ADD/SUB provenance propagation (after write-back).
                  * Only for register Ev sources (mod == 3): a memory source
                  * value carries no register provenance to fold. */
-                if (binradar_memcheck_enabled && mod == 3 &&
+                if (sem_events_active() && mod == 3 &&
                     (op == OP_ADDL || op == OP_SUBL)) {
-                    gen_prov_addsub_reg(reg, rm, op == OP_SUBL,
-                                        s->pc_start);
+                    gen_sem_reg_addsub_reg(reg, rm, op == OP_SUBL,
+                                           s->pc_start);
                 }
                 break;
             case 2: /* OP A, Iv */
@@ -5306,19 +5204,20 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                  * (offset += val). Same instrumentation as GRP1 (0x81/0x83):
                  * suppress the write-back invalidation, snapshot the pre-op
                  * register value, fold the post-op delta. */
-                if (binradar_memcheck_enabled && ot == MO_64 &&
+                if (sem_events_active() && ot == MO_64 &&
                     (op == OP_ADDL || op == OP_SUBL)) {
                     s->prov_skip_invalidate = true;
                     s->prov_pre_snapshot = tcg_temp_new();
                     tcg_gen_mov_tl(s->prov_pre_snapshot, cpu_regs[OR_EAX]);
                 }
                 gen_op(s, op, ot, OR_EAX);
-                if (binradar_memcheck_enabled && ot == MO_64 &&
+                if (sem_events_active() && ot == MO_64 &&
                     (op == OP_ADDL || op == OP_SUBL)) {
                     int64_t imm = (int64_t)(int32_t)(uint32_t)val;
                     int64_t delta = (op == OP_SUBL) ? -imm : imm;
-                    gen_prov_addsub_imm(OR_EAX, delta, s->prov_pre_snapshot,
-                                        s->pc_start);
+                    gen_sem_reg_addsub_imm(OR_EAX, delta,
+                                           s->prov_pre_snapshot,
+                                           s->pc_start);
                     s->prov_pre_snapshot = NULL;
                 }
                 break;
@@ -5353,17 +5252,7 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                 gen_lea_v_seg(s, s->aflag, ea, a.def_seg, s->override);
                 /* Store every architectural EA; unsupported modes become
                  * UNKNOWN in the runtime helper. */
-                gen_prov_set_ea(s, a.base, a.index, a.scale, a.disp);
-                if (s->aflag == MO_64 && s->override < 0) {
-                    if (a.base >= 0) {
-                        gen_osprey_set_ea(a.base, a.index, a.scale, a.disp,
-                                          cpu_regs[a.base],
-                                          a.index >= 0 ? cpu_regs[a.index] : NULL);
-                    } else if (a.index >= 0) {
-                        gen_osprey_set_ea(-1, a.index, a.scale, a.disp, NULL,
-                                          cpu_regs[a.index]);
-                    }
-                }
+                gen_sem_set_ea(s, a.base, a.index, a.scale, a.disp);
                 opreg = OR_TMP0;
             } else {
                 opreg = rm;
@@ -5385,7 +5274,7 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
              * Suppress the write-back invalidation so the post-op helper
              * can fold the pre-op tag; snapshot the pre-op register value
              * for the helper's consistency check. */
-            if (binradar_memcheck_enabled && mod == 3 && ot == MO_64 &&
+            if (sem_events_active() && mod == 3 && ot == MO_64 &&
                 (op == OP_ADDL || op == OP_SUBL)) {
                 s->prov_skip_invalidate = true;
                 s->prov_pre_snapshot = tcg_temp_new();
@@ -5395,19 +5284,16 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
             /* Access check AFTER the memory op (load+store) completed,
              * so a faulting access records nothing. */
             if (opreg == OR_TMP0) {
-                gen_prov_check_access(s->A0, ot, s->pc_start);
-                if (s->aflag == MO_64 && s->override < 0) {
-                    gen_osprey_mem_access(s->A0, ot, s->pc_start, true);
-                }
+                gen_sem_mem_access(s->A0, ot, s->pc_start, true);
             }
             /* Provenance: add/sub reg, imm preserves tag (offset += val).
              * OP_ADDL (op==0) and OP_SUBL (op==5) are pointer-preserving. */
-            if (binradar_memcheck_enabled && mod == 3 && ot == MO_64 &&
+            if (sem_events_active() && mod == 3 && ot == MO_64 &&
                 (op == OP_ADDL || op == OP_SUBL)) {
                 int64_t imm = (int64_t)(int32_t)(uint32_t)val;
                 int64_t delta = (op == OP_SUBL) ? -imm : imm;
-                gen_prov_addsub_imm(opreg, delta, s->prov_pre_snapshot,
-                                    s->pc_start);
+                gen_sem_reg_addsub_imm(opreg, delta, s->prov_pre_snapshot,
+                                       s->pc_start);
                 s->prov_pre_snapshot = NULL;
             }
         }
@@ -5460,8 +5346,11 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                 tcg_gen_movi_tl(s->T0, ~0);
                 tcg_gen_atomic_xor_fetch_tl(s->T0, s->A0, s->T0,
                                             s->mem_index, ot | MO_LE);
-                /* LOCKed RMW: atomic store bypasses gen_op_st_v; invalidate. */
-                gen_prov_on_store(OR_TMP0, s->A0, ot);
+                /* LOCKed RMW: atomic store bypasses gen_op_st_v;
+                 * invalidate, then record the F01 access fact. */
+                gen_sem_set_ea_mode(s);
+                gen_sem_on_store(OR_TMP0, s->A0, ot);
+                gen_sem_mem_access_f01(s->A0, ot, s->pc_start, true);
             } else {
                 tcg_gen_not_tl(s->T0, s->T0);
                 if (mod != 3) {
@@ -5495,8 +5384,11 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                                           s->mem_index, ot | MO_LE);
                 tcg_temp_free(t1);
                 tcg_gen_brcond_tl(TCG_COND_NE, t0, t2, label1);
-                /* LOCKed RMW: atomic store bypasses gen_op_st_v; invalidate. */
-                gen_prov_on_store(OR_TMP0, a0, ot);
+                /* LOCKed RMW: atomic store bypasses gen_op_st_v;
+                 * invalidate, then record the F01 access fact. */
+                gen_sem_set_ea_mode(s);
+                gen_sem_on_store(OR_TMP0, a0, ot);
+                gen_sem_mem_access_f01(a0, ot, s->pc_start, true);
 
                 tcg_temp_free(t2);
                 tcg_temp_free(a0);
@@ -5562,8 +5454,8 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
 #endif
             }
             /* mul writes R_EAX/R_EDX directly via tcg_gen_mulu2; default-kill. */
-            gen_prov_invalidate_reg(R_EAX, s->pc_start);
-            gen_prov_invalidate_reg(R_EDX, s->pc_start);
+            gen_sem_reg_invalidate(R_EAX, s->pc_start);
+            gen_sem_reg_invalidate(R_EDX, s->pc_start);
             break;
         case 5: /* imul */
             switch(ot) {
@@ -5619,8 +5511,8 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
 #endif
             }
             /* imul writes R_EAX and R_EDX directly; bypass-kill. */
-            gen_prov_invalidate_reg(R_EAX, s->pc_start);
-            gen_prov_invalidate_reg(R_EDX, s->pc_start);
+            gen_sem_reg_invalidate(R_EAX, s->pc_start);
+            gen_sem_reg_invalidate(R_EDX, s->pc_start);
             break;
         case 6: /* div */
             switch(ot) {
@@ -5643,10 +5535,10 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
             /* div helpers write EAX/EDX (or AX/AL) inside the helper;
              * the written GPRs cannot keep an old pointer tag. */
             if (ot == MO_8) {
-                gen_prov_invalidate_reg(R_EAX, s->pc_start);
+                gen_sem_reg_invalidate(R_EAX, s->pc_start);
             } else {
-                gen_prov_invalidate_reg(R_EAX, s->pc_start);
-                gen_prov_invalidate_reg(R_EDX, s->pc_start);
+                gen_sem_reg_invalidate(R_EAX, s->pc_start);
+                gen_sem_reg_invalidate(R_EDX, s->pc_start);
             }
             break;
         case 7: /* idiv */
@@ -5669,10 +5561,10 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
             }
             /* idiv helpers write AX/EDX:EAX; default-kill those GPRs. */
             if (ot == MO_8) {
-                gen_prov_invalidate_reg(R_EAX, s->pc_start);
+                gen_sem_reg_invalidate(R_EAX, s->pc_start);
             } else {
-                gen_prov_invalidate_reg(R_EAX, s->pc_start);
-                gen_prov_invalidate_reg(R_EDX, s->pc_start);
+                gen_sem_reg_invalidate(R_EAX, s->pc_start);
+                gen_sem_reg_invalidate(R_EDX, s->pc_start);
             }
             break;
         default:
@@ -5742,14 +5634,12 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
 #endif
 
             gen_push_v(s, s->T1);
-            /* OSPREY: indirect call frame with the runtime target.
-             * Fires AFTER the return-address push so the passed RSP is
-             * the precise callee entry. */
-            if (osprey_active()) {
-                TCGv t_callee = tcg_const_tl(0);
+            /* Shared call boundary: fires after the return-address push,
+             * so the event carries the precise callee-entry RSP. */
+            if (sem_events_active()) {
+                TCGv t_callee = tcg_temp_new();
                 tcg_gen_mov_tl(t_callee, s->T0);
-                gen_helper_osprey_call(cpu_env, t_callee,
-                                       cpu_regs[R_ESP]);
+                gen_sem_call(t_callee);
                 tcg_temp_free(t_callee);
             }
             gen_op_jmp_v(s->T0);
@@ -5958,7 +5848,7 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
         }
         /* imul Gv writes reg directly (tcg_gen_muls2_i64/extu_i32_tl);
          * the result is an integer, default-kill. */
-        gen_prov_invalidate_reg(reg, s->pc_start);
+        gen_sem_reg_invalidate(reg, s->pc_start);
         set_cc_op(s, CC_OP_MULB + ot);
         break;
     case 0x1c0:
@@ -5980,12 +5870,18 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                 tcg_gen_atomic_fetch_add_tl(s->T1, s->A0, s->T0,
                                             s->mem_index, ot | MO_LE);
                 tcg_gen_add_tl(s->T0, s->T0, s->T1);
-                /* LOCKed RMW: atomic store bypasses gen_op_st_v; invalidate. */
-                gen_prov_on_store(OR_TMP0, s->A0, ot);
+                /* LOCKed RMW: atomic store bypasses gen_op_st_v;
+                 * invalidate, then record the F01 access fact. */
+                gen_sem_set_ea_mode(s);
+                gen_sem_on_store(OR_TMP0, s->A0, ot);
+                gen_sem_mem_access_f01(s->A0, ot, s->pc_start, true);
             } else {
                 gen_op_ld_v(s, ot, s->T1, s->A0);
                 tcg_gen_add_tl(s->T0, s->T0, s->T1);
                 gen_op_st_v(s, ot, s->T0, s->A0);
+                /* RMW: ONE F01 store event after the store cycle. */
+                gen_sem_set_ea_mode(s);
+                gen_sem_mem_access_f01(s->A0, ot, s->pc_start, true);
             }
             gen_op_mov_reg_v(s, ot, reg, s->T1);
         }
@@ -6015,8 +5911,11 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                 tcg_gen_atomic_cmpxchg_tl(oldv, s->A0, cmpv, newv,
                                           s->mem_index, ot | MO_LE);
                 gen_op_mov_reg_v(s, ot, R_EAX, oldv);
-                /* LOCKed RMW: atomic store bypasses gen_op_st_v; invalidate. */
-                gen_prov_on_store(OR_TMP0, s->A0, ot);
+                /* LOCKed RMW: atomic store bypasses gen_op_st_v;
+                 * invalidate, then record the F01 access fact. */
+                gen_sem_set_ea_mode(s);
+                gen_sem_on_store(OR_TMP0, s->A0, ot);
+                gen_sem_mem_access_f01(s->A0, ot, s->pc_start, true);
             } else {
                 if (mod == 3) {
                     rm = (modrm & 7) | REX_B(s);
@@ -6039,6 +5938,9 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                        idempotency if the store faults and the instruction
                        is restarted */
                     gen_op_st_v(s, ot, newv, s->A0);
+                    /* RMW: ONE F01 store event after the store cycle. */
+                    gen_sem_set_ea_mode(s);
+                    gen_sem_mem_access_f01(s->A0, ot, s->pc_start, true);
                     gen_op_mov_reg_v(s, ot, R_EAX, oldv);
                 }
             }
@@ -6073,12 +5975,16 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                 }
                 /* cmpxchg16b always stores 16 bytes at A0 and may write
                  * EAX:EDX (mismatch); invalidate both shadow slots and
-                 * the registers. */
-                gen_prov_on_store(OR_TMP0, s->A0, MO_64);
+                 * the registers, then record ONE F01 paired-store event
+                 * (16 bytes) after the helper (fault-safe). */
+                gen_sem_set_ea_mode(s);
+                gen_sem_on_store(OR_TMP0, s->A0, MO_64);
                 tcg_gen_addi_tl(s->tmp0, s->A0, 8);
-                gen_prov_on_store(OR_TMP0, s->tmp0, MO_64);
-                gen_prov_invalidate_reg(R_EAX, s->pc_start);
-                gen_prov_invalidate_reg(R_EDX, s->pc_start);
+                gen_sem_on_store(OR_TMP0, s->tmp0, MO_64);
+                gen_sem_mem_access_f01_raw(s->A0, 16, s->pc_start,
+                                           true);
+                gen_sem_reg_invalidate(R_EAX, s->pc_start);
+                gen_sem_reg_invalidate(R_EDX, s->pc_start);
                 set_cc_op(s, CC_OP_EFLAGS);
                 break;
             }
@@ -6094,10 +6000,14 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                 gen_helper_cmpxchg8b_unlocked(cpu_env, s->A0);
             }
             /* cmpxchg8b always stores 8 bytes at A0 and may write
-             * EAX:EDX (mismatch); invalidate the slot and both regs. */
-            gen_prov_on_store(OR_TMP0, s->A0, MO_64);
-            gen_prov_invalidate_reg(R_EAX, s->pc_start);
-            gen_prov_invalidate_reg(R_EDX, s->pc_start);
+             * EAX:EDX (mismatch); invalidate the slot and both regs,
+             * then record ONE F01 paired-store event (8 bytes) after
+             * the helper (fault-safe). */
+            gen_sem_set_ea_mode(s);
+            gen_sem_on_store(OR_TMP0, s->A0, MO_64);
+            gen_sem_mem_access_f01(s->A0, MO_64, s->pc_start, true);
+            gen_sem_reg_invalidate(R_EAX, s->pc_start);
+            gen_sem_reg_invalidate(R_EDX, s->pc_start);
             set_cc_op(s, CC_OP_EFLAGS);
             break;
 
@@ -6131,28 +6041,20 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
     case 0x50 ... 0x57: /* push */
         gen_op_mov_v_reg(s, MO_32, s->T0, (b & 7) | REX_B(s));
         gen_push_v(s, s->T0);
-        /* Provenance: push stores register's tag to stack shadow.  The
+        /* Push spills the register origin/tag to the stack shadow.  The
          * actual store width is mo_pushpop(s, s->dflag) (MO_64 in 64-bit
          * mode); passing s->dflag (MO_32) would make the helper see a
          * non-full-width store and invalidate the slot instead. */
-        gen_prov_on_store((b & 7) | REX_B(s), s->A0, mo_pushpop(s, s->dflag));
-        /* OSPREY: push spills the register origin. */
-        if (osprey_active()) {
-            gen_osprey_on_store((b & 7) | REX_B(s), s->A0,
-                                mo_pushpop(s, s->dflag));
-        }
+        gen_sem_on_store((b & 7) | REX_B(s), s->A0,
+                         mo_pushpop(s, s->dflag));
         break;
     case 0x58 ... 0x5f: /* pop */
         ot = gen_pop_T0(s);
         /* NOTE: order is important for pop %sp */
         gen_pop_update(s, ot);
         gen_op_mov_reg_v(s, ot, (b & 7) | REX_B(s), s->T0);
-        /* Provenance: pop restores tag from stack shadow. */
-        gen_prov_on_load((b & 7) | REX_B(s), s->A0, ot, s->pc_start);
-        /* OSPREY: pop reloads the origin from the stack shadow. */
-        if (osprey_active()) {
-            gen_osprey_on_load((b & 7) | REX_B(s), s->A0, ot);
-        }
+        /* Pop restores the tag/origin from the stack shadow. */
+        gen_sem_on_load((b & 7) | REX_B(s), s->A0, ot, s->pc_start);
         break;
     case 0x60: /* pusha */
         if (CODE64(s))
@@ -6270,28 +6172,16 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
             gen_lea_v_seg(s, s->aflag, ea, a.def_seg, s->override);
             /* Store every architectural EA; unsupported modes become
              * UNKNOWN in the runtime helper. */
-            gen_prov_set_ea(s, a.base, a.index, a.scale, a.disp);
-            if (s->aflag == MO_64 && s->override < 0) {
-                if (a.base >= 0) {
-                    gen_osprey_set_ea(a.base, a.index, a.scale, a.disp,
-                                      cpu_regs[a.base],
-                                      a.index >= 0 ? cpu_regs[a.index] : NULL);
-                } else if (a.index >= 0) {
-                    gen_osprey_set_ea(-1, a.index, a.scale, a.disp, NULL,
-                                      cpu_regs[a.index]);
-                }
-            }
+            gen_sem_set_ea(s, a.base, a.index, a.scale, a.disp);
         }
         val = insn_get(env, s, ot);
         tcg_gen_movi_tl(s->T0, val);
         if (mod != 3) {
             gen_op_st_v(s, ot, s->T0, s->A0);
-            /* Provenance: immediate store → invalidate shadow slot. */
-            gen_prov_on_store(OR_TMP0, s->A0, ot);
-            gen_prov_check_access(s->A0, ot, s->pc_start);
-            if (s->aflag == MO_64 && s->override < 0) {
-                gen_osprey_mem_access(s->A0, ot, s->pc_start, true);
-            }
+            /* Immediate store: the gen_op_st_v store event (OR_TMP0
+             * source) invalidates the slot for both consumers; the F01
+             * store access fact follows. */
+            gen_sem_mem_access(s->A0, ot, s->pc_start, true);
         } else {
             gen_op_mov_reg_v(s, ot, (modrm & 7) | REX_B(s), s->T0);
         }
@@ -6304,10 +6194,9 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
 
         gen_ldst_modrm(env, s, modrm, ot, OR_TMP0, 0);
         gen_op_mov_reg_v(s, ot, reg, s->T0);
-        /* Provenance: restore tag from memory shadow (spill reload). */
+        /* Restore tag/origin from memory shadow (spill reload). */
         if ((modrm >> 6) != 3) {
-            gen_prov_on_load(reg, s->A0, ot, s->pc_start);
-            gen_osprey_on_load(reg, s->A0, ot);
+            gen_sem_on_load(reg, s->A0, ot, s->pc_start);
         }
         break;
     case 0x8e: /* mov seg, Gv */
@@ -6387,24 +6276,11 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                 gen_lea_v_seg(s, s->aflag, ea, a.def_seg, s->override);
                 /* Store every architectural EA; unsupported modes become
                  * UNKNOWN in the runtime helper. */
-                gen_prov_set_ea(s, a.base, a.index, a.scale, a.disp);
-                if (s->aflag == MO_64 && s->override < 0) {
-                    if (a.base >= 0) {
-                        gen_osprey_set_ea(a.base, a.index, a.scale, a.disp,
-                                          cpu_regs[a.base],
-                                          a.index >= 0 ? cpu_regs[a.index] : NULL);
-                    } else if (a.index >= 0) {
-                        gen_osprey_set_ea(-1, a.index, a.scale, a.disp, NULL,
-                                          cpu_regs[a.index]);
-                    }
-                }
+                gen_sem_set_ea(s, a.base, a.index, a.scale, a.disp);
                 gen_op_ld_v(s, s_ot, s->T0, s->A0);
                 gen_op_mov_reg_v(s, d_ot, reg, s->T0);
-                gen_osprey_on_load(reg, s->A0, s_ot);
-                gen_prov_check_access(s->A0, s_ot, s->pc_start);
-                if (s->aflag == MO_64 && s->override < 0) {
-                    gen_osprey_mem_access(s->A0, s_ot, s->pc_start, false);
-                }
+                gen_sem_on_load(reg, s->A0, s_ot, s->pc_start);
+                gen_sem_mem_access(s->A0, s_ot, s->pc_start, false);
             }
         }
         break;
@@ -6428,33 +6304,29 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
              * write-back invalidation is suppressed so the helper can
              * read the pre-op dst tag; the base's pre-instruction value
              * is snapshotted when dst == base. */
-            TCGv prov_pre_base = NULL;
-            if (binradar_memcheck_enabled && dflag == MO_64 &&
-                a.base >= 0) {
-                s->prov_skip_invalidate = true;
+            TCGv pre_base = NULL;
+            if (sem_events_active() && dflag == MO_64 && a.base >= 0) {
+                /* Constant-offset LEA is accepted by both consumers.
+                 * Indexed LEA needs the pre-write base for provenance;
+                 * OSPREY receives the event but conservatively kills the
+                 * destination until Stage 2.3 defines its policy. */
+                if (a.index < 0 || binradar_memcheck_enabled) {
+                    s->prov_skip_invalidate = true;
+                }
                 if (a.index >= 0) {
-                    prov_pre_base = tcg_temp_new();
-                    tcg_gen_mov_tl(prov_pre_base, cpu_regs[a.base]);
+                    pre_base = tcg_temp_new();
+                    tcg_gen_mov_tl(pre_base, cpu_regs[a.base]);
                 }
             }
             gen_op_mov_reg_v(s, dflag, reg, s->A0);
-            if (binradar_memcheck_enabled && dflag == MO_64 &&
-                a.base >= 0) {
+            if (dflag == MO_64 && a.base >= 0) {
                 if (a.index < 0) {
-                    gen_prov_lea_imm(reg, a.base, a.disp, s->pc_start);
+                    gen_sem_reg_lea(reg, a.base, a.disp, s->pc_start);
                 } else {
-                    gen_prov_lea_dyn(reg, a.base, s->pc_start,
-                                     prov_pre_base);
-                    tcg_temp_free(prov_pre_base);
+                    gen_sem_reg_lea_dyn(reg, a.base, s->pc_start,
+                                        pre_base);
+                    tcg_temp_free(pre_base);
                 }
-            }
-            /* OSPREY: lea propagates the ADDRESS origin with the checked
-             * constant offset.  Only the [base + disp] form is a sound
-             * constant-offset transfer; indexed forms invalidate (the
-             * runtime delta is not a compile-time offset). */
-            if (osprey_active() && dflag == MO_64 && a.base >= 0 &&
-                a.index < 0) {
-                gen_osprey_reg_lea(reg, a.base, a.disp);
             }
          }
          break;
@@ -6548,7 +6420,7 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                 s->prov_skip_invalidate = true;
                 gen_op_mov_reg_v(s, ot, reg, s->T1);
                 s->prov_skip_invalidate = false;
-                gen_prov_xchg_reg(reg, rm);
+                gen_sem_reg_xchg(reg, rm);
             } else {
                 /* Narrower xchg: partial-register writes, both tags die. */
                 gen_op_mov_reg_v(s, ot, rm, s->T0);
@@ -6564,9 +6436,12 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
             /* Memory xchg: the register now holds the OLD memory value and
              * the old register value was stored at addr.  The stored value
              * may be a pointer, but we do not model the memory shadow
-             * exchange; invalidate both the register tag and the slot. */
-            gen_prov_invalidate_reg(reg, s->pc_start);
-            gen_prov_on_store(OR_TMP0, s->A0, ot);
+             * exchange; invalidate both the register tag and the slot,
+             * then record the F01 access fact. */
+            gen_sem_set_ea_mode(s);
+            gen_sem_reg_invalidate(reg, s->pc_start);
+            gen_sem_on_store(OR_TMP0, s->A0, ot);
+            gen_sem_mem_access_f01(s->A0, ot, s->pc_start, true);
         }
         break;
     case 0xc4: /* les Gv */
@@ -6784,23 +6659,32 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                         gen_helper_fisttl_ST0(s->tmp2_i32, cpu_env);
                         tcg_gen_qemu_st_i32(s->tmp2_i32, s->A0,
                                             s->mem_index, MO_LEUL);
-                        /* Provenance: FPU store — invalidate shadow. */
-                        gen_prov_on_store(OR_TMP0, s->A0, MO_32);
+                        /* FPU store: invalidate + F01 after the store. */
+                        gen_sem_set_ea_mode(s);
+                        gen_sem_on_store(OR_TMP0, s->A0, MO_32);
+                        gen_sem_mem_access_f01(s->A0, MO_32, s->pc_start,
+                                               true);
                         break;
                     case 2:
                         gen_helper_fisttll_ST0(s->tmp1_i64, cpu_env);
                         tcg_gen_qemu_st_i64(s->tmp1_i64, s->A0,
                                             s->mem_index, MO_LEQ);
-                        /* Provenance: FPU store — invalidate shadow. */
-                        gen_prov_on_store(OR_TMP0, s->A0, MO_64);
+                        /* FPU store: invalidate + F01 after the store. */
+                        gen_sem_set_ea_mode(s);
+                        gen_sem_on_store(OR_TMP0, s->A0, MO_64);
+                        gen_sem_mem_access_f01(s->A0, MO_64, s->pc_start,
+                                               true);
                         break;
                     case 3:
                     default:
                         gen_helper_fistt_ST0(s->tmp2_i32, cpu_env);
                         tcg_gen_qemu_st_i32(s->tmp2_i32, s->A0,
                                             s->mem_index, MO_LEUW);
-                        /* Provenance: FPU store — invalidate shadow. */
-                        gen_prov_on_store(OR_TMP0, s->A0, MO_16);
+                        /* FPU store: invalidate + F01 after the store. */
+                        gen_sem_set_ea_mode(s);
+                        gen_sem_on_store(OR_TMP0, s->A0, MO_16);
+                        gen_sem_mem_access_f01(s->A0, MO_16, s->pc_start,
+                                               true);
                         break;
                     }
                     gen_helper_fpop(cpu_env);
@@ -6811,30 +6695,42 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                         gen_helper_fsts_ST0(s->tmp2_i32, cpu_env);
                         tcg_gen_qemu_st_i32(s->tmp2_i32, s->A0,
                                             s->mem_index, MO_LEUL);
-                        /* Provenance: FPU store — invalidate shadow. */
-                        gen_prov_on_store(OR_TMP0, s->A0, MO_32);
+                        /* FPU store: invalidate + F01 after the store. */
+                        gen_sem_set_ea_mode(s);
+                        gen_sem_on_store(OR_TMP0, s->A0, MO_32);
+                        gen_sem_mem_access_f01(s->A0, MO_32, s->pc_start,
+                                               true);
                         break;
                     case 1:
                         gen_helper_fistl_ST0(s->tmp2_i32, cpu_env);
                         tcg_gen_qemu_st_i32(s->tmp2_i32, s->A0,
                                             s->mem_index, MO_LEUL);
-                        /* Provenance: FPU store — invalidate shadow. */
-                        gen_prov_on_store(OR_TMP0, s->A0, MO_32);
+                        /* FPU store: invalidate + F01 after the store. */
+                        gen_sem_set_ea_mode(s);
+                        gen_sem_on_store(OR_TMP0, s->A0, MO_32);
+                        gen_sem_mem_access_f01(s->A0, MO_32, s->pc_start,
+                                               true);
                         break;
                     case 2:
                         gen_helper_fstl_ST0(s->tmp1_i64, cpu_env);
                         tcg_gen_qemu_st_i64(s->tmp1_i64, s->A0,
                                             s->mem_index, MO_LEQ);
-                        /* Provenance: FPU store — invalidate shadow. */
-                        gen_prov_on_store(OR_TMP0, s->A0, MO_64);
+                        /* FPU store: invalidate + F01 after the store. */
+                        gen_sem_set_ea_mode(s);
+                        gen_sem_on_store(OR_TMP0, s->A0, MO_64);
+                        gen_sem_mem_access_f01(s->A0, MO_64, s->pc_start,
+                                               true);
                         break;
                     case 3:
                     default:
                         gen_helper_fist_ST0(s->tmp2_i32, cpu_env);
                         tcg_gen_qemu_st_i32(s->tmp2_i32, s->A0,
                                             s->mem_index, MO_LEUW);
-                        /* Provenance: FPU store — invalidate shadow. */
-                        gen_prov_on_store(OR_TMP0, s->A0, MO_16);
+                        /* FPU store: invalidate + F01 after the store. */
+                        gen_sem_set_ea_mode(s);
+                        gen_sem_on_store(OR_TMP0, s->A0, MO_16);
+                        gen_sem_mem_access_f01(s->A0, MO_16, s->pc_start,
+                                               true);
                         break;
                     }
                     if ((op & 7) == 3)
@@ -6852,33 +6748,46 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                 break;
             case 0x0e: /* fnstenv m14/28 */
                 gen_helper_fstenv(cpu_env, s->A0, tcg_const_i32(dflag - 1));
-                /* Provenance: helper writes 14/28 bytes; invalidate. */
-                gen_prov_on_store(OR_TMP0, s->A0, MO_64);
+                /* Helper writes 14/28 bytes; invalidate the overlapping
+                 * shadow slots, then record ONE F01 event (14/28 bytes)
+                 * after the helper. */
+                gen_sem_set_ea_mode(s);
+                gen_sem_on_store(OR_TMP0, s->A0, MO_64);
                 tcg_gen_addi_tl(s->tmp0, s->A0, 8);
-                gen_prov_on_store(OR_TMP0, s->tmp0, MO_64);
+                gen_sem_on_store(OR_TMP0, s->tmp0, MO_64);
                 if (dflag != MO_16) {
                     tcg_gen_addi_tl(s->tmp0, s->A0, 16);
-                    gen_prov_on_store(OR_TMP0, s->tmp0, MO_64);
+                    gen_sem_on_store(OR_TMP0, s->tmp0, MO_64);
                     tcg_gen_addi_tl(s->tmp0, s->A0, 24);
-                    gen_prov_on_store(OR_TMP0, s->tmp0, MO_32);
+                    gen_sem_on_store(OR_TMP0, s->tmp0, MO_32);
+                    gen_sem_mem_access_f01_raw(s->A0, 28, s->pc_start,
+                                               true);
+                } else {
+                    gen_sem_mem_access_f01_raw(s->A0, 14, s->pc_start,
+                                               true);
                 }
                 break;
             case 0x0f: /* fnstcw mem */
                 gen_helper_fnstcw(s->tmp2_i32, cpu_env);
                 tcg_gen_qemu_st_i32(s->tmp2_i32, s->A0,
                                     s->mem_index, MO_LEUW);
-                /* Provenance: FPU control-word store — invalidate. */
-                gen_prov_on_store(OR_TMP0, s->A0, MO_16);
+                /* FPU control-word store: invalidate + F01. */
+                gen_sem_set_ea_mode(s);
+                gen_sem_on_store(OR_TMP0, s->A0, MO_16);
+                gen_sem_mem_access_f01(s->A0, MO_16, s->pc_start, true);
                 break;
             case 0x1d: /* fldt mem */
                 gen_helper_fldt_ST0(cpu_env, s->A0);
                 break;
             case 0x1f: /* fstpt m80 */
                 gen_helper_fstt_ST0(cpu_env, s->A0);
-                /* Provenance: helper writes 10 bytes; invalidate. */
-                gen_prov_on_store(OR_TMP0, s->A0, MO_64);
+                /* Helper writes 10 bytes: invalidate, then ONE F01 event
+                 * (10 bytes) after the helper. */
+                gen_sem_set_ea_mode(s);
+                gen_sem_on_store(OR_TMP0, s->A0, MO_64);
                 tcg_gen_addi_tl(s->tmp0, s->A0, 8);
-                gen_prov_on_store(OR_TMP0, s->tmp0, MO_16);
+                gen_sem_on_store(OR_TMP0, s->tmp0, MO_16);
+                gen_sem_mem_access_f01_raw(s->A0, 10, s->pc_start, true);
                 gen_helper_fpop(cpu_env);
                 break;
             case 0x2c: /* frstor mem */
@@ -6886,54 +6795,67 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                 break;
             case 0x2e: /* fnsave m94/108 */
                 gen_helper_fsave(cpu_env, s->A0, tcg_const_i32(dflag - 1));
-                /* Provenance: helper writes env (14/28) + 8x10 ST bytes;
-                 * invalidate exactly the overlapping pointer-shadow slots. */
-                gen_prov_on_store(OR_TMP0, s->A0, MO_64);
+                /* Helper writes env (14/28) + 8x10 ST bytes; invalidate
+                 * exactly the overlapping pointer-shadow slots, then
+                 * record ONE F01 event (94/108 bytes) after the helper. */
+                gen_sem_set_ea_mode(s);
+                tcg_gen_mov_tl(s->tmp4, s->A0); /* env-image start */
+                gen_sem_on_store(OR_TMP0, s->A0, MO_64);
                 tcg_gen_addi_tl(s->tmp0, s->A0, 8);
-                gen_prov_on_store(OR_TMP0, s->tmp0, MO_64);
+                gen_sem_on_store(OR_TMP0, s->tmp0, MO_64);
                 tcg_gen_addi_tl(s->tmp0, s->A0, 16);
-                gen_prov_on_store(OR_TMP0, s->tmp0, MO_64);
+                gen_sem_on_store(OR_TMP0, s->tmp0, MO_64);
                 tcg_gen_addi_tl(s->tmp0, s->A0, 24);
-                gen_prov_on_store(OR_TMP0, s->tmp0, MO_64);
+                gen_sem_on_store(OR_TMP0, s->tmp0, MO_64);
                 tcg_gen_addi_tl(s->tmp0, s->A0, 32);
-                gen_prov_on_store(OR_TMP0, s->tmp0, MO_64);
+                gen_sem_on_store(OR_TMP0, s->tmp0, MO_64);
                 tcg_gen_addi_tl(s->tmp0, s->A0, 40);
-                gen_prov_on_store(OR_TMP0, s->tmp0, MO_64);
+                gen_sem_on_store(OR_TMP0, s->tmp0, MO_64);
                 tcg_gen_addi_tl(s->tmp0, s->A0, 48);
-                gen_prov_on_store(OR_TMP0, s->tmp0, MO_64);
+                gen_sem_on_store(OR_TMP0, s->tmp0, MO_64);
                 tcg_gen_addi_tl(s->tmp0, s->A0, 56);
-                gen_prov_on_store(OR_TMP0, s->tmp0, MO_64);
+                gen_sem_on_store(OR_TMP0, s->tmp0, MO_64);
                 tcg_gen_addi_tl(s->tmp0, s->A0, 64);
-                gen_prov_on_store(OR_TMP0, s->tmp0, MO_64);
+                gen_sem_on_store(OR_TMP0, s->tmp0, MO_64);
                 tcg_gen_addi_tl(s->tmp0, s->A0, 72);
-                gen_prov_on_store(OR_TMP0, s->tmp0, MO_64);
+                gen_sem_on_store(OR_TMP0, s->tmp0, MO_64);
                 tcg_gen_addi_tl(s->tmp0, s->A0, 80);
-                gen_prov_on_store(OR_TMP0, s->tmp0, MO_64);
+                gen_sem_on_store(OR_TMP0, s->tmp0, MO_64);
                 tcg_gen_addi_tl(s->tmp0, s->A0, 88);
-                gen_prov_on_store(OR_TMP0, s->tmp0, MO_64);
+                gen_sem_on_store(OR_TMP0, s->tmp0, MO_64);
                 if (dflag != MO_16) {
                     tcg_gen_addi_tl(s->tmp0, s->A0, 96);
-                    gen_prov_on_store(OR_TMP0, s->tmp0, MO_64);
+                    gen_sem_on_store(OR_TMP0, s->tmp0, MO_64);
                     tcg_gen_addi_tl(s->tmp0, s->A0, 104);
-                    gen_prov_on_store(OR_TMP0, s->tmp0, MO_32);
+                    gen_sem_on_store(OR_TMP0, s->tmp0, MO_32);
+                    gen_sem_mem_access_f01_raw(s->tmp4, 108, s->pc_start,
+                                               true);
+                } else {
+                    gen_sem_mem_access_f01_raw(s->tmp4, 94, s->pc_start,
+                                               true);
                 }
                 break;
             case 0x2f: /* fnstsw m */
                 gen_helper_fnstsw(s->tmp2_i32, cpu_env);
                 tcg_gen_qemu_st_i32(s->tmp2_i32, s->A0,
                                     s->mem_index, MO_LEUW);
-                /* Provenance: FPU status-word store — invalidate. */
-                gen_prov_on_store(OR_TMP0, s->A0, MO_16);
+                /* FPU status-word store: invalidate + F01. */
+                gen_sem_set_ea_mode(s);
+                gen_sem_on_store(OR_TMP0, s->A0, MO_16);
+                gen_sem_mem_access_f01(s->A0, MO_16, s->pc_start, true);
                 break;
             case 0x3c: /* fbld m80 */
                 gen_helper_fbld_ST0(cpu_env, s->A0);
                 break;
             case 0x3e: /* fbstp m80 */
                 gen_helper_fbst_ST0(cpu_env, s->A0);
-                /* Provenance: helper writes 10 bytes; invalidate. */
-                gen_prov_on_store(OR_TMP0, s->A0, MO_64);
+                /* Helper writes 10 bytes: invalidate, then ONE F01 event
+                 * (10 bytes) after the helper. */
+                gen_sem_set_ea_mode(s);
+                gen_sem_on_store(OR_TMP0, s->A0, MO_64);
                 tcg_gen_addi_tl(s->tmp0, s->A0, 8);
-                gen_prov_on_store(OR_TMP0, s->tmp0, MO_16);
+                gen_sem_on_store(OR_TMP0, s->tmp0, MO_16);
+                gen_sem_mem_access_f01_raw(s->A0, 10, s->pc_start, true);
                 gen_helper_fpop(cpu_env);
                 break;
             case 0x3d: /* fildll m64 */
@@ -6943,8 +6865,10 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
             case 0x3f: /* fistpll m64 */
                 gen_helper_fistll_ST0(s->tmp1_i64, cpu_env);
                 tcg_gen_qemu_st_i64(s->tmp1_i64, s->A0, s->mem_index, MO_LEQ);
-                /* Provenance: FPU store — invalidate shadow. */
-                gen_prov_on_store(OR_TMP0, s->A0, MO_64);
+                /* FPU store: invalidate + F01 after the store. */
+                gen_sem_set_ea_mode(s);
+                gen_sem_on_store(OR_TMP0, s->A0, MO_64);
+                gen_sem_mem_access_f01(s->A0, MO_64, s->pc_start, true);
                 gen_helper_fpop(cpu_env);
                 break;
             default:
@@ -7443,10 +7367,8 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
 #endif
 #endif
 
-        /* OSPREY: return pops the current frame (post-pop RSP). */
-        if (osprey_active()) {
-            gen_helper_osprey_ret(cpu_env, s->T0, cpu_regs[R_ESP]);
-        }
+        /* Shared return boundary carries the post-pop RSP. */
+        gen_sem_ret(s->T0);
 
         /* Note that gen_pop_T0 uses a zero-extending load.  */
         gen_op_jmp_v(s->T0);
@@ -7465,10 +7387,8 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
 #endif
 #endif
 
-        /* OSPREY: return pops the current frame (post-pop RSP). */
-        if (osprey_active()) {
-            gen_helper_osprey_ret(cpu_env, s->T0, cpu_regs[R_ESP]);
-        }
+        /* Shared return boundary carries the post-pop RSP. */
+        gen_sem_ret(s->T0);
 
         /* Note that gen_pop_T0 uses a zero-extending load.  */
         gen_op_jmp_v(s->T0);
@@ -7547,13 +7467,10 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
 #endif
 
             gen_push_v(s, s->T0);
-            /* OSPREY: direct call with the static callee target.
-             * Fires AFTER the return-address push so the passed RSP is
-             * the precise callee entry. */
-            if (osprey_active()) {
+            /* Shared direct-call boundary after the return-address push. */
+            if (sem_events_active()) {
                 TCGv t_callee = tcg_const_tl(tval);
-                gen_helper_osprey_call(cpu_env, t_callee,
-                                       cpu_regs[R_ESP]);
+                gen_sem_call(t_callee);
                 tcg_temp_free(t_callee);
             }
             gen_bnd_jmp(s);
@@ -7612,14 +7529,12 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
         }
 #endif
 #endif
-        /* OSPREY: E9-relocated call — the callee target is the jump
-         * destination (tval); the frame is precise (same identity as the
-         * original direct call).  The stub already pushed the return
-         * address, so the current RSP is the precise callee entry. */
-        if (osprey_active() && is_e9_relocated_call(pc_start - s->cs_base,
-                                                    NULL, NULL)) {
+        /* E9-relocated call: the stub already pushed the return address,
+         * so the shared boundary sees the precise callee-entry RSP. */
+        if (sem_events_active() &&
+            is_e9_relocated_call(pc_start - s->cs_base, NULL, NULL)) {
             TCGv t_callee = tcg_const_tl(tval);
-            gen_helper_osprey_call(cpu_env, t_callee, cpu_regs[R_ESP]);
+            gen_sem_call(t_callee);
             tcg_temp_free(t_callee);
         }
         gen_bnd_jmp(s);
@@ -7859,22 +7774,31 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
             case 1: /* bts */
                 tcg_gen_atomic_fetch_or_tl(s->T0, s->A0, s->tmp0,
                                            s->mem_index, ot | MO_LE);
-                /* LOCKed RMW: atomic store bypasses gen_op_st_v; invalidate. */
-                gen_prov_on_store(OR_TMP0, s->A0, ot);
+                /* LOCKed RMW: atomic store bypasses gen_op_st_v;
+                 * invalidate, then record the F01 access fact. */
+                gen_sem_set_ea_mode(s);
+                gen_sem_on_store(OR_TMP0, s->A0, ot);
+                gen_sem_mem_access_f01(s->A0, ot, s->pc_start, true);
                 break;
             case 2: /* btr */
                 tcg_gen_not_tl(s->tmp0, s->tmp0);
                 tcg_gen_atomic_fetch_and_tl(s->T0, s->A0, s->tmp0,
                                             s->mem_index, ot | MO_LE);
-                /* LOCKed RMW: atomic store bypasses gen_op_st_v; invalidate. */
-                gen_prov_on_store(OR_TMP0, s->A0, ot);
+                /* LOCKed RMW: atomic store bypasses gen_op_st_v;
+                 * invalidate, then record the F01 access fact. */
+                gen_sem_set_ea_mode(s);
+                gen_sem_on_store(OR_TMP0, s->A0, ot);
+                gen_sem_mem_access_f01(s->A0, ot, s->pc_start, true);
                 break;
             default:
             case 3: /* btc */
                 tcg_gen_atomic_fetch_xor_tl(s->T0, s->A0, s->tmp0,
                                             s->mem_index, ot | MO_LE);
-                /* LOCKed RMW: atomic store bypasses gen_op_st_v; invalidate. */
-                gen_prov_on_store(OR_TMP0, s->A0, ot);
+                /* LOCKed RMW: atomic store bypasses gen_op_st_v;
+                 * invalidate, then record the F01 access fact. */
+                gen_sem_set_ea_mode(s);
+                gen_sem_on_store(OR_TMP0, s->A0, ot);
+                gen_sem_mem_access_f01(s->A0, ot, s->pc_start, true);
                 break;
             }
             tcg_gen_shr_tl(s->tmp4, s->T0, s->T1);
@@ -8215,8 +8139,8 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
         }
         gen_helper_rdtsc(cpu_env);
         /* rdtsc writes EAX:EDX inside the helper; default-kill both. */
-        gen_prov_invalidate_reg(R_EAX, s->pc_start);
-        gen_prov_invalidate_reg(R_EDX, s->pc_start);
+        gen_sem_reg_invalidate(R_EAX, s->pc_start);
+        gen_sem_reg_invalidate(R_EDX, s->pc_start);
         if (tb_cflags(s->base.tb) & CF_USE_ICOUNT) {
             gen_io_end();
             gen_jmp(s, s->pc - s->cs_base);
@@ -8282,10 +8206,10 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
         gen_jmp_im(s, pc_start - s->cs_base);
         gen_helper_cpuid(cpu_env);
         /* cpuid writes EAX, EBX, ECX, EDX inside the helper; default-kill. */
-        gen_prov_invalidate_reg(R_EAX, s->pc_start);
-        gen_prov_invalidate_reg(R_EBX, s->pc_start);
-        gen_prov_invalidate_reg(R_ECX, s->pc_start);
-        gen_prov_invalidate_reg(R_EDX, s->pc_start);
+        gen_sem_reg_invalidate(R_EAX, s->pc_start);
+        gen_sem_reg_invalidate(R_EBX, s->pc_start);
+        gen_sem_reg_invalidate(R_ECX, s->pc_start);
+        gen_sem_reg_invalidate(R_EDX, s->pc_start);
         break;
     case 0xf4: /* hlt */
         if (s->cpl != 0) {
@@ -8444,8 +8368,8 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
             gen_helper_xgetbv(s->tmp1_i64, cpu_env, s->tmp2_i32);
             tcg_gen_extr_i64_tl(cpu_regs[R_EAX], cpu_regs[R_EDX], s->tmp1_i64);
             /* xgetbv writes EAX:EDX; default-kill both. */
-            gen_prov_invalidate_reg(R_EAX, s->pc_start);
-            gen_prov_invalidate_reg(R_EDX, s->pc_start);
+            gen_sem_reg_invalidate(R_EAX, s->pc_start);
+            gen_sem_reg_invalidate(R_EDX, s->pc_start);
             break;
 
         case 0xd1: /* xsetbv */
@@ -8624,9 +8548,9 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
             gen_helper_rdpkru(s->tmp1_i64, cpu_env, s->tmp2_i32);
             tcg_gen_extr_i64_tl(cpu_regs[R_EAX], cpu_regs[R_EDX], s->tmp1_i64);
             /* rdpkru writes EAX:EDX:ECX; default-kill all three. */
-            gen_prov_invalidate_reg(R_EAX, s->pc_start);
-            gen_prov_invalidate_reg(R_EDX, s->pc_start);
-            gen_prov_invalidate_reg(R_ECX, s->pc_start);
+            gen_sem_reg_invalidate(R_EAX, s->pc_start);
+            gen_sem_reg_invalidate(R_EDX, s->pc_start);
+            gen_sem_reg_invalidate(R_ECX, s->pc_start);
             break;
         case 0xef: /* wrpkru */
             if (prefixes & PREFIX_LOCK) {
@@ -8690,9 +8614,9 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
             }
             gen_helper_rdtscp(cpu_env);
             /* rdtscp writes EAX:EDX:ECX inside the helper; default-kill. */
-            gen_prov_invalidate_reg(R_EAX, s->pc_start);
-            gen_prov_invalidate_reg(R_EDX, s->pc_start);
-            gen_prov_invalidate_reg(R_ECX, s->pc_start);
+            gen_sem_reg_invalidate(R_EAX, s->pc_start);
+            gen_sem_reg_invalidate(R_EDX, s->pc_start);
+            gen_sem_reg_invalidate(R_ECX, s->pc_start);
             if (tb_cflags(s->base.tb) & CF_USE_ICOUNT) {
                 gen_io_end();
                 gen_jmp(s, s->pc - s->cs_base);
@@ -8979,26 +8903,34 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                     }
                 } else {
                     gen_lea_modrm(env, s, modrm);
+                    tcg_gen_mov_tl(s->tmp4, s->A0); /* bound-pair start */
                     if (CODE64(s)) {
                         tcg_gen_qemu_st_i64(cpu_bndl[reg], s->A0,
                                             s->mem_index, MO_LEQ);
-                        /* Provenance: MPX bound store — invalidate. */
-                        gen_prov_on_store(OR_TMP0, s->A0, MO_64);
+                        /* MPX bound store — invalidate. */
+                        gen_sem_set_ea_mode(s);
+                        gen_sem_on_store(OR_TMP0, s->A0, MO_64);
                         tcg_gen_addi_tl(s->A0, s->A0, 8);
                         tcg_gen_qemu_st_i64(cpu_bndu[reg], s->A0,
                                             s->mem_index, MO_LEQ);
-                        /* Provenance: MPX bound store — invalidate. */
-                        gen_prov_on_store(OR_TMP0, s->A0, MO_64);
+                        gen_sem_on_store(OR_TMP0, s->A0, MO_64);
+                        /* 16-byte bound pair: ONE F01 event after both
+                         * qemu stores (fault on the second → nothing). */
+                        gen_sem_mem_access_f01_raw(s->tmp4, 16,
+                                                   s->pc_start, true);
                     } else {
                         tcg_gen_qemu_st_i64(cpu_bndl[reg], s->A0,
                                             s->mem_index, MO_LEUL);
-                        /* Provenance: MPX bound store — invalidate. */
-                        gen_prov_on_store(OR_TMP0, s->A0, MO_32);
+                        /* MPX bound store — invalidate. */
+                        gen_sem_set_ea_mode(s);
+                        gen_sem_on_store(OR_TMP0, s->A0, MO_32);
                         tcg_gen_addi_tl(s->A0, s->A0, 4);
                         tcg_gen_qemu_st_i64(cpu_bndu[reg], s->A0,
                                             s->mem_index, MO_LEUL);
-                        /* Provenance: MPX bound store — invalidate. */
-                        gen_prov_on_store(OR_TMP0, s->A0, MO_32);
+                        gen_sem_on_store(OR_TMP0, s->A0, MO_32);
+                        /* 8-byte bound pair: ONE F01 event. */
+                        gen_sem_mem_access_f01(s->tmp4, MO_64, s->pc_start,
+                                               true);
                     }
                 }
             } else if (mod != 3) {

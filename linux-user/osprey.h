@@ -172,14 +172,10 @@ bool osprey_raw_extent(const OspreyModel *model,
 /* Runtime collection hooks (called from translated code / models)     */
 /* ------------------------------------------------------------------ */
 
-/* Called from the x86 translator: helper_osprey_set_ea runs BEFORE the
- * guest access with the semantic EA decomposition (packed base/index/
- * scale/validity + signed disp32 + the pre-instruction base/index
- * values); helper_osprey_mem_access runs AFTER the access succeeds and
- * consumes that metadata.  A faulting access therefore never records
- * facts. */
-void osprey_set_ea(CPUArchState *env, uint32_t packed, uint32_t disp,
-                   target_ulong base_val, target_ulong index_val);
+/* EA metadata consumption (Stage 2.2): the shared semantic-event layer
+ * (linux-user/sem-events.c) records the EA record before the guest
+ * access; this hook runs AFTER the access succeeds and consumes that
+ * metadata.  A faulting access therefore never records facts. */
 void osprey_on_mem_access(CPUArchState *env, target_ulong addr,
                           uint64_t size, uint64_t pc, uint32_t is_store);
 
@@ -199,9 +195,8 @@ void osprey_on_free_identity(CPUArchState *env, uint64_t object_id,
 void osprey_on_mem_copy(CPUArchState *env, target_ulong src,
                         target_ulong dst, target_ulong size);
 
-/* Legacy OSPREY-only origin hooks emitted from the x86 translator.
- * Stages 2.2–2.4 replace their parallel coverage with shared semantic
- * events before completing address/value origin semantics. */
+/* OSPREY consumers of the shared semantic-event layer.  Stage 2.2
+ * centralizes dispatch; Stages 2.3–2.4 complete address/value policy. */
 void osprey_on_reg_copy(CPUArchState *env, uint32_t dst, uint32_t src,
                         target_ulong src_val, target_ulong dst_val);
 void osprey_on_reg_lea(CPUArchState *env, uint32_t dst, uint32_t base,

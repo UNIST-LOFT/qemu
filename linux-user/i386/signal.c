@@ -17,11 +17,11 @@
  *  along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 #include "qemu/osdep.h"
+#include "sem-events.h"
 #include "qemu.h"
 #include "signal-common.h"
 #include "linux-user/trace.h"
 #include "../snapshot.h"
-#include "../provenance.h"
 
 /* from the Linux kernel - /arch/x86/include/uapi/asm/sigcontext.h */
 
@@ -337,9 +337,7 @@ void setup_frame(int sig, struct target_sigaction *ka,
     /* Provenance: the whole frame was written via host __put_user /
      * cpu_x86_fsave, bypassing TCG; stale pointer shadow in the frame
      * must not be reloaded by the handler. */
-    if (binradar_memcheck_enabled) {
-        provenance_mem_invalidate(frame_addr, sizeof(*frame));
-    }
+    sem_mem_overwrite(frame_addr, sizeof(*frame), SEM_OP_SIGNAL);
 
     /* Set up to return from userspace.  If provided, use a stub
        already in userspace.  */
@@ -361,6 +359,9 @@ void setup_frame(int sig, struct target_sigaction *ka,
     /* Set up registers for signal handler */
     env->regs[R_ESP] = frame_addr;
     env->eip = ka->_sa_handler;
+
+    /* Signal delivery replaces the live register context. */
+    sem_context_replace(env);
 
     cpu_x86_load_seg(env, R_DS, __USER_DS);
     cpu_x86_load_seg(env, R_ES, __USER_DS);
@@ -424,9 +425,7 @@ void setup_rt_frame(int sig, struct target_sigaction *ka,
     /* Provenance: the whole frame was written via host __put_user /
      * cpu_x86_fxsave, bypassing TCG; stale pointer shadow in the frame
      * must not be reloaded by the handler. */
-    if (binradar_memcheck_enabled) {
-        provenance_mem_invalidate(frame_addr, sizeof(*frame));
-    }
+    sem_mem_overwrite(frame_addr, sizeof(*frame), SEM_OP_SIGNAL);
 
     /* Set up to return from userspace.  If provided, use a stub
        already in userspace.  */
@@ -465,7 +464,7 @@ void setup_rt_frame(int sig, struct target_sigaction *ka,
 #endif
 
     /* Signal delivery rewrites the register file: no GPR keeps a tag. */
-    provenance_invalidate_all_regs(env);
+    sem_context_replace(env);
 
     cpu_x86_load_seg(env, R_DS, __USER_DS);
     cpu_x86_load_seg(env, R_ES, __USER_DS);
@@ -529,7 +528,7 @@ restore_sigcontext(CPUX86State *env, struct target_sigcontext *sc)
     /* Signal return restores the full register file: provenance tags
      * saved in the context belong to the interrupted code, and the
      * registers now hold restored values — invalidate all. */
-    provenance_invalidate_all_regs(env);
+    sem_context_replace(env);
 
     cpu_x86_load_seg(env, R_CS, lduw_p(&sc->cs) | 3);
     cpu_x86_load_seg(env, R_SS, lduw_p(&sc->ss) | 3);

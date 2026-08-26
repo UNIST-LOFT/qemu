@@ -18,36 +18,6 @@
 #include "osprey.h"
 #include "osprey-internal.h"
 #include "provenance.h"
-/* Helper entry points (DEF_HELPER in target/i386/helper.h).  helper-proto.h
- * cannot be included here (it pulls in target-specific helper.h); declare
- * the prototypes manually to satisfy -Werror=missing-prototypes.  These are
- * also visible to translate.c via the generated helper-proto.h. */
-void helper_osprey_invalidate_reg(CPUArchState *env, uint32_t reg_idx);
-void helper_osprey_reg_copy(CPUArchState *env, uint32_t dst_idx,
-                            uint32_t src_idx, target_ulong src_val,
-                            target_ulong dst_val);
-void helper_osprey_reg_lea(CPUArchState *env, uint32_t dst_idx,
-                           uint32_t base_idx, target_ulong disp,
-                           target_ulong dst_val, target_ulong base_val);
-void helper_osprey_set_ea(CPUArchState *env, uint32_t packed, uint32_t disp,
-                          target_ulong base_val, target_ulong index_val);
-void helper_osprey_mem_access(CPUArchState *env, target_ulong addr,
-                              target_ulong size, target_ulong pc,
-                              uint32_t is_store);
-void helper_osprey_mem_copy(CPUArchState *env, target_ulong src,
-                            target_ulong dst, target_ulong size);
-void helper_osprey_on_load(CPUArchState *env, uint32_t dst_reg,
-                           target_ulong addr, target_ulong size);
-void helper_osprey_on_store(CPUArchState *env, uint32_t src_reg,
-                            target_ulong addr, target_ulong size,
-                            target_ulong src_val);
-void helper_osprey_call(CPUArchState *env, target_ulong callee_pc,
-                        target_ulong entry_sp);
-void helper_osprey_ret(CPUArchState *env, target_ulong pc,
-                       target_ulong sp);
-void helper_osprey_rsp_update(CPUArchState *env, target_ulong new_sp,
-                               target_ulong pc);
-
 /* Origin shadow register invalidation (defined below; used by the
  * stack hooks above). */
 static void origin_invalidate_reg(CPUArchState *env, int reg);
@@ -1518,29 +1488,6 @@ static void record_points_to(CPUArchState *env, target_ulong addr,
     qemu_mutex_unlock(&g_shared_mutex);
 }
 
-void osprey_set_ea(CPUArchState *env, uint32_t packed, uint32_t disp,
-                          target_ulong base_val, target_ulong index_val) {
-    OspreyCpuOriginState *st = osprey_cpu_origin(env);
-    st->ea_valid = (packed & 0x80000000u) != 0;
-    st->ea_base_reg = (int32_t)((packed >> 16) & 0xff) - 1; /* -1 = none */
-    st->ea_index_reg = (int32_t)((packed >> 8) & 0xff) - 1;
-    st->ea_scale = (int32_t)(packed & 0xff);
-    st->ea_disp = (int64_t)(int32_t)disp;
-    st->ea_base_val = base_val;
-    st->ea_index_val = index_val;
-    /* Snapshot the base/index origins NOW: the registers may be killed
-     * by the access itself before osprey_on_mem_access consumes the EA
-     * (e.g. mov (%rax),%rax). */
-    memset(&st->ea_base_origin, 0, sizeof(st->ea_base_origin));
-    memset(&st->ea_index_origin, 0, sizeof(st->ea_index_origin));
-    if (st->ea_base_reg >= 0 && st->ea_base_reg < CPU_NB_REGS) {
-        st->ea_base_origin = st->regs[st->ea_base_reg];
-    }
-    if (st->ea_index_reg >= 0 && st->ea_index_reg < CPU_NB_REGS) {
-        st->ea_index_origin = st->regs[st->ea_index_reg];
-    }
-}
-
 void osprey_on_mem_access(CPUArchState *env, target_ulong addr,
                           uint64_t size, uint64_t pc, uint32_t is_store) {
     OspreyCpuOriginState *st = osprey_cpu_origin(env);
@@ -2662,69 +2609,4 @@ const OspreyModel *osprey_model(const OspreyContext *ctx) {
     if (ctx == NULL || ctx->tx_status != OSPREY_OK ||
         !ctx->tx_model_ready) return NULL;
     return ctx->model;
-}
-
-void helper_osprey_invalidate_reg(CPUArchState *env, uint32_t i) {
-    origin_invalidate_reg(env, (int)i);
-}
-
-void helper_osprey_reg_copy(CPUArchState *env, uint32_t dst, uint32_t src,
-                            target_ulong src_val, target_ulong dst_val) {
-    origin_mov_reg(env, (int)dst, (int)src, src_val, dst_val);
-}
-
-void helper_osprey_reg_lea(CPUArchState *env, uint32_t dst, uint32_t base,
-                           target_ulong disp, target_ulong dst_val,
-                           target_ulong base_val) {
-    origin_lea_imm(env, (int)dst, (int)base, (int64_t)(int32_t)disp,
-                   dst_val, base_val);
-}
-
-void helper_osprey_set_ea(CPUArchState *env, uint32_t packed, uint32_t disp,
-                          target_ulong base_val, target_ulong index_val) {
-    osprey_set_ea(env, packed, disp, base_val, index_val);
-}
-
-void helper_osprey_mem_access(CPUArchState *env, target_ulong addr,
-                              target_ulong size, target_ulong pc,
-                              uint32_t is_store) {
-    osprey_on_mem_access(env, addr, (uint64_t)size, (uint64_t)pc, is_store);
-}
-
-void helper_osprey_mem_copy(CPUArchState *env, target_ulong src,
-                            target_ulong dst, target_ulong size) {
-    osprey_on_mem_copy(env, src, dst, size);
-}
-
-void helper_osprey_call(CPUArchState *env, target_ulong callee_pc,
-                        target_ulong entry_sp) {
-    osprey_on_call(env, callee_pc, entry_sp);
-}
-
-void helper_osprey_ret(CPUArchState *env, target_ulong pc,
-                       target_ulong sp) {
-    osprey_on_ret(env, pc, sp);
-}
-
-void helper_osprey_rsp_update(CPUArchState *env, target_ulong new_sp,
-                               target_ulong pc) {
-    osprey_on_rsp_update(env, new_sp, pc);
-}
-
-void helper_osprey_on_load(CPUArchState *env, uint32_t dst_reg,
-                           target_ulong addr, target_ulong size) {
-    /* Aligned native-width reload: restore the origin into dst_reg. */
-    if (size == OSPREY_SHADOW_ALIGN && (addr & (OSPREY_SHADOW_ALIGN - 1)) == 0) {
-        target_ulong value = 0;
-        if (is_valid_address(addr, false)) {
-            memcpy(&value, g2h(addr), sizeof(value));
-        }
-        osprey_on_mem_load_origin(env, dst_reg, addr, value);
-    }
-}
-
-void helper_osprey_on_store(CPUArchState *env, uint32_t src_reg,
-                            target_ulong addr, target_ulong size,
-                            target_ulong src_val) {
-    osprey_on_mem_store_origin(env, src_reg, addr, size, src_val);
 }

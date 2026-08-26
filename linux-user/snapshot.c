@@ -1,5 +1,6 @@
 #include "snapshot.h"
 #include "provenance.h"
+#include "sem-events.h"
 #include "osprey.h"
 #include "osprey-internal.h"
 #include "../tcg/symbolic/symbolic-struct.h"
@@ -2088,7 +2089,7 @@ void snapshot_syscall(uintptr_t syscall_no, uintptr_t syscall_arg0,
             snapshot_write_access(&mem_access);
             /* Provenance: kernel wrote into the buffer — stale shadow
              * entries must not be reloaded (FIX_TRACER.md test 18). */
-            provenance_on_modify_mem(syscall_arg1, ret_val);
+            sem_mem_overwrite(syscall_arg1, ret_val, SEM_OP_SYSCALL);
         }
         break;
     case TARGET_NR_write:
@@ -2120,7 +2121,7 @@ void snapshot_syscall(uintptr_t syscall_no, uintptr_t syscall_arg0,
             uint32_t op = (uint32_t)syscall_arg1 & FUTEX_CMD_MASK;
             if (op == FUTEX_WAKE_OP) {
                 if (syscall_arg4) {
-                    provenance_on_modify_mem(syscall_arg4, sizeof(uint32_t));
+                    sem_mem_overwrite(syscall_arg4, sizeof(uint32_t), SEM_OP_SYSCALL);
                 }
             }
         }
@@ -2130,14 +2131,14 @@ void snapshot_syscall(uintptr_t syscall_no, uintptr_t syscall_arg0,
     case TARGET_NR_newfstatat: // newfstatat(dirfd, pathname, statbuf, flags)
         // Kernel wrote sizeof(struct target_stat) bytes on success only.
         if ((long)ret_val == 0) {
-            provenance_on_modify_mem(syscall_arg2, sizeof(struct target_stat));
+            sem_mem_overwrite(syscall_arg2, sizeof(struct target_stat), SEM_OP_SYSCALL);
         }
         break;
 #endif
 #if defined(TARGET_NR_fstatat64)
     case TARGET_NR_fstatat64:
         if ((long)ret_val == 0) {
-            provenance_on_modify_mem(syscall_arg2, sizeof(struct target_stat64));
+            sem_mem_overwrite(syscall_arg2, sizeof(struct target_stat64), SEM_OP_SYSCALL);
         }
         break;
 #endif
@@ -2147,14 +2148,14 @@ void snapshot_syscall(uintptr_t syscall_no, uintptr_t syscall_arg0,
     case TARGET_NR_fstat:
         // stat(pathname, statbuf) / lstat / fstat(fd, statbuf)
         if ((long)ret_val == 0) {
-            provenance_on_modify_mem(syscall_arg1, sizeof(struct target_stat));
+            sem_mem_overwrite(syscall_arg1, sizeof(struct target_stat), SEM_OP_SYSCALL);
         }
         break;
 #endif
 #if defined(TARGET_NR_statx)
     case TARGET_NR_statx: // statx(dirfd, pathname, flags, mask, statxbuf)
         if ((long)ret_val == 0) {
-            provenance_on_modify_mem(syscall_arg4, sizeof(struct target_statx));
+            sem_mem_overwrite(syscall_arg4, sizeof(struct target_statx), SEM_OP_SYSCALL);
         }
         break;
 #endif
@@ -2163,7 +2164,7 @@ void snapshot_syscall(uintptr_t syscall_no, uintptr_t syscall_arg0,
     case TARGET_NR_fstatfs:
         // statfs(path, buf) / fstatfs(fd, buf)
         if ((long)ret_val == 0) {
-            provenance_on_modify_mem(syscall_arg1, sizeof(struct target_statfs));
+            sem_mem_overwrite(syscall_arg1, sizeof(struct target_statfs), SEM_OP_SYSCALL);
         }
         break;
 #endif
@@ -2171,21 +2172,21 @@ void snapshot_syscall(uintptr_t syscall_no, uintptr_t syscall_arg0,
     case TARGET_NR_readlink: // readlink(pathname, buf, bufsiz)
         // Kernel wrote ret bytes (the link length, no NUL).
         if ((long)ret_val > 0) {
-            provenance_on_modify_mem(syscall_arg1, ret_val);
+            sem_mem_overwrite(syscall_arg1, ret_val, SEM_OP_SYSCALL);
         }
         break;
 #endif
 #if defined(TARGET_NR_readlinkat)
     case TARGET_NR_readlinkat: // readlinkat(dirfd, pathname, buf, bufsiz)
         if ((long)ret_val > 0) {
-            provenance_on_modify_mem(syscall_arg2, ret_val);
+            sem_mem_overwrite(syscall_arg2, ret_val, SEM_OP_SYSCALL);
         }
         break;
 #endif
 #if defined(TARGET_NR_getrandom)
     case TARGET_NR_getrandom: // getrandom(buf, buflen, flags)
         if ((long)ret_val > 0) {
-            provenance_on_modify_mem(syscall_arg0, ret_val);
+            sem_mem_overwrite(syscall_arg0, ret_val, SEM_OP_SYSCALL);
         }
         break;
 #endif
@@ -2195,8 +2196,8 @@ void snapshot_syscall(uintptr_t syscall_no, uintptr_t syscall_arg0,
         // deliberately passes NULL for the obsolete timezone argument.
         if ((long)ret_val == 0) {
             if (syscall_arg0) {
-                provenance_on_modify_mem(syscall_arg0,
-                                         sizeof(struct target_timeval));
+                sem_mem_overwrite(syscall_arg0,
+                                         sizeof(struct target_timeval), SEM_OP_SYSCALL);
             }
         }
         break;
@@ -2205,16 +2206,16 @@ void snapshot_syscall(uintptr_t syscall_no, uintptr_t syscall_arg0,
     case TARGET_NR_clock_gettime: // clock_gettime(clockid, tp)
         // Kernel wrote struct timespec on success only.
         if ((long)ret_val == 0 && syscall_arg1) {
-            provenance_on_modify_mem(syscall_arg1,
-                                     sizeof(struct target_timespec));
+            sem_mem_overwrite(syscall_arg1,
+                                     sizeof(struct target_timespec), SEM_OP_SYSCALL);
         }
         break;
 #endif
 #if defined(TARGET_NR_clock_getres)
     case TARGET_NR_clock_getres: // clock_getres(clockid, res)
         if ((long)ret_val == 0 && syscall_arg1) {
-            provenance_on_modify_mem(syscall_arg1,
-                                     sizeof(struct target_timespec));
+            sem_mem_overwrite(syscall_arg1,
+                                     sizeof(struct target_timespec), SEM_OP_SYSCALL);
         }
         break;
 #endif
@@ -2222,7 +2223,7 @@ void snapshot_syscall(uintptr_t syscall_no, uintptr_t syscall_arg0,
     case TARGET_NR_getdents: // getdents(fd, dirp, count)
         // Kernel wrote ret bytes of dirent records into dirp.
         if ((long)ret_val > 0) {
-            provenance_on_modify_mem(syscall_arg1, ret_val);
+            sem_mem_overwrite(syscall_arg1, ret_val, SEM_OP_SYSCALL);
         }
         break;
 #endif
@@ -2230,7 +2231,7 @@ void snapshot_syscall(uintptr_t syscall_no, uintptr_t syscall_arg0,
     case TARGET_NR_getdents64: // getdents64(fd, dirp, count)
         // Kernel wrote ret bytes of dirent records into dirp.
         if ((long)ret_val > 0) {
-            provenance_on_modify_mem(syscall_arg1, ret_val);
+            sem_mem_overwrite(syscall_arg1, ret_val, SEM_OP_SYSCALL);
         }
         break;
 #endif
@@ -2255,7 +2256,7 @@ void snapshot_syscall(uintptr_t syscall_no, uintptr_t syscall_arg0,
         // On shrink (new brk below the previous end), stale shadow tags
         // in the unmapped tail must not be reloaded after regrowth.
         if ((long)ret_val < (long)last_brk_end) {
-            provenance_on_modify_mem(ret_val, last_brk_end - ret_val);
+            sem_mem_overwrite(ret_val, last_brk_end - ret_val, SEM_OP_MAPPING);
         }
         last_brk_end = ret_val;
         break;
@@ -2266,7 +2267,7 @@ void snapshot_syscall(uintptr_t syscall_no, uintptr_t syscall_arg0,
         // A fresh mapping must never inherit stale shadow entries (an
         // address previously used by another object).
         if ((long)ret_val > 0) {
-            provenance_on_modify_mem(ret_val, syscall_arg1);
+            sem_mem_overwrite(ret_val, syscall_arg1, SEM_OP_MAPPING);
         }
         break;
     case TARGET_NR_mremap: // memory remap
@@ -2275,9 +2276,9 @@ void snapshot_syscall(uintptr_t syscall_no, uintptr_t syscall_arg0,
         snapshot_add_mapping(ret_val, syscall_arg2);
         // Old range's shadow entries are stale (pages may be moved/freed).
         if ((long)ret_val >= 0) {
-            provenance_on_modify_mem(syscall_arg0, syscall_arg1);
+            sem_mem_overwrite(syscall_arg0, syscall_arg1, SEM_OP_MAPPING);
             if ((uintptr_t)ret_val != (uintptr_t)syscall_arg0) {
-                provenance_on_modify_mem(ret_val, syscall_arg2);
+                sem_mem_overwrite(ret_val, syscall_arg2, SEM_OP_MAPPING);
             }
         }
         break;
@@ -2287,7 +2288,7 @@ void snapshot_syscall(uintptr_t syscall_no, uintptr_t syscall_arg0,
         // Invalidate shadow for the unmapped range (stale tags must not
         // survive an address-space reuse).
         if ((long)ret_val == 0) {
-            provenance_on_modify_mem(syscall_arg0, syscall_arg1);
+            sem_mem_overwrite(syscall_arg0, syscall_arg1, SEM_OP_MAPPING);
         }
         break;
     case TARGET_NR_mprotect: // permission
@@ -2347,6 +2348,8 @@ static abi_ulong snapshot_alloc_pointer_page(void)
     }
 
     memset(g2h((target_ulong)mapped), 0, SNAPSHOT_PAGE_SIZE);
+    sem_mem_overwrite((target_ulong)mapped, SNAPSHOT_PAGE_SIZE,
+                      SEM_OP_SNAPSHOT);
     log_msg("[mod-pointer] [alloc] [addr %lx] [size %x]\n",
               (target_ulong)mapped, SNAPSHOT_PAGE_SIZE);
     return (abi_ulong)mapped;
@@ -2405,6 +2408,8 @@ static void snapshot_modify_memory(CPUArchState *cpu_env) {
                 }
                 memcpy(g2h((target_ulong)pointer_page),
                        single_mod.value_obj, obj_size);
+                sem_mem_overwrite((target_ulong)pointer_page, obj_size,
+                                  SEM_OP_SNAPSHOT);
             }
         }
         if (single_mod.addr < SNAPSHOT_PAGE_SIZE) {
@@ -2412,8 +2417,9 @@ static void snapshot_modify_memory(CPUArchState *cpu_env) {
             target_ulong reg_value;
             memcpy(&reg_value, single_mod.value, sizeof(target_ulong));
             cpu_env->regs[(size_t)single_mod.addr] = reg_value;
-            /* Provenance: register overwritten by modification → kill tag. */
-            provenance_on_modify_reg(cpu_env, (int)single_mod.addr);
+            /* Register overwritten by modification → kill tag. */
+            sem_reg_overwrite(cpu_env, (int)single_mod.addr,
+                              SEM_OP_SNAPSHOT);
             log_msg("[mod-reg] [register %ld] [size %ld] [total %d]\n",
                       single_mod.addr,
                       single_mod.size,
@@ -2424,7 +2430,7 @@ static void snapshot_modify_memory(CPUArchState *cpu_env) {
         memcpy(target_addr_h, single_mod.value, single_mod.size);
         /* Provenance: memory overwritten by modification → stale shadow
          * entries must not be reloaded (FIX_TRACER.md test 17). */
-        provenance_on_modify_mem(single_mod.addr, single_mod.size);
+        sem_mem_overwrite(single_mod.addr, single_mod.size, SEM_OP_SNAPSHOT);
         log_msg("[mod] [addr %lx] [size %ld] [total %d]\n", single_mod.addr, single_mod.size, g_queue_get_length(mod_manager->modifications));
     }
 }
