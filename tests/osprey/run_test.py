@@ -83,27 +83,10 @@ TESTS = [
         # allocations at one site (1f8), successful same-base reuse
         # (2af), forced-move realloc 16 -> 1 MiB (2e5 -> 312), failed
         # realloc preserving the old identity (348, alloc 377 -1),
-        # realloc(p,0) (3ad), and zero-size non-NULL malloc(0) (3e8).
-        dump_expect=[
-            "region 0 0 0 1 3048",          # G: one merged instance
-            "region 1 1f8 1 2 20",          # alloc32() first instance
-            "region 1 1f8 2 3 20",          # alloc32() second instance
-            "region 1 2af 3 2 20",          # same-base reuse
-            "region 1 2e5 4 5 10",          # realloc source 16 bytes
-            "region 1 312 5 6 100000",       # realloc result 1 MiB
-            "region 1 348 6 5 8",           # failed-realloc survivor
-            "region 1 3ad 7 8 8",           # realloc(p,0) source
-            "region 1 3e8 8 8 0",           # malloc(0) zero-size
-            "region 2 1fa 708 33 60",        # main frame, observed span
-            "alloc 1f8 32 2",               # two allocs at one site
-            "alloc 2af 32 1",
-            "alloc 2e5 16 1",
-            "alloc 312 1048576 1",          # forced-move realloc size
-            "alloc 348 8 1",
-            "alloc 377 -1 1",               # failed realloc
-            "alloc 3ad 8 1",
-            "alloc 3e8 0 1",                # zero-size success
-        ],
+        # realloc(p,0) (3ad), zero-size non-NULL malloc(0) (3e8), and
+        # a RET-imm callee whose following stack access proves the caller
+        # activation survived.  The checked-in file owns exact row values;
+        # the separate assertions below own cross-row invariants.
         # Structural assertions on the parsed dump (see check_dump).
         dump_assert={
             "global_rows": 1,          # one merged G instance
@@ -363,25 +346,25 @@ def run_dump_compare(test, workdir, qemu, solver):
             out,
         )
         if len(matches) != 1:
-            return (rc, out +
+            return (None, out +
                     f"\nexpected one main-image bias row, got {matches}")
         observed_biases.append(int(matches[0], 16))
         if not os.path.isfile(dump_path):
-            return (rc, out + f"\nmissing dump file: {dump_path}")
+            return (None, out + f"\nmissing dump file: {dump_path}")
         with open(dump_path, "r", errors="replace") as f:
             dumps.append(f.read())
     for i in range(1, len(dumps)):
         if dumps[i] != dumps[0]:
-            return (rcs[-1], outs[0] +
+            return (None, outs[0] +
                     f"\nDUMP MISMATCH between bias runs {0} and {i}")
     if len(set(observed_biases)) != len(observed_biases):
-        return (rcs[-1], outs[0] +
+        return (None, outs[0] +
                 f"\nPIE load biases were not distinct: {observed_biases}")
     if dumps[0] != expected:
-        return (rcs[-1], outs[0] + "\nDUMP MISMATCH vs checked-in expected")
+        return (None, outs[0] + "\nDUMP MISMATCH vs checked-in expected")
     problems = check_dump(test, dumps[0])
     if problems:
-        return (rcs[-1], outs[0] + "\n" + "\n".join(problems))
+        return (None, outs[0] + "\n" + "\n".join(problems))
     if len(set(rcs)) != 1:
         return (rcs[-1], outs[0] +
                 f"\ntracer return codes differ: {rcs}")

@@ -264,6 +264,27 @@ static void test_version_mismatch_rejection(void)
 
     osprey_free(ctx);
     g_free(run);
+
+    /* A malformed prefix freeze must remain fail-closed after prepare;
+     * the full-reset fallback cannot erase the pre-sample failure. */
+    reset_log();
+    ctx = osprey_new(&c);
+    run = new_run(&c);
+    run->version = 999;
+    CHECK(!osprey_shared_run_freeze_prefix(ctx, run),
+          "malformed prefix freeze fails");
+    osprey_shared_run_prepare(ctx, run, 2);
+    CHECK(run->version == OSPREY_SHARED_VERSION,
+          "prepare restores canonical layout");
+    CHECK(run->bad_arithmetic == 1,
+          "prepare preserves prefix-freeze fatal state");
+    st = osprey_parent_merge_sample(ctx, run);
+    CHECK(st == OSPREY_INCOMPLETE_FACTS,
+          "malformed prefix remains rejected");
+    CHECK(g_reject_rows == 1, "malformed prefix one reject row");
+    osprey_free(ctx);
+    g_free(run);
+    osprey_clear_pre_sample_fatal();
 }
 
 static void test_capacity_mismatch_rejection(void)
@@ -272,6 +293,9 @@ static void test_capacity_mismatch_rejection(void)
     OspreyConfig c = test_config();
     OspreyContext *ctx = osprey_new(&c);
     OspreySharedRun *run = new_run(&c);
+    CHECK(osprey_shared_run_size(&c) <=
+              c.shared_bytes + sizeof(OspreySharedRun) + 256,
+          "shared layout respects configured byte budget");
     run->access_cap = 0;
 
     OspreyStatus st = osprey_parent_merge_sample(ctx, run);
@@ -298,6 +322,45 @@ static void test_population_mismatch_rejection(void)
     CHECK(ctx->total_samples == 0, "population no sample count");
     CHECK(g_reject_rows == 1, "population exactly one reject row");
 
+    osprey_free(ctx);
+    g_free(run);
+
+    /* Boolean support is part of the shared format. */
+    reset_log();
+    ctx = osprey_new(&c);
+    run = new_run(&c);
+    OspreyAccessFact bad_support;
+    memset(&bad_support, 0, sizeof(bad_support));
+    bad_support.pc = 0x100;
+    bad_support.chunk.address.region.kind = OSPREY_REGION_GLOBAL;
+    bad_support.chunk.size = 8;
+    bad_support.dynamic_count = 1;
+    bad_support.sample_support = 2;
+    CHECK(osprey_table_insert_access(run, &bad_support) == 1,
+          "malformed support inserted for validation");
+    st = osprey_parent_merge_sample(ctx, run);
+    CHECK(st == OSPREY_INCOMPLETE_FACTS,
+          "non-Boolean support rejected");
+    CHECK(ctx->access_facts->len == 0,
+          "non-Boolean support no partial merge");
+    CHECK(g_reject_rows == 1, "non-Boolean support one reject row");
+    osprey_free(ctx);
+    g_free(run);
+
+    /* The maintained unique-fact count must match prefix∪suffix. */
+    reset_log();
+    ctx = osprey_new(&c);
+    run = new_run(&c);
+    bad_support.sample_support = 1;
+    CHECK(osprey_table_insert_access(run, &bad_support) == 1,
+          "fact-count validation insert");
+    run->total_facts_count = 0;
+    st = osprey_parent_merge_sample(ctx, run);
+    CHECK(st == OSPREY_INCOMPLETE_FACTS,
+          "stale unique-fact count rejected");
+    CHECK(ctx->access_facts->len == 0,
+          "stale unique-fact count no partial merge");
+    CHECK(g_reject_rows == 1, "stale fact count one reject row");
     osprey_free(ctx);
     g_free(run);
 }
@@ -1164,6 +1227,455 @@ static void test_observed_stack_bounds(void)
     g_free(env);
 }
 
+/* ------------------------------------------------------------------ */
+/* Stage 2.1: sample composition, Boolean support, caps, saturation    */
+/* ------------------------------------------------------------------ */
+
+/* Build a canonical access fact (global region, image-relative offset). */
+static void fill_access_fact(OspreyAccessFact *f, uint64_t pc,
+                             int64_t offset, uint64_t size,
+                             uint32_t dynamic) {
+    memset(f, 0, sizeof(*f));
+    f->pc = pc;
+    f->chunk.address.region.kind = OSPREY_REGION_GLOBAL;
+    f->chunk.address.region.site_offset = 0;
+    f->chunk.address.offset = offset;
+    f->chunk.size = size;
+    f->dynamic_count = dynamic;
+    f->sample_support = 1;
+    f->is_store = 0;
+}
+
+/* The baseline sample is `prefix ∪ child-suffix`: freeze the prefix,
+ * then a child suffix that re-observes one prefix fact and adds a new
+ * one.  The union must commit exactly once (support 1, never 2), the
+ * dynamic total must be the exact sum, and the per-sample unique-fact
+ * count must not double-count prefix facts. */
+static void test_prefix_suffix_composition(void)
+{
+    reset_log();
+    OspreyConfig c = test_config();
+    OspreyContext *ctx = osprey_new(&c);
+    OspreySharedRun *run = new_run(&c);
+
+    OspreyAccessFact f1, f2, f3, f4;
+    OspreyBaseFact b1;
+    fill_access_fact(&f1, 0x100, 0, 8, 1);
+    fill_access_fact(&f2, 0x200, 8, 8, 1);
+    CHECK(osprey_table_insert_access(run, &f1) == 1, "prefix insert f1");
+    CHECK(osprey_table_insert_access(run, &f2) == 1, "prefix insert f2");
+    memset(&b1, 0, sizeof(b1));
+    b1.pc = f1.pc;
+    b1.chunk = f1.chunk;
+    b1.base = f1.chunk.address;
+    b1.sample_support = 1;
+    CHECK(osprey_table_insert_base(run, &b1) == 1,
+          "prefix base fact reuses f1 chunk");
+    run->total_dynamic_observations = 2;   /* child-side counter */
+    CHECK(run->total_facts_count == 3, "prefix facts counted");
+    CHECK(run->census_chunk_used == 2,
+          "cross-family duplicate chunk counted once");
+
+    CHECK(osprey_shared_run_freeze_prefix(ctx, run), "prefix freeze");
+    CHECK(run->prefix_frozen == 1, "prefix frozen flag");
+    CHECK(osprey_run_prefix_used(run, OSPREY_TABLE_PREFIX_ACCESS) == 2,
+          "prefix family holds two access facts");
+    CHECK(run->access_used == 0, "suffix starts empty");
+    CHECK(run->total_dynamic_prefix == 2, "prefix dynamic total frozen");
+    CHECK(run->total_dynamic_observations == 0, "suffix dynamic reset");
+    CHECK(osprey_shared_run_freeze_prefix(ctx, run),
+          "freeze is idempotent success");
+
+    /* Child suffix: re-observe f1 twice, add f3. */
+    fill_access_fact(&f1, 0x100, 0, 8, 2);
+    fill_access_fact(&f3, 0x300, 16, 8, 1);
+    CHECK(osprey_table_insert_access(run, &f1) == 1, "child dup f1");
+    CHECK(osprey_table_insert_access(run, &f3) == 1, "child new f3");
+    run->total_dynamic_observations = 3;
+    CHECK(run->total_facts_count == 4,
+          "unique-fact count is the union, prefix not re-counted");
+    CHECK(run->census_chunk_used == 3, "census covers union chunks");
+
+    CHECK(osprey_parent_merge_sample(ctx, run) == OSPREY_OK, "compose merge");
+    CHECK(ctx->access_facts->len == 3, "three facts merged");
+    CHECK(ctx->base_facts->len == 1, "one base fact merged");
+    CHECK(ctx->total_samples == 1, "one sample committed");
+    CHECK(ctx->total_dynamic_observations == 5,
+          "dynamic total = prefix 2 + child 3");
+    OspreyAccessFact *m1 = NULL;
+    for (guint i = 0; i < ctx->access_facts->len; i++) {
+        OspreyAccessFact *cand = &g_array_index(ctx->access_facts,
+                                                OspreyAccessFact, i);
+        if (cand->pc == 0x100) {
+            m1 = cand;
+        }
+    }
+    CHECK(m1 != NULL, "prefix/suffix-shared fact merged");
+    if (m1 != NULL) {
+        CHECK(m1->sample_support == 1,
+              "shared fact support once per sample (never 2)");
+        CHECK(m1->dynamic_count == 3, "shared fact sums prefix + child");
+    }
+
+    /* Sample 2 (child-only): prepare keeps the frozen prefix and the
+     * per-sample census; the new sample commits exactly one fact and
+     * re-committed facts gain one support per unique sample. */
+    osprey_shared_run_prepare(ctx, run, 1);
+    CHECK(run->prefix_frozen == 1, "prepare keeps the prefix");
+    CHECK(osprey_run_prefix_used(run, OSPREY_TABLE_PREFIX_ACCESS) == 2,
+          "prefix survives prepare");
+    CHECK(run->access_used == 0, "suffix zeroed by prepare");
+    CHECK(run->total_facts_count == 3,
+          "prepare restores frozen-prefix fact count");
+    CHECK(run->census_chunk_used == 2, "census rebuilt from prefix");
+    OspreyCensusRegion *global_census = NULL;
+    {
+        OspreyRunIter it;
+        const void *rec;
+        memset(&it, 0, sizeof(it));
+        it.run = run;
+        it.table = OSPREY_TABLE_CENSUS_REGION;
+        while (osprey_run_iter_next(&it, &rec)) {
+            OspreyCensusRegion *candidate = (OspreyCensusRegion *)rec;
+            if (candidate->region.kind == OSPREY_REGION_GLOBAL) {
+                global_census = candidate;
+                break;
+            }
+        }
+    }
+    CHECK(global_census != NULL && global_census->chunk_count == 2,
+          "census rebuild counts unique chunks, not fact occurrences");
+    fill_access_fact(&f4, 0x400, 24, 8, 1);
+    CHECK(osprey_table_insert_access(run, &f4) == 1, "sample-2 child fact");
+    run->total_dynamic_observations = 1;
+    CHECK(osprey_parent_merge_sample(ctx, run) == OSPREY_OK,
+          "sample-2 merge");
+    CHECK(ctx->access_facts->len == 4, "sample 2 adds one fact");
+    CHECK(ctx->total_samples == 2, "two samples committed");
+    CHECK(ctx->total_dynamic_observations == 8,
+          "sample 2 dynamic (2 prefix + 1 child) added");
+    m1 = NULL;
+    for (guint i = 0; i < ctx->access_facts->len; i++) {
+        OspreyAccessFact *cand = &g_array_index(ctx->access_facts,
+                                                OspreyAccessFact, i);
+        if (cand->pc == 0x100) {
+            m1 = cand;
+        }
+    }
+    CHECK(m1 != NULL && m1->sample_support == 2,
+          "support is one per unique committed sample");
+
+    osprey_free(ctx);
+    g_free(run);
+}
+
+/* Child-only sample (no frozen prefix): the plain path resets the whole
+ * run and the merged facts carry Boolean per-sample support. */
+static void test_child_only_sample(void)
+{
+    reset_log();
+    OspreyConfig c = test_config();
+    OspreyContext *ctx = osprey_new(&c);
+    OspreySharedRun *run = new_run(&c);
+
+    OspreyAccessFact f;
+    fill_access_fact(&f, 0x100, 0, 8, 1);
+    CHECK(osprey_table_insert_access(run, &f) == 1, "child insert");
+    run->total_dynamic_observations = 1;
+
+    CHECK(osprey_parent_merge_sample(ctx, run) == OSPREY_OK,
+          "child-only merge");
+    CHECK(ctx->access_facts->len == 1, "one fact");
+    CHECK(ctx->total_samples == 1, "one sample");
+    OspreyAccessFact *m = &g_array_index(ctx->access_facts,
+                                         OspreyAccessFact, 0);
+    CHECK(m->sample_support == 1, "child-only support 1");
+    CHECK(m->dynamic_count == 1, "child-only dynamic 1");
+
+    osprey_free(ctx);
+    g_free(run);
+}
+
+/* Repeated dynamic observations: a fact observed N times within one
+ * sample keeps Boolean support and exact dynamic count. */
+static void test_duplicate_dynamic_observation(void)
+{
+    reset_log();
+    OspreyConfig c = test_config();
+    OspreyContext *ctx = osprey_new(&c);
+    OspreySharedRun *run = new_run(&c);
+
+    OspreyAccessFact f;
+    fill_access_fact(&f, 0x100, 0, 8, 1);
+    CHECK(osprey_table_insert_access(run, &f) == 1, "first observation");
+    CHECK(osprey_table_insert_access(run, &f) == 0, "second updates");
+    CHECK(osprey_table_insert_access(run, &f) == 0, "third updates");
+    run->total_dynamic_observations = 3;
+
+    /* Read back the merged record from the run table (open addressing
+     * places it by hash, not at slot 0). */
+    OspreyAccessFact *in_run = NULL;
+    {
+        OspreyRunIter it;
+        const void *rec;
+        memset(&it, 0, sizeof(it));
+        it.run = run;
+        it.table = OSPREY_TABLE_ACCESS;
+        while (osprey_run_iter_next(&it, &rec)) {
+            const OspreyAccessFact *cand = rec;
+            if (cand->pc == 0x100) {
+                in_run = (OspreyAccessFact *)cand;
+                break;
+            }
+        }
+    }
+    CHECK(in_run != NULL, "access fact present in run");
+    if (in_run != NULL) {
+        CHECK(in_run->dynamic_count == 3, "exact dynamic count in run");
+        CHECK(in_run->sample_support == 1, "boolean support in run");
+    }
+
+    CHECK(osprey_parent_merge_sample(ctx, run) == OSPREY_OK, "merge");
+    OspreyAccessFact *m = &g_array_index(ctx->access_facts,
+                                         OspreyAccessFact, 0);
+    CHECK(m->dynamic_count == 3, "exact dynamic count merged");
+    CHECK(m->sample_support == 1, "boolean support merged");
+    CHECK(ctx->total_dynamic_observations == 3, "exact dynamic total");
+
+    osprey_free(ctx);
+    g_free(run);
+}
+
+/* Checked/saturating counters: dynamic counts saturate at UINT32_MAX
+ * (fact) and UINT64_MAX (sample total), never wrap. */
+static void test_counter_saturation(void)
+{
+    reset_log();
+    OspreyConfig c = test_config();
+    OspreyContext *ctx = osprey_new(&c);
+    OspreySharedRun *run = new_run(&c);
+
+    OspreyAccessFact f;
+    fill_access_fact(&f, 0x100, 0, 8, UINT32_MAX - 1);
+    CHECK(osprey_table_insert_access(run, &f) == 1, "near-max observation");
+    fill_access_fact(&f, 0x100, 0, 8, 1);
+    CHECK(osprey_table_insert_access(run, &f) == 0, "overflow observation");
+    run->total_dynamic_observations = UINT64_MAX - 1;
+    OspreyAccessFact *seen = NULL;
+    {
+        OspreyRunIter it;
+        const void *rec;
+        memset(&it, 0, sizeof(it));
+        it.run = run;
+        it.table = OSPREY_TABLE_ACCESS;
+        while (osprey_run_iter_next(&it, &rec)) {
+            const OspreyAccessFact *cand = rec;
+            if (cand->pc == 0x100) {
+                seen = (OspreyAccessFact *)cand;
+                break;
+            }
+        }
+    }
+    CHECK(seen != NULL, "fact present in run");
+    if (seen != NULL) {
+        CHECK(seen->dynamic_count == UINT32_MAX, "fact dynamic saturates");
+    }
+
+    CHECK(osprey_parent_merge_sample(ctx, run) == OSPREY_OK, "merge");
+    CHECK(ctx->access_facts->len == 1, "one fact");
+    OspreyAccessFact *m = &g_array_index(ctx->access_facts,
+                                         OspreyAccessFact, 0);
+    CHECK(m->dynamic_count == UINT32_MAX, "merged dynamic saturated");
+    CHECK(ctx->total_dynamic_observations == UINT64_MAX - 1,
+          "sample total near-max exact");
+
+    /* Second sample pushes the sample total past UINT64_MAX. */
+    OspreySharedRun *run2 = new_run(&c);
+    fill_access_fact(&f, 0x100, 0, 8, 1);
+    CHECK(osprey_table_insert_access(run2, &f) == 1, "sample-2 insert");
+    run2->total_dynamic_observations = 2;
+    ctx->total_samples = UINT64_MAX;
+    CHECK(osprey_parent_merge_sample(ctx, run2) == OSPREY_OK,
+          "sample-2 merge");
+    CHECK(ctx->total_dynamic_observations == UINT64_MAX,
+          "sample total saturates, never wraps");
+    CHECK(ctx->total_samples == UINT64_MAX,
+          "committed sample count saturates, never wraps");
+
+    osprey_free(ctx);
+    g_free(run);
+    g_free(run2);
+}
+
+/* max_facts: a new unique fact beyond the per-sample unique-fact cap is
+ * rejected before insertion; the merge fails closed with no partial
+ * commit.  Duplicates never trip the cap. */
+static void test_fact_cap_rejection(void)
+{
+    reset_log();
+    OspreyConfig c = test_config();
+    c.max_facts = 16;   /* below the 64-slot table floor: the cap is the
+                         * binding limit, not the table capacity */
+    OspreyContext *ctx = osprey_new(&c);
+    OspreySharedRun *run = new_run(&c);
+
+    for (int i = 0; i < 16; i++) {
+        OspreyAccessFact f;
+        fill_access_fact(&f, 0x100 + i, i * 8, 8, 1);
+        CHECK(osprey_table_insert_access(run, &f) == 1, "unique fact ok");
+    }
+    CHECK(run->total_facts_count == 16, "sixteen unique facts");
+    CHECK(run->overflow == 0, "cap not exceeded yet");
+    /* A duplicate observation at the cap is still accepted. */
+    OspreyAccessFact dup;
+    fill_access_fact(&dup, 0x100, 0, 8, 1);
+    CHECK(osprey_table_insert_access(run, &dup) == 0,
+          "duplicate at cap updates, not rejected");
+
+    OspreyAccessFact f17;
+    fill_access_fact(&f17, 0x110, 16 * 8, 8, 1);
+    CHECK(osprey_table_insert_access(run, &f17) == -1, "cap rejects 17th");
+    CHECK(run->overflow == 1, "fact-cap overflow sticky");
+    CHECK(run->first_dropped_kind != 0, "drop kind recorded");
+
+    CHECK(osprey_parent_merge_sample(ctx, run) == OSPREY_INCOMPLETE_FACTS,
+          "fact cap merge rejects fail-closed");
+    CHECK(ctx->access_facts->len == 0, "fact cap no partial merge");
+    CHECK(g_reject_rows == 1, "fact cap one reject row");
+
+    osprey_free(ctx);
+    g_free(run);
+
+    /* A child re-observation of a frozen-prefix fact is not a new union
+     * member and remains legal when the prefix already fills max_facts. */
+    reset_log();
+    c.max_facts = 1;
+    ctx = osprey_new(&c);
+    run = new_run(&c);
+    OspreyAccessFact prefix;
+    fill_access_fact(&prefix, 0x200, 0, 8, 1);
+    CHECK(osprey_table_insert_access(run, &prefix) == 1,
+          "prefix fills fact cap");
+    CHECK(osprey_shared_run_freeze_prefix(ctx, run),
+          "fact-cap prefix freeze");
+    osprey_shared_run_prepare(ctx, run, 1);
+    CHECK(run->total_facts_count == 1, "prefix cap count restored");
+    CHECK(osprey_table_insert_access(run, &prefix) == 1,
+          "frozen duplicate accepted at cap");
+    CHECK(osprey_table_insert_access(run, &prefix) == 0,
+          "duplicate updates a physically full suffix table");
+    CHECK(run->overflow == 0, "frozen duplicate does not overflow");
+    CHECK(run->total_facts_count == 1,
+          "frozen duplicate does not consume fact cap");
+    CHECK(osprey_parent_merge_sample(ctx, run) == OSPREY_OK,
+          "frozen duplicate at cap merges");
+    CHECK(ctx->access_facts->len == 1 &&
+          g_array_index(ctx->access_facts, OspreyAccessFact, 0)
+                  .sample_support == 1 &&
+          g_array_index(ctx->access_facts, OspreyAccessFact, 0)
+                  .dynamic_count == 3,
+          "frozen duplicates contribute one support and exact dynamics");
+    osprey_free(ctx);
+    g_free(run);
+}
+
+/* max_chunks_per_region: a region with more unique chunks than the
+ * configured limit rejects the new chunk before insertion and the
+ * merge fails closed-close. */
+static void test_chunk_cap_rejection(void)
+{
+    reset_log();
+    OspreyConfig c = test_config();
+    c.max_chunks_per_region = 4;
+    OspreyContext *ctx = osprey_new(&c);
+    OspreySharedRun *run = new_run(&c);
+
+    for (int i = 0; i < 4; i++) {
+        OspreyAccessFact f;
+        fill_access_fact(&f, 0x100 + i, i * 8, 8, 1);
+        CHECK(osprey_table_insert_access(run, &f) == 1, "chunk ok");
+    }
+    CHECK(run->overflow == 0, "within per-region limit");
+    OspreyAccessFact f5;
+    fill_access_fact(&f5, 0x104, 4 * 8, 8, 1);
+    CHECK(osprey_table_insert_access(run, &f5) == -1, "5th chunk rejected");
+    CHECK(run->overflow == 1, "chunk-cap overflow sticky");
+    CHECK(run->first_dropped_kind == OSPREY_TABLE_CENSUS_REGION + 1,
+          "region census recorded as dropped kind");
+
+    CHECK(osprey_parent_merge_sample(ctx, run) == OSPREY_INCOMPLETE_FACTS,
+          "chunk cap merge rejects fail-closed");
+    CHECK(ctx->access_facts->len == 0, "chunk cap no partial merge");
+    CHECK(g_reject_rows == 1, "chunk cap one reject row");
+
+    osprey_free(ctx);
+    g_free(run);
+}
+
+/* Mutation iterations never merge: after a baseline sample, a later
+ * iteration's observations stay out of the committed facts; a
+ * subsequent baseline sample commits only its own facts. */
+static void test_mutation_run_isolated(void)
+{
+    reset_log();
+    OspreyConfig c = test_config();
+    OspreyContext *ctx = osprey_new(&c);
+    OspreySharedRun *run = new_run(&c);
+
+    OspreyAccessFact f1, f2, f3, f4;
+    fill_access_fact(&f1, 0x100, 0, 8, 1);
+    fill_access_fact(&f2, 0x200, 8, 8, 1);
+    CHECK(osprey_table_insert_access(run, &f1) == 1, "prefix f1");
+    CHECK(osprey_table_insert_access(run, &f2) == 1, "prefix f2");
+    CHECK(osprey_shared_run_freeze_prefix(ctx, run), "freeze");
+    fill_access_fact(&f3, 0x300, 16, 8, 1);
+    CHECK(osprey_table_insert_access(run, &f3) == 1, "baseline child f3");
+    CHECK(osprey_parent_merge_sample(ctx, run) == OSPREY_OK,
+          "baseline sample 1");
+    CHECK(ctx->access_facts->len == 3, "baseline 1 committed");
+    CHECK(ctx->total_samples == 1, "baseline 1 samples");
+
+    /* Mutation iteration: prepare + observations, never merged. */
+    osprey_shared_run_prepare(ctx, run, 2);
+    CHECK(run->total_facts_count == 2,
+          "mutation prepare restores prefix fact count");
+    fill_access_fact(&f4, 0x500, 32, 8, 1);
+    CHECK(osprey_table_insert_access(run, &f4) == 1, "mutation fact");
+    CHECK(ctx->access_facts->len == 3,
+          "mutation observations never committed");
+    CHECK(ctx->total_samples == 1, "mutation run commits nothing");
+
+    /* Next baseline: prepare + child facts; commit; mutation fact must
+     * not appear and old facts keep one support per sample. */
+    osprey_shared_run_prepare(ctx, run, 3);
+    CHECK(run->total_facts_count == 2,
+          "next prepare discards prior suffix fact count");
+    fill_access_fact(&f2, 0x200, 8, 8, 1);
+    CHECK(osprey_table_insert_access(run, &f2) == 1, "baseline-2 child");
+    CHECK(osprey_parent_merge_sample(ctx, run) == OSPREY_OK,
+          "baseline 2 commit");
+    CHECK(ctx->access_facts->len == 3, "baseline 2 adds no new fact");
+    CHECK(ctx->total_samples == 2, "two committed samples");
+    for (guint i = 0; i < ctx->access_facts->len; i++) {
+        OspreyAccessFact *cand = &g_array_index(ctx->access_facts,
+                                                OspreyAccessFact, i);
+        CHECK(cand->pc != 0x500, "mutation fact absent from committed");
+    }
+    OspreyAccessFact *m2 = NULL;
+    for (guint i = 0; i < ctx->access_facts->len; i++) {
+        OspreyAccessFact *cand = &g_array_index(ctx->access_facts,
+                                                OspreyAccessFact, i);
+        if (cand->pc == 0x200) {
+            m2 = cand;
+        }
+    }
+    CHECK(m2 != NULL && m2->sample_support == 2,
+          "f2 support one per committed sample");
+
+    osprey_free(ctx);
+    g_free(run);
+}
+
 /* Pre-sample fatal publication: registration-time arithmetic failure
  * marks every reset shared run bad_arithmetic so the baseline merge
  * rejects fail-closed. */
@@ -1181,6 +1693,11 @@ static void test_pre_sample_fatal(void)
 
     OspreySharedRun *run = new_run(&c);
     CHECK(run->bad_arithmetic == 1, "reset run carries bad_arithmetic");
+    CHECK(osprey_shared_run_freeze_prefix(ctx, run),
+          "fatal prefix freezes for deterministic rejection");
+    osprey_shared_run_prepare(ctx, run, 1);
+    CHECK(run->bad_arithmetic == 1,
+          "prepare preserves frozen pre-sample fatal state");
     OspreyStatus st = osprey_parent_merge_sample(ctx, run);
     CHECK(st == OSPREY_INCOMPLETE_FACTS, "pre-sample fatal merge rejects");
     CHECK(strcmp(osprey_tx_stage(ctx), "merge") == 0,
@@ -1223,6 +1740,13 @@ int main(void)
     test_entrypoint_frame_seeding();
     test_stack_resync();
     test_observed_stack_bounds();
+    test_prefix_suffix_composition();
+    test_child_only_sample();
+    test_duplicate_dynamic_observation();
+    test_counter_saturation();
+    test_fact_cap_rejection();
+    test_chunk_cap_rejection();
+    test_mutation_run_isolated();
     test_pre_sample_fatal();
     test_canonical_dump();
 
@@ -1230,6 +1754,6 @@ int main(void)
         fprintf(stderr, "%d unit test check(s) FAILED\n", failures);
         return 1;
     }
-    printf("PASS osprey_unit (26/26)\n");
+    printf("PASS osprey_unit (33/33)\n");
     return 0;
 }

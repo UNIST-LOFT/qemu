@@ -418,6 +418,10 @@ typedef struct DisasContext {
      * instruction so gen_prov_addsub_reg (emitted after gen_op) can read
      * the pre-op tag and fold the post-op delta. */
     bool prov_skip_invalidate;
+    /* RET updates RSP before the explicit OSPREY return hook.  Suppress
+     * the generic RSP-resynchronization helper for that one write so the
+     * return hook owns the activation pop exactly once (including ret imm). */
+    bool osprey_skip_rsp_update;
     /* provenance: pre-instruction register value snapshot for the
      * add/sub-imm helper's consistency check (freed by the helper
      * wrapper after emission). */
@@ -718,7 +722,7 @@ static void gen_op_mov_reg_v(DisasContext *s, TCGMemOp ot, int reg, TCGv t0)
     /* Full-width RSP writes re-derive the origin from the live frame
      * stack (push/pop/add-sub imm/mov rsp,x/leave).  Runs after the
      * kill so the origin is always rebuilt from frame identity. */
-    if (reg == R_ESP && ot == MO_64) {
+    if (reg == R_ESP && ot == MO_64 && !s->osprey_skip_rsp_update) {
         gen_osprey_rsp_update(cpu_regs[R_ESP], s->pc_start);
     }
 }
@@ -7429,7 +7433,9 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
     case 0xc2: /* ret im */
         val = x86_ldsw_code(env, s);
         ot = gen_pop_T0(s);
+        s->osprey_skip_rsp_update = true;
         gen_stack_update(s, val + (1 << ot));
+        s->osprey_skip_rsp_update = false;
 
 #ifdef SYMBOLIC_INSTRUMENTATION
 #if SYMBOLIC_CALLSTACK_INSTRUMENTATION
@@ -7449,7 +7455,9 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
         break;
     case 0xc3: /* ret */
         ot = gen_pop_T0(s);
+        s->osprey_skip_rsp_update = true;
         gen_pop_update(s, ot);
+        s->osprey_skip_rsp_update = false;
 
 #ifdef SYMBOLIC_INSTRUMENTATION
 #if SYMBOLIC_CALLSTACK_INSTRUMENTATION
@@ -9507,6 +9515,9 @@ static void i386_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cpu)
     dc->tf = (flags >> TF_SHIFT) & 1;
     dc->cc_op = CC_OP_DYNAMIC;
     dc->cc_op_dirty = false;
+    dc->prov_skip_invalidate = false;
+    dc->osprey_skip_rsp_update = false;
+    dc->prov_pre_snapshot = NULL;
     dc->cs_base = cs_base;
     dc->popl_esp_hack = 0;
     /* select memory access functions */

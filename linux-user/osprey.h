@@ -121,6 +121,22 @@ void osprey_shared_run_reset(OspreySharedRun *run, uint64_t sample_id,
 /* Child side: attach the shared sink for fact collection. */
 void osprey_child_use_shared_run(OspreyContext *ctx, OspreySharedRun *run);
 
+/* Stage 2.1 sample composition: freeze the pre-snapshot prefix so a
+ * baseline sample is `prefix ∪ baseline-child` as exactly one
+ * unmodified sample.  Called at snapshot_save() (before the baseline
+ * fork): the current shared-run contents are copied into the run's
+ * prefix record; later child hooks keep writing to the tables.  The
+ * parent merges the union at osprey_parent_merge_sample(); a fact
+ * present in both parts has sample_support 1, never 2. */
+bool osprey_shared_run_freeze_prefix(OspreyContext *ctx,
+                                     OspreySharedRun *run);
+/* Baseline forkserver path: reset the per-child suffix only, keeping
+ * the frozen prefix intact so the child inherits exactly the
+ * pre-snapshot facts.  Falls back to a full reset when no prefix is
+ * frozen. */
+void osprey_shared_run_prepare(OspreyContext *ctx, OspreySharedRun *run,
+                               uint64_t sample_id);
+
 /* Parent side: merge one completed sample (prefix + child) into the
  * committed fact tables. */
 OspreyStatus osprey_parent_merge_sample(OspreyContext *ctx,

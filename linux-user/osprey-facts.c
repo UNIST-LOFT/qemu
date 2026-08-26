@@ -190,40 +190,94 @@ bool osprey_mayarray_eq(const OspreyMayArrayFact *a,
 
 typedef uint64_t (*HashFn)(const void *);
 typedef bool (*VerifyFn)(const void *, const void *);
-typedef void (*UpdateFn)(void *dst, const void *src);
+typedef int (*UpdateFn)(void *dst, const void *src); /* <0 = limit */
 
-/* Per-record updaters (support merge on duplicate). */
-static void update_access_fact(void *dst, const void *src) {
+/* Per-record updaters (support merge on duplicate).  sample_support is
+ * Boolean within one committed sample: a duplicate dynamic observation
+ * increments only dynamic/weak counters; parent-side support is
+ * accumulated once per unique committed sample. */
+static uint32_t sat_add_u32(uint32_t a, uint32_t b) {
+    if (b > UINT32_MAX - a) return UINT32_MAX;
+    return a + b;
+}
+
+static uint64_t sat_add_u64(uint64_t a, uint64_t b) {
+    if (b > UINT64_MAX - a) return UINT64_MAX;
+    return a + b;
+}
+
+static int update_access_fact(void *dst, const void *src) {
     OspreyAccessFact *d = dst;
     const OspreyAccessFact *s = src;
-    d->dynamic_count += s->dynamic_count;
-    d->sample_support += s->sample_support;
+    d->dynamic_count = sat_add_u32(d->dynamic_count, s->dynamic_count);
+    if (s->sample_support != 0 && d->sample_support == 0) {
+        d->sample_support = 1;
+    }
+    return 0;
 }
-static void update_base_fact(void *dst, const void *src) {
+static int update_base_fact(void *dst, const void *src) {
     OspreyBaseFact *d = dst;
     const OspreyBaseFact *s = src;
-    d->sample_support += s->sample_support;
+    if (s->sample_support != 0 && d->sample_support == 0) {
+        d->sample_support = 1;
+    }
+    return 0;
 }
-static void update_copy_fact(void *dst, const void *src) {
+static int update_copy_fact(void *dst, const void *src) {
     OspreyCopyFact *d = dst;
     const OspreyCopyFact *s = src;
-    d->sample_support += s->sample_support;
+    if (s->sample_support != 0 && d->sample_support == 0) {
+        d->sample_support = 1;
+    }
+    return 0;
 }
-static void update_points_fact(void *dst, const void *src) {
+static int update_points_fact(void *dst, const void *src) {
     OspreyPointsToFact *d = dst;
     const OspreyPointsToFact *s = src;
-    d->sample_support += s->sample_support;
-    d->weak_numeric_evidence += s->weak_numeric_evidence;
+    d->weak_numeric_evidence = sat_add_u32(d->weak_numeric_evidence,
+                                           s->weak_numeric_evidence);
+    if (s->sample_support != 0 && d->sample_support == 0) {
+        d->sample_support = 1;
+    }
+    return 0;
 }
-static void update_malloc_fact(void *dst, const void *src) {
+static int update_malloc_fact(void *dst, const void *src) {
     OspreyMallocFact *d = dst;
     const OspreyMallocFact *s = src;
-    d->sample_support += s->sample_support;
+    if (s->sample_support != 0 && d->sample_support == 0) {
+        d->sample_support = 1;
+    }
+    return 0;
 }
-static void update_mayarray_fact(void *dst, const void *src) {
+static int update_mayarray_fact(void *dst, const void *src) {
     OspreyMayArrayFact *d = dst;
     const OspreyMayArrayFact *s = src;
-    d->sample_support += s->sample_support;
+    if (s->sample_support != 0 && d->sample_support == 0) {
+        d->sample_support = 1;
+    }
+    return 0;
+}
+/* Duplicate region instances merge observed bounds (min of raw_min, max
+ * of raw_max) so a growing frame updates its shared record in place;
+ * sample support stays Boolean within the sample. */
+static int update_region_instance(void *dst, const void *src) {
+    OspreyRegionInstance *d = dst;
+    const OspreyRegionInstance *s = src;
+    if (s->sample_support != 0 && d->sample_support == 0) {
+        d->sample_support = 1;
+    }
+    if (s->raw_min < d->raw_min) d->raw_min = s->raw_min;
+    if (s->raw_max > d->raw_max) d->raw_max = s->raw_max;
+    return 0;
+}
+/* Census region: per-region unique-chunk counter.  Returns -1 when the
+ * per-region chunk limit is exhausted (fail-closed). */
+static int census_region_updater(void *dst, const void *src) {
+    OspreyCensusRegion *d = dst;
+    const OspreyCensusRegion *s = src;
+    uint32_t n = sat_add_u32(d->chunk_count, s->chunk_count);
+    d->chunk_count = n;
+    return 0;
 }
 
 static uint32_t *table_used_ptr(OspreySharedRun *run, int table) {
@@ -234,40 +288,127 @@ static uint32_t *table_used_ptr(OspreySharedRun *run, int table) {
     case OSPREY_TABLE_POINTS: return &run->points_used;
     case OSPREY_TABLE_ALLOC: return &run->alloc_used;
     case OSPREY_TABLE_MAYARR: return &run->mayarray_used;
-    default: return &run->region_used;
+    case OSPREY_TABLE_REGION: return &run->region_used;
+    case OSPREY_TABLE_CENSUS_CHUNK: return &run->census_chunk_used;
+    default: return &run->census_region_used;
     }
 }
 
 static uint32_t table_cap_of(const OspreySharedRun *run, int table) {
     switch (table) {
-    case OSPREY_TABLE_ACCESS: return run->access_cap;
-    case OSPREY_TABLE_BASE: return run->base_cap;
-    case OSPREY_TABLE_COPY: return run->copy_cap;
-    case OSPREY_TABLE_POINTS: return run->points_cap;
-    case OSPREY_TABLE_ALLOC: return run->alloc_cap;
-    case OSPREY_TABLE_MAYARR: return run->mayarray_cap;
-    default: return run->region_cap;
+    case OSPREY_TABLE_ACCESS:
+    case OSPREY_TABLE_PREFIX_ACCESS: return run->access_cap;
+    case OSPREY_TABLE_BASE:
+    case OSPREY_TABLE_PREFIX_BASE: return run->base_cap;
+    case OSPREY_TABLE_COPY:
+    case OSPREY_TABLE_PREFIX_COPY: return run->copy_cap;
+    case OSPREY_TABLE_POINTS:
+    case OSPREY_TABLE_PREFIX_POINTS: return run->points_cap;
+    case OSPREY_TABLE_ALLOC:
+    case OSPREY_TABLE_PREFIX_ALLOC: return run->alloc_cap;
+    case OSPREY_TABLE_MAYARR:
+    case OSPREY_TABLE_PREFIX_MAYARR: return run->mayarray_cap;
+    case OSPREY_TABLE_REGION:
+    case OSPREY_TABLE_PREFIX_REGION: return run->region_cap;
+    case OSPREY_TABLE_CENSUS_CHUNK: return run->census_chunk_cap;
+    default: return run->census_region_cap;
     }
 }
 
 static size_t table_record_size_of(int table) {
     switch (table) {
-    case OSPREY_TABLE_ACCESS: return sizeof(OspreyAccessFact);
-    case OSPREY_TABLE_BASE: return sizeof(OspreyBaseFact);
-    case OSPREY_TABLE_COPY: return sizeof(OspreyCopyFact);
-    case OSPREY_TABLE_POINTS: return sizeof(OspreyPointsToFact);
-    case OSPREY_TABLE_ALLOC: return sizeof(OspreyMallocFact);
-    case OSPREY_TABLE_MAYARR: return sizeof(OspreyMayArrayFact);
-    default: return sizeof(OspreyRegionInstance);
+    case OSPREY_TABLE_ACCESS:
+    case OSPREY_TABLE_PREFIX_ACCESS: return sizeof(OspreyAccessFact);
+    case OSPREY_TABLE_BASE:
+    case OSPREY_TABLE_PREFIX_BASE: return sizeof(OspreyBaseFact);
+    case OSPREY_TABLE_COPY:
+    case OSPREY_TABLE_PREFIX_COPY: return sizeof(OspreyCopyFact);
+    case OSPREY_TABLE_POINTS:
+    case OSPREY_TABLE_PREFIX_POINTS: return sizeof(OspreyPointsToFact);
+    case OSPREY_TABLE_ALLOC:
+    case OSPREY_TABLE_PREFIX_ALLOC: return sizeof(OspreyMallocFact);
+    case OSPREY_TABLE_MAYARR:
+    case OSPREY_TABLE_PREFIX_MAYARR: return sizeof(OspreyMayArrayFact);
+    case OSPREY_TABLE_REGION:
+    case OSPREY_TABLE_PREFIX_REGION: return sizeof(OspreyRegionInstance);
+    case OSPREY_TABLE_CENSUS_CHUNK: return sizeof(OspreyCensusChunk);
+    default: return sizeof(OspreyCensusRegion);
     }
 }
 
-/* Generic insert; return 1 new, 0 duplicate-updated, -1 table full. */
+/* Record count a primary table's used counter denotes (occupied open
+ * slots, identical for the prefix family). */
+static uint32_t table_used_count(const OspreySharedRun *run, int table) {
+    if (table >= OSPREY_TABLE_PREFIX_ACCESS) {
+        return osprey_run_prefix_used(run, table);
+    }
+    return *table_used_ptr((OspreySharedRun *)run, table);
+}
+
+/* Stage 2.1 census hashes/equality (full-field identity). */
+uint64_t osprey_census_chunk_hash(const OspreyCensusChunk *f) {
+    OspreyKey k = osprey_chunk_key(&f->chunk);
+    return osprey_key_hash(&k);
+}
+bool osprey_census_chunk_eq(const OspreyCensusChunk *a,
+                            const OspreyCensusChunk *b) {
+    return eq_chunk(&a->chunk, &b->chunk);
+}
+uint64_t osprey_census_region_hash(const OspreyCensusRegion *f) {
+    OspreyKey k = osprey_region_key(&f->region);
+    return osprey_key_hash(&k);
+}
+bool osprey_census_region_eq(const OspreyCensusRegion *a,
+                             const OspreyCensusRegion *b) {
+    return eq_region(&a->region, &b->region);
+}
+
+/* True when the frozen-prefix peer of a primary table already holds an
+ * equal record: the fact is part of both the prefix and the suffix, so
+ * it is one union member, not two. */
+static bool run_table_has_peer(const OspreySharedRun *run, int table,
+                               const void *rec, HashFn hash, VerifyFn eq) {
+    int pref = OSPREY_TABLE_PREFIX_ACCESS +
+               (table - OSPREY_TABLE_ACCESS);
+    if (table < 0 || table >= OSPREY_TABLE_PRIMARY_COUNT) return false;
+    uint32_t cap = table_cap_of(run, pref);
+    if (cap == 0) return false;
+    uint8_t *base = osprey_run_table((OspreySharedRun *)run, pref);
+    size_t rec_size = table_record_size_of(pref);
+    uint64_t h = hash(rec);
+    uint32_t slot = (uint32_t)(h % cap);
+    uint32_t step = 1;
+    while (step <= cap) {
+        uint8_t *ent = base + (size_t)slot * rec_size;
+        bool empty = true;
+        for (size_t i = 0; i < rec_size; i++) {
+            if (ent[i] != 0) {
+                empty = false;
+                break;
+            }
+        }
+        if (empty) {
+            return false;
+        }
+        if (eq(ent, rec)) {
+            return true;
+        }
+        slot = (slot + step) % cap;
+        step++;
+    }
+    return false;
+}
+
+/* Generic insert; return 1 new, 0 duplicate-updated, -1 table full.
+ * The `is_primary` flag distinguishes child-writable tables (subject to
+ * the total unique-fact cap and census accounting) from read-only
+ * prefix tables and counting census tables. */
 static int run_table_insert(OspreySharedRun *run, int table, const void *rec,
-                            HashFn hash, VerifyFn eq, UpdateFn upd) {
+                            HashFn hash, VerifyFn eq, UpdateFn upd,
+                            bool is_primary) {
     uint32_t cap = table_cap_of(run, table);
     uint32_t used = *table_used_ptr(run, table);
-    if (cap == 0 || used >= cap) {
+    if (cap == 0) {
         goto full;
     }
     uint8_t *base = osprey_run_table(run, table);
@@ -285,13 +426,34 @@ static int run_table_insert(OspreySharedRun *run, int table, const void *rec,
             }
         }
         if (empty) {
+            /* The unique-fact cap applies only to NEW records: a
+             * duplicate observation of an already-counted fact (in the
+             * suffix or frozen prefix) must never be rejected. */
+            bool in_prefix = is_primary && run->prefix_frozen &&
+                run_table_has_peer(run, table, rec, hash, eq);
+            if (is_primary && !in_prefix &&
+                run->total_facts_count >= run->max_facts_cfg) {
+                goto full;
+            }
             memcpy(ent, rec, rec_size);
             *table_used_ptr(run, table) = used + 1;
+            if (is_primary) {
+                /* The sample's unique-fact count is the union of the
+                 * frozen prefix and the child suffix: a fact that is
+                 * already in the frozen prefix (same full-field record)
+                 * is not a new union member. */
+                if (!in_prefix) {
+                    run->total_facts_count++;
+                }
+            }
             return 1;
         }
         if (eq(ent, rec)) {
             if (upd != NULL) {
-                upd(ent, rec);
+                int rc = upd(ent, rec);
+                if (rc < 0) {
+                    goto full;
+                }
             }
             return 0;
         }
@@ -307,51 +469,144 @@ full:
     return -1;
 }
 
+/* Dedicated census inserts: count unique chunks per sample (cap
+ * max_facts) and unique chunks per region (cap max_chunks_per_region).
+ * Returns 1 new, 0 duplicate, -1 limit exhausted (fail-closed). */
+static int census_chunk_insert(OspreySharedRun *run, const OspreyChunk *chunk) {
+    OspreyCensusChunk cc;
+    memset(&cc, 0, sizeof(cc));
+    cc.chunk = *chunk;
+    return run_table_insert(run, OSPREY_TABLE_CENSUS_CHUNK, &cc,
+                            (HashFn)osprey_census_chunk_hash,
+                            (VerifyFn)osprey_census_chunk_eq, NULL, false);
+}
+
+static int census_region_record_insert(OspreySharedRun *run,
+                                       const OspreyCensusRegion *cr) {
+    int rc = run_table_insert(run, OSPREY_TABLE_CENSUS_REGION, cr,
+                              (HashFn)osprey_census_region_hash,
+                              (VerifyFn)osprey_census_region_eq,
+                              census_region_updater, false);
+    if (rc < 0) return -1;
+    /* Per-region unique-chunk limit: a region's census count may not
+     * exceed max_chunks_per_region.  The count saturates at UINT32_MAX
+     * (the census capacity is derived from the same limit, so a
+     * well-formed run cannot overflow the table first); check the
+     * count against the configured limit explicitly. */
+    if (run->max_chunks_cfg > 0) {
+        uint32_t cap = table_cap_of(run, OSPREY_TABLE_CENSUS_REGION);
+        uint8_t *base = osprey_run_table(run, OSPREY_TABLE_CENSUS_REGION);
+        size_t rec_size = table_record_size_of(OSPREY_TABLE_CENSUS_REGION);
+        uint64_t h = osprey_census_region_hash(cr);
+        uint32_t slot = (uint32_t)(h % cap);
+        uint32_t step = 1;
+        while (step <= cap) {
+            OspreyCensusRegion *ent = (OspreyCensusRegion *)
+                (base + (size_t)slot * rec_size);
+            if (osprey_census_region_eq(ent, cr)) {
+                if (ent->chunk_count > run->max_chunks_cfg) {
+                    run->overflow = 1;
+                    if (run->first_dropped_kind == 0) {
+                        run->first_dropped_kind =
+                            (uint32_t)OSPREY_TABLE_CENSUS_REGION + 1;
+                        run->first_dropped_hash = h;
+                    }
+                    return -1;
+                }
+                break;
+            }
+            slot = (slot + step) % cap;
+            step++;
+        }
+    }
+    return 0;
+}
+
+static int census_region_insert(OspreySharedRun *run,
+                                const OspreyRegionId *region) {
+    OspreyCensusRegion cr;
+    memset(&cr, 0, sizeof(cr));
+    cr.region = *region;
+    cr.chunk_count = 1;
+    return census_region_record_insert(run, &cr);
+}
+
+/* Census accounting for a new access fact: count the unique chunk and
+ * the chunk's region against their per-sample limits.  Called before
+ * the fact insert; a limit exhaustion rejects fail-closed.  The
+ * per-region census counts unique chunks per region (capped at
+ * max_chunks_per_region), and the global census counts unique chunks
+ * per sample (capped at max_facts).  A duplicate dynamic observation of
+ * an already-counted chunk does not increment either census. */
+static int census_insert_chunk(OspreySharedRun *run, const OspreyChunk *chunk) {
+    int rc = census_chunk_insert(run, chunk);
+    if (rc < 0) return -1;
+    if (rc == 1) {
+        /* New unique chunk in this sample: count it in its region. */
+        return census_region_insert(run, &chunk->address.region);
+    }
+    return 0;
+}
+
 int osprey_table_insert_access(OspreySharedRun *run, const OspreyAccessFact *f) {
+    if (census_insert_chunk(run, &f->chunk) < 0) return -1;
     return run_table_insert(run, OSPREY_TABLE_ACCESS, f,
                             (HashFn)osprey_access_hash,
-                            (VerifyFn)osprey_access_eq, update_access_fact);
+                            (VerifyFn)osprey_access_eq, update_access_fact,
+                            true);
 }
 int osprey_table_insert_base(OspreySharedRun *run, const OspreyBaseFact *f) {
+    if (census_insert_chunk(run, &f->chunk) < 0) return -1;
     return run_table_insert(run, OSPREY_TABLE_BASE, f,
                             (HashFn)osprey_base_hash,
-                            (VerifyFn)osprey_base_eq, update_base_fact);
+                            (VerifyFn)osprey_base_eq, update_base_fact,
+                            true);
 }
 int osprey_table_insert_copy(OspreySharedRun *run, const OspreyCopyFact *f) {
+    if (census_insert_chunk(run, &f->source) < 0) return -1;
+    if (census_insert_chunk(run, &f->destination) < 0) return -1;
     return run_table_insert(run, OSPREY_TABLE_COPY, f,
                             (HashFn)osprey_copy_hash,
-                            (VerifyFn)osprey_copy_eq, update_copy_fact);
+                            (VerifyFn)osprey_copy_eq, update_copy_fact,
+                            true);
 }
 int osprey_table_insert_points(OspreySharedRun *run, const OspreyPointsToFact *f) {
+    if (census_insert_chunk(run, &f->pointer_chunk) < 0) return -1;
     return run_table_insert(run, OSPREY_TABLE_POINTS, f,
                             (HashFn)osprey_points_hash,
-                            (VerifyFn)osprey_points_eq, update_points_fact);
+                            (VerifyFn)osprey_points_eq, update_points_fact,
+                            true);
 }
 int osprey_table_insert_alloc(OspreySharedRun *run, const OspreyMallocFact *f) {
     return run_table_insert(run, OSPREY_TABLE_ALLOC, f,
                             (HashFn)osprey_alloc_hash,
-                            (VerifyFn)osprey_alloc_eq, update_malloc_fact);
+                            (VerifyFn)osprey_alloc_eq, update_malloc_fact,
+                            true);
 }
 int osprey_table_insert_mayarray(OspreySharedRun *run, const OspreyMayArrayFact *f) {
     return run_table_insert(run, OSPREY_TABLE_MAYARR, f,
                             (HashFn)osprey_mayarray_hash,
-                            (VerifyFn)osprey_mayarray_eq, update_mayarray_fact);
-}
-/* Duplicate region instances merge observed bounds (min of raw_min, max
- * of raw_max) so a growing frame updates its shared record in place. */
-static void update_region_instance(void *dst, const void *src) {
-    OspreyRegionInstance *d = dst;
-    const OspreyRegionInstance *s = src;
-    d->sample_support += s->sample_support;
-    if (s->raw_min < d->raw_min) d->raw_min = s->raw_min;
-    if (s->raw_max > d->raw_max) d->raw_max = s->raw_max;
+                            (VerifyFn)osprey_mayarray_eq, update_mayarray_fact,
+                            true);
 }
 int osprey_table_insert_region(OspreySharedRun *run,
                                const OspreyRegionInstance *f) {
     return run_table_insert(run, OSPREY_TABLE_REGION, f,
                             (HashFn)osprey_region_instance_hash,
                             (VerifyFn)osprey_region_instance_eq,
-                            update_region_instance);
+                            update_region_instance, true);
+}
+
+/* Public census inserts (used by tests to drive limit fixtures). */
+int osprey_table_insert_census_chunk(OspreySharedRun *run,
+                                     const OspreyCensusChunk *f) {
+    return run_table_insert(run, OSPREY_TABLE_CENSUS_CHUNK, f,
+                            (HashFn)osprey_census_chunk_hash,
+                            (VerifyFn)osprey_census_chunk_eq, NULL, false);
+}
+int osprey_table_insert_census_region(OspreySharedRun *run,
+                                      const OspreyCensusRegion *f) {
+    return census_region_record_insert(run, f);
 }
 
 int osprey_run_iter_next(OspreyRunIter *it, const void **record) {
@@ -638,16 +893,20 @@ void osprey_on_ret(CPUArchState *env, target_ulong pc, target_ulong sp) {
         origin_invalidate_reg(env, R_ESP);
         return;
     }
-    /* A RET always ends the current activation, even when a malformed
-     * epilogue leaves the post-pop SP inside its old frame.  Pop that
-     * frame first, then discard any additional stale frames whose exact
-     * observed bounds cannot contain the surviving SP. */
+    /* A RET always ends the current activation: pop the top frame
+     * unconditionally, even when a malformed epilogue leaves the
+     * post-pop SP inside it.  Then discard any additional stale frames
+     * whose entry lies strictly below the post-pop SP; a frame whose
+     * entry is at or above it survives (the caller's entry is its
+     * call-site RSP, always at or above the post-pop SP).  A deep
+     * library return legitimately lands far below the callers'
+     * observed minima, so a frame's minimum never drives the pop. */
     g_array_set_size(g_stack_frames, g_stack_frames->len - 1);
     while (g_stack_frames->len > 0) {
         OspreyStackFrame *top = &g_array_index(g_stack_frames,
                                                OspreyStackFrame,
                                                g_stack_frames->len - 1);
-        if (sp >= top->min_sp && sp <= top->entry_sp) {
+        if (sp <= top->entry_sp) {
             break;
         }
         g_array_set_size(g_stack_frames, g_stack_frames->len - 1);
@@ -690,7 +949,9 @@ void osprey_on_rsp_update(CPUArchState *env, target_ulong new_sp,
         /* Non-local stack resynchronization: an upward replacement can
          * cross one or more callee entry anchors.  Pop those frames.
          * Downward movement belongs to the current precise activation
-         * and grows its observed bound; there is no synthetic depth cap. */
+         * and grows its observed bound; there is no synthetic depth cap.
+         * RET/RET-imm suppress this generic helper in the translator;
+         * osprey_on_ret owns their activation pop exactly once. */
         while (g_stack_frames->len > 0) {
             OspreyStackFrame *top = &g_array_index(g_stack_frames,
                                                    OspreyStackFrame,
@@ -1207,7 +1468,8 @@ static void record_access_fact(OspreySharedRun *run, uint64_t pc,
     qemu_mutex_lock(&g_shared_mutex);
     osprey_table_insert_access(run, &fact);
     qemu_mutex_unlock(&g_shared_mutex);
-    run->total_dynamic_observations++;
+    run->total_dynamic_observations =
+        sat_add_u64(run->total_dynamic_observations, 1);
 }
 
 /* F04 PointsTo: a pointer-width slot holding an ADDRESS origin at
@@ -1223,8 +1485,7 @@ static void record_points_to(CPUArchState *env, target_ulong addr,
     OspreyRegionId preg, treg;
     int64_t poff, toff;
     if (!osprey_region_of_addr(env, addr, &preg, &poff, false)) {
-        run->bad_region = 1;
-        return;
+        return; /* ordinary skip: pointer cell outside modeled regions */
     }
     /* Provenance-authoritative heap targets: the origin identity must
      * still reference a LIVE object whose base matches the concrete
@@ -1375,9 +1636,9 @@ void osprey_on_mem_access(CPUArchState *env, target_ulong addr,
                 }
             }
         }
-    } else {
-        run->bad_region = 1;
     }
+    /* An address outside every modeled region is an ordinary skipped
+     * observation (libraries, anonymous mmap), never a sticky error. */
 
     /* F04 PointsTo: a pointer-width stored/loaded value carrying a valid
      * ADDRESS origin records canonical points-to.  The value-origin of
@@ -1398,12 +1659,10 @@ void osprey_on_mem_copy(CPUArchState *env, target_ulong src,
     OspreyRegionId sreg, dreg;
     int64_t soff, doff;
     if (!osprey_region_of_addr(env, src, &sreg, &soff, false)) {
-        run->bad_region = 1;
-        return;
+        return; /* ordinary skip: source outside modeled regions */
     }
     if (!osprey_region_of_addr(env, dst, &dreg, &doff, false)) {
-        run->bad_region = 1;
-        return;
+        return; /* ordinary skip: destination outside modeled regions */
     }
     OspreyCopyFact fact;
     memset(&fact, 0, sizeof(fact));
@@ -1529,16 +1788,50 @@ void osprey_tx_abort(OspreyContext *ctx) {
     ctx->last_status = ctx->tx_status;
 }
 
+/* Prefix record-count field for a prefix table (validation). */
+static uint32_t osprey_prefix_used_field(const OspreySharedRun *run,
+                                         int table) {
+    switch (table) {
+    case OSPREY_TABLE_PREFIX_ACCESS: return run->prefix_access_used;
+    case OSPREY_TABLE_PREFIX_BASE: return run->prefix_base_used;
+    case OSPREY_TABLE_PREFIX_COPY: return run->prefix_copy_used;
+    case OSPREY_TABLE_PREFIX_POINTS: return run->prefix_points_used;
+    case OSPREY_TABLE_PREFIX_ALLOC: return run->prefix_alloc_used;
+    case OSPREY_TABLE_PREFIX_MAYARR: return run->prefix_mayarray_used;
+    default: return run->prefix_region_used;
+    }
+}
+
+static bool osprey_record_support_valid(int table, const void *record) {
+    switch (table) {
+    case OSPREY_TABLE_ACCESS:
+    case OSPREY_TABLE_PREFIX_ACCESS:
+        return ((const OspreyAccessFact *)record)->sample_support == 1;
+    case OSPREY_TABLE_BASE:
+    case OSPREY_TABLE_PREFIX_BASE:
+        return ((const OspreyBaseFact *)record)->sample_support == 1;
+    case OSPREY_TABLE_COPY:
+    case OSPREY_TABLE_PREFIX_COPY:
+        return ((const OspreyCopyFact *)record)->sample_support == 1;
+    case OSPREY_TABLE_POINTS:
+    case OSPREY_TABLE_PREFIX_POINTS:
+        return ((const OspreyPointsToFact *)record)->sample_support == 1;
+    case OSPREY_TABLE_ALLOC:
+    case OSPREY_TABLE_PREFIX_ALLOC:
+        return ((const OspreyMallocFact *)record)->sample_support == 1;
+    case OSPREY_TABLE_MAYARR:
+    case OSPREY_TABLE_PREFIX_MAYARR:
+        return ((const OspreyMayArrayFact *)record)->sample_support == 1;
+    default:
+        return ((const OspreyRegionInstance *)record)->sample_support == 1;
+    }
+}
+
 static bool osprey_run_population_valid(const OspreySharedRun *run) {
     static const int tables[] = {
         OSPREY_TABLE_ACCESS, OSPREY_TABLE_BASE, OSPREY_TABLE_COPY,
         OSPREY_TABLE_POINTS, OSPREY_TABLE_ALLOC, OSPREY_TABLE_MAYARR,
         OSPREY_TABLE_REGION,
-    };
-    const uint32_t used[] = {
-        run->access_used, run->base_used, run->copy_used,
-        run->points_used, run->alloc_used, run->mayarray_used,
-        run->region_used,
     };
     for (size_t i = 0; i < G_N_ELEMENTS(tables); i++) {
         OspreyRunIter it;
@@ -1548,18 +1841,373 @@ static bool osprey_run_population_valid(const OspreySharedRun *run) {
         it.run = run;
         it.table = tables[i];
         while (osprey_run_iter_next(&it, &record)) {
+            if (!osprey_record_support_valid(tables[i], record)) {
+                return false;
+            }
             count++;
         }
-        if (count != used[i]) return false;
+        if (count != table_used_count(run, tables[i])) return false;
+        /* Prefix family: occupied slots must equal the recorded count. */
+        int pref = OSPREY_TABLE_PREFIX_ACCESS + (int)i;
+        count = 0;
+        memset(&it, 0, sizeof(it));
+        it.run = run;
+        it.table = pref;
+        while (osprey_run_iter_next(&it, &record)) {
+            if (!osprey_record_support_valid(pref, record)) {
+                return false;
+            }
+            count++;
+        }
+        if (count != osprey_prefix_used_field(run, pref)) {
+            return false;
+        }
+    }
+    /* Census tables: occupied slots must equal the used counters. */
+    {
+        const int census_tables[2] = { OSPREY_TABLE_CENSUS_CHUNK,
+                                       OSPREY_TABLE_CENSUS_REGION };
+        const uint32_t *census_used[2] = { &run->census_chunk_used,
+                                           &run->census_region_used };
+        for (size_t i = 0; i < G_N_ELEMENTS(census_tables); i++) {
+            OspreyRunIter it;
+            const void *record;
+            uint32_t count = 0;
+            memset(&it, 0, sizeof(it));
+            it.run = run;
+            it.table = census_tables[i];
+            while (osprey_run_iter_next(&it, &record)) {
+                count++;
+            }
+            if (count != *census_used[i]) return false;
+        }
+    }
+    uint64_t prefix_count = (uint64_t)run->prefix_access_used +
+        run->prefix_base_used + run->prefix_copy_used +
+        run->prefix_points_used + run->prefix_alloc_used +
+        run->prefix_mayarray_used + run->prefix_region_used;
+    if (run->prefix_frozen) {
+        if (run->prefix_facts_count != prefix_count) return false;
+    } else if (prefix_count != 0 || run->prefix_facts_count != 0 ||
+               run->total_dynamic_prefix != 0) {
+        return false;
     }
     return true;
 }
 
+/* Open-addressed presence probe (mirrors run_table_insert probing:
+ * linear probing with growing step; an empty slot terminates).  Used
+ * for same-sample dedup between the frozen prefix and child suffix
+ * families during the parent merge. */
+static bool run_table_contains(const OspreySharedRun *run, int table,
+                               const void *rec, HashFn hash, VerifyFn eq) {
+    uint32_t cap = table_cap_of(run, table);
+    if (cap == 0) return false;
+    uint8_t *base = osprey_run_table((OspreySharedRun *)run, table);
+    size_t rec_size = table_record_size_of(table);
+    uint64_t h = hash(rec);
+    uint32_t slot = (uint32_t)(h % cap);
+    uint32_t step = 1;
+    while (step <= cap) {
+        uint8_t *ent = base + (size_t)slot * rec_size;
+        bool empty = true;
+        for (size_t i = 0; i < rec_size; i++) {
+            if (ent[i] != 0) {
+                empty = false;
+                break;
+            }
+        }
+        if (empty) {
+            return false;
+        }
+        if (eq(ent, rec)) {
+            return true;
+        }
+        slot = (slot + step) % cap;
+        step++;
+    }
+    return false;
+}
+
+/* Validate the maintained unique-fact counter against the actual
+ * `prefix ∪ suffix` population.  A corrupted or stale counter must not
+ * weaken max_facts or reject a valid duplicate at the cap. */
+static bool osprey_run_fact_count_valid(const OspreySharedRun *run) {
+    static const int tables[] = {
+        OSPREY_TABLE_ACCESS, OSPREY_TABLE_BASE, OSPREY_TABLE_COPY,
+        OSPREY_TABLE_POINTS, OSPREY_TABLE_ALLOC, OSPREY_TABLE_MAYARR,
+        OSPREY_TABLE_REGION,
+    };
+    static const HashFn hashes[] = {
+        (HashFn)osprey_access_hash, (HashFn)osprey_base_hash,
+        (HashFn)osprey_copy_hash, (HashFn)osprey_points_hash,
+        (HashFn)osprey_alloc_hash, (HashFn)osprey_mayarray_hash,
+        (HashFn)osprey_region_instance_hash,
+    };
+    static const VerifyFn equals[] = {
+        (VerifyFn)osprey_access_eq, (VerifyFn)osprey_base_eq,
+        (VerifyFn)osprey_copy_eq, (VerifyFn)osprey_points_eq,
+        (VerifyFn)osprey_alloc_eq, (VerifyFn)osprey_mayarray_eq,
+        (VerifyFn)osprey_region_instance_eq,
+    };
+    uint64_t count = 0;
+    for (size_t i = 0; i < G_N_ELEMENTS(tables); i++) {
+        int prefix = OSPREY_TABLE_PREFIX_ACCESS + (int)i;
+        count += osprey_prefix_used_field(run, prefix);
+        OspreyRunIter it;
+        const void *record;
+        memset(&it, 0, sizeof(it));
+        it.run = run;
+        it.table = tables[i];
+        while (osprey_run_iter_next(&it, &record)) {
+            if (!run->prefix_frozen ||
+                !run_table_contains(run, prefix, record,
+                                    hashes[i], equals[i])) {
+                count++;
+            }
+        }
+    }
+    return count == run->total_facts_count;
+}
+
+/* Merge one fact family from a table (suffix or prefix family) into
+ * the committed parent arrays.  `sample_from` is the parent-array index
+ * where this sample's first pass started: a record equal to an entry
+ * at/after that index is a same-sample duplicate (prefix∩suffix) and
+ * contributes no additional support (Boolean per sample); a record
+ * matching an earlier committed entry adds exactly one support.  The
+ * prefix family is merged first (its records are the sample's first
+ * occurrence); the suffix pass then skips the support increment for
+ * records already present in the prefix (`peer` table).  Dynamic/weak
+ * counters are always summed with saturation (a fact observed both
+ * before the snapshot and in the child suffix is one sample with the
+ * sum of its observations). */
+static void merge_access_family(OspreyContext *ctx, const OspreySharedRun *run,
+                                int table, int peer, guint sample_from) {
+    OspreyRunIter it;
+    const void *rec;
+    memset(&it, 0, sizeof(it));
+    it.run = run;
+    it.table = table;
+    while (osprey_run_iter_next(&it, &rec)) {
+        const OspreyAccessFact *f = rec;
+        bool found = false;
+        for (guint i = 0; i < ctx->access_facts->len; i++) {
+            OspreyAccessFact *d = &g_array_index(ctx->access_facts,
+                                                 OspreyAccessFact, i);
+            if (osprey_access_eq(d, f)) {
+                d->dynamic_count = sat_add_u32(d->dynamic_count,
+                                               f->dynamic_count);
+                if (i < sample_from && f->sample_support != 0 &&
+                    (peer < 0 || !run_table_contains(run, peer, f,
+                                        (HashFn)osprey_access_hash,
+                                        (VerifyFn)osprey_access_eq))) {
+                    d->sample_support = sat_add_u32(d->sample_support, 1);
+                }
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            g_array_append_val(ctx->access_facts, *f);
+        }
+    }
+}
+
+static void merge_base_family(OspreyContext *ctx, const OspreySharedRun *run,
+                              int table, int peer, guint sample_from) {
+    OspreyRunIter it;
+    const void *rec;
+    memset(&it, 0, sizeof(it));
+    it.run = run;
+    it.table = table;
+    while (osprey_run_iter_next(&it, &rec)) {
+        const OspreyBaseFact *f = rec;
+        bool found = false;
+        for (guint i = 0; i < ctx->base_facts->len; i++) {
+            OspreyBaseFact *d = &g_array_index(ctx->base_facts,
+                                               OspreyBaseFact, i);
+            if (osprey_base_eq(d, f)) {
+                if (i < sample_from && f->sample_support != 0 &&
+                    (peer < 0 || !run_table_contains(run, peer, f,
+                                        (HashFn)osprey_base_hash,
+                                        (VerifyFn)osprey_base_eq))) {
+                    d->sample_support = sat_add_u32(d->sample_support, 1);
+                }
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            g_array_append_val(ctx->base_facts, *f);
+        }
+    }
+}
+
+static void merge_copy_facts(OspreyContext *ctx, const OspreySharedRun *run,
+                             int table, int peer, guint sample_from) {
+    OspreyRunIter it;
+    const void *rec;
+    memset(&it, 0, sizeof(it));
+    it.run = run;
+    it.table = table;
+    while (osprey_run_iter_next(&it, &rec)) {
+        const OspreyCopyFact *f = rec;
+        bool found = false;
+        for (guint i = 0; i < ctx->copy_facts->len; i++) {
+            OspreyCopyFact *d = &g_array_index(ctx->copy_facts,
+                                               OspreyCopyFact, i);
+            if (osprey_copy_eq(d, f)) {
+                if (i < sample_from && f->sample_support != 0 &&
+                    (peer < 0 || !run_table_contains(run, peer, f,
+                                        (HashFn)osprey_copy_hash,
+                                        (VerifyFn)osprey_copy_eq))) {
+                    d->sample_support = sat_add_u32(d->sample_support, 1);
+                }
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            g_array_append_val(ctx->copy_facts, *f);
+        }
+    }
+}
+
+static void merge_points_facts(OspreyContext *ctx,
+                               const OspreySharedRun *run,
+                               int table, int peer, guint sample_from) {
+    OspreyRunIter it;
+    const void *rec;
+    memset(&it, 0, sizeof(it));
+    it.run = run;
+    it.table = table;
+    while (osprey_run_iter_next(&it, &rec)) {
+        const OspreyPointsToFact *f = rec;
+        bool found = false;
+        for (guint i = 0; i < ctx->points_facts->len; i++) {
+            OspreyPointsToFact *d = &g_array_index(ctx->points_facts,
+                                                   OspreyPointsToFact, i);
+            if (osprey_points_eq(d, f)) {
+                d->weak_numeric_evidence = sat_add_u32(
+                    d->weak_numeric_evidence, f->weak_numeric_evidence);
+                if (i < sample_from && f->sample_support != 0 &&
+                    (peer < 0 || !run_table_contains(run, peer, f,
+                                        (HashFn)osprey_points_hash,
+                                        (VerifyFn)osprey_points_eq))) {
+                    d->sample_support = sat_add_u32(d->sample_support, 1);
+                }
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            g_array_append_val(ctx->points_facts, *f);
+        }
+    }
+}
+
+static void merge_alloc_facts(OspreyContext *ctx,
+                              const OspreySharedRun *run,
+                              int table, int peer, guint sample_from) {
+    OspreyRunIter it;
+    const void *rec;
+    memset(&it, 0, sizeof(it));
+    it.run = run;
+    it.table = table;
+    while (osprey_run_iter_next(&it, &rec)) {
+        const OspreyMallocFact *f = rec;
+        bool found = false;
+        for (guint i = 0; i < ctx->alloc_facts->len; i++) {
+            OspreyMallocFact *d = &g_array_index(ctx->alloc_facts,
+                                                 OspreyMallocFact, i);
+            if (osprey_alloc_eq(d, f)) {
+                if (i < sample_from && f->sample_support != 0 &&
+                    (peer < 0 || !run_table_contains(run, peer, f,
+                                        (HashFn)osprey_alloc_hash,
+                                        (VerifyFn)osprey_alloc_eq))) {
+                    d->sample_support = sat_add_u32(d->sample_support, 1);
+                }
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            g_array_append_val(ctx->alloc_facts, *f);
+        }
+    }
+}
+
+static void merge_mayarray_facts(OspreyContext *ctx,
+                                 const OspreySharedRun *run,
+                                 int table, int peer, guint sample_from) {
+    OspreyRunIter it;
+    const void *rec;
+    memset(&it, 0, sizeof(it));
+    it.run = run;
+    it.table = table;
+    while (osprey_run_iter_next(&it, &rec)) {
+        const OspreyMayArrayFact *f = rec;
+        bool found = false;
+        for (guint i = 0; i < ctx->mayarray_facts->len; i++) {
+            OspreyMayArrayFact *d = &g_array_index(ctx->mayarray_facts,
+                                                   OspreyMayArrayFact, i);
+            if (osprey_mayarray_eq(d, f)) {
+                if (i < sample_from && f->sample_support != 0 &&
+                    (peer < 0 || !run_table_contains(run, peer, f,
+                                        (HashFn)osprey_mayarray_hash,
+                                        (VerifyFn)osprey_mayarray_eq))) {
+                    d->sample_support = sat_add_u32(d->sample_support, 1);
+                }
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            g_array_append_val(ctx->mayarray_facts, *f);
+        }
+    }
+}
+
+static void merge_region_instances(OspreyContext *ctx,
+                                   const OspreySharedRun *run,
+                                   int table, int peer, guint sample_from) {
+    OspreyRunIter it;
+    const void *rec;
+    memset(&it, 0, sizeof(it));
+    it.run = run;
+    it.table = table;
+    while (osprey_run_iter_next(&it, &rec)) {
+        const OspreyRegionInstance *f = rec;
+        bool found = false;
+        for (guint i = 0; i < ctx->region_instances->len; i++) {
+            OspreyRegionInstance *d = &g_array_index(ctx->region_instances,
+                                                     OspreyRegionInstance, i);
+            if (osprey_region_instance_eq(d, f)) {
+                if (f->raw_min < d->raw_min) d->raw_min = f->raw_min;
+                if (f->raw_max > d->raw_max) d->raw_max = f->raw_max;
+                if (i < sample_from && f->sample_support != 0 &&
+                    (peer < 0 || !run_table_contains(run, peer, f,
+                                        (HashFn)osprey_region_instance_hash,
+                                        (VerifyFn)osprey_region_instance_eq))) {
+                    d->sample_support = sat_add_u32(d->sample_support, 1);
+                }
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            g_array_append_val(ctx->region_instances, *f);
+        }
+    }
+}
+
 /* Merge one completed sample (patch-0/iter-1 child run) into the
- * committed parent tables.  Duplicates merge support in place; the
- * merged record keeps the union of sample support.  Returns
- * OSPREY_INCOMPLETE_FACTS when the sample overflowed (the model must
- * not be installed from incomplete facts). */
+ * committed parent tables.  The sample is `prefix ∪ baseline-child`:
+ * both families are iterated; duplicates merge support in place and the
+ * merged record keeps Boolean per-sample support (one per unique
+ * committed sample).  Returns OSPREY_INCOMPLETE_FACTS when the sample
+ * overflowed (the model must not be installed from incomplete facts). */
 OspreyStatus osprey_parent_merge_sample(OspreyContext *ctx,
                                          const OspreySharedRun *run) {
     if (ctx == NULL || run == NULL) return OSPREY_DISABLED;
@@ -1611,9 +2259,19 @@ OspreyStatus osprey_parent_merge_sample(OspreyContext *ctx,
         run->points_used > run->points_cap ||
         run->alloc_used > run->alloc_cap ||
         run->mayarray_used > run->mayarray_cap ||
-        run->region_used > run->region_cap) {
+        run->region_used > run->region_cap ||
+        run->census_chunk_used > run->census_chunk_cap ||
+        run->census_region_used > run->census_region_cap) {
         osprey_tx_reject(ctx, OSPREY_INCOMPLETE_FACTS, "merge",
                          "used exceeds capacity");
+        return OSPREY_INCOMPLETE_FACTS;
+    }
+    /* The child-side unique-fact cap (max_facts) is sticky: a sample
+     * that hit the cap must not install a model from partial facts. */
+    if (run->total_facts_count > run->max_facts_cfg) {
+        osprey_log_sticky(run, "facts-cap");
+        osprey_tx_reject(ctx, OSPREY_INCOMPLETE_FACTS, "merge",
+                         "max_facts exceeded");
         return OSPREY_INCOMPLETE_FACTS;
     }
     if (!osprey_run_population_valid(run)) {
@@ -1621,156 +2279,82 @@ OspreyStatus osprey_parent_merge_sample(OspreyContext *ctx,
                          "used count does not match table population");
         return OSPREY_INCOMPLETE_FACTS;
     }
-
-    OspreyRunIter it;
-    const void *rec;
-
-    memset(&it, 0, sizeof(it));
-    it.run = run;
-    it.table = OSPREY_TABLE_ACCESS;
-    while (osprey_run_iter_next(&it, &rec)) {
-        const OspreyAccessFact *f = rec;
-        bool merged = false;
-        for (guint i = 0; i < ctx->access_facts->len; i++) {
-            OspreyAccessFact *d = &g_array_index(ctx->access_facts,
-                                                 OspreyAccessFact, i);
-            if (osprey_access_eq(d, f)) {
-                d->dynamic_count += f->dynamic_count;
-                d->sample_support += f->sample_support;
-                merged = true;
-                break;
-            }
-        }
-        if (!merged) {
-            g_array_append_val(ctx->access_facts, *f);
-        }
+    if (!osprey_run_fact_count_valid(run)) {
+        osprey_tx_reject(ctx, OSPREY_INCOMPLETE_FACTS, "merge",
+                         "unique fact count does not match population");
+        return OSPREY_INCOMPLETE_FACTS;
     }
 
-    memset(&it, 0, sizeof(it));
-    it.run = run;
-    it.table = OSPREY_TABLE_BASE;
-    while (osprey_run_iter_next(&it, &rec)) {
-        const OspreyBaseFact *f = rec;
-        bool merged = false;
-        for (guint i = 0; i < ctx->base_facts->len; i++) {
-            OspreyBaseFact *d = &g_array_index(ctx->base_facts,
-                                               OspreyBaseFact, i);
-            if (osprey_base_eq(d, f)) {
-                d->sample_support += f->sample_support;
-                merged = true;
-                break;
-            }
-        }
-        if (!merged) {
-            g_array_append_val(ctx->base_facts, *f);
-        }
+    /* Merge `prefix ∪ suffix` as exactly one unmodified sample: iterate
+     * the suffix family first, then the frozen prefix family.  A record
+     * present in both parts is the same fact within this sample: it
+     * contributes one support (never two) and its dynamic counts are
+     * summed (prefix observations + suffix observations).  `sample_from`
+     * marks the parent-array index range appended by this sample's
+     * suffix pass; a prefix record matching one of those entries is a
+     * same-sample duplicate and contributes nothing more.  Records
+     * matching entries committed by earlier samples add exactly one
+     * support (one per unique committed sample).  All counters are
+     * checked/saturating. */
+
+    /* Access facts. */
+    {
+        guint sample_from = ctx->access_facts->len;
+        merge_access_family(ctx, run, OSPREY_TABLE_ACCESS, -1, sample_from);
+        merge_access_family(ctx, run, OSPREY_TABLE_PREFIX_ACCESS,
+                            OSPREY_TABLE_ACCESS, sample_from);
+    }
+    /* Base facts. */
+    {
+        guint sample_from = ctx->base_facts->len;
+        merge_base_family(ctx, run, OSPREY_TABLE_BASE, -1, sample_from);
+        merge_base_family(ctx, run, OSPREY_TABLE_PREFIX_BASE,
+                          OSPREY_TABLE_BASE, sample_from);
+    }
+    /* Copy facts. */
+    {
+        guint sample_from = ctx->copy_facts->len;
+        merge_copy_facts(ctx, run, OSPREY_TABLE_COPY, -1, sample_from);
+        merge_copy_facts(ctx, run, OSPREY_TABLE_PREFIX_COPY,
+                         OSPREY_TABLE_COPY, sample_from);
+    }
+    /* Points-to facts. */
+    {
+        guint sample_from = ctx->points_facts->len;
+        merge_points_facts(ctx, run, OSPREY_TABLE_POINTS, -1, sample_from);
+        merge_points_facts(ctx, run, OSPREY_TABLE_PREFIX_POINTS,
+                           OSPREY_TABLE_POINTS, sample_from);
+    }
+    /* Allocation facts. */
+    {
+        guint sample_from = ctx->alloc_facts->len;
+        merge_alloc_facts(ctx, run, OSPREY_TABLE_ALLOC, -1, sample_from);
+        merge_alloc_facts(ctx, run, OSPREY_TABLE_PREFIX_ALLOC,
+                          OSPREY_TABLE_ALLOC, sample_from);
+    }
+    /* MayArray facts. */
+    {
+        guint sample_from = ctx->mayarray_facts->len;
+        merge_mayarray_facts(ctx, run, OSPREY_TABLE_MAYARR, -1, sample_from);
+        merge_mayarray_facts(ctx, run, OSPREY_TABLE_PREFIX_MAYARR,
+                             OSPREY_TABLE_MAYARR, sample_from);
+    }
+    /* Region instances (bounds merge always; support once per sample). */
+    {
+        guint sample_from = ctx->region_instances->len;
+        merge_region_instances(ctx, run, OSPREY_TABLE_REGION, -1,
+                               sample_from);
+        merge_region_instances(ctx, run, OSPREY_TABLE_PREFIX_REGION,
+                               OSPREY_TABLE_REGION, sample_from);
     }
 
-    memset(&it, 0, sizeof(it));
-    it.run = run;
-    it.table = OSPREY_TABLE_COPY;
-    while (osprey_run_iter_next(&it, &rec)) {
-        const OspreyCopyFact *f = rec;
-        bool merged = false;
-        for (guint i = 0; i < ctx->copy_facts->len; i++) {
-            OspreyCopyFact *d = &g_array_index(ctx->copy_facts,
-                                               OspreyCopyFact, i);
-            if (osprey_copy_eq(d, f)) {
-                d->sample_support += f->sample_support;
-                merged = true;
-                break;
-            }
-        }
-        if (!merged) {
-            g_array_append_val(ctx->copy_facts, *f);
-        }
-    }
-
-    memset(&it, 0, sizeof(it));
-    it.run = run;
-    it.table = OSPREY_TABLE_POINTS;
-    while (osprey_run_iter_next(&it, &rec)) {
-        const OspreyPointsToFact *f = rec;
-        bool merged = false;
-        for (guint i = 0; i < ctx->points_facts->len; i++) {
-            OspreyPointsToFact *d = &g_array_index(ctx->points_facts,
-                                                   OspreyPointsToFact, i);
-            if (osprey_points_eq(d, f)) {
-                d->sample_support += f->sample_support;
-                d->weak_numeric_evidence += f->weak_numeric_evidence;
-                merged = true;
-                break;
-            }
-        }
-        if (!merged) {
-            g_array_append_val(ctx->points_facts, *f);
-        }
-    }
-
-    memset(&it, 0, sizeof(it));
-    it.run = run;
-    it.table = OSPREY_TABLE_ALLOC;
-    while (osprey_run_iter_next(&it, &rec)) {
-        const OspreyMallocFact *f = rec;
-        bool merged = false;
-        for (guint i = 0; i < ctx->alloc_facts->len; i++) {
-            OspreyMallocFact *d = &g_array_index(ctx->alloc_facts,
-                                                 OspreyMallocFact, i);
-            if (osprey_alloc_eq(d, f)) {
-                d->sample_support += f->sample_support;
-                merged = true;
-                break;
-            }
-        }
-        if (!merged) {
-            g_array_append_val(ctx->alloc_facts, *f);
-        }
-    }
-
-    memset(&it, 0, sizeof(it));
-    it.run = run;
-    it.table = OSPREY_TABLE_MAYARR;
-    while (osprey_run_iter_next(&it, &rec)) {
-        const OspreyMayArrayFact *f = rec;
-        bool merged = false;
-        for (guint i = 0; i < ctx->mayarray_facts->len; i++) {
-            OspreyMayArrayFact *g = &g_array_index(ctx->mayarray_facts,
-                                                   OspreyMayArrayFact, i);
-            if (osprey_mayarray_eq(g, f)) {
-                g->sample_support += f->sample_support;
-                merged = true;
-                break;
-            }
-        }
-        if (!merged) {
-            g_array_append_val(ctx->mayarray_facts, *f);
-        }
-    }
-
-    memset(&it, 0, sizeof(it));
-    it.run = run;
-    it.table = OSPREY_TABLE_REGION;
-    while (osprey_run_iter_next(&it, &rec)) {
-        const OspreyRegionInstance *f = rec;
-        bool merged = false;
-        for (guint i = 0; i < ctx->region_instances->len; i++) {
-            OspreyRegionInstance *d = &g_array_index(ctx->region_instances,
-                                                     OspreyRegionInstance, i);
-            if (osprey_region_instance_eq(d, f)) {
-                d->sample_support += f->sample_support;
-                if (f->raw_min < d->raw_min) d->raw_min = f->raw_min;
-                if (f->raw_max > d->raw_max) d->raw_max = f->raw_max;
-                merged = true;
-                break;
-            }
-        }
-        if (!merged) {
-            g_array_append_val(ctx->region_instances, *f);
-        }
-    }
-
-    ctx->total_samples += 1;
-    ctx->total_dynamic_observations += run->total_dynamic_observations;
+    ctx->total_samples = sat_add_u64(ctx->total_samples, 1);
+    /* The sample's dynamic observation total is the union of the frozen
+     * prefix and the child suffix (child suffix counts are reset to 0
+     * by prepare; the prefix count is preserved). */
+    ctx->total_dynamic_observations = sat_add_u64(
+        ctx->total_dynamic_observations,
+        sat_add_u64(run->total_dynamic_prefix, run->total_dynamic_observations));
 
     log_msg("[osprey] [facts] [samples %llu] [access %u] [base %u] "
             "[copy %u] [points %u] [alloc %u] [may-array %u] "

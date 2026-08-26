@@ -1937,6 +1937,17 @@ void snapshot_save(void) {
     g_snapshot.is_snapshot_taken = true;
     log_msg("[snapshot] [result] [brk %llx] [mmap %llx] [pages %d]\n", (long long int)target_brk, (long long int)mmap_next_start, g_hash_table_size(g_snapshot.pages));
     dump_coverage_edge_log(false);
+
+    /* OSPREY Stage 2.1: freeze the pre-snapshot prefix.  Every fact
+     * collected before the snapshot (entrypoint frame, init-time
+     * frames) becomes the frozen prefix family; the baseline child
+     * contributes the post-snapshot suffix.  The merge treats
+     * `prefix ∪ baseline-child` as exactly one unmodified sample.
+     * Idempotent: snapshot_save runs once. */
+    if (g_osprey_ctx != NULL && g_osprey_shared_run != NULL &&
+        g_osprey_ctx->config.enabled) {
+        osprey_shared_run_freeze_prefix(g_osprey_ctx, g_osprey_shared_run);
+    }
 }
 
 void snapshot_write_access(SnapshotMemAccess *mem_access) {
@@ -3333,12 +3344,13 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env, const ArgumentInf
         fflush(NULL);
         trace_mem_flush();
         log_msg_flush();
-        /* OSPREY: reset the shared run for the next sample; the child
-         * inherits the (now empty) tables via fork CoW-on-shared-memory. */
-        if (g_osprey_shared_run != NULL) {
-            osprey_shared_run_reset(g_osprey_shared_run,
-                                    (uint64_t)binradar_iter,
-                                    &g_osprey_ctx->config);
+        /* OSPREY: prepare the shared run for the next sample.  After
+         * the snapshot freeze, this resets only the per-child suffix,
+         * preserving the frozen pre-snapshot prefix (Stage 2.1); the
+         * child inherits `prefix ∪ empty suffix` via fork. */
+        if (g_osprey_ctx != NULL && g_osprey_shared_run != NULL) {
+            osprey_shared_run_prepare(g_osprey_ctx, g_osprey_shared_run,
+                                      (uint64_t)binradar_iter);
         }
         child_pid = fork();
         if (child_pid < 0) exit_with_status(4);

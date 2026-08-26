@@ -246,17 +246,27 @@ typedef struct OspreyCpuOriginState {
 /* Shared run (fixed layout, no pointers)                              */
 /* ------------------------------------------------------------------ */
 
-#define OSPREY_SHARED_VERSION 5u
+#define OSPREY_SHARED_VERSION 7u
 
 struct OspreySharedRun {
     uint32_t version;
     uint32_t sample_id;
+    /* Child-suffix observations (Stage 2.1: the baseline sample is the
+     * union of the frozen pre-snapshot prefix and the per-child suffix;
+     * see osprey_shared_run_freeze_prefix / osprey_shared_run_prepare). */
     uint64_t total_dynamic_observations;
     uint64_t total_samples;      /* committed unmodified samples */
+    uint64_t total_dynamic_prefix;  /* frozen pre-snapshot dynamics */
+    uint64_t total_facts_count;     /* unique facts in this sample */
+    uint64_t prefix_facts_count;    /* frozen-prefix unique fact count */
+    uint64_t max_facts_cfg;         /* config max_facts (child-side cap) */
+    uint64_t max_chunks_cfg;        /* config max_chunks_per_region */
+    uint32_t prefix_frozen;         /* freeze_prefix has run */
 
     /* Sticky overflow / error flags. */
-    uint32_t overflow;           /* any table full */
-    uint32_t bad_region;         /* access failed region resolution */
+    uint32_t overflow;           /* any table full / cap exhausted */
+    uint32_t bad_region;         /* reserved; out-of-model addresses are
+                                  * ordinary skips, never sticky */
     uint32_t bad_arithmetic;     /* checked arithmetic failed */
     uint32_t bad_identity;       /* provenance/object contract mismatch */
     uint32_t unsupported_execution; /* unsupported guest contract observed */
@@ -264,7 +274,8 @@ struct OspreySharedRun {
     uint64_t first_dropped_hash; /* hash of the first dropped record */
 
     /* Open-addressed fact tables. Capacities are derived from config at
-     * reset time; a capacity of 0 disables the table. */
+     * reset time; a capacity of 0 disables the table.  Each capacity
+     * applies to both the prefix and the suffix family. */
     uint32_t access_cap;
     uint32_t access_used;
     uint32_t base_cap;
@@ -279,6 +290,28 @@ struct OspreySharedRun {
     uint32_t mayarray_used;
     uint32_t region_cap;
     uint32_t region_used;
+    uint32_t census_chunk_cap;
+    uint32_t census_chunk_used;
+    uint32_t census_region_cap;
+    uint32_t census_region_used;
+    /* Frozen prefix record counts (osprey_shared_run_freeze_prefix). */
+    uint32_t prefix_access_used;
+    uint32_t prefix_base_used;
+    uint32_t prefix_copy_used;
+    uint32_t prefix_points_used;
+    uint32_t prefix_alloc_used;
+    uint32_t prefix_mayarray_used;
+    uint32_t prefix_region_used;
+    /* Sticky state captured at freeze.  prepare restores these values
+     * before every child suffix so a pre-snapshot failure cannot be
+     * cleared by the forkserver reset. */
+    uint32_t prefix_overflow;
+    uint32_t prefix_bad_region;
+    uint32_t prefix_bad_arithmetic;
+    uint32_t prefix_bad_identity;
+    uint32_t prefix_unsupported_execution;
+    uint32_t prefix_first_dropped_kind;
+    uint64_t prefix_first_dropped_hash;
 
     uint8_t storage[]; /* flex array; offsets computed in osprey.c */
 };
@@ -291,7 +324,35 @@ struct OspreySharedRun {
 #define OSPREY_TABLE_ALLOC  4
 #define OSPREY_TABLE_MAYARR 5
 #define OSPREY_TABLE_REGION 6
-#define OSPREY_TABLE_COUNT  7
+#define OSPREY_TABLE_CENSUS_CHUNK 7
+#define OSPREY_TABLE_CENSUS_REGION 8
+#define OSPREY_TABLE_COUNT  9
+
+/* Primary fact tables (per-child suffix family); the prefix and census
+ * families extend the layout (osprey.c). */
+#define OSPREY_TABLE_PRIMARY_COUNT 7
+
+/* Stage 2.1 census tables: enforced per-sample unique-chunk and
+ * per-region chunk limits.  These are counting tables only (no sample
+ * support), keyed by the same full-field identity used for facts.
+ * Exhausting a census limit sets run->overflow (cap exhaustion),
+ * which rejects the merge fail-closed. */
+typedef struct OspreyCensusChunk {
+    OspreyChunk chunk;
+} OspreyCensusChunk;
+
+typedef struct OspreyCensusRegion {
+    OspreyRegionId region;
+    uint32_t chunk_count;   /* unique chunks observed in this region */
+    uint32_t reserved;
+} OspreyCensusRegion;
+
+uint64_t osprey_census_chunk_hash(const OspreyCensusChunk *f);
+bool osprey_census_chunk_eq(const OspreyCensusChunk *a,
+                            const OspreyCensusChunk *b);
+uint64_t osprey_census_region_hash(const OspreyCensusRegion *f);
+bool osprey_census_region_eq(const OspreyCensusRegion *a,
+                             const OspreyCensusRegion *b);
 
 /* Hash/equality over the fixed records (osprey-facts.c). */
 uint64_t osprey_access_hash(const OspreyAccessFact *f);
@@ -357,15 +418,50 @@ int osprey_table_insert_alloc(OspreySharedRun *run, const OspreyMallocFact *f);
 int osprey_table_insert_mayarray(OspreySharedRun *run, const OspreyMayArrayFact *f);
 int osprey_table_insert_region(OspreySharedRun *run,
                                const OspreyRegionInstance *f);
+/* Stage 2.1 census inserts: count unique chunks/regions per sample.
+ * Returns 1 on new record, 0 on duplicate, -1 on limit exhausted
+ * (sets run->overflow). */
+int osprey_table_insert_census_chunk(OspreySharedRun *run,
+                                     const OspreyCensusChunk *f);
+int osprey_table_insert_census_region(OspreySharedRun *run,
+                                      const OspreyCensusRegion *f);
 
-/* Iteration (parent side). */
+/* Iteration (parent side).  table == OSPREY_TABLE_* primary tables;
+ * the prefix family of a primary table is iterated with
+ * OSPREY_TABLE_PREFIX(OSPREY_TABLE_*). */
 typedef struct OspreyRunIter {
     const OspreySharedRun *run;
-    int table;      /* OSPREY_TABLE_* */
+    int table;      /* OSPREY_TABLE_* or prefix family */
     uint32_t slot;
     uint32_t used;
 } OspreyRunIter;
 int osprey_run_iter_next(OspreyRunIter *it, const void **record);
+
+/* Prefix-family tables: the frozen pre-snapshot records for a primary
+ * table live in a second region of the shared run with the same record
+ * size and capacity (see osprey.c layout).  The parent iterates them
+ * through the same record format so `prefix ∪ child` merges as one
+ * deduplicated sample. */
+#define OSPREY_TABLE_PREFIX_ACCESS    (OSPREY_TABLE_COUNT + 0)
+#define OSPREY_TABLE_PREFIX_BASE      (OSPREY_TABLE_COUNT + 1)
+#define OSPREY_TABLE_PREFIX_COPY      (OSPREY_TABLE_COUNT + 2)
+#define OSPREY_TABLE_PREFIX_POINTS    (OSPREY_TABLE_COUNT + 3)
+#define OSPREY_TABLE_PREFIX_ALLOC     (OSPREY_TABLE_COUNT + 4)
+#define OSPREY_TABLE_PREFIX_MAYARR    (OSPREY_TABLE_COUNT + 5)
+#define OSPREY_TABLE_PREFIX_REGION    (OSPREY_TABLE_COUNT + 6)
+#define OSPREY_PREFIX_TABLE_COUNT     7
+
+/* Prefix record counts (occupied open slots).  The prefix is frozen by
+ * copying primary-table records into the prefix region at
+ * osprey_shared_run_freeze_prefix; osprey_run_prefix_used() returns the
+ * occupied count. */
+uint32_t osprey_run_prefix_used(const OspreySharedRun *run, int table);
+
+/* Stage 2.1: reset the per-sample census tables and rebuild them from
+ * the frozen prefix family, so a prepared sample's census is exactly
+ * `prefix ∪ (empty suffix)` and later forks (mutation iterations) start
+ * from a clean per-sample census. */
+void osprey_census_rebuild_from_prefix(OspreySharedRun *run);
 
 /* ------------------------------------------------------------------ */
 /* Context (parent-owned)                                              */
