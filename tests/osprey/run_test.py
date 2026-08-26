@@ -122,16 +122,17 @@ TESTS = [
         rc=(2,),
         # Exact canonical rows asserted against the checked-in dump
         # (t02_chunk_widths.expected), byte-identical across three PIE
-        # load biases.  The current fixture exercises representative F01
-        # store paths; the Stage 2.2 audit records the still-missing classes:
-        # integer b/w/l/q stores, LOCK xadd/cmpxchg (4/8), non-lock
-        # cmpxchg8b (8), movsd (8), movaps (16), fstl (8), fstpt/fbstp
-        # (10), fnstenv (28) and fnsave (108) on the 64-bit build.
+        # load biases.  The fixture forces selected integer, atomic, paired,
+        # SIMD, x87, descriptor, MXCSR, and FXSAVE/FXRSTOR producers.
+        # MOVBE/SSE4.1/MPX instructions are CPUID-gated; MPX can still be
+        # disabled by guest state and therefore is not an acceptance proof.
         # Width assertions below own the cross-row invariants.
         dump_assert={
-            "access_symbols_absent": ["t02_fault_store"],
+            "access_symbols_absent": [
+                "t02_fault_store", "t02_fault_paired_store",
+            ],
             "access_widths_allowed": [
-                1, 2, 4, 8, 10, 16, 28, 108,
+                1, 2, 4, 8, 10, 16, 28, 108, 512,
             ],
             "access_widths_min": {
                 1: 1,    # byte store
@@ -143,6 +144,31 @@ TESTS = [
                 16: 1,   # movaps 128-bit
                 28: 1,   # fnstenv (64-bit operand)
                 108: 1,  # fnsave (64-bit operand)
+                512: 2,  # fxsave + fxrstor
+            },
+        },
+        timeout=60,
+    ),
+    dict(
+        name="t02_chunk_widths_combined",
+        guest="t02_chunk_widths",
+        mode="dump_compare",
+        # The same exact F01 matrix must remain stable when provenance and
+        # OSPREY consume the neutral events together.
+        memcheck=1,
+        dump_stem="t02_combined_dump",
+        expected="t02_chunk_widths.expected",
+        rc=(2,),
+        dump_assert={
+            "access_symbols_absent": [
+                "t02_fault_store", "t02_fault_paired_store",
+            ],
+            "access_widths_allowed": [
+                1, 2, 4, 8, 10, 16, 28, 108, 512,
+            ],
+            "access_widths_min": {
+                1: 1, 2: 1, 4: 3, 8: 4, 10: 2, 16: 1,
+                28: 1, 108: 1, 512: 2,
             },
         },
         timeout=60,

@@ -8679,6 +8679,7 @@ int        parse_translation_block(TranslationBlock* tb, uintptr_t tb_pc,
                             "sem_reg_xchg", "sem_clobber_caller_saved",
                             "sem_set_pc", "sem_set_ea", "sem_set_ea_vals",
                             "sem_set_ea_mode", "sem_mem_access",
+                            "sem_mem_overwrite",
                             "sem_on_load", "sem_on_store", "sem_call",
                             "sem_ret", "sem_rsp_update"};
 

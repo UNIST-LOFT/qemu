@@ -15,8 +15,9 @@
  * surface; unit tests require the classified and emittable sets to match.
  * UNKNOWN-class runtime events are fail-closed: conservative invalidation,
  * never a recorded OSPREY fact.  Complete translator operation coverage
- * still requires the checked operation-class fixture described by the
- * Stage 2.2 audit.
+ * has a bounded source sanity check and an exact regression fixture.  The
+ * follow-up Stage 2.2 audit records producer families those checks do not
+ * inventory; later stages must not treat this table as coverage proof.
  */
 
 #include "qemu/osdep.h"
@@ -47,6 +48,20 @@ typedef struct SemHelperClass {
     SemOpClass op_class;
 } SemHelperClass;
 
+typedef enum SemIntervalPolicy {
+    SEM_INTERVAL_EXACT_WIDTH,
+    SEM_INTERVAL_PAIRED,
+    SEM_INTERVAL_RAW,
+    SEM_INTERVAL_MULTIPART,
+} SemIntervalPolicy;
+
+typedef struct SemProducerSpec {
+    const char *producer;
+    SemOpClass op_class;
+    SemIntervalPolicy interval_policy;
+    uint32_t interval_width;
+} SemProducerSpec;
+
 /* Class name + validity table (unit-testable manifest).  UNKNOWN is the
  * only invalid class: producers must never label events with it. */
 extern const char *const sem_op_class_name[SEM_OP_CLASS_COUNT];
@@ -56,6 +71,12 @@ extern const bool sem_op_class_valid[SEM_OP_CLASS_COUNT];
  * registered here so new memory-writing helpers cannot silently bypass
  * the manifest.  Terminated by { NULL, 0 }. */
 extern const SemHelperClass sem_helper_class_table[];
+
+/* Declared Stage-2.2 producer-family matrix.  This is unit-checked for shape
+ * but is not mechanically linked to translator/helper callsites.  MULTIPART
+ * means constituent guest accesses are invalidated individually while one
+ * aggregate interval is published only after the final access succeeds. */
+extern const SemProducerSpec sem_producer_table[];
 
 /* The exact set of helper names the translator is allowed to emit
  * (compile-checked by unit tests against translate.c usage). */
@@ -75,6 +96,19 @@ bool sem_events_active(void);
  * conservative invalidation and never produces an OSPREY fact. */
 void sem_mem_overwrite(target_ulong addr, target_ulong size,
                        SemOpClass cls);
+
+/* The translator carries the operation class on every memory event.  The
+ * default wrappers use SEM_OP_INTEGER; special helpers use the explicit
+ * class variant in translate.c. */
+void sem_mem_access(CPUArchState *env, target_ulong addr,
+                    target_ulong size, target_ulong pc, uint32_t flags,
+                    SemOpClass cls);
+
+/* Helper-backed guest memory operation.  The helper calls this only after
+ * its complete architectural interval succeeds. */
+void sem_mem_helper_access(CPUArchState *env, target_ulong addr,
+                           target_ulong size, target_ulong pc,
+                           bool is_store, SemOpClass cls);
 
 /* Register overwrite (snapshot reg mutation).  Same fail-closed rule. */
 void sem_reg_overwrite(CPUArchState *env, int reg_idx, SemOpClass cls);

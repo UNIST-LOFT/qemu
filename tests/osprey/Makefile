@@ -14,6 +14,7 @@
 QEMU      := ../../build/x86_64-linux-user/qemu-x86_64
 SOLVER    := ../../../solver/build/solver-smt
 RUNNER    := $(CURDIR)/run_test.py
+INVENTORY := $(CURDIR)/check_semantic_inventory.py
 GEN_PLT   := $(CURDIR)/../provenance/gen_plt.py
 GUESTS    := $(CURDIR)/guests
 WORK      := $(CURDIR)/work
@@ -64,8 +65,11 @@ TESTS := osprey_deref t01_regions t01_clone t02_chunk_widths
 GUEST_BINS := $(addprefix $(WORK)/,$(TESTS))
 PLT_FILES  := $(addprefix $(WORK)/,$(addsuffix .plt,$(TESTS)))
 
-.PHONY: check run unit unit-asan unit-asan-osprey guests plts clean
-check: run unit unit-asan-osprey
+.PHONY: check inventory run unit unit-asan unit-asan-osprey guests plts clean
+check: inventory run unit unit-asan-osprey
+run unit unit-asan-osprey: inventory
+inventory:
+	@python3 $(INVENTORY)
 run: guests plts
 	@$(RUNNER) $(GUESTS) $(WORK) $(QEMU) $(SOLVER) --quiet
 unit: $(UNIT_BIN)

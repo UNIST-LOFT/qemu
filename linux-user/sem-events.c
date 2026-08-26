@@ -18,7 +18,6 @@
  */
 
 #include "qemu/osdep.h"
-#include "qemu.h"
 
 #include "sem-events.h"
 #include "provenance.h"
@@ -59,13 +58,15 @@ void helper_sem_set_ea_vals(CPUArchState *env, target_ulong base_val,
 void helper_sem_set_ea_mode(CPUArchState *env, uint32_t mode);
 void helper_sem_mem_access(CPUArchState *env, target_ulong addr,
                            target_ulong size, target_ulong pc,
-                           uint32_t flags);
+                           uint32_t flags, uint32_t cls);
+void helper_sem_mem_overwrite(CPUArchState *env, target_ulong addr,
+                              target_ulong size, uint32_t cls);
 void helper_sem_on_load(CPUArchState *env, uint32_t dst_idx,
                         target_ulong addr, target_ulong size,
-                        target_ulong pc);
+                        target_ulong pc, uint32_t cls);
 void helper_sem_on_store(CPUArchState *env, uint32_t src_idx,
                          target_ulong addr, target_ulong size,
-                         target_ulong src_val);
+                         target_ulong src_val, uint32_t cls);
 void helper_sem_call(CPUArchState *env, target_ulong callee_pc,
                      target_ulong entry_sp);
 void helper_sem_ret(CPUArchState *env, target_ulong pc, target_ulong sp);
@@ -106,6 +107,36 @@ const bool sem_op_class_valid[SEM_OP_CLASS_COUNT] = {
     [SEM_OP_UNKNOWN]    = false, /* fail-closed: never producer-labeled */
 };
 
+const SemProducerSpec sem_producer_table[] = {
+    { "integer.modrm",       SEM_OP_INTEGER,    SEM_INTERVAL_EXACT_WIDTH, 8 },
+    { "integer.moffs",       SEM_OP_INTEGER,    SEM_INTERVAL_EXACT_WIDTH, 8 },
+    { "integer.string",      SEM_OP_INTEGER,    SEM_INTERVAL_EXACT_WIDTH, 8 },
+    { "integer.ins-outs",    SEM_OP_INTEGER,    SEM_INTERVAL_EXACT_WIDTH, 8 },
+    { "integer.stack-control", SEM_OP_INTEGER,  SEM_INTERVAL_EXACT_WIDTH, 8 },
+    { "integer.descriptor",  SEM_OP_INTEGER,    SEM_INTERVAL_MULTIPART,  8 },
+    { "atomic.lock-rmw",     SEM_OP_ATOMIC_RMW, SEM_INTERVAL_EXACT_WIDTH, 8 },
+    { "atomic.xchg",         SEM_OP_ATOMIC_RMW, SEM_INTERVAL_EXACT_WIDTH, 8 },
+    { "paired.cmpxchg8b",    SEM_OP_PAIRED,     SEM_INTERVAL_PAIRED,      8 },
+    { "paired.cmpxchg16b",   SEM_OP_PAIRED,     SEM_INTERVAL_PAIRED,     16 },
+    { "simd.scalar",         SEM_OP_SIMD,       SEM_INTERVAL_EXACT_WIDTH, 8 },
+    { "simd.vector",         SEM_OP_SIMD,       SEM_INTERVAL_PAIRED,     16 },
+    { "simd.special",        SEM_OP_SIMD,       SEM_INTERVAL_EXACT_WIDTH, 8 },
+    { "x87.scalar",          SEM_OP_X87_HELPER, SEM_INTERVAL_EXACT_WIDTH, 8 },
+    { "x87.raw",             SEM_OP_X87_HELPER, SEM_INTERVAL_RAW,         10 },
+    { "x87.environment",     SEM_OP_X87_HELPER, SEM_INTERVAL_RAW,         14 },
+    { "x87.saved-state",     SEM_OP_X87_HELPER, SEM_INTERVAL_RAW,         94 },
+    { "mpx.bndmov",          SEM_OP_MPX,        SEM_INTERVAL_PAIRED,     16 },
+    { "mpx.bndx-helper",     SEM_OP_MPX,        SEM_INTERVAL_MULTIPART,  12 },
+    { "xsave.fxsave",        SEM_OP_PAIRED,     SEM_INTERVAL_RAW,        512 },
+    { "xsave.xsave",         SEM_OP_PAIRED,     SEM_INTERVAL_RAW,          0 },
+    { "model.output",        SEM_OP_LIBC_MODEL, SEM_INTERVAL_RAW,          1 },
+    { "syscall.output",      SEM_OP_SYSCALL,    SEM_INTERVAL_RAW,          1 },
+    { "mapping.output",      SEM_OP_MAPPING,    SEM_INTERVAL_RAW,          1 },
+    { "signal.frame",        SEM_OP_SIGNAL,     SEM_INTERVAL_RAW,          1 },
+    { "snapshot.write",      SEM_OP_SNAPSHOT,   SEM_INTERVAL_RAW,          1 },
+    { NULL, 0, 0, 0 },
+};
+
 const SemHelperClass sem_helper_class_table[] = {
     { "sem_reg_invalidate",  SEM_OP_INTEGER },
     { "sem_reg_copy",        SEM_OP_INTEGER },
@@ -120,6 +151,7 @@ const SemHelperClass sem_helper_class_table[] = {
     { "sem_set_ea_vals",     SEM_OP_INTEGER },
     { "sem_set_ea_mode",     SEM_OP_INTEGER },
     { "sem_mem_access",      SEM_OP_INTEGER },
+    { "sem_mem_overwrite",   SEM_OP_INTEGER },
     { "sem_on_load",         SEM_OP_INTEGER },
     { "sem_on_store",        SEM_OP_INTEGER },
     { "sem_call",            SEM_OP_INTEGER },
@@ -142,6 +174,7 @@ const char *const sem_emittable_helpers[] = {
     "sem_set_ea_vals",
     "sem_set_ea_mode",
     "sem_mem_access",
+    "sem_mem_overwrite",
     "sem_on_load",
     "sem_on_store",
     "sem_call",
@@ -158,6 +191,8 @@ static bool sem_op_class_is_valid(SemOpClass cls) {
     return (unsigned int)cls < SEM_OP_CLASS_COUNT &&
            sem_op_class_valid[(unsigned int)cls];
 }
+
+static void osprey_clear_ea(OspreyCpuOriginState *st, bool clear_mode);
 
 /* ------------------------------------------------------------------ */
 /* Overwrite events (C API)                                           */
@@ -202,10 +237,7 @@ void sem_context_replace(CPUArchState *env) {
         /* A fault can leave pre-access EA metadata unconsumed.  A signal
          * or restored context is a hard boundary; no later access may
          * reuse that record. */
-        st->ea_valid = false;
-        st->ea_mode = 0;
-        memset(&st->ea_base_origin, 0, sizeof(st->ea_base_origin));
-        memset(&st->ea_index_origin, 0, sizeof(st->ea_index_origin));
+        osprey_clear_ea(st, true);
         for (int i = 0; i < CPU_NB_REGS; i++) {
             osprey_on_reg_invalidate(env, (uint32_t)i);
         }
@@ -521,6 +553,24 @@ static inline bool osprey_mode_ok(uint32_t mode) {
     return aflags == MO_64 && override < 0;
 }
 
+/* Drop every pending EA field without touching register or memory origins.
+ * Keep the mode optionally: plain F01 events use it for their mode gate
+ * while deliberately discarding any decomposed EA record. */
+static void osprey_clear_ea(OspreyCpuOriginState *st, bool clear_mode) {
+    st->ea_valid = false;
+    st->ea_base_reg = 0;
+    st->ea_index_reg = 0;
+    st->ea_scale = 0;
+    st->ea_disp = 0;
+    st->ea_base_val = 0;
+    st->ea_index_val = 0;
+    if (clear_mode) {
+        st->ea_mode = 0;
+    }
+    memset(&st->ea_base_origin, 0, sizeof(st->ea_base_origin));
+    memset(&st->ea_index_origin, 0, sizeof(st->ea_index_origin));
+}
+
 void helper_sem_set_ea(CPUArchState *env, uint32_t base_reg,
                        uint32_t index_reg, uint32_t scale,
                        target_ulong disp, uint32_t mode) {
@@ -535,7 +585,7 @@ void helper_sem_set_ea(CPUArchState *env, uint32_t base_reg,
         if (!osprey_mode_ok(mode)) {
             /* Not an F01-eligible mode: record nothing (stale record
              * protection). */
-            st->ea_valid = false;
+            osprey_clear_ea(st, true);
             return;
         }
         uint32_t packed = 0x80000000u;
@@ -563,7 +613,7 @@ void helper_sem_set_ea_mode(CPUArchState *env, uint32_t mode) {
     OspreyCpuOriginState *st = osprey_cpu_origin(env);
     st->ea_mode = mode;
     if (!osprey_mode_ok(mode)) {
-        st->ea_valid = false;
+        osprey_clear_ea(st, true);
     }
 }
 
@@ -591,9 +641,10 @@ void helper_sem_set_ea_vals(CPUArchState *env, target_ulong base_val,
     }
 }
 
-void helper_sem_mem_access(CPUArchState *env, target_ulong addr,
-                           target_ulong size, target_ulong pc,
-                           uint32_t flags) {
+void sem_mem_access(CPUArchState *env, target_ulong addr,
+                    target_ulong size, target_ulong pc, uint32_t flags,
+                    SemOpClass cls) {
+    bool valid_class = sem_op_class_is_valid(cls);
     uint32_t is_store = flags & 1;
     /* The provenance access check runs only at sites that emitted it
      * historically (check bit set): those are exactly the EA-decomposed
@@ -606,6 +657,15 @@ void helper_sem_mem_access(CPUArchState *env, target_ulong addr,
         return;
     }
     OspreyCpuOriginState *st = osprey_cpu_origin(env);
+    if (flags & 8) {
+        /* Plain producer events have no EA decomposition.  Discard a
+         * fault-left record before recording the successful interval. */
+        osprey_clear_ea(st, false);
+    }
+    if (!valid_class || (flags & 4)) {
+        osprey_clear_ea(st, true);
+        return;
+    }
     /* F01 gate: the current instruction must be mode-eligible.  The EA
      * record (if any) was stored by helper_sem_set_ea with its own mode;
      * when no set_ea ran (push/pop), ea_mode carries the instruction's
@@ -614,16 +674,45 @@ void helper_sem_mem_access(CPUArchState *env, target_ulong addr,
     uint32_t mode = st->ea_mode;
     st->ea_mode = 0; /* consumed */
     if (!osprey_mode_ok(mode)) {
-        st->ea_valid = false;
+        osprey_clear_ea(st, true);
         return;
     }
     osprey_on_mem_access(env, addr, (uint64_t)size, (uint64_t)pc,
                          is_store);
 }
 
+void helper_sem_mem_access(CPUArchState *env, target_ulong addr,
+                           target_ulong size, target_ulong pc,
+                           uint32_t flags, uint32_t cls) {
+    sem_mem_access(env, addr, size, pc, flags, (SemOpClass)cls);
+}
+
+void helper_sem_mem_overwrite(CPUArchState *env, target_ulong addr,
+                              target_ulong size, uint32_t cls) {
+    sem_mem_overwrite(addr, size, (SemOpClass)cls);
+}
+
+void sem_mem_helper_access(CPUArchState *env, target_ulong addr,
+                           target_ulong size, target_ulong pc,
+                           bool is_store, SemOpClass cls) {
+    sem_mem_access(env, addr, size, pc, (is_store ? 1u : 0u) | 8u, cls);
+}
+
 void helper_sem_on_load(CPUArchState *env, uint32_t dst_idx,
                         target_ulong addr, target_ulong size,
-                        target_ulong pc) {
+                        target_ulong pc, uint32_t cls) {
+    if (!sem_op_class_is_valid((SemOpClass)cls)) {
+        if (binradar_memcheck_enabled) {
+            sem_prov_on_load(env, dst_idx, addr, size, pc);
+        }
+        if (osprey_collect_enabled && dst_idx < CPU_NB_REGS) {
+            osprey_on_reg_invalidate(env, dst_idx);
+        }
+        if (osprey_collect_enabled) {
+            osprey_clear_ea(osprey_cpu_origin(env), true);
+        }
+        return;
+    }
     if (binradar_memcheck_enabled) {
         sem_prov_on_load(env, dst_idx, addr, size, pc);
     }
@@ -642,7 +731,22 @@ void helper_sem_on_load(CPUArchState *env, uint32_t dst_idx,
 
 void helper_sem_on_store(CPUArchState *env, uint32_t src_idx,
                          target_ulong addr, target_ulong size,
-                         target_ulong src_val) {
+                         target_ulong src_val, uint32_t cls) {
+    if (!sem_op_class_is_valid((SemOpClass)cls)) {
+        if (binradar_memcheck_enabled) {
+            provenance_mem_invalidate(addr, size);
+        }
+        if (osprey_collect_enabled) {
+            /* Unknown stores cannot transfer an origin.  Route an
+             * impossible source index through the normal store path so
+             * the OSPREY memory shadow is overwritten with an invalid
+             * origin instead of retaining stale metadata. */
+            osprey_on_mem_store_origin(env, CPU_NB_REGS, addr, size,
+                                       src_val);
+            osprey_clear_ea(osprey_cpu_origin(env), true);
+        }
+        return;
+    }
     if (binradar_memcheck_enabled) {
         sem_prov_on_store(env, src_idx, addr, size);
     }

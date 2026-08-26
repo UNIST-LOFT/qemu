@@ -115,6 +115,14 @@ QemuMutexTrylockFunc qemu_mutex_trylock_func = NULL;
 
 static void test_sem_manifest_integrity(void);
 static void test_sem_overwrite_fail_closed(void);
+static void test_sem_access_class_and_flags(void);
+
+void helper_sem_on_load(CPUArchState *env, uint32_t dst_idx,
+                        target_ulong addr, target_ulong size,
+                        target_ulong pc, uint32_t cls);
+void helper_sem_on_store(CPUArchState *env, uint32_t src_idx,
+                         target_ulong addr, target_ulong size,
+                         target_ulong src_val, uint32_t cls);
 
 /* ------------------------------------------------------------------ */
 /* Harness                                                             */
@@ -1755,12 +1763,13 @@ int main(void)
     test_canonical_dump();
     test_sem_manifest_integrity();
     test_sem_overwrite_fail_closed();
+    test_sem_access_class_and_flags();
 
     if (failures != 0) {
         fprintf(stderr, "%d unit test check(s) FAILED\n", failures);
         return 1;
     }
-    printf("PASS osprey_unit (35/35)\n");
+    printf("PASS osprey_unit (37/37)\n");
     return 0;
 }
 
@@ -1801,7 +1810,7 @@ static void test_sem_manifest_integrity(void)
         }
         CHECK(matches == 1, "classified helper appears once in emit set");
     }
-    CHECK(n_helpers == 18, "exact semantic helper count");
+    CHECK(n_helpers == 19, "exact semantic helper count");
 
     int n_emittable = 0;
     for (const char *const *e = sem_emittable_helpers; *e != NULL; e++) {
@@ -1816,6 +1825,37 @@ static void test_sem_manifest_integrity(void)
         n_emittable++;
     }
     CHECK(n_emittable == n_helpers, "semantic helper sets have equal size");
+
+    int n_producers = 0;
+    bool seen_class[SEM_OP_CLASS_COUNT] = { false };
+    for (const SemProducerSpec *p = sem_producer_table;
+         p->producer != NULL; p++, n_producers++) {
+        CHECK(p->producer[0] != '\0', "producer name non-empty");
+        int name_matches = 0;
+        for (const SemProducerSpec *q = sem_producer_table;
+             q->producer != NULL; q++) {
+            if (strcmp(p->producer, q->producer) == 0) {
+                name_matches++;
+            }
+        }
+        CHECK(name_matches == 1, "producer name appears once");
+        CHECK((unsigned int)p->op_class < SEM_OP_CLASS_COUNT,
+              "producer class in range");
+        CHECK(sem_op_class_valid[(unsigned int)p->op_class],
+              "producer class valid");
+        CHECK(p->interval_policy <= SEM_INTERVAL_MULTIPART,
+              "producer interval policy valid");
+        /* Zero denotes a dynamic XSAVE area; all fixed and raw families
+         * advertise their minimum architectural interval. */
+        CHECK(p->interval_width != 0 ||
+              strcmp(p->producer, "xsave.xsave") == 0,
+              "producer interval width present");
+        seen_class[(unsigned int)p->op_class] = true;
+    }
+    CHECK(n_producers == 26, "complete producer matrix count");
+    for (int i = 0; i < SEM_OP_UNKNOWN; i++) {
+        CHECK(seen_class[i], "producer matrix covers operation class");
+    }
 }
 
 static void test_sem_overwrite_fail_closed(void)
@@ -1861,6 +1901,18 @@ static void test_sem_overwrite_fail_closed(void)
     osprey_collect_enabled = 1;
     ost->regs[R_EAX].valid = 1;
     ost->regs[R_EAX].kind = OSPREY_ORIGIN_ADDRESS;
+    ost->regs[R_EAX].concrete_value = 0;
+    helper_sem_on_store(&env, R_EAX, 0x402000, 8, 0,
+                        SEM_OP_INTEGER);
+    ost->regs[R_EBX].valid = 0;
+    helper_sem_on_store(&env, R_EAX, 0x402000, 8, 0,
+                        (uint32_t)-1);
+    helper_sem_on_load(&env, R_EBX, 0x402000, 8, 0x400100,
+                       SEM_OP_INTEGER);
+    CHECK(!ost->regs[R_EBX].valid,
+          "invalid class clears OSPREY memory shadow");
+    ost->regs[R_EAX].valid = 1;
+    ost->regs[R_EAX].kind = OSPREY_ORIGIN_ADDRESS;
     sem_reg_overwrite(&env, R_EAX, SEM_OP_UNKNOWN);
     CHECK(!ost->regs[R_EAX].valid, "OSPREY register overwrite invalidates");
 
@@ -1890,4 +1942,75 @@ static void test_sem_overwrite_fail_closed(void)
     sem_reg_overwrite(NULL, 0, SEM_OP_UNKNOWN);
     sem_context_replace(NULL);
     osprey_collect_enabled = 0;
+}
+
+static void test_sem_access_class_and_flags(void)
+{
+    OspreyConfig c = test_config();
+    OspreyContext *ctx = osprey_new(&c);
+    OspreySharedRun *run = new_run(&c);
+    CPUArchState *env = g_malloc0(sizeof(CPUArchState));
+
+    osprey_set_image_bounds(0x400000, 0x401000);
+    osprey_register_image_global(NULL, 0x402000, 0x1000);
+    osprey_child_use_shared_run(ctx, run);
+    binradar_memcheck_enabled = 0;
+    osprey_collect_enabled = 1;
+
+    /* A valid SIMD class on a plain F01 event records exactly one access. */
+    OspreyCpuOriginState *st = osprey_cpu_origin(env);
+    st->ea_mode = MO_64;
+    sem_mem_access(env, 0x402008, 8, 0x400100, 8, SEM_OP_SIMD);
+    CHECK(run->access_used == 1, "valid class records F01 access");
+    CHECK(!st->ea_valid && st->ea_mode == 0,
+          "plain event consumes EA state");
+
+    /* Unknown classes are rejected without recording, and still consume
+     * the state left by a preceding failed/unsupported path. */
+    st->ea_valid = true;
+    st->ea_mode = MO_64;
+    st->ea_base_reg = R_EAX;
+    st->ea_base_val = 0x402010;
+    st->ea_base_origin.valid = 1;
+    sem_mem_access(env, 0x402010, 8, 0x400100, 8,
+                   (SemOpClass)-1);
+    CHECK(run->access_used == 1, "invalid class suppresses F01 access");
+    CHECK(!st->ea_valid && st->ea_mode == 0,
+          "invalid class clears EA state");
+    CHECK(st->ea_base_reg == 0 && st->ea_base_val == 0 &&
+          !st->ea_base_origin.valid,
+          "invalid class clears all EA metadata");
+
+    /* Bit 4 is the provenance-only follow-up for an EA-decomposed
+     * operation; it must not create a duplicate F01 row. */
+    st->ea_valid = true;
+    st->ea_mode = MO_64;
+    sem_mem_access(env, 0x402018, 8, 0x400100, 4, SEM_OP_ATOMIC_RMW);
+    CHECK(run->access_used == 1, "EA follow-up suppresses duplicate F01");
+    CHECK(!st->ea_valid && st->ea_mode == 0,
+          "EA follow-up clears pending state");
+
+    st->ea_valid = true;
+    st->ea_mode = MO_64;
+    st->ea_index_reg = R_ECX;
+    st->ea_index_val = 0x402020;
+    st->ea_index_origin.valid = 1;
+    sem_mem_access(env, 0x402020, 8, 0x400100, 4, SEM_OP_SIMD);
+    CHECK(st->ea_index_reg == 0 && st->ea_index_val == 0 &&
+          !st->ea_index_origin.valid,
+          "provenance-only follow-up clears all EA metadata");
+
+    st->ea_valid = true;
+    st->ea_mode = MO_32;
+    st->ea_base_origin.valid = 1;
+    sem_mem_access(env, 0x402028, 8, 0x400100, 8, SEM_OP_INTEGER);
+    CHECK(run->access_used == 1, "ineligible address mode suppresses F01");
+    CHECK(!st->ea_valid && st->ea_mode == 0 &&
+          !st->ea_base_origin.valid,
+          "ineligible address mode clears EA state");
+
+    osprey_collect_enabled = 0;
+    osprey_free(ctx);
+    g_free(run);
+    g_free(env);
 }

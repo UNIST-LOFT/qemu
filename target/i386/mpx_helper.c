@@ -75,7 +75,8 @@ static uint32_t lookup_bte32(CPUX86State *env, uint32_t base, uintptr_t ra)
     return (extract32(base, 2, 10) << 4) + (bt & ~3);
 }
 
-uint64_t helper_bndldx64(CPUX86State *env, target_ulong base, target_ulong ptr)
+uint64_t helper_bndldx64(CPUX86State *env, target_ulong base,
+                         target_ulong ptr, target_ulong pc)
 {
     uintptr_t ra = GETPC();
     uint64_t bte, lb, ub, pt;
@@ -89,10 +90,12 @@ uint64_t helper_bndldx64(CPUX86State *env, target_ulong base, target_ulong ptr)
         lb = ub = 0;
     }
     env->mmx_t0.MMX_Q(0) = ub;
+    sem_mem_helper_access(env, bte, 24, pc, false, SEM_OP_MPX);
     return lb;
 }
 
-uint64_t helper_bndldx32(CPUX86State *env, target_ulong base, target_ulong ptr)
+uint64_t helper_bndldx32(CPUX86State *env, target_ulong base,
+                         target_ulong ptr, target_ulong pc)
 {
     uintptr_t ra = GETPC();
     uint32_t bte, lb, ub, pt;
@@ -105,11 +108,12 @@ uint64_t helper_bndldx32(CPUX86State *env, target_ulong base, target_ulong ptr)
     if (pt != ptr) {
         lb = ub = 0;
     }
+    sem_mem_helper_access(env, bte, 12, pc, false, SEM_OP_MPX);
     return ((uint64_t)ub << 32) | lb;
 }
 
 void helper_bndstx64(CPUX86State *env, target_ulong base, target_ulong ptr,
-                     uint64_t lb, uint64_t ub)
+                     uint64_t lb, uint64_t ub, target_ulong pc)
 {
     uintptr_t ra = GETPC();
     uint64_t bte;
@@ -120,10 +124,11 @@ void helper_bndstx64(CPUX86State *env, target_ulong base, target_ulong ptr,
     cpu_stq_data_ra(env, bte + 16, ptr, ra);
     /* 24-byte BTE store: route through the shared overwrite event. */
     sem_mem_overwrite(bte, 24, SEM_OP_MPX);
+    sem_mem_helper_access(env, bte, 24, pc, true, SEM_OP_MPX);
 }
 
 void helper_bndstx32(CPUX86State *env, target_ulong base, target_ulong ptr,
-                     uint64_t lb, uint64_t ub)
+                     uint64_t lb, uint64_t ub, target_ulong pc)
 {
     uintptr_t ra = GETPC();
     uint32_t bte;
@@ -134,6 +139,7 @@ void helper_bndstx32(CPUX86State *env, target_ulong base, target_ulong ptr,
     cpu_stl_data_ra(env, bte + 8, ptr, ra);
     /* 12-byte BTE store: route through the shared overwrite event. */
     sem_mem_overwrite(bte, 12, SEM_OP_MPX);
+    sem_mem_helper_access(env, bte, 12, pc, true, SEM_OP_MPX);
 }
 
 void helper_bnd_jmp(CPUX86State *env)
