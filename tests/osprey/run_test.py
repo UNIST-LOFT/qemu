@@ -40,6 +40,9 @@ TESTS = [
         name="osprey_deref",
         mode="binradar",
         rc=(2,),  # driver closes the ctrl pipe after 2 iterations
+        # Deterministic exact-component rejection.  Do not rely on an
+        # incidental graph becoming oversized as fact identity improves.
+        env={"BINRADAR_OSPREY_MAX_EXACT_CLIQUE_VARS": "1"},
         expect_rows=[
             ("facts", "[samples 1]"),
             ("facts", "[access "),
@@ -72,21 +75,44 @@ TESTS = [
         name="t01_regions",
         mode="dump_compare",
         rc=(2,),
-        # Canonical rows asserted in the final dump (merged state).
+        # Exact canonical rows asserted against the checked-in dump
+        # (t01_regions.expected): the fixture runs under three distinct
+        # PIE load biases (default + two forced BINRADAR_MMAP_START
+        # values) and every dump must be byte-identical to the expected
+        # file.  The lifecycle rows are deterministic: two live
+        # allocations at one site (1f8), successful same-base reuse
+        # (2af), forced-move realloc 16 -> 1 MiB (2e5 -> 312), failed
+        # realloc preserving the old identity (348, alloc 377 -1),
+        # realloc(p,0) (3ad), and zero-size non-NULL malloc(0) (3e8).
         dump_expect=[
-            "region 0 0 ",          # G: site 0
-            "region 1 ",            # H_site instances
-            "region 2 ",            # S_f frames
-            "alloc ",
-            "access ",
+            "region 0 0 0 1 3048",          # G: one merged instance
+            "region 1 1f8 1 2 20",          # alloc32() first instance
+            "region 1 1f8 2 3 20",          # alloc32() second instance
+            "region 1 2af 3 2 20",          # same-base reuse
+            "region 1 2e5 4 5 10",          # realloc source 16 bytes
+            "region 1 312 5 6 100000",       # realloc result 1 MiB
+            "region 1 348 6 5 8",           # failed-realloc survivor
+            "region 1 3ad 7 8 8",           # realloc(p,0) source
+            "region 1 3e8 8 8 0",           # malloc(0) zero-size
+            "region 2 1fa 708 33 60",        # main frame, observed span
+            "alloc 1f8 32 2",               # two allocs at one site
+            "alloc 2af 32 1",
+            "alloc 2e5 16 1",
+            "alloc 312 1048576 1",          # forced-move realloc size
+            "alloc 348 8 1",
+            "alloc 377 -1 1",               # failed realloc
+            "alloc 3ad 8 1",
+            "alloc 3e8 0 1",                # zero-size success
         ],
         # Structural assertions on the parsed dump (see check_dump).
         dump_assert={
             "global_rows": 1,          # one merged G instance
             "recurse_frames": 4,       # recurse(3) -> 4 live frames
             "same_site_alloc_min": 2,   # two allocations at one site
-            "same_base_reuse": True,    # free + realloc at same base
-            "realloc_same_base": True,  # realloc success at same base
+            "same_base_reuse": True,    # free + malloc at same base
+            "realloc_moved": True,      # 16 -> 1 MiB at a distinct base
+            "failed_realloc_preserved": True,  # old identity survives
+            "zero_size_nonnull": True,  # malloc(0) instance present
         },
         timeout=60,
     ),
@@ -297,19 +323,28 @@ def run_test(test, workdir, qemu, solver):
 
 
 def run_dump_compare(test, workdir, qemu, solver):
-    """Stage-1 canonical-dump gate: run the guest twice with
-    BINRADAR_OSPREY_DUMP_FILE set, require byte-identical dumps (PIE
-    determinism / ASLR invariance), then assert the expected canonical
-    rows.  Returns (tracer_rc, stderr_text)."""
+    """Stage-1 canonical-dump gate: run the guest under three distinct
+    PIE load biases (default + two forced BINRADAR_MMAP_START values),
+    require byte-identical dumps (ASLR invariance), then compare every
+    dump against the checked-in exact canonical rows
+    (t01_regions.expected).  Returns (tracer_rc, stderr_text)."""
     guest = os.path.join(workdir, test.get("guest", test["name"]))
     if not os.path.isfile(guest):
         return (None, f"guest binary missing: {guest} (run 'make guests')")
     if not os.path.isfile(guest + ".plt"):
         return (None, f"plt file missing: {guest}.plt (run 'make plts')")
+    expected_path = os.path.join(os.path.dirname(__file__),
+                                 test.get("expected", "t01_regions.expected"))
+    if not os.path.isfile(expected_path):
+        return (None, f"expected dump missing: {expected_path}")
+    with open(expected_path, "r", errors="replace") as f:
+        expected = f.read()
+    biases = [None, "0x4100000000", "0x4200000000"]
     dumps = []
     outs = []
     rcs = []
-    for i in range(2):
+    observed_biases = []
+    for i, bias in enumerate(biases):
         dump_path = os.path.join(workdir, f"t01_dump_{i}.txt")
         try:
             os.unlink(dump_path)
@@ -318,27 +353,38 @@ def run_dump_compare(test, workdir, qemu, solver):
         spec = dict(test)
         spec["env"] = dict(test.get("env", {}))
         spec["env"]["BINRADAR_OSPREY_DUMP_FILE"] = dump_path
+        if bias is not None:
+            spec["env"]["BINRADAR_MMAP_START"] = bias
         rc, out = run_binradar(spec, guest, qemu, solver, workdir)
         rcs.append(rc)
         outs.append(out)
+        matches = re.findall(
+            r"\[snapshot\] \[entrypoint\].*\[bias ([0-9a-fA-F]+)\]",
+            out,
+        )
+        if len(matches) != 1:
+            return (rc, out +
+                    f"\nexpected one main-image bias row, got {matches}")
+        observed_biases.append(int(matches[0], 16))
         if not os.path.isfile(dump_path):
             return (rc, out + f"\nmissing dump file: {dump_path}")
         with open(dump_path, "r", errors="replace") as f:
             dumps.append(f.read())
-    if dumps[0] != dumps[1]:
-        return (rcs[-1], outs[0] + "\nDUMP MISMATCH between runs")
-    problems = []
-    for needle in test.get("dump_expect", []):
-        if needle not in dumps[0]:
-            problems.append(f"dump missing row {needle!r}")
-    if problems:
-        return (rcs[-1], outs[0] + "\n" + "\n".join(problems))
+    for i in range(1, len(dumps)):
+        if dumps[i] != dumps[0]:
+            return (rcs[-1], outs[0] +
+                    f"\nDUMP MISMATCH between bias runs {0} and {i}")
+    if len(set(observed_biases)) != len(observed_biases):
+        return (rcs[-1], outs[0] +
+                f"\nPIE load biases were not distinct: {observed_biases}")
+    if dumps[0] != expected:
+        return (rcs[-1], outs[0] + "\nDUMP MISMATCH vs checked-in expected")
     problems = check_dump(test, dumps[0])
     if problems:
         return (rcs[-1], outs[0] + "\n" + "\n".join(problems))
-    if rcs[0] != rcs[1]:
+    if len(set(rcs)) != 1:
         return (rcs[-1], outs[0] +
-                f"\ntracer return codes differ: {rcs[0]} != {rcs[1]}")
+                f"\ntracer return codes differ: {rcs}")
     return (rcs[-1], outs[0])
 
 
@@ -379,15 +425,33 @@ def check_dump(test, dump):
         if not reused:
             problems.append("no same-base reuse observed")
 
-    if want.get("realloc_same_base"):
-        # realloc success: two heap instances at the same base with
-        # different extents (16 -> 64)
-        from collections import defaultdict
-        by_base = defaultdict(set)
-        for r in heap_rows:
-            by_base[r[4]].add(r[5])
-        if not any(len(exts) >= 2 for exts in by_base.values()):
-            problems.append("no realloc same-base extent change observed")
+    if want.get("realloc_moved"):
+        # forced-move realloc: the 1 MiB result instance (extent
+        # 100000) must be at a base distinct from its 16-byte source
+        # (the source's raw class appears once, the result's once).
+        from collections import Counter
+        raw_classes = Counter(r[4] for r in heap_rows)
+        big = [r for r in heap_rows if r[5] == "100000"]
+        moved = any(raw_classes[r[4]] == 1 for r in big)
+        if not moved:
+            problems.append("no forced-move realloc at distinct base")
+
+    if want.get("failed_realloc_preserved"):
+        # failed realloc: the 8-byte instance at site 348 survives with
+        # its original extent; the failed alloc row (size -1) exists
+        allocs = [ln.split() for ln in dump.splitlines()
+                  if ln.startswith("alloc ")]
+        failed = any(a[2] == "-1" for a in allocs)
+        survivor = any(
+            r[2] == "348" and r[5] == "8" for r in heap_rows)
+        if not (failed and survivor):
+            problems.append("failed realloc did not preserve old identity")
+
+    if want.get("zero_size_nonnull"):
+        # malloc(0): a heap instance with extent 0 (zero-size success)
+        zero = any(r[5] == "0" for r in heap_rows)
+        if not zero:
+            problems.append("no zero-size non-NULL instance observed")
     return problems
 
 

@@ -38,6 +38,11 @@ int osprey_collect_enabled = 0;
  * osprey_get_image_base are declared in osprey-internal.h. */
 void osprey_free_cpu_origins(void);
 
+/* Module-global pre-sample fatal state (defined below with the image
+ * helpers; used by osprey_shared_run_reset and osprey_new above it). */
+static bool g_pre_sample_fatal;
+static const char *g_pre_sample_reason;
+
 /* ------------------------------------------------------------------ */
 /* Configuration                                                       */
 /* ------------------------------------------------------------------ */
@@ -246,6 +251,13 @@ void osprey_shared_run_reset(OspreySharedRun *run, uint64_t sample_id,
     run->sample_id = (uint32_t)sample_id;
     run->first_dropped_hash = 0;
 
+    /* Pre-sample fatal state (e.g. ELF/global registration overflow)
+     * is copied into every reset shared run so the baseline merge
+     * rejects fail-closed; silent range omission is never acceptance. */
+    if (g_pre_sample_fatal) {
+        run->bad_arithmetic = 1;
+    }
+
     uint32_t caps[OSPREY_TABLE_COUNT];
     size_t offs[OSPREY_TABLE_COUNT];
     size_t total = osprey_run_layout(config, caps, offs);
@@ -271,6 +283,11 @@ void osprey_shared_run_reset(OspreySharedRun *run, uint64_t sample_id,
 OspreyContext *osprey_new(const OspreyConfig *config) {
     OspreyContext *ctx = g_new0(OspreyContext, 1);
     ctx->config = *config;
+    /* Copy the module-global pre-sample fatal state (set by
+     * registration-time failures that precede context creation) into
+     * the context. */
+    ctx->pre_sample_fatal = g_pre_sample_fatal;
+    ctx->pre_sample_reason = g_pre_sample_reason;
     qemu_mutex_init(&ctx->shared_lock);
     ctx->global_ranges = g_array_new(FALSE, FALSE, sizeof(OspreyGlobalRange));
     ctx->access_facts = g_array_new(FALSE, FALSE, sizeof(OspreyAccessFact));
@@ -332,10 +349,14 @@ void global_ranges_add(OspreyContext *ctx, target_ulong base,
     target_ulong image_base = osprey_get_image_base();
     if (image_base == 0 || base < image_base ||
         (uint64_t)(base - image_base) > INT64_MAX || size > INT64_MAX) {
+        osprey_mark_pre_sample_fatal(ctx,
+            "global range outside image or exceeds INT64_MAX");
         return;
     }
     int64_t off = (int64_t)(base - image_base);
     if (off > INT64_MAX - (int64_t)size) {
+        osprey_mark_pre_sample_fatal(ctx,
+            "global range offset+size overflow");
         return;
     }
     OspreyGlobalRange r;
@@ -421,6 +442,28 @@ void osprey_set_image_bounds(target_ulong start, target_ulong end) {
 }
 
 target_ulong osprey_get_image_end(void) { return osprey_image_end; }
+
+/* Module-global pre-sample fatal state: registration-time arithmetic
+ * failures (global_ranges_add) can precede the OspreyContext creation
+ * (elfload runs before snapshot_init), so the reason is stored here,
+ * copied into the context at creation, and mirrored into every reset
+ * shared run. */
+static bool g_pre_sample_fatal = false;
+static const char *g_pre_sample_reason = NULL;
+
+void osprey_mark_pre_sample_fatal(OspreyContext *ctx, const char *reason) {
+    g_pre_sample_fatal = true;
+    g_pre_sample_reason = reason;
+    if (ctx != NULL) {
+        ctx->pre_sample_fatal = true;
+        ctx->pre_sample_reason = reason;
+    }
+}
+
+void osprey_clear_pre_sample_fatal(void) {
+    g_pre_sample_fatal = false;
+    g_pre_sample_reason = NULL;
+}
 
 /* ------------------------------------------------------------------ */
 /* Origin shadows (per-CPU; module-level, single-threaded TCG)         */

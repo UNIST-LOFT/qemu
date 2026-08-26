@@ -360,9 +360,24 @@ static OspreyStatus decode_graph(OspreyContext *ctx) {
                 continue;
             OspRawSpan sp;
             memset(&sp, 0, sizeof(sp));
-            sp.raw_start = ri->raw_base +
-                           (uint64_t)o->chunk.address.offset;
-            sp.raw_end = sp.raw_start + (ri->extent > 0 ? ri->extent : 0);
+            if (ri->region.kind == OSPREY_REGION_STACK_FUNCTION) {
+                /* Downward stack: the observed window is
+                 * [raw_min, raw_max] == [min_sp, entry_sp].  The object
+                 * span runs from the object's raw start up to the frame
+                 * top; never treat the stack as
+                 * [entry_sp, entry_sp+extent). */
+                sp.raw_start = ri->raw_base +
+                               (uint64_t)o->chunk.address.offset;
+                sp.raw_end = ri->raw_max;
+            } else {
+                sp.raw_start = ri->raw_base +
+                               (uint64_t)o->chunk.address.offset;
+                /* raw_max is already the exclusive end of the runtime
+                 * region.  Adding the full span to an interior object
+                 * start would extend the lookup beyond the allocation or
+                 * global window. */
+                sp.raw_end = ri->raw_max;
+            }
             sp.obj_idx = j;
             sp.is_chunk = 0;
             g_array_append_val(m->raw_spans, sp);

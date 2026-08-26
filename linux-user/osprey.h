@@ -138,7 +138,7 @@ const OspreyModel *osprey_model(const OspreyContext *ctx);
 const OspreyDecodedObject *osprey_lookup_chunk(const OspreyModel *model,
                                                 const OspreyChunk *chunk);
 
-/* Stage 4 consumer API (parent side): map a raw guest address back to
+/* Stage 7 consumer API (parent side): map a raw guest address back to
  * the decoded object covering it (chunk-exact for scalar/field/pointer
  * chunks; point base for array starts).  Returns NULL when the address
  * is outside every modeled instance. */
@@ -183,9 +183,9 @@ void osprey_on_free_identity(CPUArchState *env, uint64_t object_id,
 void osprey_on_mem_copy(CPUArchState *env, target_ulong src,
                         target_ulong dst, target_ulong size);
 
-/* Origin-shadow hooks emitted from the x86 translator (Stage 1):
- * full-width register copy, lea with constant offset, default-kill
- * invalidation, and aligned native-width spill/reload. */
+/* Legacy OSPREY-only origin hooks emitted from the x86 translator.
+ * Stages 2.2–2.4 replace their parallel coverage with shared semantic
+ * events before completing address/value origin semantics. */
 void osprey_on_reg_copy(CPUArchState *env, uint32_t dst, uint32_t src,
                         target_ulong src_val, target_ulong dst_val);
 void osprey_on_reg_lea(CPUArchState *env, uint32_t dst, uint32_t base,
@@ -210,6 +210,16 @@ void osprey_on_ret(CPUArchState *env, target_ulong pc, target_ulong sp);
  * live frame stack; only in-image writes re-derive. */
 void osprey_on_rsp_update(CPUArchState *env, target_ulong new_sp,
                           target_ulong pc);
+
+/* Entrypoint barrier (snapshot/forkserver entry): seed the initial
+ * stack frame for the main image when the entrypoint is reached from
+ * uninstrumented loader/libc code (no call hook fired for main).
+ * Idempotent: creates a precise frame only when no live frame with the
+ * same region and entry SP exists; the observed entry SP is the
+ * offset-zero anchor.  Fires once per process (parent at the target
+ * hit; the child re-executes the entrypoint TB with count target+1). */
+void osprey_on_entrypoint(CPUArchState *env, target_ulong pc,
+                          target_ulong sp);
 
 /* Mark the current sample unsupported (CLONE_VM multithreaded guest). */
 void osprey_mark_unsupported_execution(void);

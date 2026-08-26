@@ -756,6 +756,24 @@ int main(int argc, char **argv, char **envp)
         }
     }
 
+    /* OSPREY test hook: force a distinct PIE load bias for the
+     * ASLR-invariance gate.  The PIE image is mapped via
+     * target_mmap(loaddr=0, ...) -> mmap_find_vma(0, ...) which starts
+     * at mmap_next_start; setting it before loader_exec relocates the
+     * image (and the stack, mapped after it) to a different bias.  The
+     * canonical dump is bias-invariant, so two runs with different
+     * BINRADAR_MMAP_START values must produce byte-identical dumps. */
+    {
+        const char *mmap_start_env = getenv("BINRADAR_MMAP_START");
+        if (mmap_start_env != NULL && mmap_start_env[0] != '\0') {
+            char *end = NULL;
+            unsigned long long v = strtoull(mmap_start_env, &end, 0);
+            if (end != mmap_start_env && *end == '\0' && v != 0) {
+                mmap_next_start = (abi_ulong)v;
+            }
+        }
+    }
+
     /*
      * Read in mmap_min_addr kernel parameter.  This value is used
      * When loading the ELF image to determine whether guest_base

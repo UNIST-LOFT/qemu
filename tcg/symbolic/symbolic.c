@@ -1791,6 +1791,15 @@ void snapshot_maybe_forkserver(CPUState *cpu, CPUArchState *env, target_ulong pc
     if (!snapshot_on_entrypoint_hit(pc)) {
         return;
     }
+    /* OSPREY: seed the initial stack frame for the main image.  The
+     * entrypoint is reached from uninstrumented loader/libc code, so no
+     * call hook fired for main; the observed RSP is main's entry SP
+     * (offset zero).  Idempotent: fires once per process (parent at the
+     * target hit; the child re-executes the entrypoint TB with count
+     * target+1 and returns false above). */
+    if (osprey_collect_enabled) {
+        osprey_on_entrypoint(env, pc, env->regs[R_ESP]);
+    }
 #ifdef TARGET_X86_64
     #define NUM_ARG_REGS 6
     static const uint8_t arg_regs[NUM_ARG_REGS] = {

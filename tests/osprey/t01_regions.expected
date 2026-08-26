@@ -1,0 +1,139 @@
+region 0 0 0 1 3048
+region 1 1f8 1 2 20
+region 1 1f8 2 3 20
+region 1 2af 3 2 20
+region 1 2e5 4 5 10
+region 1 312 5 6 100000
+region 1 348 6 5 8
+region 1 3ad 7 8 8
+region 1 3e8 8 8 0
+region 2 80 742 10 0
+region 2 80 763 10 0
+region 2 80 765 10 0
+region 2 80 767 10 0
+region 2 80 769 10 0
+region 2 80 771 10 0
+region 2 90 773 10 0
+region 2 a0 714 17 10
+region 2 a0 740 17 10
+region 2 a0 744 10 0
+region 2 a0 745 10 0
+region 2 a0 755 10 0
+region 2 a0 757 10 0
+region 2 a0 762 10 0
+region 2 b0 747 10 c0
+region 2 b0 756 10 0
+region 2 b0 759 10 68
+region 2 1a9 709 10 30
+region 2 1a9 710 28 30
+region 2 1a9 711 29 30
+region 2 1a9 712 30 28
+region 2 1e6 713 10 10
+region 2 1e6 739 10 10
+region 2 1fa 708 33 60
+access 1b5 1 2 1a9 ffffffffffffffe4 4 4
+access 1b8 0 2 1a9 ffffffffffffffe4 4 4
+access 1bb 1 2 1a9 fffffffffffffff0 4 4
+access 1be 0 2 1a9 ffffffffffffffe4 4 4
+access 1c4 1 2 1a9 fffffffffffffff4 4 4
+access 1c7 1 2 1a9 ffffffffffffffe4 4 4
+access 1cd 0 2 1a9 fffffffffffffff0 4 1
+access 1d2 0 2 1a9 ffffffffffffffe4 4 3
+access 1df 0 2 1a9 fffffffffffffff4 4 3
+access 206 0 0 0 3014 4 1
+access 20c 0 0 0 3018 4 1
+access 214 1 0 0 3010 4 1
+access 21a 0 0 0 3010 4 1
+access 220 1 0 0 3030 4 1
+access 226 0 0 0 3030 4 1
+access 22f 1 0 0 303c 4 1
+access 23f 1 0 0 3040 4 1
+access 24a 1 2 1fa fffffffffffffff0 8 1
+access 253 1 2 1fa ffffffffffffffe8 8 1
+access 257 1 2 1fa fffffffffffffff0 8 1
+access 25e 1 2 1fa ffffffffffffffe8 8 1
+access 26f 0 2 1fa fffffffffffffff0 8 1
+access 273 1 1 1f8 0 1 1
+access 276 0 2 1fa ffffffffffffffe8 8 1
+access 27a 1 1 1f8 0 1 1
+access 27d 0 2 1fa fffffffffffffff0 8 1
+access 281 0 1 1f8 0 1 1
+access 287 0 2 1fa ffffffffffffffe8 8 1
+access 28b 0 1 1f8 0 1 1
+access 293 1 0 0 3040 4 1
+access 299 0 2 1fa fffffffffffffff0 8 1
+access 2af 1 2 1fa ffffffffffffffe0 8 1
+access 2b3 1 2 1fa ffffffffffffffe0 8 1
+access 2c4 0 2 1fa ffffffffffffffe0 8 1
+access 2c8 1 1 2af 0 1 1
+access 2cb 0 2 1fa ffffffffffffffe0 8 1
+access 2cf 0 1 2af 0 1 1
+access 2d5 1 0 0 3040 4 1
+access 2e5 1 2 1fa ffffffffffffffd8 8 1
+access 2e9 1 2 1fa ffffffffffffffd8 8 1
+access 2fa 0 2 1fa ffffffffffffffd8 8 1
+access 2fe 1 1 2e5 0 1 1
+access 301 0 2 1fa ffffffffffffffd8 8 1
+access 312 1 2 1fa ffffffffffffffd0 8 1
+access 316 1 2 1fa ffffffffffffffd0 8 1
+access 327 0 2 1fa ffffffffffffffd0 8 1
+access 32b 1 1 312 0 1 1
+access 32e 0 2 1fa ffffffffffffffd0 8 1
+access 332 0 1 312 0 1 1
+access 338 1 0 0 3040 4 1
+access 348 1 2 1fa ffffffffffffffc8 8 1
+access 34c 1 2 1fa ffffffffffffffc8 8 1
+access 35d 0 2 1fa ffffffffffffffc8 8 1
+access 361 1 1 348 0 1 1
+access 364 0 2 1fa ffffffffffffffc8 8 1
+access 377 1 2 1fa ffffffffffffffc0 8 1
+access 37b 1 2 1fa ffffffffffffffc0 8 1
+access 38c 0 2 1fa ffffffffffffffc8 8 1
+access 390 1 1 348 0 1 1
+access 393 0 2 1fa ffffffffffffffc8 8 1
+access 397 0 1 348 0 1 1
+access 39d 1 0 0 3040 4 1
+access 3ad 1 2 1fa ffffffffffffffb8 8 1
+access 3b1 1 2 1fa ffffffffffffffb8 8 1
+access 3c2 0 2 1fa ffffffffffffffb8 8 1
+access 3c6 1 1 3ad 0 1 1
+access 3c9 0 2 1fa ffffffffffffffb8 8 1
+access 3da 1 2 1fa ffffffffffffffb0 8 1
+access 3e8 1 2 1fa ffffffffffffffa8 8 1
+access 3ec 1 2 1fa ffffffffffffffa8 8 1
+access 3fa 1 2 1fa ffffffffffffffa8 8 1
+access 405 1 0 0 3040 4 1
+access 40b 0 2 1fa ffffffffffffffe8 8 1
+access 417 0 2 1fa ffffffffffffffe0 8 1
+access 423 0 2 1fa ffffffffffffffd0 8 1
+access 42f 0 2 1fa ffffffffffffffc8 8 1
+access 43b 0 2 1fa ffffffffffffffa8 8 1
+base 1b5 2 1a9 ffffffffffffffe4 fffffffffffffff8 0 0
+base 1b8 2 1a9 ffffffffffffffe4 fffffffffffffff8 0 0
+base 1bb 2 1a9 fffffffffffffff0 fffffffffffffff8 0 0
+base 1be 2 1a9 ffffffffffffffe4 fffffffffffffff8 0 0
+base 1c4 2 1a9 fffffffffffffff4 fffffffffffffff8 0 0
+base 1c7 2 1a9 ffffffffffffffe4 fffffffffffffff8 0 0
+base 1cd 2 1a9 fffffffffffffff0 fffffffffffffff8 0 0
+base 1d2 2 1a9 ffffffffffffffe4 fffffffffffffff8 0 0
+base 273 1 1f8 0 0 1 1
+base 27a 1 1f8 0 0 2 1
+base 281 1 1f8 0 0 1 1
+base 28b 1 1f8 0 0 2 1
+base 2c8 1 2af 0 0 3 1
+base 2cf 1 2af 0 0 3 1
+base 2fe 1 2e5 0 0 4 1
+base 32b 1 312 0 0 5 1
+base 332 1 312 0 0 5 1
+base 361 1 348 0 0 6 1
+base 390 1 348 0 0 6 1
+base 397 1 348 0 0 6 1
+base 3c6 1 3ad 0 0 7 1
+alloc 1f8 32 2
+alloc 2af 32 1
+alloc 2e5 16 1
+alloc 312 1048576 1
+alloc 348 8 1
+alloc 377 -1 1
+alloc 3ad 8 1
+alloc 3e8 0 1

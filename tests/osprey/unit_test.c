@@ -691,7 +691,8 @@ static void test_pc_normalization_and_global_merge(void)
                                               OspreyRegionInstance, 0);
     CHECK(gi->raw_base == 0x400000, "global raw base = image base");
     CHECK(gi->instance_id == 0, "global instance uses reserved id");
-    CHECK(gi->extent == 0x3800, "global span reaches highest image offset");
+    CHECK(gi->raw_min == 0x400000 && gi->raw_max == 0x403800,
+          "global observed bounds reach highest image offset");
 
     osprey_free(ctx);
     g_free(run);
@@ -769,6 +770,104 @@ static void test_heap_identity_lifecycle(void)
     g_free(env);
 }
 
+/* Deterministic allocator lifecycle variants.  These drive the same
+ * accepted provenance/OSPREY event order as the modeled realloc return
+ * hook without relying on glibc placement choices. */
+static void test_realloc_lifecycle_variants(void)
+{
+    reset_log();
+    OspreyConfig c = test_config();
+    OspreyContext *ctx = osprey_new(&c);
+    OspreySharedRun *run = new_run(&c);
+    osprey_set_image_bounds(0x400000, 0x401000);
+    osprey_child_use_shared_run(ctx, run);
+
+    CPUArchState *env = g_malloc0(sizeof(CPUArchState));
+    provenance_init();
+    OspreyRegionId r;
+    int64_t off;
+
+    PtrTag old = provenance_create_object(0x2000, 16, 0x400210,
+                                           PROV_PRODUCER_MALLOC_RETURN);
+    osprey_on_alloc_success(env, 0x2000, 16, 0x400210,
+                            old.object_id, old.generation);
+
+    /* Failed realloc publishes only the failure observation; the old
+     * provenance identity and OSPREY runtime instance remain live. */
+    osprey_on_alloc_failure(env, 0x400220);
+    CHECK(osprey_region_of_addr(env, 0x2000, &r, &off, false),
+          "failed realloc preserves old instance");
+
+    /* Successful in-place realloc: retire old identity first, then create
+     * a new generation at the same numeric base and new allocation site. */
+    osprey_on_free_identity(env, old.object_id, old.generation, 0x400230);
+    provenance_retire_object(0x2000);
+    PtrTag same = provenance_create_object(0x2000, 64, 0x400230,
+                                            PROV_PRODUCER_REALLOC_RETURN);
+    osprey_on_alloc_success(env, 0x2000, 64, 0x400230,
+                            same.object_id, same.generation);
+    CHECK(osprey_region_of_addr(env, 0x203f, &r, &off, false) && off == 63,
+          "in-place realloc installs new extent");
+    CHECK(same.object_id != old.object_id,
+          "in-place realloc uses a new provenance identity");
+
+    /* Successful moved realloc: old same-base generation is retired and
+     * only the new numeric base resolves. */
+    osprey_on_free_identity(env, same.object_id, same.generation, 0x400240);
+    provenance_retire_object(0x2000);
+    PtrTag moved = provenance_create_object(0x3000, 128, 0x400240,
+                                             PROV_PRODUCER_REALLOC_RETURN);
+    osprey_on_alloc_success(env, 0x3000, 128, 0x400240,
+                            moved.object_id, moved.generation);
+    CHECK(!osprey_region_of_addr(env, 0x2000, &r, &off, false),
+          "moved realloc retires old numeric base");
+    CHECK(osprey_region_of_addr(env, 0x307f, &r, &off, false) && off == 127,
+          "moved realloc installs destination extent");
+
+    /* realloc(p,0) with NULL return retires without replacement. */
+    osprey_on_free_identity(env, moved.object_id, moved.generation, 0x400250);
+    provenance_retire_object(0x3000);
+    CHECK(!osprey_region_of_addr(env, 0x3000, &r, &off, false),
+          "realloc zero retires old instance");
+
+    /* A successful zero-size non-NULL result remains a distinct runtime
+     * instance with an empty half-open span. */
+    PtrTag zero = provenance_create_object(0x4000, 0, 0x400260,
+                                            PROV_PRODUCER_REALLOC_RETURN);
+    osprey_on_alloc_success(env, 0x4000, 0, 0x400260,
+                            zero.object_id, zero.generation);
+
+    CHECK(osprey_parent_merge_sample(ctx, run) == OSPREY_OK, "merge ok");
+    int same_base_rows = 0;
+    int zero_rows = 0;
+    for (guint i = 0; i < ctx->region_instances->len; i++) {
+        OspreyRegionInstance *ri = &g_array_index(
+            ctx->region_instances, OspreyRegionInstance, i);
+        if (ri->raw_base == 0x2000) {
+            same_base_rows++;
+        }
+        if (ri->raw_base == 0x4000 && ri->raw_min == ri->raw_max) {
+            zero_rows++;
+        }
+    }
+    CHECK(same_base_rows == 2,
+          "in-place realloc preserves two distinct lifecycle rows");
+    CHECK(zero_rows == 1, "zero-size success records empty instance");
+    bool saw_failure = false;
+    for (guint i = 0; i < ctx->alloc_facts->len; i++) {
+        OspreyMallocFact *f = &g_array_index(ctx->alloc_facts,
+                                             OspreyMallocFact, i);
+        if (f->site_pc == 0x220 && f->requested_size == -1) {
+            saw_failure = true;
+        }
+    }
+    CHECK(saw_failure, "failed realloc lifecycle row is explicit");
+
+    osprey_free(ctx);
+    g_free(run);
+    g_free(env);
+}
+
 /* Stack frames: entry_sp convention, imprecise-frame exclusion, RSP
  * origin seeding and re-derivation. */
 static void test_stack_frames_and_rsp_origin(void)
@@ -814,14 +913,23 @@ static void test_stack_frames_and_rsp_origin(void)
     osprey_on_rsp_update(env, 0x7ffbfff0, 0x400501);
     CHECK(st->regs[R_ESP].valid, "in-image rsp write re-derives");
 
-    /* A stack pointer above a nested callee's entry belongs to the
-     * caller; the innermost frame must not claim the caller's range. */
-    osprey_on_call(env, 0x400600, 0x7ffbffe8);
-    osprey_on_rsp_update(env, 0x7ffbfff0, 0x400601);
+    /* An imprecise nested call invalidates the precise caller's RSP
+     * origin while library code runs; its RET restores the caller. */
+    osprey_on_call(env, 0x7f0000000000, 0x7ffbffe8);
+    CHECK(!st->regs[R_ESP].valid,
+          "imprecise nested call invalidates caller rsp origin");
+    osprey_on_ret(env, 0x400501, 0x7ffbfff0);
     CHECK(st->regs[R_ESP].valid &&
           st->regs[R_ESP].address.region.site_offset == 0x500,
-          "rsp above nested entry resolves to caller");
+          "library return restores precise caller");
+
+    /* A normal nested return selects the caller; the callee must not
+     * claim the caller's post-pop RSP. */
+    osprey_on_call(env, 0x400600, 0x7ffbffe8);
     osprey_on_ret(env, 0x400601, 0x7ffbfff0);
+    CHECK(st->regs[R_ESP].valid &&
+          st->regs[R_ESP].address.region.site_offset == 0x500,
+          "normal return resolves to caller");
 
     /* ret pops the frame; no frames left -> invalid */
     osprey_on_ret(env, 0x400501, 0x7ffc0008);
@@ -859,6 +967,234 @@ static void test_canonical_dump(void)
     g_free(run);
 }
 
+/* Entrypoint frame seeding: a main-image function reached from
+ * uninstrumented loader/libc code has no call hook; the entrypoint
+ * barrier seeds a precise frame at the observed entry SP. */
+static void test_entrypoint_frame_seeding(void)
+{
+    reset_log();
+    OspreyConfig c = test_config();
+    OspreyContext *ctx = osprey_new(&c);
+    OspreySharedRun *run = new_run(&c);
+    osprey_set_image_bounds(0x400000, 0x401000);
+    osprey_child_use_shared_run(ctx, run);
+
+    CPUArchState *env = g_malloc0(sizeof(CPUArchState));
+    OspreyCpuOriginState *st = osprey_cpu_origin(env);
+
+    /* Seed main's frame at the observed entry SP. */
+    osprey_on_entrypoint(env, 0x400100, 0x7ffc0000);
+    CHECK(st->regs[R_ESP].valid &&
+          st->regs[R_ESP].kind == OSPREY_ORIGIN_ADDRESS,
+          "entrypoint seeds rsp origin");
+    CHECK(st->regs[R_ESP].address.offset == 0,
+          "entrypoint origin at offset zero");
+    CHECK(st->regs[R_ESP].address.region.site_offset == 0x100,
+          "entrypoint origin frame site");
+
+    /* A real prologue establishes the observed lower bound before local
+     * addresses are resolved. */
+    osprey_on_rsp_update(env, 0x7ffbff00, 0x400101);
+    OspreyRegionId r;
+    int64_t off;
+    CHECK(osprey_region_of_addr(env, 0x7ffbff00, &r, &off, false),
+          "entrypoint frame window resolves");
+    CHECK(r.kind == OSPREY_REGION_STACK_FUNCTION &&
+          r.site_offset == 0x100 && off == -0x100,
+          "entrypoint frame region + signed offset");
+
+    /* Idempotent: a second hit with the same region + entry SP creates
+     * no second frame. */
+    osprey_on_entrypoint(env, 0x400100, 0x7ffc0000);
+
+    /* Called-patch case: the ordinary call hook already created the
+     * exact frame.  The barrier must reuse it and restore its origin,
+     * not append a duplicate runtime instance. */
+    osprey_on_rsp_update(env, 0x7ffbfff8, 0x400100);
+    osprey_on_call(env, 0x400200, 0x7ffbfff8);
+    osprey_on_reg_invalidate(env, R_ESP);
+    osprey_on_entrypoint(env, 0x400200, 0x7ffbfff8);
+    CHECK(st->regs[R_ESP].valid &&
+          st->regs[R_ESP].address.region.site_offset == 0x200,
+          "called-patch barrier restores existing frame origin");
+
+    CHECK(osprey_parent_merge_sample(ctx, run) == OSPREY_OK, "merge ok");
+    int frames = 0;
+    int called_patch_frames = 0;
+    for (guint i = 0; i < ctx->region_instances->len; i++) {
+        OspreyRegionInstance *ri = &g_array_index(
+            ctx->region_instances, OspreyRegionInstance, i);
+        if (ri->region.kind == OSPREY_REGION_STACK_FUNCTION &&
+            ri->region.site_offset == 0x100) {
+            frames++;
+        }
+        if (ri->region.kind == OSPREY_REGION_STACK_FUNCTION &&
+            ri->region.site_offset == 0x200) {
+            called_patch_frames++;
+        }
+    }
+    CHECK(frames == 1, "entrypoint seeding is idempotent");
+    CHECK(called_patch_frames == 1,
+          "called-patch entrypoint does not duplicate frame");
+
+    osprey_free(ctx);
+    g_free(run);
+    g_free(env);
+}
+
+/* Non-local stack resynchronization: longjmp-style RSP replacement and
+ * RSP writes above the top frame pop stale frames; mismatched-return
+ * near misses pop nothing. */
+static void test_stack_resync(void)
+{
+    reset_log();
+    OspreyConfig c = test_config();
+    OspreyContext *ctx = osprey_new(&c);
+    OspreySharedRun *run = new_run(&c);
+    osprey_set_image_bounds(0x400000, 0x401000);
+    osprey_child_use_shared_run(ctx, run);
+
+    CPUArchState *env = g_malloc0(sizeof(CPUArchState));
+    OspreyCpuOriginState *st = osprey_cpu_origin(env);
+
+    /* main -> f1 -> f2 nested frames. */
+    osprey_on_entrypoint(env, 0x400100, 0x7ffc0000);
+    osprey_on_call(env, 0x400200, 0x7ffbfff8);
+    osprey_on_call(env, 0x400300, 0x7ffbfff0);
+
+    /* longjmp: in-image RSP write back into main's frame.  The stale
+     * f1/f2 frames cannot contain the new SP and are popped; main
+     * survives as the owner. */
+    osprey_on_rsp_update(env, 0x7ffbfffc, 0x400100);
+    CHECK(st->regs[R_ESP].valid &&
+          st->regs[R_ESP].address.region.site_offset == 0x100,
+          "longjmp rsp write resolves to surviving main frame");
+    CHECK(st->regs[R_ESP].address.offset == -4,
+          "longjmp rsp write seeds main at signed offset");
+    OspreyRegionId r;
+    int64_t off;
+    CHECK(osprey_region_of_addr(env, 0x7ffbffe0, &r, &off, false),
+          "stale f1 window no longer claims addresses");
+    CHECK(r.site_offset == 0x100, "f1 window address resolves to main");
+
+    /* RSP write above the top frame (stack switch / unwind): pops
+     * everything, no owner -> invalidate. */
+    osprey_on_call(env, 0x400400, 0x7ffbffc0);
+    osprey_on_rsp_update(env, 0x7ffd0000, 0x400401);
+    CHECK(!st->regs[R_ESP].valid, "rsp above all frames invalidates");
+
+    /* Mismatched-return near miss: RET always pops the callee, but a
+     * post-pop SP still inside the caller's exact window must not pop
+     * the caller as well. */
+    osprey_on_entrypoint(env, 0x400100, 0x7ffc2000);
+    osprey_on_rsp_update(env, 0x7ffc1ff8, 0x400100);
+    osprey_on_call(env, 0x400500, 0x7ffc1ff8);
+    osprey_on_ret(env, 0x400501, 0x7ffc1ff8);
+    CHECK(st->regs[R_ESP].valid &&
+          st->regs[R_ESP].address.region.site_offset == 0x100,
+          "near-miss ret keeps the caller frame");
+    CHECK(st->regs[R_ESP].address.offset == -8,
+          "near-miss ret restores caller signed offset");
+
+    osprey_on_call(env, 0x400500, 0x7ffc1ff0);
+
+    /* Recursion cleanup: one ret with sp above all stale frames pops
+     * the whole stale chain. */
+    osprey_on_call(env, 0x400600, 0x7ffc1fe8);
+    osprey_on_call(env, 0x400600, 0x7ffc1fe0);
+    osprey_on_ret(env, 0x400601, 0x7ffc1ff0);
+    CHECK(st->regs[R_ESP].valid &&
+          st->regs[R_ESP].address.region.site_offset == 0x500,
+          "ret above stale chain pops to surviving owner");
+
+    osprey_free(ctx);
+    g_free(run);
+    g_free(env);
+}
+
+/* Observed stack bounds: the shared record tracks {entry_sp, min_sp,
+ * max_sp} and merges as the frame grows; the canonical dump extent is
+ * the observed span, not a synthetic 1 MiB. */
+static void test_observed_stack_bounds(void)
+{
+    reset_log();
+    OspreyConfig c = test_config();
+    OspreyContext *ctx = osprey_new(&c);
+    OspreySharedRun *run = new_run(&c);
+    osprey_set_image_bounds(0x400000, 0x401000);
+    osprey_child_use_shared_run(ctx, run);
+
+    CPUArchState *env = g_malloc0(sizeof(CPUArchState));
+
+    osprey_on_entrypoint(env, 0x400100, 0x7ffc0000);
+    /* A proven prologue RSP write more than one MiB below entry remains
+     * in the current frame; there is no synthetic depth window. */
+    osprey_on_rsp_update(env, 0x7feb0000, 0x400101);
+    /* A red-zone access grows the observed bound by exactly 128 bytes. */
+    OspreyRegionId r;
+    int64_t off;
+    CHECK(osprey_region_of_addr(env, 0x7feaff80, &r, &off, false),
+          "red-zone access resolves");
+    CHECK(off == -0x110080, "deep access signed offset");
+    CHECK(!osprey_region_of_addr(env, 0x7feafe00, &r, &off, false),
+          "address below red zone is not guessed into frame");
+
+    CHECK(osprey_parent_merge_sample(ctx, run) == OSPREY_OK, "merge ok");
+    OspreyRegionInstance *ri = NULL;
+    for (guint i = 0; i < ctx->region_instances->len; i++) {
+        OspreyRegionInstance *cand = &g_array_index(
+            ctx->region_instances, OspreyRegionInstance, i);
+        if (cand->region.kind == OSPREY_REGION_STACK_FUNCTION &&
+            cand->region.site_offset == 0x100) {
+            ri = cand;
+            break;
+        }
+    }
+    CHECK(ri != NULL, "frame instance recorded");
+    if (ri != NULL) {
+        CHECK(ri->raw_base == 0x7ffc0000, "frame raw base = entry sp");
+        CHECK(ri->raw_min == 0x7feaff80, "frame raw_min = deepest access");
+        CHECK(ri->raw_max == 0x7ffc0000, "frame raw_max = entry sp");
+        CHECK(ri->raw_max - ri->raw_min == 0x110080,
+              "frame observed span, not synthetic 1 MiB");
+    }
+
+    osprey_free(ctx);
+    g_free(run);
+    g_free(env);
+}
+
+/* Pre-sample fatal publication: registration-time arithmetic failure
+ * marks every reset shared run bad_arithmetic so the baseline merge
+ * rejects fail-closed. */
+static void test_pre_sample_fatal(void)
+{
+    reset_log();
+    OspreyConfig c = test_config();
+    OspreyContext *ctx = osprey_new(&c);
+
+    /* Injected overflow: the image-relative end exceeds INT64_MAX. */
+    osprey_set_image_bounds(0x400000, 0x401000);
+    target_ulong huge = (target_ulong)0x400000 + (target_ulong)INT64_MAX;
+    osprey_register_image_global(NULL, huge, 2);
+    CHECK(ctx->pre_sample_fatal, "context records pre-sample fatal");
+
+    OspreySharedRun *run = new_run(&c);
+    CHECK(run->bad_arithmetic == 1, "reset run carries bad_arithmetic");
+    OspreyStatus st = osprey_parent_merge_sample(ctx, run);
+    CHECK(st == OSPREY_INCOMPLETE_FACTS, "pre-sample fatal merge rejects");
+    CHECK(strcmp(osprey_tx_stage(ctx), "merge") == 0,
+          "pre-sample fatal tx stage");
+    CHECK(strcmp(ctx->tx_reason, "global range offset+size overflow") == 0,
+          "pre-sample fatal preserves first reason");
+    CHECK(ctx->access_facts->len == 0, "pre-sample fatal no partial merge");
+    CHECK(g_reject_rows == 1, "pre-sample fatal one reject row");
+
+    osprey_free(ctx);
+    g_free(run);
+    osprey_clear_pre_sample_fatal();
+}
+
 /* ------------------------------------------------------------------ */
 
 int main(void)
@@ -882,13 +1218,18 @@ int main(void)
     test_factor_key_bidirectional();
     test_pc_normalization_and_global_merge();
     test_heap_identity_lifecycle();
+    test_realloc_lifecycle_variants();
     test_stack_frames_and_rsp_origin();
+    test_entrypoint_frame_seeding();
+    test_stack_resync();
+    test_observed_stack_bounds();
+    test_pre_sample_fatal();
     test_canonical_dump();
 
     if (failures != 0) {
         fprintf(stderr, "%d unit test check(s) FAILED\n", failures);
         return 1;
     }
-    printf("PASS osprey_unit (21/21)\n");
+    printf("PASS osprey_unit (26/26)\n");
     return 0;
 }

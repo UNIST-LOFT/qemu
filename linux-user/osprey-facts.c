@@ -337,11 +337,21 @@ int osprey_table_insert_mayarray(OspreySharedRun *run, const OspreyMayArrayFact 
                             (HashFn)osprey_mayarray_hash,
                             (VerifyFn)osprey_mayarray_eq, update_mayarray_fact);
 }
+/* Duplicate region instances merge observed bounds (min of raw_min, max
+ * of raw_max) so a growing frame updates its shared record in place. */
+static void update_region_instance(void *dst, const void *src) {
+    OspreyRegionInstance *d = dst;
+    const OspreyRegionInstance *s = src;
+    d->sample_support += s->sample_support;
+    if (s->raw_min < d->raw_min) d->raw_min = s->raw_min;
+    if (s->raw_max > d->raw_max) d->raw_max = s->raw_max;
+}
 int osprey_table_insert_region(OspreySharedRun *run,
                                const OspreyRegionInstance *f) {
     return run_table_insert(run, OSPREY_TABLE_REGION, f,
                             (HashFn)osprey_region_instance_hash,
-                            (VerifyFn)osprey_region_instance_eq, NULL);
+                            (VerifyFn)osprey_region_instance_eq,
+                            update_region_instance);
 }
 
 int osprey_run_iter_next(OspreyRunIter *it, const void **record) {
@@ -379,10 +389,17 @@ int osprey_run_iter_next(OspreyRunIter *it, const void **record) {
 typedef struct OspreyStackFrame {
     OspreyRegionId region;
     target_ulong entry_sp;
+    target_ulong current_sp;
     target_ulong min_sp;
+    target_ulong max_sp;   /* observed top; entry_sp for stack frames */
     bool precise;
     uint64_t instance_id;   /* monotonic; distinguishes same-site frames */
 } OspreyStackFrame;
+
+/* x86-64 SysV leaf functions may use 128 bytes below RSP without moving
+ * the register.  This is the only implicit stack-growth allowance; all
+ * other growth must first be observed through an architectural RSP write. */
+#define OSPREY_STACK_RED_ZONE 128u
 
 static GArray *g_stack_frames = NULL; /* OspreyStackFrame */
 static uint64_t g_next_stack_instance = 1;
@@ -409,7 +426,8 @@ static uint64_t g_next_heap_instance = 1;
 static void record_region_instance(const OspreyRegionId *region,
                                    uint64_t instance_id,
                                    target_ulong raw_base,
-                                   uint64_t extent,
+                                   uint64_t raw_min,
+                                   uint64_t raw_max,
                                    uint64_t prov_object_id,
                                    uint32_t prov_generation);
 
@@ -449,9 +467,9 @@ bool osprey_region_of_addr(CPUArchState *env, target_ulong addr,
         return true;
     }
     /* 3. Stack frames: innermost live frame first.  Offsets are signed
-     * relative to the entry SP (negative below it).  A frame grows to
-     * cover accesses below its current min_sp, bounded by a window so an
-     * unrelated deep address is not folded into a frame. */
+     * relative to the entry SP (negative below it).  Architectural RSP
+     * writes establish the observed lower bound; only the ABI red zone
+     * can extend it implicitly. */
     if (g_stack_frames != NULL) {
         for (guint i = g_stack_frames->len; i > 0; i--) {
             OspreyStackFrame *f = &g_array_index(g_stack_frames,
@@ -470,11 +488,21 @@ bool osprey_region_of_addr(CPUArchState *env, target_ulong addr,
                 *offset = (int64_t)addr - (int64_t)f->entry_sp;
                 return true;
             }
-            /* Access below min_sp: grow only within a bounded window. */
-            target_ulong low = f->entry_sp >= 0x100000
-                ? f->entry_sp - 0x100000 : 0;
-            if (addr >= low) {
+            /* Access below min_sp: grow only through the ABI-defined
+             * red zone below the currently observed RSP.  The previous
+             * synthetic one-MiB window could assign an unrelated address
+             * to the innermost frame and was not an observed bound. */
+            target_ulong red_zone_low =
+                f->current_sp >= OSPREY_STACK_RED_ZONE
+                    ? f->current_sp - OSPREY_STACK_RED_ZONE : 0;
+            if (addr >= red_zone_low && addr < f->current_sp) {
                 f->min_sp = addr;
+                /* Publish the grown bounds into the shared record so
+                 * the parent sees the observed span, not a synthetic
+                 * extent. */
+                record_region_instance(&f->region, f->instance_id,
+                                       f->entry_sp, f->min_sp, f->max_sp,
+                                       0, 0);
                 *region = f->region;
                 *offset = (int64_t)addr - (int64_t)f->entry_sp;
                 return true;
@@ -489,15 +517,29 @@ bool osprey_region_of_addr(CPUArchState *env, target_ulong addr,
 static bool osprey_normalize_pc(target_ulong pc, uint64_t *out) {
     target_ulong image_base = osprey_get_image_base();
     target_ulong image_end = osprey_get_image_end();
-    if (image_base == 0) {
-        *out = (uint64_t)pc;
-        return true;
-    }
-    if (pc < image_base || (image_end != 0 && pc >= image_end)) {
+    if (image_end <= image_base || pc < image_base || pc >= image_end) {
         return false;
     }
     *out = (uint64_t)(pc - image_base);
     return true;
+}
+
+static void stack_seed_rsp_origin(CPUArchState *env,
+                                  const OspreyStackFrame *frame,
+                                  target_ulong sp) {
+    if (frame == NULL || !frame->precise) {
+        origin_invalidate_reg(env, R_ESP);
+        return;
+    }
+    OspreyCpuOriginState *st = osprey_cpu_origin(env);
+    OspreyRegOrigin *o = &st->regs[R_ESP];
+    memset(o, 0, sizeof(*o));
+    o->kind = OSPREY_ORIGIN_ADDRESS;
+    o->valid = 1;
+    o->concrete_value = sp;
+    o->address.region = frame->region;
+    o->address.offset = (int64_t)sp - (int64_t)frame->entry_sp;
+    o->producer_pc = 0; /* synthetic: frame identity, not an insn */
 }
 
 void osprey_on_call(CPUArchState *env, target_ulong callee_pc,
@@ -518,10 +560,12 @@ void osprey_on_call(CPUArchState *env, target_ulong callee_pc,
      * after gen_push_v; the E9 site observes the stub's push), so the
      * passed RSP is the callee entry. */
     f.entry_sp = entry_sp;
+    f.current_sp = entry_sp;
     f.min_sp = f.entry_sp;
+    f.max_sp = f.entry_sp;
     f.instance_id = g_next_stack_instance++;
     g_array_append_val(g_stack_frames, f);
-    /* Stack instance extent is dynamic; record the entry SP as the raw
+    /* Stack instance bounds are dynamic; record the entry SP as the raw
      * base with the observed span so the parent can map addresses.
      * Imprecise frames (callee outside the main image) are never
      * recorded: no fact can reference them (their accesses are skipped
@@ -529,23 +573,63 @@ void osprey_on_call(CPUArchState *env, target_ulong callee_pc,
      * region set. */
     if (f.precise) {
         record_region_instance(&f.region, f.instance_id, f.entry_sp,
-                               0x100000, 0, 0);
+                               f.min_sp, f.max_sp, 0, 0);
     }
     /* Seed the RSP origin: the register holds entry_sp (the hook fires
      * after the return-address push), i.e. the new frame at offset 0.
      * Precise callee entry only — imprecise frames never contribute
      * facts. */
-    if (f.precise) {
-        OspreyCpuOriginState *st = osprey_cpu_origin(env);
-        OspreyRegOrigin *o = &st->regs[R_ESP];
-        memset(o, 0, sizeof(*o));
-        o->kind = OSPREY_ORIGIN_ADDRESS;
-        o->valid = 1;
-        o->concrete_value = entry_sp;
-        o->address.region = f.region;
-        o->address.offset = 0;
-        o->producer_pc = 0; /* synthetic: frame identity, not an insn */
+    stack_seed_rsp_origin(env, &f, entry_sp);
+}
+
+/* Entrypoint barrier (snapshot/forkserver entry): seed the initial
+ * stack frame for the main image when the entrypoint is reached from
+ * uninstrumented loader/libc code (no call hook fired for main).
+ * Idempotent: creates a precise frame only when no live frame with the
+ * same region and entry SP exists; the observed entry SP is the
+ * offset-zero anchor.  Fires once per process (parent at the target
+ * hit; the child re-executes the entrypoint TB with count target+1). */
+void osprey_on_entrypoint(CPUArchState *env, target_ulong pc,
+                          target_ulong sp) {
+    if (g_stack_frames == NULL) {
+        g_stack_frames = g_array_new(FALSE, FALSE, sizeof(OspreyStackFrame));
     }
+    OspreyRegionId region;
+    memset(&region, 0, sizeof(region));
+    region.kind = OSPREY_REGION_STACK_FUNCTION;
+    region.code_image_id = 0;
+    if (!osprey_normalize_pc(pc, &region.site_offset)) {
+        /* Entrypoint outside the main image: nothing to seed. */
+        return;
+    }
+    /* Idempotent: a matching live frame (same region + entry SP) means
+     * the entrypoint was already reached (called-patch fixture where
+     * main is called from instrumented code, or a re-hit). */
+    for (guint i = 0; i < g_stack_frames->len; i++) {
+        OspreyStackFrame *f = &g_array_index(g_stack_frames,
+                                            OspreyStackFrame, i);
+        if (f->region.site_offset == region.site_offset &&
+            f->entry_sp == sp) {
+            f->current_sp = sp;
+            stack_seed_rsp_origin(env, f, sp);
+            return;
+        }
+    }
+    OspreyStackFrame f;
+    memset(&f, 0, sizeof(f));
+    f.region = region;
+    f.entry_sp = sp;
+    f.current_sp = sp;
+    f.min_sp = sp;
+    f.max_sp = sp;
+    f.precise = true;
+    f.instance_id = g_next_stack_instance++;
+    g_array_append_val(g_stack_frames, f);
+    record_region_instance(&f.region, f.instance_id, f.entry_sp,
+                           f.min_sp, f.max_sp, 0, 0);
+    /* Seed the RSP origin: the register holds the entry SP (offset
+     * zero of the new frame). */
+    stack_seed_rsp_origin(env, &f, sp);
 }
 
 void osprey_on_ret(CPUArchState *env, target_ulong pc, target_ulong sp) {
@@ -554,15 +638,18 @@ void osprey_on_ret(CPUArchState *env, target_ulong pc, target_ulong sp) {
         origin_invalidate_reg(env, R_ESP);
         return;
     }
-    OspreyStackFrame *top = &g_array_index(g_stack_frames, OspreyStackFrame,
-                                           g_stack_frames->len - 1);
-    /* Real rets observe the post-pop RSP (== entry_sp); modeled-call
-     * returns observe the RSP with the return address still pushed
-     * (== entry_sp).  Both satisfy sp >= entry_sp, so one condition pops
-     * either.  A spurious pop is impossible: if no frame was pushed for
-     * the modeled call, the top frame's entry_sp is above the current
-     * RSP and the check fails. */
-    if (sp >= top->entry_sp) {
+    /* A RET always ends the current activation, even when a malformed
+     * epilogue leaves the post-pop SP inside its old frame.  Pop that
+     * frame first, then discard any additional stale frames whose exact
+     * observed bounds cannot contain the surviving SP. */
+    g_array_set_size(g_stack_frames, g_stack_frames->len - 1);
+    while (g_stack_frames->len > 0) {
+        OspreyStackFrame *top = &g_array_index(g_stack_frames,
+                                               OspreyStackFrame,
+                                               g_stack_frames->len - 1);
+        if (sp >= top->min_sp && sp <= top->entry_sp) {
+            break;
+        }
         g_array_set_size(g_stack_frames, g_stack_frames->len - 1);
     }
     /* Re-seed the RSP origin to the caller frame (now top): after the
@@ -574,15 +661,8 @@ void osprey_on_ret(CPUArchState *env, target_ulong pc, target_ulong sp) {
                                                   OspreyStackFrame,
                                                   g_stack_frames->len - 1);
         if (caller->precise) {
-            OspreyCpuOriginState *st = osprey_cpu_origin(env);
-            OspreyRegOrigin *o = &st->regs[R_ESP];
-            memset(o, 0, sizeof(*o));
-            o->kind = OSPREY_ORIGIN_ADDRESS;
-            o->valid = 1;
-            o->concrete_value = sp;
-            o->address.region = caller->region;
-            o->address.offset = (int64_t)sp - (int64_t)caller->entry_sp;
-            o->producer_pc = 0;
+            caller->current_sp = sp;
+            stack_seed_rsp_origin(env, caller, sp);
         } else {
             origin_invalidate_reg(env, R_ESP);
         }
@@ -593,14 +673,12 @@ void osprey_on_ret(CPUArchState *env, target_ulong pc, target_ulong sp) {
 
 /* RSP update (push/pop/add/sub imm, call): re-derive the RSP origin
  * from the live frame stack.  The innermost precise frame whose entry
- * SP is at or below the new RSP owns the register; offset is signed
+ * SP is at or above the new RSP owns the register; offset is signed
  * relative to that entry.  No frame (or only imprecise frames) →
  * invalidate.  This runs after the write-back kill, so the origin is
  * always rebuilt from frame identity, never adjusted incrementally. */
 void osprey_on_rsp_update(CPUArchState *env, target_ulong new_sp,
                           target_ulong pc) {
-    OspreyCpuOriginState *st = osprey_cpu_origin(env);
-    OspreyRegOrigin *o = &st->regs[R_ESP];
     /* Only in-image RSP writes re-derive the origin: libc frames are
      * imprecise and must never claim a precise frame's identity. */
     uint64_t norm_pc = 0;
@@ -609,26 +687,36 @@ void osprey_on_rsp_update(CPUArchState *env, target_ulong new_sp,
         return;
     }
     if (g_stack_frames != NULL) {
+        /* Non-local stack resynchronization: an upward replacement can
+         * cross one or more callee entry anchors.  Pop those frames.
+         * Downward movement belongs to the current precise activation
+         * and grows its observed bound; there is no synthetic depth cap. */
+        while (g_stack_frames->len > 0) {
+            OspreyStackFrame *top = &g_array_index(g_stack_frames,
+                                                   OspreyStackFrame,
+                                                   g_stack_frames->len - 1);
+            if (new_sp <= top->entry_sp) {
+                break;
+            }
+            g_array_set_size(g_stack_frames, g_stack_frames->len - 1);
+        }
         for (guint i = g_stack_frames->len; i > 0; i--) {
             OspreyStackFrame *f = &g_array_index(g_stack_frames,
                                                  OspreyStackFrame, i - 1);
             if (f->region.site_offset == OSPREY_STACK_IMPRECISE_SITE) {
                 continue;
             }
-            /* The frame owns RSP from its entry down to its observed
-             * window (prologue pushes/sub allocations move RSP below
-             * entry_sp; offsets are signed).  Above entry_sp the
-             * register belongs to the caller frame. */
-            target_ulong low = f->entry_sp >= 0x100000
-                ? f->entry_sp - 0x100000 : 0;
-            if (new_sp >= low && new_sp <= f->entry_sp) {
-                memset(o, 0, sizeof(*o));
-                o->kind = OSPREY_ORIGIN_ADDRESS;
-                o->valid = 1;
-                o->concrete_value = new_sp;
-                o->address.region = f->region;
-                o->address.offset = (int64_t)new_sp - (int64_t)f->entry_sp;
-                o->producer_pc = 0; /* synthetic: frame identity */
+            if (new_sp <= f->entry_sp) {
+                f->current_sp = new_sp;
+                /* The frame grows to cover the new RSP position
+                 * (prologue sub rsp); publish the grown bounds. */
+                if (new_sp < f->min_sp) {
+                    f->min_sp = new_sp;
+                    record_region_instance(&f->region, f->instance_id,
+                                           f->entry_sp, f->min_sp,
+                                           f->max_sp, 0, 0);
+                }
+                stack_seed_rsp_origin(env, f, new_sp);
                 return;
             }
         }
@@ -858,7 +946,7 @@ static void osprey_backfill_instances(void) {
                 continue; /* imprecise frames never contribute facts */
             }
             record_region_instance(&f->region, f->instance_id, f->entry_sp,
-                                   0x100000, 0, 0);
+                                   f->min_sp, f->max_sp, 0, 0);
         }
     }
     if (g_heap_instances != NULL) {
@@ -866,12 +954,18 @@ static void osprey_backfill_instances(void) {
             const HeapInstance *h = &g_array_index(
                 g_heap_instances, HeapInstance, i);
             if (h->live) {
+                uint64_t raw_base = (uint64_t)h->base;
+                if (raw_base > UINT64_MAX - h->size) {
+                    run->bad_arithmetic = 1;
+                    return;
+                }
                 record_region_instance(&h->region, h->instance_id,
-                                       h->base, h->size,
+                                       h->base, raw_base,
+                                       raw_base + h->size,
                                        h->prov_object_id,
                                        h->prov_generation);
-        }
             }
+        }
     }
     /* Global region: ONE merged instance per sample with the union
      * span, raw_base = image base so raw_base + image-relative offset
@@ -894,12 +988,18 @@ static void osprey_backfill_instances(void) {
             }
         }
         if (hi > 0) {
+            uint64_t image_base = (uint64_t)osprey_get_image_base();
+            if (image_base > UINT64_MAX - (uint64_t)hi) {
+                run->bad_arithmetic = 1;
+                return;
+            }
             OspreyRegionId gid;
             gid.kind = OSPREY_REGION_GLOBAL;
             gid.code_image_id = 0;
             gid.site_offset = 0;
-            record_region_instance(&gid, 0, osprey_get_image_base(),
-                                   (uint64_t)hi, 0, 0);
+            record_region_instance(&gid, 0, (target_ulong)image_base,
+                                   image_base, image_base + (uint64_t)hi,
+                                   0, 0);
         }
     }
 }
@@ -929,7 +1029,8 @@ void osprey_mark_unsupported_execution(void) {
 static void record_region_instance(const OspreyRegionId *region,
                                    uint64_t instance_id,
                                    target_ulong raw_base,
-                                   uint64_t extent,
+                                   uint64_t raw_min,
+                                   uint64_t raw_max,
                                    uint64_t prov_object_id,
                                    uint32_t prov_generation) {
     OspreySharedRun *run = g_shared_run;
@@ -939,7 +1040,8 @@ static void record_region_instance(const OspreyRegionId *region,
     f.region = *region;
     f.instance_id = instance_id;
     f.raw_base = (uint64_t)raw_base;
-    f.extent = extent;
+    f.raw_min = raw_min;
+    f.raw_max = raw_max;
     f.prov_object_id = prov_object_id;
     f.prov_generation = prov_generation;
     f.sample_support = 1;
@@ -952,6 +1054,14 @@ void osprey_on_alloc_success(CPUArchState *env, target_ulong base,
                              target_ulong size, target_ulong site_pc,
                              uint64_t object_id, uint32_t generation) {
     if (base == 0 && size != 0) return; /* failure: no object */
+    uint64_t raw_base = (uint64_t)base;
+    uint64_t raw_size = (uint64_t)size;
+    if (raw_size > INT64_MAX || raw_base > UINT64_MAX - raw_size) {
+        if (g_shared_run != NULL) {
+            g_shared_run->bad_arithmetic = 1;
+        }
+        return;
+    }
     uint64_t norm_pc = 0;
     if (!osprey_normalize_pc(site_pc, &norm_pc)) {
         /* Allocation from out-of-image code (libc-internal): the site
@@ -983,7 +1093,8 @@ void osprey_on_alloc_success(CPUArchState *env, target_ulong base,
     h.live = true;
     g_array_append_val(g_heap_instances, h);
 
-    record_region_instance(&h.region, h.instance_id, base, (uint64_t)size,
+    record_region_instance(&h.region, h.instance_id, base,
+                           raw_base, raw_base + raw_size,
                            h.prov_object_id, h.prov_generation);
 
     /* F05: successful-return requested size. */
@@ -1473,7 +1584,9 @@ OspreyStatus osprey_parent_merge_sample(OspreyContext *ctx,
     if (run->bad_arithmetic) {
         osprey_log_sticky(run, "bad-arithmetic");
         osprey_tx_reject(ctx, OSPREY_INCOMPLETE_FACTS, "merge",
-                         "checked arithmetic failed");
+                         ctx->pre_sample_fatal && ctx->pre_sample_reason != NULL
+                             ? ctx->pre_sample_reason
+                             : "checked arithmetic failed");
         return OSPREY_INCOMPLETE_FACTS;
     }
     if (run->bad_identity) {
@@ -1645,7 +1758,8 @@ OspreyStatus osprey_parent_merge_sample(OspreyContext *ctx,
                                                      OspreyRegionInstance, i);
             if (osprey_region_instance_eq(d, f)) {
                 d->sample_support += f->sample_support;
-                if (f->extent > d->extent) d->extent = f->extent;
+                if (f->raw_min < d->raw_min) d->raw_min = f->raw_min;
+                if (f->raw_max > d->raw_max) d->raw_max = f->raw_max;
                 merged = true;
                 break;
             }
@@ -1737,7 +1851,7 @@ void osprey_dump_canonical(OspreyContext *ctx, const char *path) {
                     (unsigned long long)r->region.site_offset,
                     (unsigned long long)r->instance_id,
                     raw_class,
-                    (unsigned long long)r->extent);
+                    (unsigned long long)(r->raw_max - r->raw_min));
         }
         g_array_free(rows, TRUE);
     }

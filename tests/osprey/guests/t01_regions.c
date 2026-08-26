@@ -4,13 +4,21 @@
  *  - .data and .bss globals (one merged canonical G region);
  *  - recursion (recurse(3) -> 4 live frames of the same function);
  *  - two allocations at one site (same H_site, distinct instances);
- *  - same-base reuse (free + realloc at the same address);
- *  - realloc success (old object retired, new object created);
- *  - realloc(p, 0) (old object retired, NULL return).
+ *  - successful same-base reuse (free + malloc at the same address,
+ *    glibc tcache LIFO: deterministic);
+ *  - realloc success with a forced move (16 -> 1 MiB, above the mmap
+ *    threshold: glibc cannot grow the 16-byte chunk in place, so the
+ *    new object is at a distinct base — deterministic, and never
+ *    depends on glibc choosing in-place realloc);
+ *  - failed realloc preserving the old identity (huge size -> NULL,
+ *    old object stays live and usable);
+ *  - realloc(p, 0) (old object retired, NULL return);
+ *  - zero-size non-NULL malloc(0) (unique pointer, extent 0).
  *
- * The harness runs the guest twice and compares the canonical fact
- * dumps byte-identically (PIE determinism / ASLR invariance), then
- * asserts the expected canonical rows.
+ * The harness runs the guest three times with distinct PIE load biases
+ * (default + two forced BINRADAR_MMAP_START values) and compares the
+ * canonical fact dumps byte-identically, then compares against the
+ * checked-in exact canonical rows (t01_regions.expected).
  */
 #include <stdlib.h>
 
@@ -41,7 +49,7 @@ int main(void) {
     /* Recursion: 4 live frames of recurse at the deepest point. */
     g_sink = recurse(3);
 
-    /* Two allocations at one site (the malloc inside alloc32). */
+    /* Two live allocations at one site (the malloc inside alloc32). */
     char *a = alloc32();
     char *b = alloc32();
     if (!a || !b) return 0;
@@ -49,31 +57,60 @@ int main(void) {
     b[0] = 2;
     g_sink = a[0] + b[0];
 
-    /* Same-base reuse: free a, then realloc returns the same address. */
+    /* Successful same-base reuse: free a, then malloc(32) returns the
+     * same address (glibc tcache LIFO for the same size class). */
     free(a);
     char *c = malloc(32);
     if (!c) return 0;
     c[0] = 3;
     g_sink = c[0];
 
-    /* realloc success: old object retired, new object created. */
+    /* realloc success with a forced move: 16 -> 1 MiB.  The new size is
+     * above the glibc mmap threshold, so the chunk cannot grow in
+     * place; the new object is at a distinct base.  The lifecycle rows
+     * (old retired, new object with the requested size) are
+     * deterministic and never depend on glibc choosing in-place
+     * realloc. */
     char *d = malloc(16);
     if (!d) return 0;
     d[0] = 4;
-    char *e = realloc(d, 64);
+    char *e = realloc(d, 1024 * 1024);
     if (!e) return 0;
     e[0] = 5;
     g_sink = e[0];
 
-    /* realloc(p, 0): glibc frees p and returns NULL. */
+    /* Failed realloc preserving the old identity: a huge size makes
+     * glibc fail with ENOMEM and return NULL; the old object stays
+     * live and usable. */
     char *f = malloc(8);
     if (!f) return 0;
     f[0] = 6;
-    char *g = realloc(f, 0);
-    (void)g;
+    char *g = realloc(f, (size_t)-1);
+    if (g) return 0;   /* must fail */
+    f[0] = 7;          /* old pointer still usable */
+    g_sink = f[0];
+
+    /* realloc(p, 0): glibc frees p and returns NULL. */
+    char *h = malloc(8);
+    if (!h) return 0;
+    h[0] = 8;
+    char *i = realloc(h, 0);
+    (void)i;
+
+    /* Zero-size non-NULL: glibc malloc(0) returns a unique pointer. */
+    char *z = malloc(0);
+    if (!z) return 0;
+    g_sink = (z != NULL);
 
     free(b);
     free(c);
     free(e);
-    return 0;
+    free(f);
+    free(z);
+    /* _exit: no atexit handlers, no global dtors, no _fini.  The exit
+     * path is bias-dependent (the child can fault at different points
+     * depending on the stack position), so the fixture must not
+     * exercise it: the canonical dump must be byte-identical across
+     * forced PIE biases. */
+    _exit(0);
 }

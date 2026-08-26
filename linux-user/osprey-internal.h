@@ -161,14 +161,21 @@ typedef struct OspreyMayArrayFact {
 } OspreyMayArrayFact;
 
 /* One live canonical region instance (child-written): canonical region,
- * the raw runtime base it resolved to, and the observed extent.  The
- * parent uses these to map raw mutation addresses back to canonical
- * chunks (consumer cutover; Stage 4). */
+ * the raw runtime anchor it resolved to, and the observed raw span.
+ * raw_base is the offset-zero anchor (entry SP for stack frames, heap
+ * base, image base for the global region); raw_min/raw_max are the
+ * lowest/highest observed raw addresses (stack: [min_sp, entry_sp];
+ * heap: [base, base+size]; global: [image_base, image_base+span]).
+ * Canonical offsets are signed relative to raw_base; the downward
+ * stack is never treated as [entry_sp, entry_sp+extent).  The parent
+ * uses these to map raw mutation addresses back to canonical chunks
+ * (consumer cutover; Stage 7). */
 typedef struct OspreyRegionInstance {
     OspreyRegionId region;
     uint64_t instance_id;      /* runtime identity within this process */
     uint64_t raw_base;
-    uint64_t extent;
+    uint64_t raw_min;          /* lowest observed raw address */
+    uint64_t raw_max;          /* highest observed raw address */
     uint64_t prov_object_id;   /* heap: provenance identity */
     uint32_t prov_generation;
     uint32_t sample_support;
@@ -239,7 +246,7 @@ typedef struct OspreyCpuOriginState {
 /* Shared run (fixed layout, no pointers)                              */
 /* ------------------------------------------------------------------ */
 
-#define OSPREY_SHARED_VERSION 4u
+#define OSPREY_SHARED_VERSION 5u
 
 struct OspreySharedRun {
     uint32_t version;
@@ -364,12 +371,19 @@ int osprey_run_iter_next(OspreyRunIter *it, const void **record);
 /* Context (parent-owned)                                              */
 /* ------------------------------------------------------------------ */
 
-typedef struct OspreyGraph OspreyGraph; /* Stage-2 factor graph */
+typedef struct OspreyGraph OspreyGraph; /* Stage 3 factor graph */
 
 struct OspreyContext {
     OspreyConfig config;
     OspreySharedRun *shared;   /* attached in child; NULL in parent */
     QemuMutex shared_lock;     /* child-side insert mutex */
+
+    /* Pre-sample fatal state: set by registration-time failures that
+     * precede the sample transaction (e.g. ELF/global range overflow).
+     * Copied into every reset shared run so the baseline merge rejects
+     * (fail-closed); silent range omission is never acceptance. */
+    bool pre_sample_fatal;
+    const char *pre_sample_reason;
 
     /* Main-image writable global ranges (merged interval set). */
     GArray *global_ranges;     /* OspreyGlobalRange, sorted by offset */
@@ -418,7 +432,7 @@ struct OspreyContext {
     OspreyStatus last_status;
     uint64_t last_analyze_time_ms;
 
-    /* Committed Stage-2 factor graph (parent side). */
+    /* Committed Stage 3 factor graph (parent side). */
     OspreyGraph *graph;
 };
 
@@ -437,6 +451,15 @@ bool osprey_region_of_addr(CPUArchState *env, target_ulong addr,
                            bool create);
 void osprey_free_runtime_regions(void);
 void osprey_log_sticky(const OspreySharedRun *run, const char *tag);
+
+/* Mark the context with a pre-sample fatal condition (registration-time
+ * arithmetic failure).  Every subsequently reset shared run carries the
+ * bad_arithmetic flag so the baseline merge rejects. */
+void osprey_mark_pre_sample_fatal(OspreyContext *ctx, const char *reason);
+
+/* Clear the module-global pre-sample fatal state (unit-test isolation;
+ * the real tracer never clears it after registration). */
+void osprey_clear_pre_sample_fatal(void);
 
 /* Fail-closed transaction helpers (osprey-facts.c). */
 void osprey_tx_begin(OspreyContext *ctx);
@@ -466,7 +489,7 @@ typedef enum OspreyDecodedKind {
 } OspreyDecodedKind;
 
 /* ------------------------------------------------------------------ */
-/* Stage 2+: predicate interning and factor graph                      */
+/* Stage 3+: predicate interning and factor graph                      */
 /* ------------------------------------------------------------------ */
 
 /* Predicate kinds (P01-P11 of the reference).  Each concrete predicate
@@ -515,7 +538,7 @@ typedef struct OspreyVar {
     uint8_t hard_false;            /* CB06-style hard constraint */
     uint8_t region_limit_hit;      /* per-region candidate cap exceeded */
     uint8_t reserved;
-    double belief;                 /* current marginal (Stage 3 fills) */
+    double belief;                 /* current marginal (Stages 4/5 fill) */
     OspreyVarPayload payload;
 } OspreyVar;
 
@@ -583,9 +606,9 @@ struct OspreyGraph {
     uint64_t cd04_extensions;      /* CD04 closure extensions */
 };
 
-/* Stage 2 entry: deterministic closure (R01-R12), predicate interning,
- * bounded candidate generation, and static factor instantiation.
- * Does not solve anything. */
+/* Stage 3 entry (legacy function name): deterministic closure (R01-R12),
+ * predicate interning, bounded candidate generation, and static factor
+ * instantiation.  Does not solve anything. */
 OspreyStatus osprey_stage2_closure(OspreyContext *ctx);
 
 /* Ownership: free a factor graph or decoded model (osprey-rules.c /
@@ -594,19 +617,18 @@ OspreyGraph *osprey_graph_new(void);
 void osprey_graph_free(OspreyGraph *g);
 void osprey_model_free(OspreyModel *m);
 
-/* Stage 3 entry: secondary deterministic rules (CB02-CB09, CC04/CC05,
- * CD07, CD08) whose preconditions are fact- or candidate-driven; adds
- * stage-2 factors to the graph.  Belief-dependent folding (CC07) is
- * deferred until after the first inference pass. */
+/* Stage 3 secondary construction (legacy function name): deterministic
+ * rules (CB02-CB09, CC04/CC05, CD07, CD08) whose preconditions are fact-
+ * or candidate-driven.  Belief-dependent folding (CC07) is deferred to
+ * the Stage 5 dynamic closure. */
 OspreyStatus osprey_stage2_secondary(OspreyContext *ctx);
 
-/* Stage 3 inference (osprey-infer.c): exact bucket elimination per
- * bounded component over stage-1 factors, then log-domain loopy BP over
- * the full graph seeded from the exact beliefs. */
+/* Stages 4/5 inference (osprey-infer.c): exact base inference followed
+ * by secondary loopy BP.  The current implementation is non-conformant. */
 OspreyStatus osprey_infer(OspreyContext *ctx);
 
-/* Shared graph builders (osprey-rules.c); used by the folding closure
- * and the Stage-3 dynamic rules. */
+/* Shared graph builders (osprey-rules.c); used by Stage 3 construction
+ * and the Stage 5 dynamic closure. */
 uint32_t osprey_intern_var(OspreyContext *ctx, uint8_t kind,
                            const OspreyVarPayload *payload);
 void osprey_factor_add(OspreyContext *ctx, uint16_t rule, uint16_t head_idx,
@@ -634,7 +656,7 @@ struct OspreyModel {
                                  independent of scalar/field exclusivity */
 };
 
-/* Stage 4 entry (osprey-decode.c): consistent decoding of posterior
+/* Stage 6 entry (osprey-decode.c): consistent decoding of posterior
  * predicates (§10 of the reference): hard-false/threshold discard,
  * per-chunk exclusivity between scalar/field/pointer/array-element,
  * non-overlapping field layouts per base, weighted interval array
