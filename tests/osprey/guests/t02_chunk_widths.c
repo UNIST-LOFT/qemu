@@ -16,6 +16,8 @@
  *  - MOVD, PEXTR/EXTRACTPS, INSERTPS/PINSR loads, SIMD loads;
  *  - x87 loads, frstor, MXCSR, FXSAVE/FXRSTOR;
  *  - SGDT/SIDT descriptor stores and MPX BNDMOV where supported;
+ *  - an SSE2 MASKMOVDQU with a sparse byte mask (only selected bytes may
+ *    produce F01 rows);
  *  - a labeled byte store to a read-only main-image page faults and must
  *    not contribute an F01 row;
  *  - a labeled 16-byte store commits its first 8-byte TCG half, faults on
@@ -39,7 +41,7 @@ static volatile sig_atomic_t fault_seen;
 
 /* One call site per width: a 16-byte aligned buffer, integer stores
  * of each width land at distinct offsets (facts key on (pc, size)). */
-static __attribute__((aligned(32))) uint8_t buf[1024];
+static __attribute__((aligned(64))) uint8_t buf[2048];
 static __attribute__((aligned(4096))) uint8_t fault_page[4096];
 static __attribute__((aligned(4096))) uint8_t paired_fault_pages[8192];
 
@@ -166,6 +168,37 @@ static void sse_stores(void) {
     g_sink = *(volatile uint64_t *)(buf + 144);
 }
 
+static int maskmov_sparse(void)
+{
+    uint8_t data[16] __attribute__((aligned(16)));
+    uint8_t mask[16] __attribute__((aligned(16)));
+    uint8_t *dst = buf + 448;
+    for (int i = 0; i < 16; i++) {
+        data[i] = (uint8_t)(0x20 + i);
+        mask[i] = (i == 1 || i == 5 || i == 9 || i == 15) ? 0x80 : 0;
+        dst[i] = 0xa5;
+    }
+    if (!__builtin_cpu_supports("sse2")) {
+        return 0;
+    }
+    __asm__ volatile(
+        "movdqu %1, %%xmm0\n\t"
+        "movdqu %2, %%xmm1\n\t"
+        ".globl t02_maskmov\n\t"
+        "t02_maskmov:\n\t"
+        "maskmovdqu %%xmm1, %%xmm0\n\t"
+        : : "D"(dst), "m"(data), "m"(mask)
+        : "xmm0", "xmm1", "memory");
+    for (int i = 0; i < 16; i++) {
+        uint8_t want = (mask[i] & 0x80) ? data[i] : 0xa5;
+        if (dst[i] != want) {
+            return -1;
+        }
+    }
+    g_sink ^= dst[1] ^ dst[5] ^ dst[9] ^ dst[15];
+    return 0;
+}
+
 static void x87_stores(void) {
     __asm__ volatile("fstl %0" : "=m"(*(double *)(buf + 160)));
     __asm__ volatile("fstpt %0" : "=m"(*(long double *)(buf + 176)));
@@ -265,11 +298,63 @@ static void descriptor_stores(void) {
 }
 
 static void fxsave_state(void) {
-    __asm__ volatile("fxsave %0"
+    __asm__ volatile(".globl t02_fxsave\n"
+                     "t02_fxsave:\n"
+                     "fxsave %0"
                      : "=m"(*(uint8_t (*)[512])(buf + 512)) : : "memory");
-    __asm__ volatile("fxrstor %0"
+    __asm__ volatile(".globl t02_fxrstor\n"
+                     "t02_fxrstor:\n"
+                     "fxrstor %0"
                      : : "m"(*(const uint8_t (*)[512])(buf + 512))
                      : "memory");
+}
+
+static void xsave_state(void) {
+    uint32_t eax = 1, ebx, ecx, edx;
+    uint32_t mask_lo, mask_hi;
+    if (!__builtin_cpu_supports("xsave")) {
+        return;
+    }
+    __asm__ volatile("cpuid" : "+a"(eax), "=b"(ebx), "+c"(ecx),
+                     "=d"(edx) :: "memory");
+    if ((ecx & (1u << 27)) == 0) { /* OSXSAVE */
+        return;
+    }
+    eax = 0;
+    ecx = 0;
+    __asm__ volatile("xgetbv" : "=a"(mask_lo), "=d"(mask_hi)
+                     : "c"(ecx));
+    mask_lo &= 3u; /* FP + SSE: implemented by the target helper. */
+    mask_hi = 0;
+    if (mask_lo != 3u) {
+        return;
+    }
+    __asm__ volatile(".globl t02_xsave\n"
+                     "t02_xsave:\n"
+                     "xsave %0" : "=m"(*(uint8_t (*)[1024])(buf + 1024))
+                     : "a"(mask_lo), "d"(mask_hi) : "memory");
+    __asm__ volatile(".globl t02_xsaveopt\n"
+                     "t02_xsaveopt:\n"
+                     "xsaveopt %0"
+                     : "=m"(*(uint8_t (*)[1024])(buf + 1024))
+                     : "a"(mask_lo), "d"(mask_hi) : "memory");
+    __asm__ volatile(".globl t02_xrstor\n"
+                     "t02_xrstor:\n"
+                     "xrstor %0"
+                     : : "m"(*(const uint8_t (*)[1024])(buf + 1024)),
+                       "a"(mask_lo), "d"(mask_hi) : "memory");
+}
+
+/* ENTER copies 31 frame pointers before writing its final RSP.  The
+ * reservation hook must retain the deepest successful stack interval rather
+ * than relying on the 128-byte SysV red zone. */
+__attribute__((used, naked, noinline)) static void deep_enter(void) {
+    __asm__ volatile(
+        ".globl t02_deep_enter\n"
+        "t02_deep_enter:\n"
+        "enter $0, $31\n"
+        "leave\n"
+        "ret\n");
 }
 
 static void mpx_pair(void) {
@@ -280,8 +365,12 @@ static void mpx_pair(void) {
     if (!(ebx & (1u << 14))) {
         return;
     }
-    __asm__ volatile("bndmov %0, %%bnd0" :: "m"(pair) : "memory");
-    __asm__ volatile("bndmov %%bnd0, %0" : "=m"(pair) : : "memory");
+    __asm__ volatile(".globl t02_bndmov_load\n"
+                     "t02_bndmov_load:\n"
+                     "bndmov %0, %%bnd0" :: "m"(pair) : "memory");
+    __asm__ volatile(".globl t02_bndmov_store\n"
+                     "t02_bndmov_store:\n"
+                     "bndmov %%bnd0, %0" : "=m"(pair) : : "memory");
     g_sink ^= pair[0] ^ pair[1];
 }
 
@@ -297,13 +386,18 @@ int main(void) {
     atomic_rmw64();
     paired_64();
     sse_stores();
+    if (maskmov_sparse() != 0) {
+        return 4;
+    }
     x87_stores();
     atomic_specials();
     special_simd();
     movbe_ops();
     x87_loads_and_state();
     descriptor_stores();
+    xsave_state();
     fxsave_state();
+    deep_enter();
     mpx_pair();
     return (int)(g_sink & 1);
 }

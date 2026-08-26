@@ -17,6 +17,7 @@
 
 #include "osprey.h"
 #include "osprey-internal.h"
+#include "sem-events.h"
 #include "provenance.h"
 /* Origin shadow register invalidation (defined below; used by the
  * stack hooks above). */
@@ -54,27 +55,54 @@ static bool eq_chunk(const OspreyChunk *a, const OspreyChunk *b) {
     return a->size == b->size && eq_addr(&a->address, &b->address);
 }
 
+static uint64_t fact_hash_mix(uint64_t hash, uint64_t value) {
+    return hash ^ (value + 0x9e3779b97f4a7c15ULL +
+                   (hash << 6) + (hash >> 2));
+}
+
 uint64_t osprey_access_hash(const OspreyAccessFact *f) {
     OspreyKey k = osprey_chunk_key(&f->chunk);
     k.tag = 0x414343ULL; /* "ACC" */
     k.w[3] = f->pc;
     k.w[4] = f->is_store;
+    k.w[5] = f->op_class;
+    k.w[6] = (uint64_t)f->chunk.address.offset;
+    k.w[7] = f->chunk.size;
     return osprey_key_hash(&k);
 }
 bool osprey_access_eq(const OspreyAccessFact *a, const OspreyAccessFact *b) {
     return a->pc == b->pc && a->is_store == b->is_store &&
+           a->op_class == b->op_class &&
            eq_chunk(&a->chunk, &b->chunk);
+}
+
+static bool access_fact_before(const OspreyAccessFact *a,
+                               const OspreyAccessFact *b) {
+#define CMP(_field) do { \
+        if (a->_field != b->_field) return a->_field < b->_field; \
+    } while (0)
+    CMP(pc);
+    CMP(is_store);
+    CMP(op_class);
+    CMP(chunk.address.region.kind);
+    CMP(chunk.address.region.site_offset);
+    CMP(chunk.address.offset);
+    CMP(chunk.size);
+#undef CMP
+    return false;
 }
 
 uint64_t osprey_base_hash(const OspreyBaseFact *f) {
     OspreyKey k = osprey_chunk_key(&f->chunk);
     k.tag = 0x425345ULL; /* "BSE" */
-    k.w[3] = f->pc;
-    k.w[4] = (uint64_t)f->base.offset;
-    k.w[5] = (uint64_t)f->base.region.kind;
-    k.w[6] = f->base.region.site_offset;
-    k.w[7] = f->prov_object_id;
-    return osprey_key_hash(&k);
+    uint64_t hash = osprey_key_hash(&k);
+    hash = fact_hash_mix(hash, f->pc);
+    hash = fact_hash_mix(hash, (uint64_t)f->base.offset);
+    hash = fact_hash_mix(hash, (uint64_t)f->base.region.kind);
+    hash = fact_hash_mix(hash, f->base.region.site_offset);
+    hash = fact_hash_mix(hash, f->prov_object_id);
+    hash = fact_hash_mix(hash, f->prov_generation);
+    return hash;
 }
 bool osprey_base_eq(const OspreyBaseFact *a, const OspreyBaseFact *b) {
     return a->pc == b->pc && eq_chunk(&a->chunk, &b->chunk) &&
@@ -86,11 +114,13 @@ bool osprey_base_eq(const OspreyBaseFact *a, const OspreyBaseFact *b) {
 uint64_t osprey_copy_hash(const OspreyCopyFact *f) {
     OspreyKey k = osprey_chunk_key(&f->source);
     k.tag = 0x435059ULL; /* "CPY" */
-    k.w[3] = (uint64_t)f->destination.address.offset;
-    k.w[4] = f->destination.size;
-    k.w[5] = (uint64_t)f->destination.address.region.kind;
-    k.w[6] = f->destination.address.region.site_offset;
-    return osprey_key_hash(&k);
+    uint64_t hash = osprey_key_hash(&k);
+    hash = fact_hash_mix(hash,
+                         (uint64_t)f->destination.address.region.kind);
+    hash = fact_hash_mix(hash, f->destination.address.region.site_offset);
+    hash = fact_hash_mix(hash, (uint64_t)f->destination.address.offset);
+    hash = fact_hash_mix(hash, f->destination.size);
+    return hash;
 }
 bool osprey_copy_eq(const OspreyCopyFact *a, const OspreyCopyFact *b) {
     return eq_chunk(&a->source, &b->source) &&
@@ -100,10 +130,11 @@ bool osprey_copy_eq(const OspreyCopyFact *a, const OspreyCopyFact *b) {
 uint64_t osprey_points_hash(const OspreyPointsToFact *f) {
     OspreyKey k = osprey_chunk_key(&f->pointer_chunk);
     k.tag = 0x504E54ULL; /* "PNT" */
-    k.w[3] = (uint64_t)f->target.offset;
-    k.w[4] = (uint64_t)f->target.region.kind;
-    k.w[5] = f->target.region.site_offset;
-    return osprey_key_hash(&k);
+    uint64_t hash = osprey_key_hash(&k);
+    hash = fact_hash_mix(hash, (uint64_t)f->target.region.kind);
+    hash = fact_hash_mix(hash, f->target.region.site_offset);
+    hash = fact_hash_mix(hash, (uint64_t)f->target.offset);
+    return hash;
 }
 bool osprey_points_eq(const OspreyPointsToFact *a, const OspreyPointsToFact *b) {
     return eq_chunk(&a->pointer_chunk, &b->pointer_chunk) &&
@@ -1426,7 +1457,8 @@ void osprey_on_free_identity(CPUArchState *env, uint64_t object_id,
 /* ------------------------------------------------------------------ */
 
 static void record_access_fact(OspreySharedRun *run, uint64_t pc,
-                               const OspreyChunk *chunk, int is_store) {
+                               const OspreyChunk *chunk, int is_store,
+                               uint32_t op_class) {
     if (run == NULL) return;
     OspreyAccessFact fact;
     memset(&fact, 0, sizeof(fact));
@@ -1435,6 +1467,7 @@ static void record_access_fact(OspreySharedRun *run, uint64_t pc,
     fact.dynamic_count = 1;
     fact.sample_support = 1;
     fact.is_store = (uint8_t)(is_store != 0);
+    fact.op_class = (uint8_t)op_class;
     qemu_mutex_lock(&g_shared_mutex);
     osprey_table_insert_access(run, &fact);
     qemu_mutex_unlock(&g_shared_mutex);
@@ -1490,9 +1523,28 @@ static void record_points_to(CPUArchState *env, target_ulong addr,
 
 void osprey_on_mem_access(CPUArchState *env, target_ulong addr,
                           uint64_t size, uint64_t pc, uint32_t is_store) {
+    osprey_on_mem_access_class(env, addr, size, pc, is_store,
+                               0); /* SEM_OP_INTEGER */
+}
+
+void osprey_on_mem_access_class(CPUArchState *env, target_ulong addr,
+                                uint64_t size, uint64_t pc,
+                                uint32_t is_store, uint32_t op_class) {
     OspreyCpuOriginState *st = osprey_cpu_origin(env);
+    if (op_class >= SEM_OP_CLASS_COUNT ||
+        !sem_op_class_valid[op_class]) {
+        st->pending_helper_count = 0;
+        st->ea_valid = false;
+        st->ea_mode = 0;
+        return;
+    }
     OspreySharedRun *run = g_shared_run;
-    if (run == NULL) return;
+    if (run == NULL) {
+        st->pending_helper_count = 0;
+        st->ea_valid = false;
+        st->ea_mode = 0;
+        return;
+    }
 
     /* Normalize the PC against the main image base; facts from
      * out-of-image code (libraries, interpreter) are not part of the
@@ -1528,7 +1580,7 @@ void osprey_on_mem_access(CPUArchState *env, target_ulong addr,
         chunk.address.offset = off;
         chunk.size = size;
 
-        record_access_fact(run, pc, &chunk, is_store != 0);
+        record_access_fact(run, pc, &chunk, is_store != 0, op_class);
 
         /* F02 BaseAddr: emit only when the EA decomposition proves the
          * base relationship: the base register carries a valid ADDRESS
@@ -2401,29 +2453,7 @@ void osprey_dump_canonical(OspreyContext *ctx, const char *path) {
             while (j > 0) {
                 OspreyAccessFact *prev = &g_array_index(rows,
                                                         OspreyAccessFact, j - 1);
-                if (prev->pc < key.pc ||
-                    (prev->pc == key.pc && prev->is_store < key.is_store) ||
-                    (prev->pc == key.pc && prev->is_store == key.is_store &&
-                     prev->chunk.address.region.kind <
-                         key.chunk.address.region.kind) ||
-                    (prev->pc == key.pc && prev->is_store == key.is_store &&
-                     prev->chunk.address.region.kind ==
-                         key.chunk.address.region.kind &&
-                     prev->chunk.address.region.site_offset <
-                         key.chunk.address.region.site_offset) ||
-                    (prev->pc == key.pc && prev->is_store == key.is_store &&
-                     prev->chunk.address.region.kind ==
-                         key.chunk.address.region.kind &&
-                     prev->chunk.address.region.site_offset ==
-                         key.chunk.address.region.site_offset &&
-                     prev->chunk.address.offset < key.chunk.address.offset) ||
-                    (prev->pc == key.pc && prev->is_store == key.is_store &&
-                     prev->chunk.address.region.kind ==
-                         key.chunk.address.region.kind &&
-                     prev->chunk.address.region.site_offset ==
-                         key.chunk.address.region.site_offset &&
-                     prev->chunk.address.offset == key.chunk.address.offset &&
-                     prev->chunk.size < key.chunk.size)) {
+                if (access_fact_before(prev, &key)) {
                     break;
                 }
                 g_array_index(rows, OspreyAccessFact, j) = *prev;
@@ -2433,13 +2463,26 @@ void osprey_dump_canonical(OspreyContext *ctx, const char *path) {
         }
         for (guint i = 0; i < rows->len; i++) {
             OspreyAccessFact *a = &g_array_index(rows, OspreyAccessFact, i);
-            fprintf(f, "access %llx %u %u %llx %llx %llu %u\n",
-                    (unsigned long long)a->pc, (unsigned)a->is_store,
-                    (unsigned)a->chunk.address.region.kind,
-                    (unsigned long long)a->chunk.address.region.site_offset,
-                    (unsigned long long)a->chunk.address.offset,
-                    (unsigned long long)a->chunk.size,
-                    (unsigned)a->sample_support);
+            if (a->op_class == 0) {
+                /* Keep the canonical integer-row format byte-compatible
+                 * with the accepted Stage-1 dump.  Non-integer rows carry
+                 * the new trailing class field below. */
+                fprintf(f, "access %llx %u %u %llx %llx %llu %u\n",
+                        (unsigned long long)a->pc, (unsigned)a->is_store,
+                        (unsigned)a->chunk.address.region.kind,
+                        (unsigned long long)a->chunk.address.region.site_offset,
+                        (unsigned long long)a->chunk.address.offset,
+                        (unsigned long long)a->chunk.size,
+                        (unsigned)a->sample_support);
+            } else {
+                fprintf(f, "access %llx %u %u %llx %llx %llu %u %u\n",
+                        (unsigned long long)a->pc, (unsigned)a->is_store,
+                        (unsigned)a->chunk.address.region.kind,
+                        (unsigned long long)a->chunk.address.region.site_offset,
+                        (unsigned long long)a->chunk.address.offset,
+                        (unsigned long long)a->chunk.size,
+                        (unsigned)a->sample_support, (unsigned)a->op_class);
+            }
         }
         g_array_free(rows, TRUE);
     }

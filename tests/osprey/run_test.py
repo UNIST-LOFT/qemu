@@ -19,6 +19,7 @@ Usage:
 """
 
 import argparse
+from collections import Counter
 import os
 import random
 import re
@@ -117,6 +118,7 @@ TESTS = [
         # Exercise the OSPREY consumer without provenance.  The shared
         # translator dispatch must not depend on memcheck being enabled.
         memcheck=0,
+        qemu_args=["-cpu", "qemu64,+xsave,+xsaveopt,+mpx"],
         dump_stem="t02_dump",
         expected="t02_chunk_widths.expected",
         rc=(2,),
@@ -124,15 +126,17 @@ TESTS = [
         # (t02_chunk_widths.expected), byte-identical across three PIE
         # load biases.  The fixture forces selected integer, atomic, paired,
         # SIMD, x87, descriptor, MXCSR, and FXSAVE/FXRSTOR producers.
-        # MOVBE/SSE4.1/MPX instructions are CPUID-gated; MPX can still be
-        # disabled by guest state and therefore is not an acceptance proof.
-        # Width assertions below own the cross-row invariants.
+        # The explicit qemu64 feature set makes XSAVE/XSAVEOPT deterministic
+        # without enabling unrelated SSE4 paths unsupported by the symbolic
+        # engine.  MPX is advertised but remains disabled by guest state; its
+        # labeled BNDMOV operations must therefore stay absent.
         dump_assert={
             "access_symbols_absent": [
                 "t02_fault_store", "t02_fault_paired_store",
+                "t02_bndmov_load", "t02_bndmov_store",
             ],
             "access_widths_allowed": [
-                1, 2, 4, 8, 10, 16, 28, 108, 512,
+                1, 2, 4, 6, 8, 10, 16, 24, 28, 64, 108, 128, 256,
             ],
             "access_widths_min": {
                 1: 1,    # byte store
@@ -144,7 +148,51 @@ TESTS = [
                 16: 1,   # movaps 128-bit
                 28: 1,   # fnstenv (64-bit operand)
                 108: 1,  # fnsave (64-bit operand)
-                512: 2,  # fxsave + fxrstor
+                6: 2,    # x87 control fields in FXSAVE/FXRSTOR
+                256: 2,  # FXSAVE + FXRSTOR XMM state
+            },
+            "access_classes_min": {0: 1, 1: 1, 2: 1, 3: 1, 4: 1},
+            "access_symbols_expected": {
+                "t02_maskmov": {
+                    "class": 1, "is_store": 1, "size": 1,
+                    "min_rows": 4, "max_rows": 4,
+                },
+                "t02_deep_enter": {
+                    "class": 0, "size": 8,
+                    "direction_counts": {0: 30, 1: 32},
+                    "min_rows": 62, "max_rows": 62,
+                },
+                "t02_fxsave": {
+                    "class": 4,
+                    "sizes": {6: 1, 8: 1, 10: 8, 16: 1, 256: 1},
+                    "direction_counts": {1: 12},
+                    "min_rows": 12, "max_rows": 12,
+                },
+                "t02_fxrstor": {
+                    "class": 4,
+                    "sizes": {4: 1, 6: 1, 10: 8, 16: 1, 256: 1},
+                    "direction_counts": {0: 12},
+                    "min_rows": 12, "max_rows": 12,
+                },
+                "t02_xsave": {
+                    "class": 4,
+                    "sizes": {6: 1, 8: 3, 10: 8, 16: 1, 256: 1},
+                    "direction_counts": {0: 1, 1: 13},
+                    "min_rows": 14, "max_rows": 14,
+                },
+                "t02_xsaveopt": {
+                    "class": 4,
+                    "sizes": {6: 1, 8: 3, 10: 8, 16: 1, 256: 1},
+                    "direction_counts": {0: 1, 1: 13},
+                    "min_rows": 14, "max_rows": 14,
+                },
+                "t02_xrstor": {
+                    "class": 4,
+                    "sizes": {4: 1, 6: 1, 10: 8, 16: 1, 24: 1,
+                              256: 1},
+                    "direction_counts": {0: 13},
+                    "min_rows": 13, "max_rows": 13,
+                },
             },
         },
         timeout=60,
@@ -156,19 +204,64 @@ TESTS = [
         # The same exact F01 matrix must remain stable when provenance and
         # OSPREY consume the neutral events together.
         memcheck=1,
+        qemu_args=["-cpu", "qemu64,+xsave,+xsaveopt,+mpx"],
         dump_stem="t02_combined_dump",
         expected="t02_chunk_widths.expected",
         rc=(2,),
         dump_assert={
             "access_symbols_absent": [
                 "t02_fault_store", "t02_fault_paired_store",
+                "t02_bndmov_load", "t02_bndmov_store",
             ],
             "access_widths_allowed": [
-                1, 2, 4, 8, 10, 16, 28, 108, 512,
+                1, 2, 4, 6, 8, 10, 16, 24, 28, 64, 108, 128, 256,
             ],
             "access_widths_min": {
-                1: 1, 2: 1, 4: 3, 8: 4, 10: 2, 16: 1,
-                28: 1, 108: 1, 512: 2,
+                1: 1, 2: 1, 4: 3, 6: 2, 8: 4, 10: 2, 16: 1,
+                28: 1, 108: 1, 256: 2,
+            },
+            "access_classes_min": {0: 1, 1: 1, 2: 1, 3: 1, 4: 1},
+            "access_symbols_expected": {
+                "t02_maskmov": {
+                    "class": 1, "is_store": 1, "size": 1,
+                    "min_rows": 4, "max_rows": 4,
+                },
+                "t02_deep_enter": {
+                    "class": 0, "size": 8,
+                    "direction_counts": {0: 30, 1: 32},
+                    "min_rows": 62, "max_rows": 62,
+                },
+                "t02_fxsave": {
+                    "class": 4,
+                    "sizes": {6: 1, 8: 1, 10: 8, 16: 1, 256: 1},
+                    "direction_counts": {1: 12},
+                    "min_rows": 12, "max_rows": 12,
+                },
+                "t02_fxrstor": {
+                    "class": 4,
+                    "sizes": {4: 1, 6: 1, 10: 8, 16: 1, 256: 1},
+                    "direction_counts": {0: 12},
+                    "min_rows": 12, "max_rows": 12,
+                },
+                "t02_xsave": {
+                    "class": 4,
+                    "sizes": {6: 1, 8: 3, 10: 8, 16: 1, 256: 1},
+                    "direction_counts": {0: 1, 1: 13},
+                    "min_rows": 14, "max_rows": 14,
+                },
+                "t02_xsaveopt": {
+                    "class": 4,
+                    "sizes": {6: 1, 8: 3, 10: 8, 16: 1, 256: 1},
+                    "direction_counts": {0: 1, 1: 13},
+                    "min_rows": 14, "max_rows": 14,
+                },
+                "t02_xrstor": {
+                    "class": 4,
+                    "sizes": {4: 1, 6: 1, 10: 8, 16: 1, 24: 1,
+                              256: 1},
+                    "direction_counts": {0: 13},
+                    "min_rows": 13, "max_rows": 13,
+                },
             },
         },
         timeout=60,
@@ -215,6 +308,22 @@ def resolve_symbol(guest, symbol):
         if len(parts) == 3 and parts[2] == symbol:
             return int(parts[0], 16)
     raise RuntimeError(f"no {symbol!r} symbol in {guest}")
+
+
+def resolve_access_symbol(guest, symbol):
+    """Map a linked text symbol to the tracer's image-relative PC."""
+    text_base = None
+    readelf = subprocess.run(["readelf", "-lW", guest],
+                             capture_output=True, text=True)
+    for line in readelf.stdout.splitlines():
+        parts = line.split()
+        if (len(parts) >= 7 and parts[0] == "LOAD" and
+                "E" in parts[6:-1]):
+            text_base = int(parts[2], 16)
+            break
+    if text_base is None:
+        raise RuntimeError(f"no executable LOAD segment in {guest}")
+    return resolve_symbol(guest, symbol) - text_base
 
 
 def resolve_entrypoint(guest):
@@ -288,7 +397,7 @@ def run_binradar(test, guest, qemu, solver_bin, workdir):
         stderr_path = os.path.join(run_dir, "tracer.stderr")
         stderr_fh = open(stderr_path, "w")
         proc = subprocess.Popen(
-            [qemu, "-symbolic", guest],
+            [qemu, *test.get("qemu_args", []), "-symbolic", guest],
             env=env, pass_fds=(ctrl_r, stat_w, patch_r),
             stdout=subprocess.DEVNULL, stderr=stderr_fh,
             start_new_session=True,
@@ -524,16 +633,69 @@ def check_dump(test, dump, guest):
                 problems.append(
                     f"access facts of width {w}: {got[w]} < {n}")
 
+    access_rows = [ln.split() for ln in dump.splitlines()
+                   if ln.startswith("access ")]
+    if "access_classes_min" in want:
+        classes = Counter(int(row[8]) if len(row) > 8 else 0
+                          for row in access_rows)
+        for cls, n in want["access_classes_min"].items():
+            if classes[cls] < n:
+                problems.append(
+                    f"access facts of class {cls}: {classes[cls]} < {n}")
+
     access_pcs = {
         int(fields[1], 16)
         for fields in (ln.split() for ln in dump.splitlines())
         if fields and fields[0] == "access"
     }
     for symbol in want.get("access_symbols_absent", []):
-        pc = resolve_symbol(guest, symbol)
+        pc = resolve_access_symbol(guest, symbol)
         if pc in access_pcs:
             problems.append(
-                f"faulting access symbol {symbol} unexpectedly recorded at {pc:x}")
+                f"access symbol {symbol} unexpectedly recorded at {pc:x}")
+    for symbol, policy in want.get("access_symbols_expected", {}).items():
+        pc = resolve_access_symbol(guest, symbol)
+        rows = [row for row in access_rows if int(row[1], 16) == pc]
+        if len(rows) < policy.get("min_rows", 1):
+            problems.append(
+                f"access symbol {symbol} rows {len(rows)} < "
+                f"{policy.get('min_rows', 1)}")
+        for row in rows:
+            row_class = int(row[8]) if len(row) > 8 else 0
+            if "class" in policy and row_class != policy["class"]:
+                problems.append(
+                    f"access symbol {symbol} class {row_class} != "
+                    f"{policy['class']}")
+            if "is_store" in policy and int(row[2]) != policy["is_store"]:
+                problems.append(
+                    f"access symbol {symbol} direction {row[2]} != "
+                    f"{policy['is_store']}")
+            if "directions" in policy and int(row[2]) not in policy["directions"]:
+                problems.append(
+                    f"access symbol {symbol} direction {row[2]} not in "
+                    f"{sorted(policy['directions'])}")
+            if "size" in policy and int(row[6]) != policy["size"]:
+                problems.append(
+                    f"access symbol {symbol} size {row[6]} != "
+                    f"{policy['size']}")
+        if "max_rows" in policy and len(rows) > policy["max_rows"]:
+            problems.append(
+                f"access symbol {symbol} rows {len(rows)} > "
+                f"{policy['max_rows']}")
+        if "direction_counts" in policy:
+            directions = Counter(int(row[2]) for row in rows)
+            expected = Counter(policy["direction_counts"])
+            if directions != expected:
+                problems.append(
+                    f"access symbol {symbol} direction counts "
+                    f"{dict(directions)} != {dict(expected)}")
+        if "sizes" in policy:
+            sizes = Counter(int(row[6]) for row in rows)
+            expected = Counter(policy["sizes"])
+            if sizes != expected:
+                problems.append(
+                    f"access symbol {symbol} sizes {dict(sizes)} != "
+                    f"{dict(expected)}")
     return problems
 
 

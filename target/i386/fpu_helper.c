@@ -18,6 +18,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "../../linux-user/sem-events.h"
 #include <math.h>
 #include "cpu.h"
 #include "exec/helper-proto.h"
@@ -81,12 +82,14 @@ static inline floatx80 helper_fldt(CPUX86State *env, target_ulong ptr,
 }
 
 static inline void helper_fstt(CPUX86State *env, floatx80 f, target_ulong ptr,
-                               uintptr_t retaddr)
+                               uintptr_t retaddr, SemOpClass cls)
 {
     CPU_LDoubleU temp;
 
     temp.d = f;
+    sem_mem_overwrite(ptr, 8, cls);
     cpu_stq_data_ra(env, ptr, temp.l.lower, retaddr);
+    sem_mem_overwrite(ptr + 8, 2, cls);
     cpu_stw_data_ra(env, ptr + 8, temp.l.upper, retaddr);
 }
 
@@ -319,7 +322,7 @@ void helper_fldt_ST0(CPUX86State *env, target_ulong ptr)
 
 void helper_fstt_ST0(CPUX86State *env, target_ulong ptr)
 {
-    helper_fstt(env, ST0, ptr, GETPC());
+    helper_fstt(env, ST0, ptr, GETPC(), SEM_OP_X87_HELPER);
 }
 
 void helper_fpush(CPUX86State *env)
@@ -653,9 +656,11 @@ void helper_fbst_ST0(CPUX86State *env, target_ulong ptr)
     mem_ref = ptr;
     mem_end = mem_ref + 9;
     if (val < 0) {
+        sem_mem_overwrite(mem_end, 1, SEM_OP_X87_HELPER);
         cpu_stb_data_ra(env, mem_end, 0x80, GETPC());
         val = -val;
     } else {
+        sem_mem_overwrite(mem_end, 1, SEM_OP_X87_HELPER);
         cpu_stb_data_ra(env, mem_end, 0x00, GETPC());
     }
     while (mem_ref < mem_end) {
@@ -665,9 +670,11 @@ void helper_fbst_ST0(CPUX86State *env, target_ulong ptr)
         v = val % 100;
         val = val / 100;
         v = ((v / 10) << 4) | (v % 10);
+        sem_mem_overwrite(mem_ref, 1, SEM_OP_X87_HELPER);
         cpu_stb_data_ra(env, mem_ref++, v, GETPC());
     }
     while (mem_ref < mem_end) {
+        sem_mem_overwrite(mem_ref, 1, SEM_OP_X87_HELPER);
         cpu_stb_data_ra(env, mem_ref++, 0, GETPC());
     }
 }
@@ -1005,21 +1012,35 @@ static void do_fstenv(CPUX86State *env, target_ulong ptr, int data32,
     }
     if (data32) {
         /* 32 bit */
+        sem_mem_overwrite(ptr, 4, SEM_OP_X87_HELPER);
         cpu_stl_data_ra(env, ptr, env->fpuc, retaddr);
+        sem_mem_overwrite(ptr + 4, 4, SEM_OP_X87_HELPER);
         cpu_stl_data_ra(env, ptr + 4, fpus, retaddr);
+        sem_mem_overwrite(ptr + 8, 4, SEM_OP_X87_HELPER);
         cpu_stl_data_ra(env, ptr + 8, fptag, retaddr);
+        sem_mem_overwrite(ptr + 12, 4, SEM_OP_X87_HELPER);
         cpu_stl_data_ra(env, ptr + 12, 0, retaddr); /* fpip */
+        sem_mem_overwrite(ptr + 16, 4, SEM_OP_X87_HELPER);
         cpu_stl_data_ra(env, ptr + 16, 0, retaddr); /* fpcs */
+        sem_mem_overwrite(ptr + 20, 4, SEM_OP_X87_HELPER);
         cpu_stl_data_ra(env, ptr + 20, 0, retaddr); /* fpoo */
+        sem_mem_overwrite(ptr + 24, 4, SEM_OP_X87_HELPER);
         cpu_stl_data_ra(env, ptr + 24, 0, retaddr); /* fpos */
     } else {
         /* 16 bit */
+        sem_mem_overwrite(ptr, 2, SEM_OP_X87_HELPER);
         cpu_stw_data_ra(env, ptr, env->fpuc, retaddr);
+        sem_mem_overwrite(ptr + 2, 2, SEM_OP_X87_HELPER);
         cpu_stw_data_ra(env, ptr + 2, fpus, retaddr);
+        sem_mem_overwrite(ptr + 4, 2, SEM_OP_X87_HELPER);
         cpu_stw_data_ra(env, ptr + 4, fptag, retaddr);
+        sem_mem_overwrite(ptr + 6, 2, SEM_OP_X87_HELPER);
         cpu_stw_data_ra(env, ptr + 6, 0, retaddr);
+        sem_mem_overwrite(ptr + 8, 2, SEM_OP_X87_HELPER);
         cpu_stw_data_ra(env, ptr + 8, 0, retaddr);
+        sem_mem_overwrite(ptr + 10, 2, SEM_OP_X87_HELPER);
         cpu_stw_data_ra(env, ptr + 10, 0, retaddr);
+        sem_mem_overwrite(ptr + 12, 2, SEM_OP_X87_HELPER);
         cpu_stw_data_ra(env, ptr + 12, 0, retaddr);
     }
 }
@@ -1066,7 +1087,7 @@ void helper_fsave(CPUX86State *env, target_ulong ptr, int data32)
     ptr += (14 << data32);
     for (i = 0; i < 8; i++) {
         tmp = ST(i);
-        helper_fstt(env, tmp, ptr, GETPC());
+        helper_fstt(env, tmp, ptr, GETPC(), SEM_OP_X87_HELPER);
         ptr += 10;
     }
 
@@ -1113,6 +1134,106 @@ void cpu_x86_frstor(CPUX86State *env, target_ulong ptr, int data32)
 
 #define XO(X)  offsetof(X86XSaveArea, X)
 
+typedef struct SemXsaveInterval {
+    size_t offset;
+    size_t size;
+    bool is_store;
+} SemXsaveInterval;
+
+static void sem_xsave_publish(CPUX86State *env, target_ulong ptr,
+                              uint64_t rfbm, uint64_t opt_mask,
+                              uint64_t xstate_bv, target_ulong pc,
+                              bool is_store, bool xsave_format,
+                              bool restore, bool publish_f01) {
+    if (!sem_events_active()) {
+        return;
+    }
+    SemXsaveInterval intervals[32];
+    size_t count = 0;
+    int nb_xmm = (env->hflags & HF_CS64_MASK) ? 16 : 8;
+    bool fx_sse = (env->cr[4] & CR4_OSFXSR_MASK) != 0;
+    bool fx_sse_regs = fx_sse &&
+        (!(env->efer & MSR_EFER_FFXSR) ||
+         (env->hflags & HF_CPL_MASK) || !(env->hflags & HF_LMA_MASK));
+
+#define ADD_INTERVAL(_offset, _size, _is_store) do { \
+        intervals[count].offset = (_offset); \
+        intervals[count].size = (_size); \
+        intervals[count].is_store = (_is_store); \
+        count++; \
+    } while (0)
+
+    if (xsave_format && restore) {
+        /* XRSTOR validates exactly these three header qwords before any
+         * selected component access. */
+        ADD_INTERVAL(XO(header.xstate_bv), 24, false);
+    }
+
+    bool fp = !xsave_format ? true :
+              ((rfbm & XSTATE_FP_MASK) &&
+               (!restore ? (opt_mask & XSTATE_FP_MASK) :
+                (xstate_bv & XSTATE_FP_MASK)));
+    bool sse = !xsave_format ? fx_sse_regs :
+               ((rfbm & XSTATE_SSE_MASK) &&
+                (!restore ? (opt_mask & XSTATE_SSE_MASK) :
+                 (xstate_bv & XSTATE_SSE_MASK)));
+    if (fp) {
+        ADD_INTERVAL(XO(legacy.fcw), 6, is_store);
+        ADD_INTERVAL(XO(legacy.fpip), 16, is_store);
+        for (int i = 0; i < 8; i++) {
+            ADD_INTERVAL(XO(legacy.fpregs) + i * sizeof(FPReg),
+                         10, is_store);
+        }
+    }
+    if ((!xsave_format && fx_sse) ||
+        (xsave_format && (rfbm & XSTATE_SSE_MASK))) {
+        /* MXCSR is saved/restored whenever SSE is selected.  XSAVEOPT
+         * suppresses XMM data, not the MXCSR pair. */
+        ADD_INTERVAL(XO(legacy.mxcsr), is_store ? 8 : 4, is_store);
+    }
+    if (sse) {
+        ADD_INTERVAL(XO(legacy.xmm_regs), (size_t)nb_xmm * 16, is_store);
+    }
+
+    if (xsave_format && !restore) {
+        if (opt_mask & XSTATE_BNDREGS_MASK) {
+            ADD_INTERVAL(XO(bndreg_state), sizeof(XSaveBNDREG), true);
+        }
+        if (opt_mask & XSTATE_BNDCSR_MASK) {
+            ADD_INTERVAL(XO(bndcsr_state), 16, true);
+        }
+        if (opt_mask & XSTATE_PKRU_MASK) {
+            ADD_INTERVAL(XO(pkru_state), sizeof(uint64_t), true);
+        }
+        /* XSAVE reads the old XSTATE_BV immediately before its final write. */
+        ADD_INTERVAL(XO(header.xstate_bv), sizeof(uint64_t), false);
+        ADD_INTERVAL(XO(header.xstate_bv), sizeof(uint64_t), true);
+    } else if (xsave_format && restore) {
+        if ((rfbm & XSTATE_BNDREGS_MASK) &&
+            (xstate_bv & XSTATE_BNDREGS_MASK)) {
+            ADD_INTERVAL(XO(bndreg_state), sizeof(XSaveBNDREG), false);
+        }
+        if ((rfbm & XSTATE_BNDCSR_MASK) &&
+            (xstate_bv & XSTATE_BNDCSR_MASK)) {
+            ADD_INTERVAL(XO(bndcsr_state), 16, false);
+        }
+        if ((rfbm & XSTATE_PKRU_MASK) &&
+            (xstate_bv & XSTATE_PKRU_MASK)) {
+            ADD_INTERVAL(XO(pkru_state), sizeof(uint64_t), false);
+        }
+    }
+
+    for (size_t i = 0; i < count; i++) {
+        target_ulong addr = ptr + intervals[i].offset;
+        if (publish_f01) {
+            sem_mem_helper_access_part(env, addr, intervals[i].size, pc,
+                                       intervals[i].is_store, SEM_OP_PAIRED,
+                                       i + 1 == count);
+        }
+    }
+#undef ADD_INTERVAL
+}
+
 static void do_xsave_fpu(CPUX86State *env, target_ulong ptr, uintptr_t ra)
 {
     int fpus, fptag, i;
@@ -1124,27 +1245,34 @@ static void do_xsave_fpu(CPUX86State *env, target_ulong ptr, uintptr_t ra)
         fptag |= (env->fptags[i] << i);
     }
 
+    sem_mem_overwrite(ptr + XO(legacy.fcw), 2, SEM_OP_PAIRED);
     cpu_stw_data_ra(env, ptr + XO(legacy.fcw), env->fpuc, ra);
+    sem_mem_overwrite(ptr + XO(legacy.fsw), 2, SEM_OP_PAIRED);
     cpu_stw_data_ra(env, ptr + XO(legacy.fsw), fpus, ra);
+    sem_mem_overwrite(ptr + XO(legacy.ftw), 2, SEM_OP_PAIRED);
     cpu_stw_data_ra(env, ptr + XO(legacy.ftw), fptag ^ 0xff, ra);
 
     /* In 32-bit mode this is eip, sel, dp, sel.
        In 64-bit mode this is rip, rdp.
        But in either case we don't write actual data, just zeros.  */
+    sem_mem_overwrite(ptr + XO(legacy.fpip), 8, SEM_OP_PAIRED);
     cpu_stq_data_ra(env, ptr + XO(legacy.fpip), 0, ra); /* eip+sel; rip */
+    sem_mem_overwrite(ptr + XO(legacy.fpdp), 8, SEM_OP_PAIRED);
     cpu_stq_data_ra(env, ptr + XO(legacy.fpdp), 0, ra); /* edp+sel; rdp */
 
     addr = ptr + XO(legacy.fpregs);
     for (i = 0; i < 8; i++) {
         floatx80 tmp = ST(i);
-        helper_fstt(env, tmp, addr, ra);
+        helper_fstt(env, tmp, addr, ra, SEM_OP_PAIRED);
         addr += 16;
     }
 }
 
 static void do_xsave_mxcsr(CPUX86State *env, target_ulong ptr, uintptr_t ra)
 {
+    sem_mem_overwrite(ptr + XO(legacy.mxcsr), 4, SEM_OP_PAIRED);
     cpu_stl_data_ra(env, ptr + XO(legacy.mxcsr), env->mxcsr, ra);
+    sem_mem_overwrite(ptr + XO(legacy.mxcsr_mask), 4, SEM_OP_PAIRED);
     cpu_stl_data_ra(env, ptr + XO(legacy.mxcsr_mask), 0x0000ffff, ra);
 }
 
@@ -1161,7 +1289,9 @@ static void do_xsave_sse(CPUX86State *env, target_ulong ptr, uintptr_t ra)
 
     addr = ptr + XO(legacy.xmm_regs);
     for (i = 0; i < nb_xmm_regs; i++) {
+        sem_mem_overwrite(addr, 8, SEM_OP_PAIRED);
         cpu_stq_data_ra(env, addr, env->xmm_regs[i].ZMM_Q(0), ra);
+        sem_mem_overwrite(addr + 8, 8, SEM_OP_PAIRED);
         cpu_stq_data_ra(env, addr + 8, env->xmm_regs[i].ZMM_Q(1), ra);
         addr += 16;
     }
@@ -1173,25 +1303,32 @@ static void do_xsave_bndregs(CPUX86State *env, target_ulong ptr, uintptr_t ra)
     int i;
 
     for (i = 0; i < 4; i++, addr += 16) {
+        sem_mem_overwrite(addr, 8, SEM_OP_PAIRED);
         cpu_stq_data_ra(env, addr, env->bnd_regs[i].lb, ra);
+        sem_mem_overwrite(addr + 8, 8, SEM_OP_PAIRED);
         cpu_stq_data_ra(env, addr + 8, env->bnd_regs[i].ub, ra);
     }
 }
 
 static void do_xsave_bndcsr(CPUX86State *env, target_ulong ptr, uintptr_t ra)
 {
+    sem_mem_overwrite(ptr + offsetof(XSaveBNDCSR, bndcsr.cfgu), 8,
+                      SEM_OP_PAIRED);
     cpu_stq_data_ra(env, ptr + offsetof(XSaveBNDCSR, bndcsr.cfgu),
                     env->bndcs_regs.cfgu, ra);
+    sem_mem_overwrite(ptr + offsetof(XSaveBNDCSR, bndcsr.sts), 8,
+                      SEM_OP_PAIRED);
     cpu_stq_data_ra(env, ptr + offsetof(XSaveBNDCSR, bndcsr.sts),
                     env->bndcs_regs.sts, ra);
 }
 
 static void do_xsave_pkru(CPUX86State *env, target_ulong ptr, uintptr_t ra)
 {
+    sem_mem_overwrite(ptr, 8, SEM_OP_PAIRED);
     cpu_stq_data_ra(env, ptr, env->pkru, ra);
 }
 
-void helper_fxsave(CPUX86State *env, target_ulong ptr)
+void helper_fxsave(CPUX86State *env, target_ulong ptr, target_ulong pc)
 {
     uintptr_t ra = GETPC();
 
@@ -1211,6 +1348,9 @@ void helper_fxsave(CPUX86State *env, target_ulong ptr)
             do_xsave_sse(env, ptr, ra);
         }
     }
+    sem_xsave_publish(env, ptr, XSTATE_FP_MASK | XSTATE_SSE_MASK,
+                      XSTATE_FP_MASK | XSTATE_SSE_MASK, 0, pc, true,
+                      false, false, true);
 }
 
 static uint64_t get_xinuse(CPUX86State *env)
@@ -1269,18 +1409,27 @@ static void do_xsave(CPUX86State *env, target_ulong ptr, uint64_t rfbm,
     /* Update the XSTATE_BV field.  */
     old_bv = cpu_ldq_data_ra(env, ptr + XO(header.xstate_bv), ra);
     new_bv = (old_bv & ~rfbm) | (inuse & rfbm);
+    sem_mem_overwrite(ptr + XO(header.xstate_bv), 8, SEM_OP_PAIRED);
     cpu_stq_data_ra(env, ptr + XO(header.xstate_bv), new_bv, ra);
 }
 
-void helper_xsave(CPUX86State *env, target_ulong ptr, uint64_t rfbm)
+void helper_xsave(CPUX86State *env, target_ulong ptr, uint64_t rfbm,
+                  target_ulong pc)
 {
+    uint64_t mask = rfbm & env->xcr0;
     do_xsave(env, ptr, rfbm, get_xinuse(env), -1, GETPC());
+    sem_xsave_publish(env, ptr, mask, mask, 0, pc, true, true, false,
+                      true);
 }
 
-void helper_xsaveopt(CPUX86State *env, target_ulong ptr, uint64_t rfbm)
+void helper_xsaveopt(CPUX86State *env, target_ulong ptr, uint64_t rfbm,
+                     target_ulong pc)
 {
     uint64_t inuse = get_xinuse(env);
+    uint64_t mask = rfbm & env->xcr0;
     do_xsave(env, ptr, rfbm, inuse, inuse, GETPC());
+    sem_xsave_publish(env, ptr, mask, mask & inuse, 0, pc, true, true,
+                      false, true);
 }
 
 static void do_xrstor_fpu(CPUX86State *env, target_ulong ptr, uintptr_t ra)
@@ -1356,7 +1505,7 @@ static void do_xrstor_pkru(CPUX86State *env, target_ulong ptr, uintptr_t ra)
     env->pkru = cpu_ldq_data_ra(env, ptr, ra);
 }
 
-void helper_fxrstor(CPUX86State *env, target_ulong ptr)
+void helper_fxrstor(CPUX86State *env, target_ulong ptr, target_ulong pc)
 {
     uintptr_t ra = GETPC();
 
@@ -1376,21 +1525,25 @@ void helper_fxrstor(CPUX86State *env, target_ulong ptr)
             do_xrstor_sse(env, ptr, ra);
         }
     }
+    sem_xsave_publish(env, ptr, XSTATE_FP_MASK | XSTATE_SSE_MASK,
+                      XSTATE_FP_MASK | XSTATE_SSE_MASK, 0, pc, false,
+                      false, true, true);
 }
 
 #if defined(CONFIG_USER_ONLY)
 void cpu_x86_fxsave(CPUX86State *env, target_ulong ptr)
 {
-    helper_fxsave(env, ptr);
+    helper_fxsave(env, ptr, 0);
 }
 
 void cpu_x86_fxrstor(CPUX86State *env, target_ulong ptr)
 {
-    helper_fxrstor(env, ptr);
+    helper_fxrstor(env, ptr, 0);
 }
 #endif
 
-void helper_xrstor(CPUX86State *env, target_ulong ptr, uint64_t rfbm)
+void helper_xrstor(CPUX86State *env, target_ulong ptr, uint64_t rfbm,
+                   target_ulong pc)
 {
     uintptr_t ra = GETPC();
     uint64_t xstate_bv, xcomp_bv, reserve0;
@@ -1481,6 +1634,8 @@ void helper_xrstor(CPUX86State *env, target_ulong ptr, uint64_t rfbm)
             tlb_flush(cs);
         }
     }
+    sem_xsave_publish(env, ptr, rfbm, 0, xstate_bv, pc, false, true, true,
+                      true);
 }
 
 #undef XO

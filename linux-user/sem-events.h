@@ -14,10 +14,11 @@
  * label their events.  The helper manifest below records the neutral TCG
  * surface; unit tests require the classified and emittable sets to match.
  * UNKNOWN-class runtime events are fail-closed: conservative invalidation,
- * never a recorded OSPREY fact.  Complete translator operation coverage
- * has a bounded source sanity check and an exact regression fixture.  The
- * follow-up Stage 2.2 audit records producer families those checks do not
- * inventory; later stages must not treat this table as coverage proof.
+ * never a recorded OSPREY fact.  The producer matrix and bounded source
+ * inventory sanity-check direct, atomic, helper-backed, function-pointer,
+ * and explicitly unsupported dynamic producer families.  The source check
+ * is bounded and does not replace control-flow or ordering review.  Multipart
+ * events are buffered until their final post-success constituent.
  */
 
 #include "qemu/osdep.h"
@@ -53,13 +54,19 @@ typedef enum SemIntervalPolicy {
     SEM_INTERVAL_PAIRED,
     SEM_INTERVAL_RAW,
     SEM_INTERVAL_MULTIPART,
+    SEM_INTERVAL_SPARSE,
+    SEM_INTERVAL_DYNAMIC,
+    SEM_INTERVAL_UNSUPPORTED,
 } SemIntervalPolicy;
 
 typedef struct SemProducerSpec {
     const char *producer;
     SemOpClass op_class;
     SemIntervalPolicy interval_policy;
-    uint32_t interval_width;
+    const uint32_t *interval_widths;
+    uint32_t interval_width_count;
+    bool supported;
+    const char *coverage;
 } SemProducerSpec;
 
 /* Class name + validity table (unit-testable manifest).  UNKNOWN is the
@@ -72,10 +79,11 @@ extern const bool sem_op_class_valid[SEM_OP_CLASS_COUNT];
  * the manifest.  Terminated by { NULL, 0 }. */
 extern const SemHelperClass sem_helper_class_table[];
 
-/* Declared Stage-2.2 producer-family matrix.  This is unit-checked for shape
- * but is not mechanically linked to translator/helper callsites.  MULTIPART
- * means constituent guest accesses are invalidated individually while one
- * aggregate interval is published only after the final access succeeds. */
+/* Declared Stage-2.2 producer-family matrix.  Fixed-width supported rows
+ * carry every legal interval width; DYNAMIC rows deliberately have no fixed
+ * list.  SPARSE and MULTIPART rows describe ordered interval policies rather
+ * than inventing a contiguous extent.  Unsupported rows are explicit and
+ * include a concrete coverage reason. */
 extern const SemProducerSpec sem_producer_table[];
 
 /* The exact set of helper names the translator is allowed to emit
@@ -109,6 +117,21 @@ void sem_mem_access(CPUArchState *env, target_ulong addr,
 void sem_mem_helper_access(CPUArchState *env, target_ulong addr,
                            target_ulong size, target_ulong pc,
                            bool is_store, SemOpClass cls);
+
+/* Publish one part of a helper-backed operation.  Parts are emitted only
+ * after the helper's complete architectural operation succeeds.  A false
+ * final_part preserves the instruction mode for the next ordered interval. */
+void sem_mem_helper_access_part(CPUArchState *env, target_ulong addr,
+                                target_ulong size, target_ulong pc,
+                                bool is_store, SemOpClass cls,
+                                bool final_part);
+
+/* MASKMOV writes only bytes whose mask MSB is set.  The helper publishes
+ * one-byte intervals only after the complete helper succeeds; no partial
+ * or contiguous full-width fact is invented for the sparse write. */
+void sem_mem_maskmov(CPUArchState *env, target_ulong addr,
+                     uint32_t selected_mask, uint32_t width,
+                     target_ulong pc, SemOpClass cls);
 
 /* Register overwrite (snapshot reg mutation).  Same fail-closed rule. */
 void sem_reg_overwrite(CPUArchState *env, int reg_idx, SemOpClass cls);

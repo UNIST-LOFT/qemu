@@ -35,7 +35,8 @@ void helper_bndck(CPUX86State *env, uint32_t fail)
     }
 }
 
-static uint64_t lookup_bte64(CPUX86State *env, uint64_t base, uintptr_t ra)
+static uint64_t lookup_bte64(CPUX86State *env, uint64_t base, uintptr_t ra,
+                             uint64_t *bde_out)
 {
     uint64_t bndcsr, bde, bt;
 
@@ -46,6 +47,7 @@ static uint64_t lookup_bte64(CPUX86State *env, uint64_t base, uintptr_t ra)
     }
 
     bde = (extract64(base, 20, 28) << 3) + (extract64(bndcsr, 20, 44) << 12);
+    *bde_out = bde;
     bt = cpu_ldq_data_ra(env, bde, ra);
     if ((bt & 1) == 0) {
         env->bndcs_regs.sts = bde | 2;
@@ -55,7 +57,8 @@ static uint64_t lookup_bte64(CPUX86State *env, uint64_t base, uintptr_t ra)
     return (extract64(base, 3, 17) << 5) + (bt & ~7);
 }
 
-static uint32_t lookup_bte32(CPUX86State *env, uint32_t base, uintptr_t ra)
+static uint32_t lookup_bte32(CPUX86State *env, uint32_t base, uintptr_t ra,
+                             uint32_t *bde_out)
 {
     uint32_t bndcsr, bde, bt;
 
@@ -66,6 +69,7 @@ static uint32_t lookup_bte32(CPUX86State *env, uint32_t base, uintptr_t ra)
     }
 
     bde = (extract32(base, 12, 20) << 2) + (bndcsr & TARGET_PAGE_MASK);
+    *bde_out = bde;
     bt = cpu_ldl_data_ra(env, bde, ra);
     if ((bt & 1) == 0) {
         env->bndcs_regs.sts = bde | 2;
@@ -79,9 +83,9 @@ uint64_t helper_bndldx64(CPUX86State *env, target_ulong base,
                          target_ulong ptr, target_ulong pc)
 {
     uintptr_t ra = GETPC();
-    uint64_t bte, lb, ub, pt;
+    uint64_t bde, bte, lb, ub, pt;
 
-    bte = lookup_bte64(env, base, ra);
+    bte = lookup_bte64(env, base, ra, &bde);
     lb = cpu_ldq_data_ra(env, bte, ra);
     ub = cpu_ldq_data_ra(env, bte + 8, ra);
     pt = cpu_ldq_data_ra(env, bte + 16, ra);
@@ -90,7 +94,8 @@ uint64_t helper_bndldx64(CPUX86State *env, target_ulong base,
         lb = ub = 0;
     }
     env->mmx_t0.MMX_Q(0) = ub;
-    sem_mem_helper_access(env, bte, 24, pc, false, SEM_OP_MPX);
+    sem_mem_helper_access_part(env, bde, 8, pc, false, SEM_OP_MPX, false);
+    sem_mem_helper_access_part(env, bte, 24, pc, false, SEM_OP_MPX, true);
     return lb;
 }
 
@@ -98,9 +103,9 @@ uint64_t helper_bndldx32(CPUX86State *env, target_ulong base,
                          target_ulong ptr, target_ulong pc)
 {
     uintptr_t ra = GETPC();
-    uint32_t bte, lb, ub, pt;
+    uint32_t bde, bte, lb, ub, pt;
 
-    bte = lookup_bte32(env, base, ra);
+    bte = lookup_bte32(env, base, ra, &bde);
     lb = cpu_ldl_data_ra(env, bte, ra);
     ub = cpu_ldl_data_ra(env, bte + 4, ra);
     pt = cpu_ldl_data_ra(env, bte + 8, ra);
@@ -108,7 +113,8 @@ uint64_t helper_bndldx32(CPUX86State *env, target_ulong base,
     if (pt != ptr) {
         lb = ub = 0;
     }
-    sem_mem_helper_access(env, bte, 12, pc, false, SEM_OP_MPX);
+    sem_mem_helper_access_part(env, bde, 4, pc, false, SEM_OP_MPX, false);
+    sem_mem_helper_access_part(env, bte, 12, pc, false, SEM_OP_MPX, true);
     return ((uint64_t)ub << 32) | lb;
 }
 
@@ -116,30 +122,34 @@ void helper_bndstx64(CPUX86State *env, target_ulong base, target_ulong ptr,
                      uint64_t lb, uint64_t ub, target_ulong pc)
 {
     uintptr_t ra = GETPC();
-    uint64_t bte;
+    uint64_t bde, bte;
 
-    bte = lookup_bte64(env, base, ra);
+    bte = lookup_bte64(env, base, ra, &bde);
+    sem_mem_overwrite(bte, 8, SEM_OP_MPX);
     cpu_stq_data_ra(env, bte, lb, ra);
+    sem_mem_overwrite(bte + 8, 8, SEM_OP_MPX);
     cpu_stq_data_ra(env, bte + 8, ub, ra);
+    sem_mem_overwrite(bte + 16, 8, SEM_OP_MPX);
     cpu_stq_data_ra(env, bte + 16, ptr, ra);
-    /* 24-byte BTE store: route through the shared overwrite event. */
-    sem_mem_overwrite(bte, 24, SEM_OP_MPX);
-    sem_mem_helper_access(env, bte, 24, pc, true, SEM_OP_MPX);
+    sem_mem_helper_access_part(env, bde, 8, pc, false, SEM_OP_MPX, false);
+    sem_mem_helper_access_part(env, bte, 24, pc, true, SEM_OP_MPX, true);
 }
 
 void helper_bndstx32(CPUX86State *env, target_ulong base, target_ulong ptr,
                      uint64_t lb, uint64_t ub, target_ulong pc)
 {
     uintptr_t ra = GETPC();
-    uint32_t bte;
+    uint32_t bde, bte;
 
-    bte = lookup_bte32(env, base, ra);
+    bte = lookup_bte32(env, base, ra, &bde);
+    sem_mem_overwrite(bte, 4, SEM_OP_MPX);
     cpu_stl_data_ra(env, bte, lb, ra);
+    sem_mem_overwrite(bte + 4, 4, SEM_OP_MPX);
     cpu_stl_data_ra(env, bte + 4, ub, ra);
+    sem_mem_overwrite(bte + 8, 4, SEM_OP_MPX);
     cpu_stl_data_ra(env, bte + 8, ptr, ra);
-    /* 12-byte BTE store: route through the shared overwrite event. */
-    sem_mem_overwrite(bte, 12, SEM_OP_MPX);
-    sem_mem_helper_access(env, bte, 12, pc, true, SEM_OP_MPX);
+    sem_mem_helper_access_part(env, bde, 4, pc, false, SEM_OP_MPX, false);
+    sem_mem_helper_access_part(env, bte, 12, pc, true, SEM_OP_MPX, true);
 }
 
 void helper_bnd_jmp(CPUX86State *env)

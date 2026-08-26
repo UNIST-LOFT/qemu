@@ -61,6 +61,8 @@ void helper_sem_mem_access(CPUArchState *env, target_ulong addr,
                            uint32_t flags, uint32_t cls);
 void helper_sem_mem_overwrite(CPUArchState *env, target_ulong addr,
                               target_ulong size, uint32_t cls);
+void helper_sem_mem_unsupported(CPUArchState *env, target_ulong pc,
+                                uint32_t reason);
 void helper_sem_on_load(CPUArchState *env, uint32_t dst_idx,
                         target_ulong addr, target_ulong size,
                         target_ulong pc, uint32_t cls);
@@ -107,35 +109,106 @@ const bool sem_op_class_valid[SEM_OP_CLASS_COUNT] = {
     [SEM_OP_UNKNOWN]    = false, /* fail-closed: never producer-labeled */
 };
 
-const SemProducerSpec sem_producer_table[] = {
-    { "integer.modrm",       SEM_OP_INTEGER,    SEM_INTERVAL_EXACT_WIDTH, 8 },
-    { "integer.moffs",       SEM_OP_INTEGER,    SEM_INTERVAL_EXACT_WIDTH, 8 },
-    { "integer.string",      SEM_OP_INTEGER,    SEM_INTERVAL_EXACT_WIDTH, 8 },
-    { "integer.ins-outs",    SEM_OP_INTEGER,    SEM_INTERVAL_EXACT_WIDTH, 8 },
-    { "integer.stack-control", SEM_OP_INTEGER,  SEM_INTERVAL_EXACT_WIDTH, 8 },
-    { "integer.descriptor",  SEM_OP_INTEGER,    SEM_INTERVAL_MULTIPART,  8 },
-    { "atomic.lock-rmw",     SEM_OP_ATOMIC_RMW, SEM_INTERVAL_EXACT_WIDTH, 8 },
-    { "atomic.xchg",         SEM_OP_ATOMIC_RMW, SEM_INTERVAL_EXACT_WIDTH, 8 },
-    { "paired.cmpxchg8b",    SEM_OP_PAIRED,     SEM_INTERVAL_PAIRED,      8 },
-    { "paired.cmpxchg16b",   SEM_OP_PAIRED,     SEM_INTERVAL_PAIRED,     16 },
-    { "simd.scalar",         SEM_OP_SIMD,       SEM_INTERVAL_EXACT_WIDTH, 8 },
-    { "simd.vector",         SEM_OP_SIMD,       SEM_INTERVAL_PAIRED,     16 },
-    { "simd.special",        SEM_OP_SIMD,       SEM_INTERVAL_EXACT_WIDTH, 8 },
-    { "x87.scalar",          SEM_OP_X87_HELPER, SEM_INTERVAL_EXACT_WIDTH, 8 },
-    { "x87.raw",             SEM_OP_X87_HELPER, SEM_INTERVAL_RAW,         10 },
-    { "x87.environment",     SEM_OP_X87_HELPER, SEM_INTERVAL_RAW,         14 },
-    { "x87.saved-state",     SEM_OP_X87_HELPER, SEM_INTERVAL_RAW,         94 },
-    { "mpx.bndmov",          SEM_OP_MPX,        SEM_INTERVAL_PAIRED,     16 },
-    { "mpx.bndx-helper",     SEM_OP_MPX,        SEM_INTERVAL_MULTIPART,  12 },
-    { "xsave.fxsave",        SEM_OP_PAIRED,     SEM_INTERVAL_RAW,        512 },
-    { "xsave.xsave",         SEM_OP_PAIRED,     SEM_INTERVAL_RAW,          0 },
-    { "model.output",        SEM_OP_LIBC_MODEL, SEM_INTERVAL_RAW,          1 },
-    { "syscall.output",      SEM_OP_SYSCALL,    SEM_INTERVAL_RAW,          1 },
-    { "mapping.output",      SEM_OP_MAPPING,    SEM_INTERVAL_RAW,          1 },
-    { "signal.frame",        SEM_OP_SIGNAL,     SEM_INTERVAL_RAW,          1 },
-    { "snapshot.write",      SEM_OP_SNAPSHOT,   SEM_INTERVAL_RAW,          1 },
-    { NULL, 0, 0, 0 },
+static const uint32_t widths_1_2_4_8[] = { 1, 2, 4, 8 };
+static const uint32_t widths_1_2_4[] = { 1, 2, 4 };
+static const uint32_t widths_2_4_8[] = { 2, 4, 8 };
+static const uint32_t widths_2_4_6_8_10[] = { 2, 4, 6, 8, 10 };
+static const uint32_t widths_4_8[] = { 4, 8 };
+static const uint32_t widths_8[] = { 8 };
+static const uint32_t widths_16[] = { 16 };
+static const uint32_t widths_10[] = { 10 };
+static const uint32_t widths_14_28[] = { 14, 28 };
+static const uint32_t widths_94_108[] = { 94, 108 };
+static const uint32_t widths_8_16[] = { 8, 16 };
+static const uint32_t widths_4_8_12_24[] = { 4, 8, 12, 24 };
+static const uint32_t widths_4_6_8_10_16_128_256[] = {
+    4, 6, 8, 10, 16, 128, 256
 };
+static const uint32_t widths_4_6_8_10_16_24_64_128_256[] = {
+    4, 6, 8, 10, 16, 24, 64, 128, 256
+};
+
+#define PRODUCER(_name, _class, _policy, _widths, _supported, _coverage) \
+    { (_name), (_class), (_policy), (_widths), G_N_ELEMENTS(_widths), \
+      (_supported), (_coverage) }
+#define UNSUPPORTED(_name, _coverage) \
+    { (_name), SEM_OP_INTEGER, SEM_INTERVAL_UNSUPPORTED, NULL, 0, false, \
+      (_coverage) }
+#define DYNAMIC_PRODUCER(_name, _class, _coverage) \
+    { (_name), (_class), SEM_INTERVAL_DYNAMIC, NULL, 0, true, (_coverage) }
+
+const SemProducerSpec sem_producer_table[] = {
+    PRODUCER("integer.modrm", SEM_OP_INTEGER, SEM_INTERVAL_EXACT_WIDTH,
+             widths_1_2_4_8, true, "gen_op_ld_v_class,gen_op_st_v_class"),
+    PRODUCER("integer.moffs", SEM_OP_INTEGER, SEM_INTERVAL_EXACT_WIDTH,
+             widths_1_2_4_8, true, "gen_op_ld_v,gen_op_st_v"),
+    PRODUCER("integer.string", SEM_OP_INTEGER, SEM_INTERVAL_EXACT_WIDTH,
+             widths_1_2_4_8, true, "gen_string_movl_A0_ESI,gen_string_movl_A0_EDI"),
+    PRODUCER("integer.ins-outs", SEM_OP_INTEGER, SEM_INTERVAL_EXACT_WIDTH,
+             widths_1_2_4, true, "gen_ins,gen_outs"),
+    PRODUCER("integer.stack-control", SEM_OP_INTEGER, SEM_INTERVAL_EXACT_WIDTH,
+             widths_2_4_8, true, "gen_push_v,gen_pop_T0,gen_enter,gen_leave"),
+    PRODUCER("integer.descriptor", SEM_OP_INTEGER, SEM_INTERVAL_MULTIPART,
+             widths_2_4_6_8_10, true, "gen_ldst_modrm"),
+    PRODUCER("atomic.lock-rmw", SEM_OP_ATOMIC_RMW, SEM_INTERVAL_EXACT_WIDTH,
+             widths_1_2_4_8, true, "gen_op"),
+    PRODUCER("atomic.xchg", SEM_OP_ATOMIC_RMW, SEM_INTERVAL_EXACT_WIDTH,
+             widths_1_2_4_8, true, "gen_op"),
+    PRODUCER("paired.cmpxchg8b", SEM_OP_PAIRED, SEM_INTERVAL_PAIRED,
+             widths_8, true, "gen_helper_cmpxchg8b,gen_helper_cmpxchg8b_unlocked"),
+    PRODUCER("paired.cmpxchg16b", SEM_OP_PAIRED, SEM_INTERVAL_PAIRED,
+             widths_16, true, "gen_helper_cmpxchg16b,gen_helper_cmpxchg16b_unlocked"),
+    PRODUCER("simd.scalar", SEM_OP_SIMD, SEM_INTERVAL_EXACT_WIDTH,
+             widths_4_8, true, "gen_ldst_modrm_simd"),
+    PRODUCER("simd.vector", SEM_OP_SIMD, SEM_INTERVAL_PAIRED,
+             widths_8_16, true, "gen_ldst_modrm_simd"),
+    PRODUCER("simd.special", SEM_OP_SIMD, SEM_INTERVAL_EXACT_WIDTH,
+             widths_4_8, true, "gen_ldst_modrm_simd"),
+    PRODUCER("x87.scalar", SEM_OP_X87_HELPER, SEM_INTERVAL_EXACT_WIDTH,
+             widths_1_2_4_8, true, "gen_helper_fldl_ST0,gen_helper_fstl_ST0"),
+    PRODUCER("x87.raw", SEM_OP_X87_HELPER, SEM_INTERVAL_RAW,
+             widths_10, true, "gen_helper_fldt_ST0,gen_helper_fstt_ST0,gen_helper_fbld_ST0,gen_helper_fbst_ST0"),
+    PRODUCER("x87.environment", SEM_OP_X87_HELPER, SEM_INTERVAL_RAW,
+             widths_14_28, true, "gen_helper_fstenv,gen_helper_fldenv"),
+    PRODUCER("x87.saved-state", SEM_OP_X87_HELPER, SEM_INTERVAL_RAW,
+             widths_94_108, true, "gen_helper_fsave,gen_helper_frstor"),
+    PRODUCER("mpx.bndmov", SEM_OP_MPX, SEM_INTERVAL_PAIRED,
+             widths_8_16, true, "gen_ldst_modrm"),
+    PRODUCER("mpx.bndx-helper", SEM_OP_MPX, SEM_INTERVAL_MULTIPART,
+             widths_4_8_12_24, true, "gen_helper_bndldx32,gen_helper_bndldx64,gen_helper_bndstx32,gen_helper_bndstx64"),
+    PRODUCER("xsave.fxsave", SEM_OP_PAIRED, SEM_INTERVAL_SPARSE,
+             widths_4_6_8_10_16_128_256, true,
+             "gen_helper_fxsave,gen_helper_fxrstor"),
+    PRODUCER("xsave.xsave", SEM_OP_PAIRED, SEM_INTERVAL_SPARSE,
+             widths_4_6_8_10_16_24_64_128_256, true,
+             "gen_helper_xsave,gen_helper_xsaveopt,gen_helper_xrstor"),
+    DYNAMIC_PRODUCER("model.output", SEM_OP_LIBC_MODEL,
+                     "sem_mem_overwrite"),
+    DYNAMIC_PRODUCER("syscall.output", SEM_OP_SYSCALL,
+                     "sem_mem_overwrite"),
+    DYNAMIC_PRODUCER("mapping.output", SEM_OP_MAPPING,
+                     "sem_mem_overwrite"),
+    DYNAMIC_PRODUCER("signal.frame", SEM_OP_SIGNAL,
+                     "sem_context_replace"),
+    DYNAMIC_PRODUCER("snapshot.write", SEM_OP_SNAPSHOT,
+                     "sem_mem_overwrite"),
+    PRODUCER("simd.maskmov", SEM_OP_SIMD, SEM_INTERVAL_EXACT_WIDTH,
+             widths_8_16, true, "gen_helper_maskmov_mmx,gen_helper_maskmov_xmm"),
+    UNSUPPORTED("control.far", "gen_helper_lcall_real,gen_helper_lcall_protected,gen_helper_ljmp_protected,gen_helper_lret_protected:protected far-control/task-state helpers are unsupported in user F01"),
+    UNSUPPORTED("control.iret", "gen_helper_iret_real,gen_helper_iret_protected:IRET helper has dynamic privilege/task-state accesses"),
+    UNSUPPORTED("control.seg-load", "gen_helper_load_seg:descriptor-table segment loads are dynamic"),
+    UNSUPPORTED("control.lldt", "gen_helper_lldt:descriptor-table LDT loads are dynamic"),
+    UNSUPPORTED("control.ltr", "gen_helper_ltr:descriptor-table TR loads/stores are dynamic"),
+    UNSUPPORTED("control.seg-query", "gen_helper_lar,gen_helper_lsl,gen_helper_verr,gen_helper_verw:descriptor-table queries are dynamic"),
+    UNSUPPORTED("control.io-bitmap", "gen_helper_check_iob,gen_helper_check_iow,gen_helper_check_iol:I/O bitmap accesses are dynamic"),
+    PRODUCER("bound.legacy", SEM_OP_INTEGER, SEM_INTERVAL_EXACT_WIDTH,
+             widths_4_8, true, "gen_helper_boundw,gen_helper_boundl"),
+    { NULL, 0, 0, NULL, 0, false, NULL },
+};
+
+#undef UNSUPPORTED
+#undef DYNAMIC_PRODUCER
+#undef PRODUCER
 
 const SemHelperClass sem_helper_class_table[] = {
     { "sem_reg_invalidate",  SEM_OP_INTEGER },
@@ -150,8 +223,9 @@ const SemHelperClass sem_helper_class_table[] = {
     { "sem_set_ea",          SEM_OP_INTEGER },
     { "sem_set_ea_vals",     SEM_OP_INTEGER },
     { "sem_set_ea_mode",     SEM_OP_INTEGER },
-    { "sem_mem_access",      SEM_OP_INTEGER },
-    { "sem_mem_overwrite",   SEM_OP_INTEGER },
+    { "sem_mem_access",         SEM_OP_INTEGER },
+    { "sem_mem_overwrite",      SEM_OP_INTEGER },
+    { "sem_mem_unsupported",    SEM_OP_INTEGER },
     { "sem_on_load",         SEM_OP_INTEGER },
     { "sem_on_store",        SEM_OP_INTEGER },
     { "sem_call",            SEM_OP_INTEGER },
@@ -175,6 +249,7 @@ const char *const sem_emittable_helpers[] = {
     "sem_set_ea_mode",
     "sem_mem_access",
     "sem_mem_overwrite",
+    "sem_mem_unsupported",
     "sem_on_load",
     "sem_on_store",
     "sem_call",
@@ -194,12 +269,19 @@ static bool sem_op_class_is_valid(SemOpClass cls) {
 
 static void osprey_clear_ea(OspreyCpuOriginState *st, bool clear_mode);
 
+static void osprey_clear_pending_helper(OspreyCpuOriginState *st) {
+    st->pending_helper_count = 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* Overwrite events (C API)                                           */
 /* ------------------------------------------------------------------ */
 
 void sem_mem_overwrite(target_ulong addr, target_ulong size,
                        SemOpClass cls) {
+    if (!sem_events_active()) {
+        return;
+    }
     bool valid_class = sem_op_class_is_valid(cls);
     /* Invalid classes still invalidate active consumer state, but can
      * never authorize an OSPREY fact or a more precise transfer. */
@@ -234,6 +316,7 @@ void sem_context_replace(CPUArchState *env) {
     }
     if (osprey_collect_enabled) {
         OspreyCpuOriginState *st = osprey_cpu_origin(env);
+        osprey_clear_pending_helper(st);
         /* A fault can leave pre-access EA metadata unconsumed.  A signal
          * or restored context is a hard boundary; no later access may
          * reuse that record. */
@@ -581,6 +664,7 @@ void helper_sem_set_ea(CPUArchState *env, uint32_t base_reg,
     }
     if (osprey_collect_enabled) {
         OspreyCpuOriginState *st = osprey_cpu_origin(env);
+        osprey_clear_pending_helper(st);
         st->ea_mode = mode;
         if (!osprey_mode_ok(mode)) {
             /* Not an F01-eligible mode: record nothing (stale record
@@ -611,6 +695,7 @@ void helper_sem_set_ea_mode(CPUArchState *env, uint32_t mode) {
         return;
     }
     OspreyCpuOriginState *st = osprey_cpu_origin(env);
+    osprey_clear_pending_helper(st);
     st->ea_mode = mode;
     if (!osprey_mode_ok(mode)) {
         osprey_clear_ea(st, true);
@@ -660,9 +745,11 @@ void sem_mem_access(CPUArchState *env, target_ulong addr,
     if (flags & 8) {
         /* Plain producer events have no EA decomposition.  Discard a
          * fault-left record before recording the successful interval. */
+        osprey_clear_pending_helper(st);
         osprey_clear_ea(st, false);
     }
     if (!valid_class || (flags & 4)) {
+        osprey_clear_pending_helper(st);
         osprey_clear_ea(st, true);
         return;
     }
@@ -677,8 +764,8 @@ void sem_mem_access(CPUArchState *env, target_ulong addr,
         osprey_clear_ea(st, true);
         return;
     }
-    osprey_on_mem_access(env, addr, (uint64_t)size, (uint64_t)pc,
-                         is_store);
+    osprey_on_mem_access_class(env, addr, (uint64_t)size, (uint64_t)pc,
+                               is_store, (uint32_t)cls);
 }
 
 void helper_sem_mem_access(CPUArchState *env, target_ulong addr,
@@ -690,12 +777,127 @@ void helper_sem_mem_access(CPUArchState *env, target_ulong addr,
 void helper_sem_mem_overwrite(CPUArchState *env, target_ulong addr,
                               target_ulong size, uint32_t cls) {
     sem_mem_overwrite(addr, size, (SemOpClass)cls);
+    if (!sem_op_class_is_valid((SemOpClass)cls)) {
+        if (binradar_memcheck_enabled) {
+            provenance_get_reg_shadow(env)->ea_meta.valid = false;
+        }
+        if (osprey_collect_enabled) {
+            osprey_clear_ea(osprey_cpu_origin(env), true);
+        }
+    }
+}
+
+void helper_sem_mem_unsupported(CPUArchState *env, target_ulong pc,
+                                uint32_t reason) {
+    (void)pc;
+    (void)reason;
+    if (binradar_memcheck_enabled) {
+        provenance_get_reg_shadow(env)->ea_meta.valid = false;
+    }
+    if (osprey_collect_enabled) {
+        OspreyCpuOriginState *st = osprey_cpu_origin(env);
+        osprey_clear_pending_helper(st);
+        osprey_clear_ea(st, true);
+        /* An explicitly unsupported guest-memory producer makes the sample
+         * incomplete.  Clearing EA state alone would silently accept a fact
+         * set known to omit architectural accesses. */
+        osprey_mark_unsupported_execution();
+    }
 }
 
 void sem_mem_helper_access(CPUArchState *env, target_ulong addr,
                            target_ulong size, target_ulong pc,
                            bool is_store, SemOpClass cls) {
-    sem_mem_access(env, addr, size, pc, (is_store ? 1u : 0u) | 8u, cls);
+    sem_mem_helper_access_part(env, addr, size, pc, is_store, cls, true);
+}
+
+void sem_mem_helper_access_part(CPUArchState *env, target_ulong addr,
+                                target_ulong size, target_ulong pc,
+                                bool is_store, SemOpClass cls,
+                                bool final_part) {
+    bool valid_class = sem_op_class_is_valid(cls);
+    /* Helper-backed operations publish after the helper succeeds.  If the
+     * translator supplied provenance EA metadata, consume it for the first
+     * ordered interval even when OSPREY is disabled.  Later parts have no
+     * independent EA decomposition and must not trigger a spurious fallback
+     * check. */
+    if (binradar_memcheck_enabled) {
+        PtrRegShadow *shadow = provenance_get_reg_shadow(env);
+        if (shadow->ea_meta.valid) {
+            sem_prov_check_access(env, addr, size, pc);
+        }
+    }
+    if (!osprey_collect_enabled) {
+        return;
+    }
+    OspreyCpuOriginState *st = osprey_cpu_origin(env);
+    uint32_t mode = st->ea_mode;
+    /* Helper-backed producers publish only after their complete operation
+     * succeeds.  Clear decomposed EA fields after each part, but retain the
+     * instruction mode until the final ordered interval. */
+    osprey_clear_ea(st, false);
+    if (!valid_class || !osprey_mode_ok(mode)) {
+        osprey_clear_pending_helper(st);
+        osprey_clear_ea(st, true);
+        return;
+    }
+    if (st->pending_helper_count >= OSPREY_MAX_PENDING_HELPER_INTERVALS) {
+        /* No supported producer currently needs this many intervals.  A
+         * future helper must not wrap the fixed pending array and publish
+         * an incomplete or unrelated fact set. */
+        osprey_clear_pending_helper(st);
+        osprey_clear_ea(st, true);
+        return;
+    }
+    OspreyPendingHelperInterval *pending =
+        &st->pending_helper[st->pending_helper_count++];
+    pending->addr = addr;
+    pending->size = size;
+    pending->pc = pc;
+    pending->op_class = (uint32_t)cls;
+    pending->is_store = is_store;
+    if (final_part) {
+        for (uint32_t i = 0; i < st->pending_helper_count; i++) {
+            pending = &st->pending_helper[i];
+            osprey_on_mem_access_class(env, pending->addr, pending->size,
+                                       pending->pc, pending->is_store,
+                                       pending->op_class);
+        }
+        osprey_clear_pending_helper(st);
+        st->ea_mode = 0;
+    }
+}
+
+void sem_mem_maskmov(CPUArchState *env, target_ulong addr,
+                     uint32_t selected_mask, uint32_t width,
+                     target_ulong pc, SemOpClass cls) {
+    bool valid_class = sem_op_class_is_valid(cls);
+    if (binradar_memcheck_enabled && (width == 8 || width == 16)) {
+        for (uint32_t i = 0; i < width; i++) {
+            if (selected_mask & (1u << i)) {
+                provenance_mem_invalidate(addr + i, 1);
+            }
+        }
+    }
+    if (!osprey_collect_enabled) {
+        return;
+    }
+    OspreyCpuOriginState *st = osprey_cpu_origin(env);
+    uint32_t mode = st->ea_mode;
+    /* MASKMOV has no decomposed EA transfer.  Consume all pending state
+     * before publishing selected-byte intervals. */
+    osprey_clear_pending_helper(st);
+    osprey_clear_ea(st, true);
+    if (!valid_class || (width != 8 && width != 16) ||
+        !osprey_mode_ok(mode)) {
+        return;
+    }
+    for (uint32_t i = 0; i < width; i++) {
+        if (selected_mask & (1u << i)) {
+            osprey_on_mem_access_class(env, addr + i, 1, pc, true,
+                                       (uint32_t)cls);
+        }
+    }
 }
 
 void helper_sem_on_load(CPUArchState *env, uint32_t dst_idx,

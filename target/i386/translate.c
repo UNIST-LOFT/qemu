@@ -216,16 +216,6 @@ static void gen_sem_on_store_x87(int src_idx, TCGv t_addr, TCGMemOp ot) {
     gen_sem_on_store_class(src_idx, t_addr, ot, SEM_OP_X87_HELPER);
 }
 
-static void gen_sem_mem_overwrite(DisasContext *s, TCGv t_addr,
-                                  target_ulong size, SemOpClass cls) {
-    if (!sem_events_active()) return;
-    TCGv t_size = tcg_const_tl(size);
-    TCGv_i32 t_cls = tcg_const_i32(cls);
-    gen_helper_sem_mem_overwrite(cpu_env, t_addr, t_size, t_cls);
-    tcg_temp_free(t_size);
-    tcg_temp_free_i32(t_cls);
-}
-
 /* Full-width register xchg: swap the two registers' provenance tags. */
 static void gen_sem_reg_xchg(int dst_idx, int src_idx) {
     if (!sem_events_active()) return;
@@ -293,6 +283,18 @@ static void gen_sem_mem_access_f01_class(TCGv t_addr, TCGMemOp ot,
                                          SemOpClass cls) {
     gen_sem_mem_access_f01_raw_class(t_addr, 1 << (ot & MO_SIZE), pc,
                                      is_store, cls);
+}
+
+/* Explicit fail-closed boundary for helper-backed operations whose guest
+ * memory footprint is privilege- or state-dependent and is not yet modeled.
+ * The helper may still execute architecturally; no F01 row is authorized. */
+static void gen_sem_mem_unsupported(target_ulong pc, uint32_t reason) {
+    if (!sem_events_active()) return;
+    TCGv t_pc = tcg_const_tl(pc);
+    TCGv_i32 t_reason = tcg_const_i32(reason);
+    gen_helper_sem_mem_unsupported(cpu_env, t_pc, t_reason);
+    tcg_temp_free(t_pc);
+    tcg_temp_free_i32(t_reason);
 }
 
 /* RSP write (push/pop/add-sub imm/call): re-derive the RSP origin from
@@ -421,6 +423,10 @@ struct DisasContext {
     /* RMW instructions publish one architectural interval after the
      * write; suppress the constituent read event. */
     bool sem_skip_f01_load;
+    /* Multipart translator operations publish only after every constituent
+     * succeeds; suppress one constituent store event without suppressing its
+     * provenance invalidation. */
+    bool sem_skip_f01_store;
     /* Sem layer: pre-instruction register value snapshot for the
      * add/sub-imm helper's consistency check (freed by the helper
      * wrapper after emission). */
@@ -897,7 +903,13 @@ static inline void gen_op_st_v_class(DisasContext *s, int idx, TCGv t0,
 {
     gen_sem_set_ea_mode(s);
     gen_op_st_v_raw_class(s, idx, t0, a0, cls);
-    gen_sem_mem_access_f01_auto_class(s, a0, idx, s->pc_start, true, cls);
+    if (s->sem_skip_f01_store) {
+        s->sem_skip_f01_store = false;
+        s->sem_ea_pending = false;
+    } else {
+        gen_sem_mem_access_f01_auto_class(s, a0, idx, s->pc_start, true,
+                                          cls);
+    }
 }
 
 static inline void gen_op_st_v(DisasContext *s, int idx, TCGv t0, TCGv a0)
@@ -1093,12 +1105,15 @@ static void gen_check_io(DisasContext *s, TCGMemOp ot, target_ulong cur_eip,
         switch (ot) {
         case MO_8:
             gen_helper_check_iob(cpu_env, s->tmp2_i32);
+            gen_sem_mem_unsupported(s->pc_start, 6);
             break;
         case MO_16:
             gen_helper_check_iow(cpu_env, s->tmp2_i32);
+            gen_sem_mem_unsupported(s->pc_start, 6);
             break;
         case MO_32:
             gen_helper_check_iol(cpu_env, s->tmp2_i32);
+            gen_sem_mem_unsupported(s->pc_start, 6);
             break;
         default:
             tcg_abort();
@@ -2895,6 +2910,10 @@ static void gen_movl_seg_T0(DisasContext *s, int seg_reg)
     if (s->pe && !s->vm86) {
         tcg_gen_trunc_tl_i32(s->tmp2_i32, s->T0);
         gen_helper_load_seg(cpu_env, tcg_const_i32(seg_reg), s->tmp2_i32);
+        /* Descriptor-table helper accesses are dynamic and have no exact
+         * user-mode F01 interval; invalidate any pending semantic EA state
+         * rather than publishing an invented width. */
+        gen_sem_mem_unsupported(s->pc_start, 3);
         /* abort translation because the addseg value may change or
            because ss32 may change. For R_SS, translation must always
            stop as a special handling must be done to disable hardware
@@ -3024,13 +3043,24 @@ static void gen_enter(DisasContext *s, int esp_addend, int level)
     TCGMemOp d_ot = mo_pushpop(s, s->dflag);
     TCGMemOp a_ot = CODE64(s) ? MO_64 : s->ss32 ? MO_32 : MO_16;
     int size = 1 << d_ot;
+    bool sem_active = sem_events_active();
+    TCGv old_sp = NULL;
+    TCGv old_bp = NULL;
+
+    level &= 31;
+    if (sem_active) {
+        old_sp = tcg_temp_new();
+        old_bp = tcg_temp_new();
+        tcg_gen_mov_tl(old_sp, cpu_regs[R_ESP]);
+        tcg_gen_mov_tl(old_bp, cpu_regs[R_EBP]);
+    }
 
     /* Push BP; compute FrameTemp into T1.  */
     tcg_gen_subi_tl(s->T1, cpu_regs[R_ESP], size);
     gen_lea_v_seg(s, a_ot, s->T1, R_SS, -1);
+    s->sem_skip_f01_store = sem_active;
     gen_op_st_v(s, d_ot, cpu_regs[R_EBP], s->T1);
 
-    level &= 31;
     if (level != 0) {
         int i;
 
@@ -3038,16 +3068,19 @@ static void gen_enter(DisasContext *s, int esp_addend, int level)
         for (i = 1; i < level; ++i) {
             tcg_gen_subi_tl(s->A0, cpu_regs[R_EBP], size * i);
             gen_lea_v_seg(s, a_ot, s->A0, R_SS, -1);
+            s->sem_skip_f01_load = sem_active;
             gen_op_ld_v(s, d_ot, s->tmp0, s->A0);
 
             tcg_gen_subi_tl(s->A0, s->T1, size * i);
             gen_lea_v_seg(s, a_ot, s->A0, R_SS, -1);
+            s->sem_skip_f01_store = sem_active;
             gen_op_st_v(s, d_ot, s->tmp0, s->A0);
         }
 
         /* Push the current FrameTemp as the last level.  */
         tcg_gen_subi_tl(s->A0, s->T1, size * level);
         gen_lea_v_seg(s, a_ot, s->A0, R_SS, -1);
+        s->sem_skip_f01_store = sem_active;
         gen_op_st_v(s, d_ot, s->T1, s->A0);
     }
 
@@ -3057,6 +3090,41 @@ static void gen_enter(DisasContext *s, int esp_addend, int level)
     /* Compute the final value of ESP.  */
     tcg_gen_subi_tl(s->T1, s->T1, esp_addend + size * level);
     gen_op_mov_reg_v(s, a_ot, R_ESP, s->T1);
+
+    if (sem_active) {
+        /* All constituent accesses and the architectural RSP transition have
+         * now succeeded.  The RSP hook has extended the exact observed stack
+         * bound, so replay the instruction's intervals without a speculative
+         * pre-operation reservation.  A fault above exits before this block
+         * and publishes no partial ENTER F01 set. */
+        tcg_gen_subi_tl(s->A0, old_sp, size);
+        gen_lea_v_seg(s, a_ot, s->A0, R_SS, -1);
+        gen_sem_set_ea_mode(s);
+        gen_sem_mem_access_f01_raw_class(s->A0, size, s->pc_start, true,
+                                         SEM_OP_INTEGER);
+        if (level != 0) {
+            for (int i = 1; i < level; ++i) {
+                tcg_gen_subi_tl(s->A0, old_bp, size * i);
+                gen_lea_v_seg(s, a_ot, s->A0, R_SS, -1);
+                gen_sem_set_ea_mode(s);
+                gen_sem_mem_access_f01_raw_class(s->A0, size, s->pc_start,
+                                                 false, SEM_OP_INTEGER);
+
+                tcg_gen_subi_tl(s->A0, old_sp, size + size * i);
+                gen_lea_v_seg(s, a_ot, s->A0, R_SS, -1);
+                gen_sem_set_ea_mode(s);
+                gen_sem_mem_access_f01_raw_class(s->A0, size, s->pc_start,
+                                                 true, SEM_OP_INTEGER);
+            }
+            tcg_gen_subi_tl(s->A0, old_sp, size + size * level);
+            gen_lea_v_seg(s, a_ot, s->A0, R_SS, -1);
+            gen_sem_set_ea_mode(s);
+            gen_sem_mem_access_f01_raw_class(s->A0, size, s->pc_start, true,
+                                             SEM_OP_INTEGER);
+        }
+        tcg_temp_free(old_bp);
+        tcg_temp_free(old_sp);
+    }
 }
 
 static void gen_leave(DisasContext *s)
@@ -3316,7 +3384,7 @@ typedef void (*SSEFunc_0_eppi)(TCGv_ptr env, TCGv_ptr reg_a, TCGv_ptr reg_b,
                                TCGv_i32 val);
 typedef void (*SSEFunc_0_ppi)(TCGv_ptr reg_a, TCGv_ptr reg_b, TCGv_i32 val);
 typedef void (*SSEFunc_0_eppt)(TCGv_ptr env, TCGv_ptr reg_a, TCGv_ptr reg_b,
-                               TCGv val);
+                               TCGv val, TCGv pc);
 
 #define SSE_SPECIAL ((void *)1)
 #define SSE_DUMMY ((void *)2)
@@ -5084,7 +5152,10 @@ static void gen_sse(CPUX86State *env, DisasContext *s, int b,
             tcg_gen_addi_ptr(s->ptr1, cpu_env, op2_offset);
             /* XXX: introduce a new table? */
             sse_fn_eppt = (SSEFunc_0_eppt)sse_fn_epp;
-            sse_fn_eppt(cpu_env, s->ptr0, s->ptr1, s->A0);
+            gen_sem_set_ea_mode(s);
+            TCGv t_maskmov_pc = tcg_const_tl(s->pc_start);
+            sse_fn_eppt(cpu_env, s->ptr0, s->ptr1, s->A0, t_maskmov_pc);
+            tcg_temp_free(t_maskmov_pc);
             break;
         default:
             tcg_gen_addi_ptr(s->ptr0, cpu_env, op1_offset);
@@ -5843,6 +5914,9 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                                       tcg_const_i32(dflag - 1),
                                       tcg_const_i32(s->pc - s->cs_base));
             }
+            /* The helper may touch dynamic privilege/task-state stack
+             * memory; keep this producer explicitly fail-closed for F01. */
+            gen_sem_mem_unsupported(s->pc_start, 1);
             tcg_gen_ld_tl(s->tmp4, cpu_env, offsetof(CPUX86State, eip));
             gen_jr(s, s->tmp4);
             break;
@@ -5889,6 +5963,7 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                 tcg_gen_trunc_tl_i32(s->tmp2_i32, s->T0);
                 gen_helper_ljmp_protected(cpu_env, s->tmp2_i32, s->T1,
                                           tcg_const_tl(s->pc - s->cs_base));
+                gen_sem_mem_unsupported(s->pc_start, 1);
             } else {
                 gen_op_movl_seg_T0_vm(s, R_CS);
                 gen_op_jmp_v(s->T1);
@@ -7638,6 +7713,7 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
             gen_jmp_im(s, pc_start - s->cs_base);
             gen_helper_lret_protected(cpu_env, tcg_const_i32(dflag - 1),
                                       tcg_const_i32(val));
+            gen_sem_mem_unsupported(s->pc_start, 1);
         } else {
             gen_stack_A0(s);
             /* pop offset */
@@ -7662,17 +7738,20 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
         if (!s->pe) {
             /* real mode */
             gen_helper_iret_real(cpu_env, tcg_const_i32(dflag - 1));
+            gen_sem_mem_unsupported(s->pc_start, 2);
             set_cc_op(s, CC_OP_EFLAGS);
         } else if (s->vm86) {
             if (s->iopl != 3) {
                 gen_exception(s, EXCP0D_GPF, pc_start - s->cs_base);
             } else {
                 gen_helper_iret_real(cpu_env, tcg_const_i32(dflag - 1));
+                gen_sem_mem_unsupported(s->pc_start, 2);
                 set_cc_op(s, CC_OP_EFLAGS);
             }
         } else {
             gen_helper_iret_protected(cpu_env, tcg_const_i32(dflag - 1),
                                       tcg_const_i32(s->pc - s->cs_base));
+            gen_sem_mem_unsupported(s->pc_start, 2);
             set_cc_op(s, CC_OP_EFLAGS);
         }
         gen_eob(s);
@@ -8290,11 +8369,14 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
         gen_op_mov_v_reg(s, ot, s->T0, reg);
         gen_lea_modrm(env, s, modrm);
         tcg_gen_trunc_tl_i32(s->tmp2_i32, s->T0);
+        gen_sem_set_ea_mode(s);
+        TCGv t_bound_pc = tcg_const_tl(s->pc_start);
         if (ot == MO_16) {
-            gen_helper_boundw(cpu_env, s->A0, s->tmp2_i32);
+            gen_helper_boundw(cpu_env, s->A0, s->tmp2_i32, t_bound_pc);
         } else {
-            gen_helper_boundl(cpu_env, s->A0, s->tmp2_i32);
+            gen_helper_boundl(cpu_env, s->A0, s->tmp2_i32, t_bound_pc);
         }
+        tcg_temp_free(t_bound_pc);
         break;
     case 0x1c8 ... 0x1cf: /* bswap reg */
         reg = (b & 7) | REX_B(s);
@@ -8492,6 +8574,7 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                 gen_ldst_modrm(env, s, modrm, MO_16, OR_TMP0, 0);
                 tcg_gen_trunc_tl_i32(s->tmp2_i32, s->T0);
                 gen_helper_lldt(cpu_env, s->tmp2_i32);
+                gen_sem_mem_unsupported(s->pc_start, 4);
             }
             break;
         case 1: /* str */
@@ -8513,6 +8596,7 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                 gen_ldst_modrm(env, s, modrm, MO_16, OR_TMP0, 0);
                 tcg_gen_trunc_tl_i32(s->tmp2_i32, s->T0);
                 gen_helper_ltr(cpu_env, s->tmp2_i32);
+                gen_sem_mem_unsupported(s->pc_start, 5);
             }
             break;
         case 4: /* verr */
@@ -8526,6 +8610,7 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
             } else {
                 gen_helper_verw(cpu_env, s->T0);
             }
+            gen_sem_mem_unsupported(s->pc_start, 7);
             set_cc_op(s, CC_OP_EFLAGS);
             break;
         default:
@@ -9003,6 +9088,7 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
             } else {
                 gen_helper_lsl(t0, cpu_env, s->T0);
             }
+            gen_sem_mem_unsupported(s->pc_start, 8);
             tcg_gen_andi_tl(s->tmp0, cpu_cc_src, CC_Z);
             label1 = gen_new_label();
             tcg_gen_brcondi_tl(TCG_COND_EQ, s->tmp0, 0, label1);
@@ -9392,10 +9478,9 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
             }
             gen_lea_modrm(env, s, modrm);
             gen_sem_set_ea_mode(s);
-            gen_sem_mem_overwrite(s, s->A0, 512, SEM_OP_PAIRED);
-            gen_helper_fxsave(cpu_env, s->A0);
-            gen_sem_mem_access_f01_raw_class(s->A0, 512, s->pc_start, true,
-                                             SEM_OP_PAIRED);
+            TCGv t_fxsave_pc = tcg_const_tl(s->pc_start);
+            gen_helper_fxsave(cpu_env, s->A0, t_fxsave_pc);
+            tcg_temp_free(t_fxsave_pc);
             break;
 
         CASE_MODRM_MEM_OP(1): /* fxrstor */
@@ -9409,9 +9494,9 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
             }
             gen_lea_modrm(env, s, modrm);
             gen_sem_set_ea_mode(s);
-            gen_helper_fxrstor(cpu_env, s->A0);
-            gen_sem_mem_access_f01_raw_class(s->A0, 512, s->pc_start, false,
-                                             SEM_OP_PAIRED);
+            TCGv t_fxrstor_pc = tcg_const_tl(s->pc_start);
+            gen_helper_fxrstor(cpu_env, s->A0, t_fxrstor_pc);
+            tcg_temp_free(t_fxrstor_pc);
             break;
 
         CASE_MODRM_MEM_OP(2): /* ldmxcsr */
@@ -9453,12 +9538,9 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
             gen_sem_set_ea_mode(s);
             tcg_gen_concat_tl_i64(s->tmp1_i64, cpu_regs[R_EAX],
                                   cpu_regs[R_EDX]);
-            gen_sem_mem_overwrite(s, s->A0, sizeof(X86XSaveArea),
-                                  SEM_OP_PAIRED);
-            gen_helper_xsave(cpu_env, s->A0, s->tmp1_i64);
-            gen_sem_mem_access_f01_raw_class(s->A0, sizeof(X86XSaveArea),
-                                             s->pc_start, true,
-                                             SEM_OP_PAIRED);
+            TCGv t_xsave_pc = tcg_const_tl(s->pc_start);
+            gen_helper_xsave(cpu_env, s->A0, s->tmp1_i64, t_xsave_pc);
+            tcg_temp_free(t_xsave_pc);
             break;
 
         CASE_MODRM_MEM_OP(5): /* xrstor */
@@ -9471,10 +9553,9 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
             gen_sem_set_ea_mode(s);
             tcg_gen_concat_tl_i64(s->tmp1_i64, cpu_regs[R_EAX],
                                   cpu_regs[R_EDX]);
-            gen_helper_xrstor(cpu_env, s->A0, s->tmp1_i64);
-            gen_sem_mem_access_f01_raw_class(s->A0, sizeof(X86XSaveArea),
-                                             s->pc_start, false,
-                                             SEM_OP_PAIRED);
+            TCGv t_xrstor_pc = tcg_const_tl(s->pc_start);
+            gen_helper_xrstor(cpu_env, s->A0, s->tmp1_i64, t_xrstor_pc);
+            tcg_temp_free(t_xrstor_pc);
             /* XRSTOR is how MPX is enabled, which changes how
                we translate.  Thus we need to end the TB.  */
             gen_update_cc_op(s);
@@ -9503,12 +9584,10 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                 gen_sem_set_ea_mode(s);
                 tcg_gen_concat_tl_i64(s->tmp1_i64, cpu_regs[R_EAX],
                                       cpu_regs[R_EDX]);
-                gen_sem_mem_overwrite(s, s->A0, sizeof(X86XSaveArea),
-                                      SEM_OP_PAIRED);
-                gen_helper_xsaveopt(cpu_env, s->A0, s->tmp1_i64);
-                gen_sem_mem_access_f01_raw_class(s->A0, sizeof(X86XSaveArea),
-                                                 s->pc_start, true,
-                                                 SEM_OP_PAIRED);
+                TCGv t_xsaveopt_pc = tcg_const_tl(s->pc_start);
+                gen_helper_xsaveopt(cpu_env, s->A0, s->tmp1_i64,
+                                    t_xsaveopt_pc);
+                tcg_temp_free(t_xsaveopt_pc);
             }
             break;
 
@@ -9771,6 +9850,7 @@ static void i386_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cpu)
     dc->osprey_skip_rsp_update = false;
     dc->sem_ea_pending = false;
     dc->sem_skip_f01_load = false;
+    dc->sem_skip_f01_store = false;
     dc->prov_pre_snapshot = NULL;
     dc->cs_base = cs_base;
     dc->popl_esp_hack = 0;

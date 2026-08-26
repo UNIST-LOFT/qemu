@@ -118,7 +118,8 @@ typedef struct OspreyAccessFact {
     uint32_t dynamic_count;
     uint32_t sample_support;   /* distinct unmodified samples */
     uint8_t is_store;
-    uint8_t reserved[7];
+    uint8_t op_class;           /* SemOpClass, serialized for F01 audits */
+    uint8_t reserved[6];
 } OspreyAccessFact;
 
 typedef struct OspreyBaseFact {
@@ -220,6 +221,17 @@ typedef struct OspreyMemSlotOrigin {
 
 #define OSPREY_SHADOW_ALIGN 8
 
+#define OSPREY_MAX_PENDING_HELPER_INTERVALS 64
+
+typedef struct OspreyPendingHelperInterval {
+    target_ulong addr;
+    target_ulong size;
+    target_ulong pc;
+    uint32_t op_class;
+    uint8_t is_store;
+    uint8_t reserved[4];
+} OspreyPendingHelperInterval;
+
 typedef struct OspreyCpuOriginState {
     OspreyRegOrigin regs[CPU_NB_REGS];
     /* Aligned native-width memory-shadow hash table.  Key = guest
@@ -246,13 +258,19 @@ typedef struct OspreyCpuOriginState {
      * origin, never the post-access one. */
     OspreyRegOrigin ea_base_origin;
     OspreyRegOrigin ea_index_origin;
+    /* Helper-backed multipart accesses are committed only after their
+     * final constituent succeeds.  A fault between parts therefore
+     * cannot publish a partial F01 aggregate. */
+    OspreyPendingHelperInterval pending_helper[
+        OSPREY_MAX_PENDING_HELPER_INTERVALS];
+    uint32_t pending_helper_count;
 } OspreyCpuOriginState;
 
 /* ------------------------------------------------------------------ */
 /* Shared run (fixed layout, no pointers)                              */
 /* ------------------------------------------------------------------ */
 
-#define OSPREY_SHARED_VERSION 7u
+#define OSPREY_SHARED_VERSION 8u
 
 struct OspreySharedRun {
     uint32_t version;

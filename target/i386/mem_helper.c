@@ -25,6 +25,7 @@
 #include "qemu/int128.h"
 #include "qemu/atomic128.h"
 #include "tcg.h"
+#include "../../linux-user/sem-events.h"
 
 void helper_cmpxchg8b_unlocked(CPUX86State *env, target_ulong a0)
 {
@@ -163,31 +164,37 @@ void helper_cmpxchg16b(CPUX86State *env, target_ulong a0)
 }
 #endif
 
-void helper_boundw(CPUX86State *env, target_ulong a0, int v)
+void helper_boundw(CPUX86State *env, target_ulong a0, int v,
+                   target_ulong pc)
 {
     int low, high;
+    uintptr_t ra = GETPC();
 
-    low = cpu_ldsw_data_ra(env, a0, GETPC());
-    high = cpu_ldsw_data_ra(env, a0 + 2, GETPC());
+    low = cpu_ldsw_data_ra(env, a0, ra);
+    high = cpu_ldsw_data_ra(env, a0 + 2, ra);
     v = (int16_t)v;
     if (v < low || v > high) {
         if (env->hflags & HF_MPX_EN_MASK) {
             env->bndcs_regs.sts = 0;
         }
-        raise_exception_ra(env, EXCP05_BOUND, GETPC());
+        raise_exception_ra(env, EXCP05_BOUND, ra);
     }
+    sem_mem_helper_access(env, a0, 4, pc, false, SEM_OP_INTEGER);
 }
 
-void helper_boundl(CPUX86State *env, target_ulong a0, int v)
+void helper_boundl(CPUX86State *env, target_ulong a0, int v,
+                   target_ulong pc)
 {
     int low, high;
+    uintptr_t ra = GETPC();
 
-    low = cpu_ldl_data_ra(env, a0, GETPC());
-    high = cpu_ldl_data_ra(env, a0 + 4, GETPC());
+    low = cpu_ldl_data_ra(env, a0, ra);
+    high = cpu_ldl_data_ra(env, a0 + 4, ra);
     if (v < low || v > high) {
         if (env->hflags & HF_MPX_EN_MASK) {
             env->bndcs_regs.sts = 0;
         }
-        raise_exception_ra(env, EXCP05_BOUND, GETPC());
+        raise_exception_ra(env, EXCP05_BOUND, ra);
     }
+    sem_mem_helper_access(env, a0, 8, pc, false, SEM_OP_INTEGER);
 }

@@ -477,15 +477,27 @@ void glue(helper_psadbw, SUFFIX)(CPUX86State *env, Reg *d, Reg *s)
 }
 
 void glue(helper_maskmov, SUFFIX)(CPUX86State *env, Reg *d, Reg *s,
-                                  target_ulong a0)
+                                  target_ulong a0, target_ulong pc)
 {
     int i;
 
     for (i = 0; i < (8 << SHIFT); i++) {
         if (s->B(i) & 0x80) {
+            /* Invalidate before each helper-owned byte store so a fault
+             * midway through the sparse operation cannot leave stale
+             * provenance for bytes already attempted.  OSPREY F01 rows
+             * remain buffered until the helper returns successfully. */
+            sem_mem_overwrite(a0 + i, 1, SEM_OP_SIMD);
             cpu_stb_data_ra(env, a0 + i, d->B(i), GETPC());
         }
     }
+    uint32_t selected_mask = 0;
+    for (i = 0; i < (8 << SHIFT); i++) {
+        if (s->B(i) & 0x80) {
+            selected_mask |= 1u << i;
+        }
+    }
+    sem_mem_maskmov(env, a0, selected_mask, 8 << SHIFT, pc, SEM_OP_SIMD);
 }
 
 void glue(helper_movl_mm_T0, SUFFIX)(Reg *d, uint32_t val)

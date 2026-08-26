@@ -178,6 +178,9 @@ bool osprey_raw_extent(const OspreyModel *model,
  * metadata.  A faulting access therefore never records facts. */
 void osprey_on_mem_access(CPUArchState *env, target_ulong addr,
                           uint64_t size, uint64_t pc, uint32_t is_store);
+void osprey_on_mem_access_class(CPUArchState *env, target_ulong addr,
+                                uint64_t size, uint64_t pc,
+                                uint32_t is_store, uint32_t op_class);
 
 /* Successful-return allocator hooks (site = call PC of the allocator).
  * A failed/overflowed allocation creates no heap region and no size
