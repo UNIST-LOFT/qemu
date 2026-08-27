@@ -199,18 +199,35 @@ void osprey_on_mem_copy(CPUArchState *env, target_ulong src,
                         target_ulong dst, target_ulong size);
 
 /* OSPREY consumers of the shared semantic-event layer.  Stage 2.2
- * centralizes dispatch; Stages 2.3–2.4 complete address/value policy. */
+ * centralizes dispatch; Stages 2.3–2.4 complete address/value policy.
+ * Every accepted Stage 2.3 transfer event carries the raw instruction
+ * PC so the origin's producer identity is exact and image-relative. */
+void osprey_on_reg_materialize_address(CPUArchState *env, uint32_t dst,
+                                       target_ulong value,
+                                       target_ulong pc);
 void osprey_on_reg_copy(CPUArchState *env, uint32_t dst, uint32_t src,
-                        target_ulong src_val, target_ulong dst_val);
+                        target_ulong src_value, target_ulong dst_value,
+                        target_ulong pc);
 void osprey_on_reg_lea(CPUArchState *env, uint32_t dst, uint32_t base,
-                       int64_t disp, target_ulong dst_val,
-                       target_ulong base_val);
+                       int64_t disp, target_ulong dst_value,
+                       target_ulong base_value, target_ulong pc);
+void osprey_on_reg_addsub_imm(CPUArchState *env, uint32_t reg,
+                              int64_t delta, target_ulong pre_value,
+                              target_ulong post_value, target_ulong pc);
+void osprey_on_reg_addsub_reg(CPUArchState *env, uint32_t dst,
+                              uint32_t src, bool is_sub,
+                              target_ulong dst_value,
+                              target_ulong src_value, target_ulong pc);
+void osprey_on_reg_xchg(CPUArchState *env, uint32_t dst, uint32_t src,
+                        target_ulong dst_value, target_ulong src_value,
+                        target_ulong pc);
 void osprey_on_reg_invalidate(CPUArchState *env, uint32_t reg);
-void osprey_on_mem_store_origin(CPUArchState *env, uint32_t src_reg,
-                                target_ulong addr, target_ulong size,
-                                target_ulong src_val);
-void osprey_on_mem_load_origin(CPUArchState *env, uint32_t dst_reg,
-                               target_ulong addr, target_ulong value);
+void osprey_on_mem_store_address(CPUArchState *env, uint32_t src,
+                                 target_ulong addr, target_ulong size,
+                                 target_ulong src_value);
+void osprey_on_mem_load_address(CPUArchState *env, uint32_t dst,
+                                target_ulong addr, target_ulong value,
+                                target_ulong pc);
 
 /* Call/return stack events.  The call hook fires AFTER the return-
  * address push, so entry_sp is the precise callee-entry RSP; callee_pc

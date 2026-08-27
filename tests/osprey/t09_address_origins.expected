@@ -1,0 +1,142 @@
+region 0 0 0 1 70f0
+region 1 297 1 2 40
+region 1 3ba 2 3 40
+region 1 44e 3 4 40
+region 1 481 4 4 40
+region 2 0 723 6 8
+region 2 d0 764 7 0
+region 2 e0 781 7 0
+region 2 f0 769 7 0
+region 2 f0 780 7 0
+region 2 100 774 11 0
+region 2 110 767 7 0
+region 2 120 768 7 0
+region 2 130 735 7 0
+region 2 130 760 7 0
+region 2 130 762 7 0
+region 2 130 766 7 0
+region 2 140 770 7 0
+region 2 140 779 7 0
+region 2 150 771 7 0
+region 2 240 724 6 0
+region 2 276 734 22 5f0
+access 8 0 0 0 2fe8 8 1
+access d4 0 0 0 2f90 8 1
+access e4 0 0 0 2f98 8 1
+access f4 0 0 0 2fa0 8 1
+access 104 0 0 0 2fa8 8 1
+access 114 0 0 0 2fb0 8 1
+access 124 0 0 0 2fb8 8 1
+access 134 0 0 0 2fc0 8 1
+access 144 0 0 0 2fc8 8 1
+access 154 0 0 0 2fd0 8 1
+access 17f 0 0 0 2fd8 8 1
+access 255 1 2 276 fffffffffffffa24 4 1
+access 258 1 0 0 70e8 4 1
+access 271 1 2 276 fffffffffffffa10 8 1
+access 27a 1 2 276 fffffffffffffff8 8 1
+access 27e 1 2 276 fffffffffffffff0 8 1
+access 280 1 2 276 ffffffffffffffe8 8 1
+access 282 1 2 276 ffffffffffffffe0 8 1
+access 284 1 2 276 ffffffffffffffd8 8 1
+access 292 1 2 276 fffffffffffffe70 8 1
+access 297 1 2 276 ffffffffffffffc8 8 1
+access 29b 0 2 276 ffffffffffffffc8 8 1
+access 2ac 0 2 276 ffffffffffffffc8 8 1
+access 2b0 1 0 0 5008 8 1
+access 2be 0 0 0 3010 8 1
+access 2c2 0 0 0 3010 4 1
+access 2cb 0 0 0 7000 8 1
+access 2d5 1 0 0 7000 8 1
+access 2df 0 2 276 fffffffffffffe78 8 1
+access 2e3 0 0 0 5008 8 1
+access 2ea 0 1 297 0 1 1
+access 2ef 0 0 0 5008 8 1
+access 2f9 0 1 297 0 1 1
+access 2fe 0 0 0 5008 8 1
+access 30a 0 1 297 4 1 1
+access 30f 0 0 0 5008 8 1
+access 316 1 0 0 5000 8 1
+access 31d 0 0 0 5000 8 1
+access 324 0 1 297 0 1 1
+access 329 0 0 0 5008 8 1
+access 335 0 1 297 8 1 1
+access 33a 0 0 0 5008 8 1
+access 34a 0 1 297 c 1 1
+access 34f 0 0 0 5008 8 1
+access 35f 0 1 297 6 1 1
+access 364 0 0 0 5008 8 1
+access 37a 0 1 297 b 1 1
+access 37f 0 0 0 5008 8 1
+access 391 0 1 297 8 1 1
+access 395 0 0 0 5008 8 1
+access 3a3 0 1 297 3 1 1
+access 3a8 0 1 297 0 8 1
+access 3b5 1 2 276 fffffffffffffe70 8 1
+access 3ba 1 2 276 ffffffffffffffd0 8 1
+access 3be 0 2 276 ffffffffffffffd0 8 1
+access 3cf 0 2 276 ffffffffffffffd0 8 1
+access 3d3 1 0 0 5010 8 1
+access 3da 0 0 0 5010 8 1
+access 3e1 0 0 0 5008 8 1
+access 3e8 1 1 297 0 8 1
+access 3ec 0 0 0 5008 8 1
+access 3f3 0 1 297 0 8 1
+access 3f7 0 0 0 5008 8 1
+access 405 0 1 297 0 1 1
+access 40a 0 0 0 5008 8 1
+access 41c 0 1 297 4 1 1
+access 421 0 0 0 5008 8 1
+access 42e 0 0 0 5008 8 1
+access 43f 0 1 297 0 1 1
+access 449 1 2 276 fffffffffffffe70 8 1
+access 44e 1 2 276 ffffffffffffffc0 8 1
+access 452 0 2 276 ffffffffffffffc0 8 1
+access 463 0 2 276 ffffffffffffffc0 8 1
+access 467 1 2 276 ffffffffffffffb0 8 1
+access 46b 0 2 276 ffffffffffffffc0 8 1
+access 472 1 2 276 fffffffffffffe70 8 1
+access 47c 1 2 276 fffffffffffffe70 8 1
+access 481 1 2 276 ffffffffffffffb8 8 1
+access 485 0 2 276 ffffffffffffffb8 8 1
+access 496 0 2 276 ffffffffffffffb0 8 1
+access 49a 0 1 481 0 1 1
+access 4b3 1 2 276 fffffffffffffe70 8 1
+access 4bf 1 2 276 fffffffffffffe78 8 1
+access 4d4 1 2 276 fffffffffffffe70 8 1
+access 4ef 1 2 276 fffffffffffffe70 8 1
+access 50c 1 2 276 fffffffffffffe70 8 1
+access 51f 1 0 0 70e8 4 1
+access 538 1 2 276 fffffffffffffe70 8 1
+access 551 0 0 0 70e8 4 1
+access 576 1 2 276 fffffffffffffe70 8 1
+access 58f 1 2 276 fffffffffffffe70 8 1
+access 594 0 2 276 ffffffffffffffc8 8 1
+access 598 0 1 297 0 1 1
+access 59b 0 2 276 ffffffffffffffd0 8 1
+access 59f 0 1 3ba 0 1 1
+access 5aa 0 0 0 7000 8 1
+access 5b4 1 0 0 7000 8 1
+access 5c0 1 2 276 fffffffffffffe70 8 1
+base 255 2 276 fffffffffffffa24 4 2 276 fffffffffffffa28 0 0 24e 1
+base 2be 0 0 3010 8 0 0 3010 0 0 2b7 1
+base 2df 2 276 fffffffffffffe78 8 2 276 fffffffffffffe78 0 0 2dc 1
+base 2ea 1 297 0 1 1 297 0 1 1 2e3 1
+base 2f9 1 297 0 1 1 297 0 1 1 2f6 1
+base 30a 1 297 4 1 1 297 4 1 1 305 1
+base 324 1 297 0 1 1 297 0 1 1 31d 1
+base 335 1 297 8 1 1 297 8 1 1 330 1
+base 34a 1 297 c 1 1 297 c 1 1 346 1
+base 35f 1 297 6 1 1 297 6 1 1 35b 1
+base 37a 1 297 b 1 1 297 b 1 1 377 1
+base 391 1 297 8 1 1 297 8 1 1 38e 1
+base 3a3 1 297 3 1 1 297 0 1 1 395 1
+base 3a8 1 297 0 8 1 297 0 1 1 395 1
+base 3e8 1 297 0 8 1 297 0 1 1 3e1 1
+base 3f3 1 297 0 8 1 297 0 1 1 3ec 1
+base 598 1 297 0 1 1 297 0 1 1 594 1
+base 59f 1 3ba 0 1 1 3ba 0 2 1 59b 1
+alloc 297 64 1
+alloc 3ba 64 1
+alloc 44e 64 1
+alloc 481 64 1

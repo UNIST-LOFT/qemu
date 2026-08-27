@@ -71,6 +71,20 @@ static void gen_sem_reg_invalidate(int reg_idx, target_ulong pc) {
     tcg_temp_free(t_pc);
 }
 
+/* Immediate materialization of a full-width GPR value: the OSPREY
+ * consumer attempts the proven global seed (RIP-relative/absolute
+ * main-image addresses); provenance is a deliberate no-op (the default
+ * register-write invalidation already ran). */
+static void gen_sem_reg_materialize_address(int dst_idx, target_ulong pc,
+                                            TCGv value) {
+    if (!sem_events_active()) return;
+    TCGv_i32 t_dst = tcg_const_i32(dst_idx);
+    TCGv t_pc = tcg_const_tl(pc);
+    gen_helper_sem_reg_materialize_address(cpu_env, t_dst, value, t_pc);
+    tcg_temp_free_i32(t_dst);
+    tcg_temp_free(t_pc);
+}
+
 /* Full-width register copy: transfer the origin with a runtime
  * value-consistency check. */
 static void gen_sem_reg_copy(int dst_idx, int src_idx, target_ulong pc) {
@@ -91,7 +105,7 @@ static void gen_sem_reg_copy(int dst_idx, int src_idx, target_ulong pc) {
  * recorded in the provenance scratch via sem_set_pc first (arity is
  * full: env + 5 args). */
 static void gen_sem_reg_lea(int dst_idx, int base_idx, int64_t disp,
-                            target_ulong pc) {
+                            target_ulong pc, TCGv base_val) {
     if (!sem_events_active()) return;
     TCGv t_pc = tcg_const_tl(pc);
     gen_helper_sem_set_pc(cpu_env, t_pc);
@@ -100,7 +114,7 @@ static void gen_sem_reg_lea(int dst_idx, int base_idx, int64_t disp,
     TCGv_i32 t_base = tcg_const_i32(base_idx);
     TCGv t_disp = tcg_const_tl((target_ulong)disp);
     gen_helper_sem_reg_lea(cpu_env, t_dst, t_base, t_disp,
-                           cpu_regs[dst_idx], cpu_regs[base_idx]);
+                           cpu_regs[dst_idx], base_val);
     tcg_temp_free_i32(t_dst);
     tcg_temp_free_i32(t_base);
     tcg_temp_free(t_disp);
@@ -216,14 +230,19 @@ static void gen_sem_on_store_x87(int src_idx, TCGv t_addr, TCGMemOp ot) {
     gen_sem_on_store_class(src_idx, t_addr, ot, SEM_OP_X87_HELPER);
 }
 
-/* Full-width register xchg: swap the two registers' provenance tags. */
-static void gen_sem_reg_xchg(int dst_idx, int src_idx) {
+/* Full-width register xchg: swap the two registers' provenance tags.
+ * Post-swap concrete values and the raw instruction PC ride as explicit
+ * args (env->regs may be stale inside helpers). */
+static void gen_sem_reg_xchg(int dst_idx, int src_idx, target_ulong pc) {
     if (!sem_events_active()) return;
     TCGv_i32 t_dst = tcg_const_i32(dst_idx);
     TCGv_i32 t_src = tcg_const_i32(src_idx);
-    gen_helper_sem_reg_xchg(cpu_env, t_dst, t_src);
+    TCGv t_pc = tcg_const_tl(pc);
+    gen_helper_sem_reg_xchg(cpu_env, t_dst, t_src,
+                            cpu_regs[dst_idx], cpu_regs[src_idx], t_pc);
     tcg_temp_free_i32(t_dst);
     tcg_temp_free_i32(t_src);
+    tcg_temp_free(t_pc);
 }
 static SemProducerId sem_default_producer(SemOpClass cls)
 {
@@ -579,9 +598,17 @@ static void gen_sem_mem_access_f01_auto_class(DisasContext *s, TCGv t_addr,
 {
     SemProducerId producer = sem_instruction_producer(s, cls);
     if (s->sem_ea_pending) {
+        /* EA-decomposed first F01 event: records F01 and consumes the
+         * OSPREY EA snapshot.  NO_EA is deliberately NOT set so the
+         * decomposed record survives until the successful mem-access
+         * event (a fault discards it via the pending-state clearing
+         * paths instead). */
         gen_sem_mem_access_flags_class_producer(
-            t_addr, ot, pc, (is_store ? 1 : 0) | 8, cls, producer);
+            t_addr, ot, pc, (is_store ? 1 : 0), cls, producer);
     } else {
+        /* Mode-only/raw event: no EA decomposition exists; set NO_EA so
+         * any stale decomposed record is cleared and can never gate or
+         * feed a later instruction. */
         gen_sem_mem_access_f01_raw_class_policy(
             t_addr, 1 << (ot & MO_SIZE), pc, is_store, cls,
             SEM_INTERVAL_EXACT_WIDTH, producer);
@@ -2825,6 +2852,13 @@ static void gen_ldst_modrm_class(CPUX86State *env, DisasContext *s, int modrm,
         if (is_store) {
             if (reg != OR_TMP0)
                 gen_op_mov_v_reg(s, ot, s->T0, reg);
+            /* Keep the source channel available when source and
+             * destination are the same architectural register.  The
+             * semantic copy helper validates and replaces it afterward. */
+            if (reg != OR_TMP0 && reg == rm && ot == MO_64 &&
+                sem_events_active()) {
+                s->prov_skip_invalidate = true;
+            }
             gen_op_mov_reg_v(s, ot, rm, s->T0);
             /* Sound full-width reg→reg mov (shared event: provenance
              * transfer + OSPREY origin copy). */
@@ -2833,8 +2867,12 @@ static void gen_ldst_modrm_class(CPUX86State *env, DisasContext *s, int modrm,
             }
         } else {
             gen_op_mov_v_reg(s, ot, s->T0, rm);
-            if (reg != OR_TMP0)
+            if (reg != OR_TMP0) {
+                if (reg == rm && ot == MO_64 && sem_events_active()) {
+                    s->prov_skip_invalidate = true;
+                }
                 gen_op_mov_reg_v(s, ot, reg, s->T0);
+            }
             /* Sound full-width reg→reg mov. */
             if (reg != OR_TMP0 && ot == MO_64) {
                 gen_sem_reg_copy(reg, rm, s->pc_start);
@@ -6575,6 +6613,12 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
             gen_sem_mem_access(s->A0, ot, s->pc_start, true);
         } else {
             gen_op_mov_reg_v(s, ot, (modrm & 7) | REX_B(s), s->T0);
+            /* Register form of MOV r/m64, imm32: full-width immediate
+             * materialization for the OSPREY global seed. */
+            if (ot == MO_64 && sem_events_active()) {
+                gen_sem_reg_materialize_address((modrm & 7) | REX_B(s),
+                                                s->pc_start, s->T0);
+            }
         }
         break;
     case 0x8a:
@@ -6704,7 +6748,7 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                 if (a.index < 0 || binradar_memcheck_enabled) {
                     s->prov_skip_invalidate = true;
                 }
-                if (a.index >= 0) {
+                if (a.index >= 0 || reg == a.base) {
                     pre_base = tcg_temp_new();
                     tcg_gen_mov_tl(pre_base, cpu_regs[a.base]);
                 }
@@ -6712,11 +6756,26 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
             gen_op_mov_reg_v(s, dflag, reg, s->A0);
             if (dflag == MO_64 && a.base >= 0) {
                 if (a.index < 0) {
-                    gen_sem_reg_lea(reg, a.base, a.disp, s->pc_start);
+                    gen_sem_reg_lea(reg, a.base, a.disp, s->pc_start,
+                                    pre_base != NULL
+                                        ? pre_base : cpu_regs[a.base]);
+                    if (pre_base != NULL) {
+                        tcg_temp_free(pre_base);
+                    }
                 } else {
                     gen_sem_reg_lea_dyn(reg, a.base, s->pc_start,
                                         pre_base);
                     tcg_temp_free(pre_base);
+                }
+            } else if (dflag == MO_64 && a.index < 0) {
+                /* No architectural base/index register (RIP-relative or
+                 * absolute displacement form): the write-back kill already
+                 * ran; runtime global-range resolution decides whether the
+                 * result is a valid G origin.  Never seed heap, stack,
+                 * anonymous-map, library, or merely mapped values. */
+                if (sem_events_active()) {
+                    gen_sem_reg_materialize_address(reg, s->pc_start,
+                                                    s->A0);
                 }
             }
          }
@@ -6775,6 +6834,12 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
             reg = (b & 7) | REX_B(s);
             tcg_gen_movi_tl(s->T0, tmp);
             gen_op_mov_reg_v(s, MO_64, reg, s->T0);
+            /* Full-width immediate materialization: the OSPREY
+             * consumer attempts the proven global seed; the default
+             * write-back kill already ran for every other value. */
+            if (sem_events_active()) {
+                gen_sem_reg_materialize_address(reg, s->pc_start, s->T0);
+            }
         } else
 #endif
         {
@@ -6812,7 +6877,7 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                 s->prov_skip_invalidate = true;
                 gen_op_mov_reg_v(s, ot, reg, s->T1);
                 s->prov_skip_invalidate = false;
-                gen_sem_reg_xchg(reg, rm);
+                gen_sem_reg_xchg(reg, rm, s->pc_start);
             } else {
                 /* Narrower xchg: partial-register writes, both tags die. */
                 gen_op_mov_reg_v(s, ot, rm, s->T0);

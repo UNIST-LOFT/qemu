@@ -444,6 +444,196 @@ TESTS = [
         expect_queue_min=1,
         timeout=60,
     ),
+    dict(
+        name="t09_address_origins",
+        mode="dump_compare",
+        # Exercise the OSPREY address-origin/F02 channel without
+        # provenance; the shared translator dispatch must not depend on
+        # memcheck being enabled.
+        memcheck=0,
+        # This fixture validates the merged F01/F02 dump, not the
+        # known-invalid later inference stages.  Reject immediately after
+        # fact collection.
+        env={"BINRADAR_OSPREY_MAX_VARIABLES": "1"},
+        dump_stem="t09_dump",
+        expected="t09_address_origins.expected",
+        rc=(2,),
+        expect_rows=[("facts", "[copy 0] [points 0]")],
+        # Exact canonical rows asserted against the checked-in dump
+        # (t09_address_origins.expected), byte-identical across three PIE
+        # load biases.  Every positive access label owns exactly one base
+        # row with the expected normalized producer PC; every negative
+        # label is absent from the base rows.
+        dump_assert={
+            "access_symbols_absent": [
+                "t09_no_base_segment", "t09_fault_access",
+            ],
+            "access_symbols_expected": {
+                "t09_no_base_scaled": {"min_rows": 1, "max_rows": 1},
+                "t09_no_base_indexed_lea": {"min_rows": 1, "max_rows": 1},
+                "t09_no_base_stale": {"min_rows": 1, "max_rows": 1},
+                "t09_no_base_simd": {"min_rows": 1, "max_rows": 1},
+            },
+            "base_symbols_expected": {
+                "t09_access_global_rip": {
+                    "producer": "t09_prod_global_rip", "kind": 0,
+                    "min_rows": 1, "max_rows": 1,
+                },
+                "t09_access_stack_mov": {
+                    "producer": "t09_prod_stack_mov", "kind": 2,
+                    "min_rows": 1, "max_rows": 1,
+                },
+                "t09_access_heap_mov": {
+                    "producer": "t09_prod_heap_mov", "kind": 1,
+                    "min_rows": 1, "max_rows": 1,
+                },
+                "t09_access_heap_self_mov": {
+                    "producer": "t09_prod_heap_self_mov", "kind": 1,
+                    "min_rows": 1, "max_rows": 1,
+                },
+                "t09_access_heap_self_lea": {
+                    "producer": "t09_prod_heap_self_lea", "kind": 1,
+                    "min_rows": 1, "max_rows": 1,
+                },
+                "t09_access_heap_reload": {
+                    "producer": "t09_prod_heap_reload", "kind": 1,
+                    "min_rows": 1, "max_rows": 1,
+                },
+                "t09_access_heap_lea": {
+                    "producer": "t09_prod_heap_lea", "kind": 1,
+                    "min_rows": 1, "max_rows": 1,
+                },
+                "t09_access_heap_add_imm": {
+                    "producer": "t09_prod_heap_add_imm", "kind": 1,
+                    "min_rows": 1, "max_rows": 1,
+                },
+                "t09_access_heap_sub_imm": {
+                    "producer": "t09_prod_heap_sub_imm", "kind": 1,
+                    "min_rows": 1, "max_rows": 1,
+                },
+                "t09_access_heap_add_reg": {
+                    "producer": "t09_prod_heap_add_reg", "kind": 1,
+                    "min_rows": 1, "max_rows": 1,
+                },
+                "t09_access_heap_xchg": {
+                    "producer": "t09_prod_heap_xchg", "kind": 1,
+                    "min_rows": 1, "max_rows": 1,
+                },
+                "t09_access_heap_base_index": {
+                    "producer": "t09_prod_heap_index_base", "kind": 1,
+                    "min_rows": 1, "max_rows": 1,
+                },
+                "t09_access_heap_index_only": {
+                    "producer": "t09_prod_heap_index_base", "kind": 1,
+                    "min_rows": 1, "max_rows": 1,
+                },
+                "t09_access_self_load": {
+                    "producer": "t09_prod_self_base", "kind": 1,
+                    "min_rows": 1, "max_rows": 1,
+                },
+            },
+            "base_symbols_absent": [
+                "t09_no_base_scaled", "t09_no_base_indexed_lea",
+                "t09_no_base_segment", "t09_no_base_stale",
+                "t09_no_base_simd", "t09_fault_access",
+            ],
+            "no_copy_points": True,
+        },
+        timeout=60,
+    ),
+    dict(
+        name="t09_address_origins_combined",
+        guest="t09_address_origins",
+        mode="dump_compare",
+        # The same exact F01/F02 dump must remain stable when provenance
+        # and OSPREY consume the neutral events together.  Provenance
+        # legitimately reports the deliberate stale fixture
+        # (t09_no_base_stale) as heap-use-after-free.  The shared F01/F02
+        # dump and tracer outcome must nevertheless be deterministic
+        # across the same three verified PIE biases.
+        memcheck=1,
+        env={"BINRADAR_OSPREY_MAX_VARIABLES": "1"},
+        dump_stem="t09_combined_dump",
+        expected="t09_address_origins.expected",
+        rc=(2,),
+        expect_rows=[("facts", "[copy 0] [points 0]")],
+        dump_assert={
+            "access_symbols_absent": [
+                "t09_no_base_segment", "t09_fault_access",
+            ],
+            "access_symbols_expected": {
+                "t09_no_base_scaled": {"min_rows": 1, "max_rows": 1},
+                "t09_no_base_indexed_lea": {"min_rows": 1, "max_rows": 1},
+                "t09_no_base_stale": {"min_rows": 1, "max_rows": 1},
+                "t09_no_base_simd": {"min_rows": 1, "max_rows": 1},
+            },
+            "base_symbols_expected": {
+                "t09_access_global_rip": {
+                    "producer": "t09_prod_global_rip", "kind": 0,
+                    "min_rows": 1, "max_rows": 1,
+                },
+                "t09_access_stack_mov": {
+                    "producer": "t09_prod_stack_mov", "kind": 2,
+                    "min_rows": 1, "max_rows": 1,
+                },
+                "t09_access_heap_mov": {
+                    "producer": "t09_prod_heap_mov", "kind": 1,
+                    "min_rows": 1, "max_rows": 1,
+                },
+                "t09_access_heap_self_mov": {
+                    "producer": "t09_prod_heap_self_mov", "kind": 1,
+                    "min_rows": 1, "max_rows": 1,
+                },
+                "t09_access_heap_self_lea": {
+                    "producer": "t09_prod_heap_self_lea", "kind": 1,
+                    "min_rows": 1, "max_rows": 1,
+                },
+                "t09_access_heap_reload": {
+                    "producer": "t09_prod_heap_reload", "kind": 1,
+                    "min_rows": 1, "max_rows": 1,
+                },
+                "t09_access_heap_lea": {
+                    "producer": "t09_prod_heap_lea", "kind": 1,
+                    "min_rows": 1, "max_rows": 1,
+                },
+                "t09_access_heap_add_imm": {
+                    "producer": "t09_prod_heap_add_imm", "kind": 1,
+                    "min_rows": 1, "max_rows": 1,
+                },
+                "t09_access_heap_sub_imm": {
+                    "producer": "t09_prod_heap_sub_imm", "kind": 1,
+                    "min_rows": 1, "max_rows": 1,
+                },
+                "t09_access_heap_add_reg": {
+                    "producer": "t09_prod_heap_add_reg", "kind": 1,
+                    "min_rows": 1, "max_rows": 1,
+                },
+                "t09_access_heap_xchg": {
+                    "producer": "t09_prod_heap_xchg", "kind": 1,
+                    "min_rows": 1, "max_rows": 1,
+                },
+                "t09_access_heap_base_index": {
+                    "producer": "t09_prod_heap_index_base", "kind": 1,
+                    "min_rows": 1, "max_rows": 1,
+                },
+                "t09_access_heap_index_only": {
+                    "producer": "t09_prod_heap_index_base", "kind": 1,
+                    "min_rows": 1, "max_rows": 1,
+                },
+                "t09_access_self_load": {
+                    "producer": "t09_prod_self_base", "kind": 1,
+                    "min_rows": 1, "max_rows": 1,
+                },
+            },
+            "base_symbols_absent": [
+                "t09_no_base_scaled", "t09_no_base_indexed_lea",
+                "t09_no_base_segment", "t09_no_base_stale",
+                "t09_no_base_simd", "t09_fault_access",
+            ],
+            "no_copy_points": True,
+        },
+        timeout=60,
+    ),
 ]
 
 
@@ -882,6 +1072,71 @@ def check_dump(test, dump, guest):
                 problems.append(
                     f"access symbol {symbol} sizes {dict(sizes)} != "
                     f"{dict(expected)}")
+
+    # Stage 2.3 base rows: strict 13-token format
+    # `base <access-pc-hex> <chunk-kind> <chunk-site-hex>
+    # <chunk-offset-hex> <chunk-size-dec> <base-kind> <base-site-hex>
+    # <base-offset-hex> <prov-id> <generation> <producer-pc-hex>
+    # <support>`; every token must parse, and the access/producer PCs
+    # must resolve exactly to the labeled symbols.
+    base_rows = [ln.split() for ln in dump.splitlines()
+                 if ln.startswith("base ")]
+    for row in base_rows:
+        if len(row) != 13:
+            problems.append(f"malformed base row: {' '.join(row)}")
+            continue
+        try:
+            int(row[1], 16)   # access pc
+            int(row[2])       # chunk kind
+            int(row[3], 16)   # chunk site
+            int(row[4], 16)   # chunk offset
+            int(row[5])       # chunk size
+            int(row[6])       # base kind
+            int(row[7], 16)   # base site
+            int(row[8], 16)   # base offset
+            int(row[9])       # prov id
+            int(row[10])      # generation
+            int(row[11], 16)  # producer pc
+            int(row[12])      # support
+        except ValueError:
+            problems.append(f"malformed base row: {' '.join(row)}")
+    base_by_access_pc = {}
+    for row in base_rows:
+        base_by_access_pc.setdefault(int(row[1], 16), []).append(row)
+
+    for symbol, policy in want.get("base_symbols_expected", {}).items():
+        access_pc = resolve_access_symbol(guest, symbol)
+        producer_pc = resolve_access_symbol(guest, policy["producer"])
+        rows = base_by_access_pc.get(access_pc, [])
+        if len(rows) < policy.get("min_rows", 1):
+            problems.append(
+                f"base symbol {symbol} rows {len(rows)} < "
+                f"{policy.get('min_rows', 1)}")
+        for row in rows:
+            if int(row[2]) != policy["kind"] or \
+                    int(row[6]) != policy["kind"]:
+                problems.append(
+                    f"base symbol {symbol} kinds "
+                    f"{row[2]}/{row[6]} != {policy['kind']}")
+            if int(row[11], 16) != producer_pc:
+                problems.append(
+                    f"base symbol {symbol} producer {row[11]} != "
+                    f"{producer_pc:x} ({policy['producer']})")
+        if "max_rows" in policy and len(rows) > policy["max_rows"]:
+            problems.append(
+                f"base symbol {symbol} rows {len(rows)} > "
+                f"{policy['max_rows']}")
+
+    for symbol in want.get("base_symbols_absent", []):
+        access_pc = resolve_access_symbol(guest, symbol)
+        if access_pc in base_by_access_pc:
+            problems.append(
+                f"base symbol {symbol} unexpectedly has a base row")
+
+    if want.get("no_copy_points"):
+        if any(ln.startswith("copy ") or ln.startswith("points ")
+               for ln in dump.splitlines()):
+            problems.append("unexpected copy/points rows in dump")
     return problems
 
 

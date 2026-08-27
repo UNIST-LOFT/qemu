@@ -114,6 +114,10 @@ typedef enum SemProducerId {
  * and manifest-family ID into the unused high flags bits so runtime dispatch
  * validates the exact class/policy/width row that the source inventory checks.
  */
+#define SEM_MEM_F_STORE           (1u << 0) /* store direction */
+#define SEM_MEM_F_PROVENANCE_CHECK (1u << 1) /* run provenance EA check */
+#define SEM_MEM_F_OSPREY_SKIP_F01 (1u << 2) /* provenance-only follow-up */
+#define SEM_MEM_F_NO_EA           (1u << 3) /* plain F01; no EA decomposition */
 #define SEM_MEM_POLICY_SHIFT 8
 #define SEM_MEM_POLICY_MASK  (0x7u << SEM_MEM_POLICY_SHIFT)
 #define SEM_MEM_PRODUCER_SHIFT 11

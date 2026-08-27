@@ -1,6 +1,6 @@
 region 0 0 0 1 302020
 region 2 0 684 2 8
-region 2 40 713 3 28
+region 2 40 713 3 0
 region 2 50 697 4 0
 region 2 90 715 3 0
 region 2 100 712 6 10
@@ -69,3 +69,17 @@ access 2c6 1 2 2ae fffffffffffffff0 8 1
 access 2cb 1 2 2ae fffffffffffffff0 8 1
 access 2d0 0 0 0 1ff000 8 1
 access 2da 0 2 2ae fffffffffffffff8 8 1
+base 15c 2 149 fffffffffffffff0 8 2 149 fffffffffffffff8 0 0 14e 1
+base 167 2 149 ffffffffffffffe8 8 2 149 fffffffffffffff8 0 0 14e 1
+base 16b 2 149 ffffffffffffffe0 8 2 149 fffffffffffffff8 0 0 14e 1
+base 18c 2 149 fffffffffffffff0 8 2 149 fffffffffffffff8 0 0 14e 1
+base 190 2 149 ffffffffffffffe0 8 2 149 fffffffffffffff8 0 0 14e 1
+base 194 0 0 1ff240 8 0 0 1ff240 0 0 18c 1
+base 1a9 2 149 ffffffffffffffe8 8 2 149 fffffffffffffff8 0 0 14e 1
+base 1ad 0 0 1ff440 8 0 0 1ff440 0 0 1a9 1
+base 1b7 2 149 ffffffffffffffe0 8 2 149 fffffffffffffff8 0 0 14e 1
+base 1bd 2 149 ffffffffffffffe0 8 2 149 fffffffffffffff8 0 0 14e 1
+base 1de 0 0 2ff000 8 0 0 2ff000 0 0 1d3 1
+base 1ef 0 0 300000 8 0 0 300000 0 0 1e1 1
+base 207 0 0 300008 8 0 0 300008 0 0 1f9 1
+base 218 0 0 300010 8 0 0 300010 0 0 20a 1

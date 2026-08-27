@@ -119,6 +119,10 @@ QemuMutexTrylockFunc qemu_mutex_trylock_func = NULL;
 static void test_sem_manifest_integrity(void);
 static void test_sem_overwrite_fail_closed(void);
 static void test_sem_access_class_and_flags(void);
+static void test_address_origin_channels_and_producers(void);
+static void test_address_shadow_reload(void);
+static void test_f02_ea_selection(void);
+static void test_base_fact_producer_merge(void);
 
 void helper_sem_on_load(CPUArchState *env, uint32_t dst_idx,
                         target_ulong addr, target_ulong size,
@@ -126,6 +130,10 @@ void helper_sem_on_load(CPUArchState *env, uint32_t dst_idx,
 void helper_sem_on_store(CPUArchState *env, uint32_t src_idx,
                          target_ulong addr, target_ulong size,
                          target_ulong src_val, uint32_t cls);
+void helper_sem_reg_lea(CPUArchState *env, uint32_t dst_idx,
+                        uint32_t base_idx, target_ulong disp,
+                        target_ulong dst_val, target_ulong base_val);
+void helper_sem_set_pc(CPUArchState *env, target_ulong pc);
 
 /* ------------------------------------------------------------------ */
 /* Harness                                                             */
@@ -823,20 +831,22 @@ static void test_heap_identity_lifecycle(void)
           "heap region + offset");
 
     /* origin validation: freed identity rejected, live accepted */
-    OspreyRegOrigin o;
+    OspreyAddressOrigin o;
     memset(&o, 0, sizeof(o));
+    o.valid = 1;
+    o.width = sizeof(target_ulong);
     o.prov_object_id = t1.object_id;
     o.prov_generation = t1.generation;
     o.concrete_value = 0x1000;
-    o.address.region.kind = OSPREY_REGION_HEAP_SITE;
-    o.address.region.site_offset = 0x200;
-    o.address.offset = 0;
-    CHECK(!osprey_origin_prov_live(&o), "freed identity rejected");
+    o.canonical.region.kind = OSPREY_REGION_HEAP_SITE;
+    o.canonical.region.site_offset = 0x200;
+    o.canonical.offset = 0;
+    CHECK(!osprey_address_origin_live(&o), "freed identity rejected");
     o.prov_object_id = t2.object_id;
     o.prov_generation = t2.generation;
-    CHECK(osprey_origin_prov_live(&o), "live identity accepted");
+    CHECK(osprey_address_origin_live(&o), "live identity accepted");
     o.concrete_value = 0x1000 + 64; /* past end */
-    CHECK(!osprey_origin_prov_live(&o), "out-of-bounds value rejected");
+    CHECK(!osprey_address_origin_live(&o), "out-of-bounds value rejected");
 
     /* The lifecycle API accepts only the authoritative identity. */
     osprey_on_free_identity(env, t2.object_id, t2.generation, 0x400400);
@@ -963,55 +973,56 @@ static void test_stack_frames_and_rsp_origin(void)
     /* imprecise callee (libc) as the only frame: no seed, window not
      * resolvable, ret pops it */
     osprey_on_call(env, 0x7f0000000000, 0x7ffbfff8);
-    CHECK(!st->regs[R_ESP].valid, "imprecise call leaves rsp origin invalid");
+    CHECK(!st->regs[R_ESP].address.valid, "imprecise call leaves rsp origin invalid");
     OspreyRegionId r;
     int64_t off;
     CHECK(!osprey_region_of_addr(env, 0x7ffbff00, &r, &off, false),
           "imprecise frame window not resolvable");
     osprey_on_ret(env, 0x7f0000000001, 0x7ffc0000);
-    CHECK(!st->regs[R_ESP].valid, "no frames -> rsp origin invalid");
+    CHECK(!st->regs[R_ESP].address.valid, "no frames -> rsp origin invalid");
 
     /* precise callee: entry_sp = 0x7ffc0000, origin at offset 0 */
     osprey_on_call(env, 0x400500, 0x7ffc0000);
-    CHECK(st->regs[R_ESP].valid &&
-          st->regs[R_ESP].kind == OSPREY_ORIGIN_ADDRESS,
+    CHECK(st->regs[R_ESP].address.valid &&
+          st->regs[R_ESP].address.width == sizeof(target_ulong),
           "rsp origin seeded at call");
-    CHECK(st->regs[R_ESP].address.offset == 0, "rsp origin offset 0");
-    CHECK(st->regs[R_ESP].address.region.site_offset == 0x500,
+    CHECK(st->regs[R_ESP].address.canonical.offset == 0,
+          "rsp origin offset 0");
+    CHECK(st->regs[R_ESP].address.canonical.region.site_offset == 0x500,
           "rsp origin frame site");
 
     /* rsp update below entry (prologue push): signed offset */
     osprey_on_rsp_update(env, 0x7ffbfff0, 0x400501);
-    CHECK(st->regs[R_ESP].valid &&
-          st->regs[R_ESP].address.offset == -16,
+    CHECK(st->regs[R_ESP].address.valid &&
+          st->regs[R_ESP].address.canonical.offset == -16,
           "rsp update keeps frame origin with signed offset");
     /* out-of-image rsp write invalidates */
     osprey_on_rsp_update(env, 0x7ffbffe0, 0x7f0000001234);
-    CHECK(!st->regs[R_ESP].valid, "out-of-image rsp write invalidates");
+    CHECK(!st->regs[R_ESP].address.valid, "out-of-image rsp write invalidates");
     osprey_on_rsp_update(env, 0x7ffbfff0, 0x400501);
-    CHECK(st->regs[R_ESP].valid, "in-image rsp write re-derives");
+    CHECK(st->regs[R_ESP].address.valid, "in-image rsp write re-derives");
 
     /* An imprecise nested call invalidates the precise caller's RSP
      * origin while library code runs; its RET restores the caller. */
     osprey_on_call(env, 0x7f0000000000, 0x7ffbffe8);
-    CHECK(!st->regs[R_ESP].valid,
+    CHECK(!st->regs[R_ESP].address.valid,
           "imprecise nested call invalidates caller rsp origin");
     osprey_on_ret(env, 0x400501, 0x7ffbfff0);
-    CHECK(st->regs[R_ESP].valid &&
-          st->regs[R_ESP].address.region.site_offset == 0x500,
+    CHECK(st->regs[R_ESP].address.valid &&
+          st->regs[R_ESP].address.canonical.region.site_offset == 0x500,
           "library return restores precise caller");
 
     /* A normal nested return selects the caller; the callee must not
      * claim the caller's post-pop RSP. */
     osprey_on_call(env, 0x400600, 0x7ffbffe8);
     osprey_on_ret(env, 0x400601, 0x7ffbfff0);
-    CHECK(st->regs[R_ESP].valid &&
-          st->regs[R_ESP].address.region.site_offset == 0x500,
+    CHECK(st->regs[R_ESP].address.valid &&
+          st->regs[R_ESP].address.canonical.region.site_offset == 0x500,
           "normal return resolves to caller");
 
     /* ret pops the frame; no frames left -> invalid */
     osprey_on_ret(env, 0x400501, 0x7ffc0008);
-    CHECK(!st->regs[R_ESP].valid, "rsp origin invalid after final ret");
+    CHECK(!st->regs[R_ESP].address.valid, "rsp origin invalid after final ret");
 
     osprey_free(ctx);
     g_free(run);
@@ -1062,12 +1073,12 @@ static void test_entrypoint_frame_seeding(void)
 
     /* Seed main's frame at the observed entry SP. */
     osprey_on_entrypoint(env, 0x400100, 0x7ffc0000);
-    CHECK(st->regs[R_ESP].valid &&
-          st->regs[R_ESP].kind == OSPREY_ORIGIN_ADDRESS,
+    CHECK(st->regs[R_ESP].address.valid &&
+          st->regs[R_ESP].address.width == sizeof(target_ulong),
           "entrypoint seeds rsp origin");
-    CHECK(st->regs[R_ESP].address.offset == 0,
+    CHECK(st->regs[R_ESP].address.canonical.offset == 0,
           "entrypoint origin at offset zero");
-    CHECK(st->regs[R_ESP].address.region.site_offset == 0x100,
+    CHECK(st->regs[R_ESP].address.canonical.region.site_offset == 0x100,
           "entrypoint origin frame site");
 
     /* A real prologue establishes the observed lower bound before local
@@ -1092,8 +1103,8 @@ static void test_entrypoint_frame_seeding(void)
     osprey_on_call(env, 0x400200, 0x7ffbfff8);
     osprey_on_reg_invalidate(env, R_ESP);
     osprey_on_entrypoint(env, 0x400200, 0x7ffbfff8);
-    CHECK(st->regs[R_ESP].valid &&
-          st->regs[R_ESP].address.region.site_offset == 0x200,
+    CHECK(st->regs[R_ESP].address.valid &&
+          st->regs[R_ESP].address.canonical.region.site_offset == 0x200,
           "called-patch barrier restores existing frame origin");
 
     CHECK(osprey_parent_merge_sample(ctx, run) == OSPREY_OK, "merge ok");
@@ -1144,10 +1155,10 @@ static void test_stack_resync(void)
      * f1/f2 frames cannot contain the new SP and are popped; main
      * survives as the owner. */
     osprey_on_rsp_update(env, 0x7ffbfffc, 0x400100);
-    CHECK(st->regs[R_ESP].valid &&
-          st->regs[R_ESP].address.region.site_offset == 0x100,
+    CHECK(st->regs[R_ESP].address.valid &&
+          st->regs[R_ESP].address.canonical.region.site_offset == 0x100,
           "longjmp rsp write resolves to surviving main frame");
-    CHECK(st->regs[R_ESP].address.offset == -4,
+    CHECK(st->regs[R_ESP].address.canonical.offset == -4,
           "longjmp rsp write seeds main at signed offset");
     OspreyRegionId r;
     int64_t off;
@@ -1159,7 +1170,7 @@ static void test_stack_resync(void)
      * everything, no owner -> invalidate. */
     osprey_on_call(env, 0x400400, 0x7ffbffc0);
     osprey_on_rsp_update(env, 0x7ffd0000, 0x400401);
-    CHECK(!st->regs[R_ESP].valid, "rsp above all frames invalidates");
+    CHECK(!st->regs[R_ESP].address.valid, "rsp above all frames invalidates");
 
     /* Mismatched-return near miss: RET always pops the callee, but a
      * post-pop SP still inside the caller's exact window must not pop
@@ -1168,10 +1179,10 @@ static void test_stack_resync(void)
     osprey_on_rsp_update(env, 0x7ffc1ff8, 0x400100);
     osprey_on_call(env, 0x400500, 0x7ffc1ff8);
     osprey_on_ret(env, 0x400501, 0x7ffc1ff8);
-    CHECK(st->regs[R_ESP].valid &&
-          st->regs[R_ESP].address.region.site_offset == 0x100,
+    CHECK(st->regs[R_ESP].address.valid &&
+          st->regs[R_ESP].address.canonical.region.site_offset == 0x100,
           "near-miss ret keeps the caller frame");
-    CHECK(st->regs[R_ESP].address.offset == -8,
+    CHECK(st->regs[R_ESP].address.canonical.offset == -8,
           "near-miss ret restores caller signed offset");
 
     osprey_on_call(env, 0x400500, 0x7ffc1ff0);
@@ -1181,8 +1192,8 @@ static void test_stack_resync(void)
     osprey_on_call(env, 0x400600, 0x7ffc1fe8);
     osprey_on_call(env, 0x400600, 0x7ffc1fe0);
     osprey_on_ret(env, 0x400601, 0x7ffc1ff0);
-    CHECK(st->regs[R_ESP].valid &&
-          st->regs[R_ESP].address.region.site_offset == 0x500,
+    CHECK(st->regs[R_ESP].address.valid &&
+          st->regs[R_ESP].address.canonical.region.site_offset == 0x500,
           "ret above stale chain pops to surviving owner");
 
     osprey_free(ctx);
@@ -1767,12 +1778,16 @@ int main(void)
     test_sem_manifest_integrity();
     test_sem_overwrite_fail_closed();
     test_sem_access_class_and_flags();
+    test_address_origin_channels_and_producers();
+    test_address_shadow_reload();
+    test_f02_ea_selection();
+    test_base_fact_producer_merge();
 
     if (failures != 0) {
         fprintf(stderr, "%d unit test check(s) FAILED\n", failures);
         return 1;
     }
-    printf("PASS osprey_unit (37/37)\n");
+    printf("PASS osprey_unit (41/41)\n");
     return 0;
 }
 
@@ -1907,8 +1922,8 @@ static void test_sem_overwrite_fail_closed(void)
     tag.concrete_value = 0x1000;
 
     OspreyCpuOriginState *ost = osprey_cpu_origin(&env);
-    ost->regs[R_EAX].valid = 1;
-    ost->regs[R_EAX].kind = OSPREY_ORIGIN_ADDRESS;
+    ost->regs[R_EAX].address.valid = 1;
+    ost->regs[R_EAX].address.width = sizeof(target_ulong);
     provenance_set_reg_tag(&env, R_EAX, tag);
     provenance_mem_store_tag(0x1000, tag);
 
@@ -1921,7 +1936,7 @@ static void test_sem_overwrite_fail_closed(void)
           "inactive provenance register unchanged");
     CHECK(provenance_mem_load_tag(0x1000).valid,
           "inactive provenance memory unchanged");
-    CHECK(ost->regs[R_EAX].valid,
+    CHECK(ost->regs[R_EAX].address.valid,
           "inactive OSPREY register unchanged");
 
     /* Invalid class values are bounds-safe and still fail closed for an
@@ -1938,45 +1953,49 @@ static void test_sem_overwrite_fail_closed(void)
      * fault-left EA record without requiring provenance to be active. */
     binradar_memcheck_enabled = 0;
     osprey_collect_enabled = 1;
-    ost->regs[R_EAX].valid = 1;
-    ost->regs[R_EAX].kind = OSPREY_ORIGIN_ADDRESS;
-    ost->regs[R_EAX].concrete_value = 0;
+    ost->regs[R_EAX].address.valid = 1;
+    ost->regs[R_EAX].address.width = sizeof(target_ulong);
+    ost->regs[R_EAX].address.concrete_value = 0;
     helper_sem_on_store(&env, R_EAX, 0x402000, 8, 0,
                         SEM_OP_INTEGER);
-    ost->regs[R_EBX].valid = 0;
+    ost->regs[R_EBX].address.valid = 0;
     helper_sem_on_store(&env, R_EAX, 0x402000, 8, 0,
                         (uint32_t)-1);
     helper_sem_on_load(&env, R_EBX, 0x402000, 8, 0x400100,
                        SEM_OP_INTEGER);
-    CHECK(!ost->regs[R_EBX].valid,
+    CHECK(!ost->regs[R_EBX].address.valid,
           "invalid class clears OSPREY memory shadow");
-    ost->regs[R_EAX].valid = 1;
-    ost->regs[R_EAX].kind = OSPREY_ORIGIN_ADDRESS;
+    ost->regs[R_EAX].address.valid = 1;
+    ost->regs[R_EAX].address.width = sizeof(target_ulong);
     sem_reg_overwrite(&env, R_EAX, SEM_OP_UNKNOWN);
-    CHECK(!ost->regs[R_EAX].valid, "OSPREY register overwrite invalidates");
+    CHECK(!ost->regs[R_EAX].address.valid,
+          "OSPREY register overwrite invalidates");
 
     for (int i = 0; i < CPU_NB_REGS; i++) {
-        ost->regs[i].valid = 1;
-        ost->regs[i].kind = OSPREY_ORIGIN_ADDRESS;
+        ost->regs[i].address.valid = 1;
+        ost->regs[i].address.width = sizeof(target_ulong);
     }
-    ost->ea_valid = true;
+    ost->ea.valid = true;
     ost->ea_mode = MO_64;
-    ost->ea_base_origin.valid = 1;
-    ost->ea_index_origin.valid = 1;
+    ost->ea.base_origin.valid = 1;
+    ost->ea.index_origin.valid = 1;
     sem_context_replace(&env);
     for (int i = 0; i < CPU_NB_REGS; i++) {
-        CHECK(!ost->regs[i].valid, "context replacement kills OSPREY reg");
+        CHECK(!ost->regs[i].address.valid,
+              "context replacement kills OSPREY reg");
     }
-    CHECK(!ost->ea_valid && ost->ea_mode == 0,
+    CHECK(!ost->ea.valid && ost->ea_mode == 0,
           "context replacement consumes EA metadata");
-    CHECK(!ost->ea_base_origin.valid && !ost->ea_index_origin.valid,
+    CHECK(!ost->ea.base_origin.valid && !ost->ea.index_origin.valid,
           "context replacement clears EA origins");
 
-    ost->regs[R_EAX].valid = 1;
-    ost->regs[R_EBX].valid = 1;
+    ost->regs[R_EAX].address.valid = 1;
+    ost->regs[R_EBX].address.valid = 1;
     sem_clobber_caller_saved(&env);
-    CHECK(!ost->regs[R_EAX].valid, "modeled call kills caller-saved origin");
-    CHECK(ost->regs[R_EBX].valid, "modeled call keeps callee-saved origin");
+    CHECK(!ost->regs[R_EAX].address.valid,
+          "modeled call kills caller-saved origin");
+    CHECK(ost->regs[R_EBX].address.valid,
+          "modeled call keeps callee-saved origin");
 
     sem_reg_overwrite(NULL, 0, SEM_OP_UNKNOWN);
     sem_context_replace(NULL);
@@ -2002,7 +2021,7 @@ static void test_sem_access_class_and_flags(void)
     sem_mem_access(env, 0x402008, 8, 0x400100, 8, SEM_OP_SIMD,
                    SEM_INTERVAL_EXACT_WIDTH, SEM_PRODUCER_SIMD_SCALAR);
     CHECK(run->access_used == 1, "valid class records F01 access");
-    CHECK(!st->ea_valid && st->ea_mode == 0,
+    CHECK(!st->ea.valid && st->ea_mode == 0,
           "plain event consumes EA state");
 
     /* Operation class is part of F01 identity: the same PC/address/width
@@ -2048,7 +2067,7 @@ static void test_sem_access_class_and_flags(void)
     osprey_shared_run_reset(run, 1, &c);
     osprey_child_use_shared_run(ctx, run);
     fill_two_access_facts(run);
-    st->ea_valid = false;
+    st->ea.valid = false;
     st->ea_mode = 0;
     st->pending_helper_count = 0;
 
@@ -2062,7 +2081,7 @@ static void test_sem_access_class_and_flags(void)
           "undeclared policy suppresses F01 access");
     CHECK(run->unsupported_execution == 1,
           "undeclared policy rejects the sample");
-    CHECK(!st->ea_valid && st->ea_mode == 0,
+    CHECK(!st->ea.valid && st->ea_mode == 0,
           "undeclared policy clears EA state");
     osprey_collect_enabled = 1;
 
@@ -2072,7 +2091,7 @@ static void test_sem_access_class_and_flags(void)
                    SEM_INTERVAL_EXACT_WIDTH, SEM_PRODUCER_INVALID);
     CHECK(run->access_used == 2 && run->unsupported_execution == 1,
           "invalid producer family rejects F01 access");
-    CHECK(!st->ea_valid && st->ea_mode == 0,
+    CHECK(!st->ea.valid && st->ea_mode == 0,
           "invalid producer family clears EA state");
     osprey_collect_enabled = 1;
 
@@ -2082,7 +2101,7 @@ static void test_sem_access_class_and_flags(void)
                    SEM_INTERVAL_SPARSE, SEM_PRODUCER_XSAVE_FXSAVE);
     CHECK(run->access_used == 2 && run->unsupported_execution == 1,
           "cross-family width rejects F01 access");
-    CHECK(!st->ea_valid && st->ea_mode == 0,
+    CHECK(!st->ea.valid && st->ea_mode == 0,
           "cross-family width clears EA state");
     osprey_collect_enabled = 1;
 
@@ -2092,27 +2111,27 @@ static void test_sem_access_class_and_flags(void)
                     SEM_INTERVAL_SPARSE, SEM_PRODUCER_SIMD_MASKMOV);
     CHECK(run->access_used == 2 && run->unsupported_execution == 1,
           "invalid sparse width rejects F01 access");
-    CHECK(!st->ea_valid && st->ea_mode == 0,
+    CHECK(!st->ea.valid && st->ea_mode == 0,
           "invalid sparse width clears EA state");
     osprey_collect_enabled = 1;
 
     /* Unknown classes reject the sample without recording, and still consume
      * the state left by a preceding failed/unsupported path. */
     run->unsupported_execution = 0;
-    st->ea_valid = true;
+    st->ea.valid = true;
     st->ea_mode = MO_64;
-    st->ea_base_reg = R_EAX;
-    st->ea_base_val = 0x402010;
-    st->ea_base_origin.valid = 1;
+    st->ea.base_reg = R_EAX;
+    st->ea.base_val = 0x402010;
+    st->ea.base_origin.valid = 1;
     st->pending_helper_count = 1;
     sem_mem_access(env, 0x402010, 8, 0x400100, 8,
                    (SemOpClass)-1, SEM_INTERVAL_EXACT_WIDTH,
                    SEM_PRODUCER_INTEGER_MODRM);
     CHECK(run->access_used == 2, "invalid class suppresses F01 access");
-    CHECK(!st->ea_valid && st->ea_mode == 0,
+    CHECK(!st->ea.valid && st->ea_mode == 0,
           "invalid class clears EA state");
-    CHECK(st->ea_base_reg == 0 && st->ea_base_val == 0 &&
-          !st->ea_base_origin.valid,
+    CHECK(st->ea.base_reg == 0 && st->ea.base_val == 0 &&
+          !st->ea.base_origin.valid,
           "invalid class clears all EA metadata");
     CHECK(st->pending_helper_count == 0,
           "invalid class clears multipart state");
@@ -2122,34 +2141,34 @@ static void test_sem_access_class_and_flags(void)
 
     /* Bit 4 is the provenance-only follow-up for an EA-decomposed
      * operation; it must not create a duplicate F01 row. */
-    st->ea_valid = true;
+    st->ea.valid = true;
     st->ea_mode = MO_64;
     sem_mem_access(env, 0x402018, 8, 0x400100, 4, SEM_OP_ATOMIC_RMW,
                    SEM_INTERVAL_EXACT_WIDTH,
                    SEM_PRODUCER_ATOMIC_LOCK_RMW);
     CHECK(run->access_used == 2, "EA follow-up suppresses duplicate F01");
-    CHECK(!st->ea_valid && st->ea_mode == 0,
+    CHECK(!st->ea.valid && st->ea_mode == 0,
           "EA follow-up clears pending state");
 
-    st->ea_valid = true;
+    st->ea.valid = true;
     st->ea_mode = MO_64;
-    st->ea_index_reg = R_ECX;
-    st->ea_index_val = 0x402020;
-    st->ea_index_origin.valid = 1;
+    st->ea.index_reg = R_ECX;
+    st->ea.index_val = 0x402020;
+    st->ea.index_origin.valid = 1;
     sem_mem_access(env, 0x402020, 8, 0x400100, 4, SEM_OP_SIMD,
                    SEM_INTERVAL_EXACT_WIDTH, SEM_PRODUCER_SIMD_SCALAR);
-    CHECK(st->ea_index_reg == 0 && st->ea_index_val == 0 &&
-          !st->ea_index_origin.valid,
+    CHECK(st->ea.index_reg == 0 && st->ea.index_val == 0 &&
+          !st->ea.index_origin.valid,
           "provenance-only follow-up clears all EA metadata");
 
-    st->ea_valid = true;
+    st->ea.valid = true;
     st->ea_mode = MO_32;
-    st->ea_base_origin.valid = 1;
+    st->ea.base_origin.valid = 1;
     sem_mem_access(env, 0x402028, 8, 0x400100, 8, SEM_OP_INTEGER,
                    SEM_INTERVAL_EXACT_WIDTH, SEM_PRODUCER_INTEGER_MODRM);
     CHECK(run->access_used == 2, "ineligible address mode suppresses F01");
-    CHECK(!st->ea_valid && st->ea_mode == 0 &&
-          !st->ea_base_origin.valid,
+    CHECK(!st->ea.valid && st->ea_mode == 0 &&
+          !st->ea.base_origin.valid,
           "ineligible address mode clears EA state");
 
     /* Helper-backed events retain provenance dispatch when OSPREY is off. */
@@ -2229,10 +2248,10 @@ static void test_sem_access_class_and_flags(void)
     run->unsupported_execution = 0;
     osprey_collect_enabled = 1;
     st->ea_mode = MO_64;
-    st->ea_valid = true;
+    st->ea.valid = true;
     st->pending_helper_count = 1;
     helper_sem_mem_unsupported(env, 0x400130, 1);
-    CHECK(st->pending_helper_count == 0 && !st->ea_valid &&
+    CHECK(st->pending_helper_count == 0 && !st->ea.valid &&
           st->ea_mode == 0,
           "unsupported helper clears pending semantic state");
     CHECK(run->unsupported_execution == 1,
@@ -2243,4 +2262,899 @@ static void test_sem_access_class_and_flags(void)
     osprey_free(ctx);
     g_free(run);
     g_free(env);
+}
+
+/* ------------------------------------------------------------------ */
+/* Stage 2.3: address-origin channels and ordinary producer identity   */
+/* ------------------------------------------------------------------ */
+
+/* A shared env+context fixture for the Stage 2.3 tests.  Image bounds
+ * [0x400000, 0x401000); global data at 0x402000 (offset 0x2000). */
+static void stage23_setup(OspreyConfig *c, OspreyContext **ctx,
+                          OspreySharedRun **run, CPUArchState **env) {
+    *c = test_config();
+    *ctx = osprey_new(c);
+    *run = new_run(c);
+    osprey_set_image_bounds(0x400000, 0x401000);
+    osprey_register_image_global(NULL, 0x402000, 0x1000);
+    osprey_child_use_shared_run(*ctx, *run);
+    *env = g_malloc0(sizeof(CPUArchState));
+    binradar_memcheck_enabled = 0;
+    osprey_collect_enabled = 1;
+}
+
+static void install_addr_origin(OspreyCpuOriginState *st, int reg,
+                                target_ulong value,
+                                const OspreyRegionId *region,
+                                int64_t offset, uint64_t producer_pc) {
+    OspreyAddressOrigin *o = &st->regs[reg].address;
+    memset(o, 0, sizeof(*o));
+    o->valid = 1;
+    o->width = (uint8_t)sizeof(target_ulong);
+    o->concrete_value = value;
+    o->canonical.region = *region;
+    o->canonical.offset = offset;
+    o->producer_pc = producer_pc;
+}
+
+static void test_address_origin_channels_and_producers(void)
+{
+    reset_log();
+    OspreyConfig c;
+    OspreyContext *ctx;
+    OspreySharedRun *run;
+    CPUArchState *env;
+    stage23_setup(&c, &ctx, &run, &env);
+    OspreyCpuOriginState *st = osprey_cpu_origin(env);
+    OspreyRegionId G, S, H;
+    memset(&G, 0, sizeof(G));
+    G.kind = OSPREY_REGION_GLOBAL;
+    memset(&S, 0, sizeof(S));
+    S.kind = OSPREY_REGION_STACK_FUNCTION;
+    S.site_offset = 0x500;
+    memset(&H, 0, sizeof(H));
+    H.kind = OSPREY_REGION_HEAP_SITE;
+    H.site_offset = 0x300;
+    (void)run;
+
+    /* Global materialization: a RIP-relative/absolute main-image
+     * address seeds a G origin with the normalized instruction PC. */
+    osprey_on_reg_materialize_address(env, R_R8, 0x402008, 0x400600);
+    CHECK(st->regs[R_R8].address.valid &&
+          st->regs[R_R8].address.width == sizeof(target_ulong),
+          "global materialization seeds valid pointer-width origin");
+    CHECK(st->regs[R_R8].address.canonical.region.kind ==
+              OSPREY_REGION_GLOBAL &&
+          st->regs[R_R8].address.canonical.offset == 0x2008,
+          "global materialization canonical G+0x2008");
+    CHECK(st->regs[R_R8].address.producer_pc == 0x600,
+          "global materialization producer PC normalized");
+    CHECK(st->regs[R_R8].address.concrete_value == 0x402008,
+          "global materialization concrete value");
+    CHECK(!st->regs[R_R8].value.valid, "materialization clears value channel");
+
+    /* Out-of-image / non-global values never seed: libc address,
+     * anonymous map, or a merely mapped numeric value. */
+    osprey_on_reg_materialize_address(env, R_R9, 0x7f0000001234, 0x400610);
+    CHECK(!st->regs[R_R9].address.valid, "libc materialization rejected");
+    osprey_on_reg_materialize_address(env, R_R10, 0x402000, 0x7f0012345678);
+    CHECK(!st->regs[R_R10].address.valid,
+          "out-of-image producer PC kills destination");
+
+    /* Precise stack seed: RSP origin with normalized callee entry as
+     * producer. */
+    osprey_on_call(env, 0x400500, 0x7ffc0000);
+    CHECK(st->regs[R_ESP].address.valid &&
+          st->regs[R_ESP].address.canonical.region.site_offset == 0x500 &&
+          st->regs[R_ESP].address.canonical.offset == 0,
+          "precise callee seeds RSP at frame offset 0");
+    CHECK(st->regs[R_ESP].address.producer_pc == 0x500,
+          "stack seed producer PC is the normalized callee entry");
+    osprey_on_rsp_update(env, 0x7ffbfff0, 0x400501);
+    CHECK(st->regs[R_ESP].address.canonical.offset == -16,
+          "rsp update re-derives signed offset");
+    CHECK(st->regs[R_ESP].address.producer_pc == 0x501,
+          "rsp update producer PC is the write instruction");
+    /* A malformed source origin cannot replace the independently
+     * re-derived RSP lifecycle seed. */
+    install_addr_origin(st, R_R8, 0x7ffbfff0, &H, 0, 0x300);
+    osprey_on_reg_copy(env, R_ESP, R_R8, 0x7ffbfff0, 0x7ffbfff0,
+                       0x400502);
+    CHECK(st->regs[R_ESP].address.valid &&
+          st->regs[R_ESP].address.canonical.region.kind ==
+              OSPREY_REGION_STACK_FUNCTION &&
+          st->regs[R_ESP].address.canonical.offset == -16 &&
+          st->regs[R_ESP].address.producer_pc == 0x501,
+          "invalid MOV-to-RSP source preserves lifecycle seed");
+    osprey_on_rsp_update(env, 0x7ffbffe0, 0x400503);
+    osprey_on_reg_addsub_imm(env, R_ESP, -16, 0x7ffbfff0,
+                             0x7ffbffe0, 0x400503);
+    CHECK(st->regs[R_ESP].address.valid &&
+          st->regs[R_ESP].address.canonical.offset == -32 &&
+          st->regs[R_ESP].address.producer_pc == 0x503,
+          "post-write RSP lifecycle seed survives ADD/SUB helper ordering");
+
+    /* Allocator return: RAX gets H_site+0 with provenance identity. */
+    provenance_init();
+    PtrTag t = provenance_create_object(0x10000, 64, 0x400300,
+                                        PROV_PRODUCER_MALLOC_RETURN);
+    osprey_on_alloc_success(env, 0x10000, 64, 0x400300,
+                            t.object_id, t.generation);
+    CHECK(st->regs[R_EAX].address.valid &&
+          st->regs[R_EAX].address.canonical.region.kind ==
+              OSPREY_REGION_HEAP_SITE &&
+          st->regs[R_EAX].address.canonical.offset == 0,
+          "allocator return seeds RAX H_site+0");
+    CHECK(st->regs[R_EAX].address.prov_object_id == t.object_id &&
+          st->regs[R_EAX].address.prov_generation == t.generation,
+          "allocator origin carries provenance identity");
+    CHECK(st->regs[R_EAX].address.producer_pc == 0x300,
+          "allocator origin producer PC is the normalized site");
+    install_addr_origin(st, R_R8, 0x10040, &H, 64, 0x300);
+    st->regs[R_R8].address.prov_object_id = t.object_id;
+    st->regs[R_R8].address.prov_generation = t.generation;
+    CHECK(osprey_address_origin_live(&st->regs[R_R8].address),
+          "live heap origin permits the architectural one-past address");
+
+    /* Full-width MOV: copies the channel, replaces producer PC. */
+    install_addr_origin(st, R_R12, 0x402010, &G, 0x2010, 0x700);
+    st->regs[R_R13].value.valid = 1;
+    osprey_on_reg_copy(env, R_R13, R_R12, 0x402010, 0x402010, 0x400710);
+    CHECK(st->regs[R_R13].address.valid &&
+          st->regs[R_R13].address.canonical.offset == 0x2010 &&
+          st->regs[R_R13].address.producer_pc == 0x710,
+          "full-width MOV copies channel and replaces producer PC");
+    CHECK(!st->regs[R_R13].value.valid, "MOV clears destination value channel");
+    osprey_on_reg_copy(env, R_R12, R_R12, 0x402010, 0x402010, 0x400715);
+    CHECK(st->regs[R_R12].address.valid &&
+          st->regs[R_R12].address.canonical.offset == 0x2010 &&
+          st->regs[R_R12].address.producer_pc == 0x715,
+          "self-MOV preserves the source origin and refreshes producer PC");
+    osprey_on_reg_copy(env, R_R13, R_R12, 0xdeadbeef, 0x402010, 0x400720);
+    CHECK(!st->regs[R_R13].address.valid,
+          "value-mismatched MOV kills destination");
+    osprey_on_reg_copy(env, R_R13, R_R12, 0x402010, 0x402010, 0x7f0012345678);
+    CHECK(!st->regs[R_R13].address.valid,
+          "out-of-image MOV producer kills destination");
+
+    /* Constant-offset LEA: exact wrapping reconstruction + checked
+     * offset fold; producer PC becomes the LEA instruction. */
+    install_addr_origin(st, R_R12, 0x10000, &H, 0, 0x300);
+    st->regs[R_R12].address.prov_object_id = t.object_id;
+    st->regs[R_R12].address.prov_generation = t.generation;
+    osprey_on_reg_lea(env, R_R13, R_R12, 8, 0x10008, 0x10000, 0x400800);
+    CHECK(st->regs[R_R13].address.valid &&
+          st->regs[R_R13].address.canonical.offset == 8 &&
+          st->regs[R_R13].address.producer_pc == 0x800,
+          "constant LEA folds offset and sets LEA producer");
+    CHECK(st->regs[R_R13].address.prov_object_id == t.object_id,
+          "LEA preserves heap provenance identity");
+    osprey_on_reg_lea(env, R_R12, R_R12, 4, 0x10004, 0x10000, 0x400805);
+    CHECK(st->regs[R_R12].address.valid &&
+          st->regs[R_R12].address.canonical.offset == 4 &&
+          st->regs[R_R12].address.producer_pc == 0x805,
+          "in-place LEA preserves the pre-write base origin");
+    /* Restore H+0 for the reconstruction-mismatch case. */
+    install_addr_origin(st, R_R12, 0x10000, &H, 0, 0x300);
+    st->regs[R_R12].address.prov_object_id = t.object_id;
+    st->regs[R_R12].address.prov_generation = t.generation;
+    osprey_on_reg_lea(env, R_R13, R_R12, 8, 0x10009, 0x10000, 0x400810);
+    CHECK(!st->regs[R_R13].address.valid,
+          "reconstruction-mismatched LEA kills destination");
+    /* Missing or context-cleared two-helper PC scratch cannot reuse a
+     * prior producer identity. */
+    helper_sem_reg_lea(env, R_R13, R_R12, 8, 0x10008, 0x10000);
+    CHECK(!st->regs[R_R13].address.valid,
+          "LEA without producer-PC scratch kills destination");
+    helper_sem_set_pc(env, 0x400800);
+    sem_context_replace(env);
+    install_addr_origin(st, R_R12, 0x10000, &H, 0, 0x300);
+    st->regs[R_R12].address.prov_object_id = t.object_id;
+    st->regs[R_R12].address.prov_generation = t.generation;
+    helper_sem_reg_lea(env, R_R13, R_R12, 8, 0x10008, 0x10000);
+    CHECK(!st->regs[R_R13].address.valid,
+          "context boundary clears stranded LEA producer PC");
+    /* Checked offset overflow (INT64_MAX + 1). */
+    install_addr_origin(st, R_R12, 0x10000, &H, INT64_MAX, 0x300);
+    osprey_on_reg_lea(env, R_R13, R_R12, 1, 0x10001, 0x10000, 0x400820);
+    CHECK(!st->regs[R_R13].address.valid,
+          "canonical offset overflow kills LEA destination");
+
+    /* ADD/SUB immediate: exact wrapping reconstruction + checked fold. */
+    install_addr_origin(st, R_R13, 0x10008, &H, 8, 0x800);
+    st->regs[R_R13].address.prov_object_id = t.object_id;
+    st->regs[R_R13].address.prov_generation = t.generation;
+    osprey_on_reg_addsub_imm(env, R_R13, 4, 0x10008, 0x1000c, 0x400900);
+    CHECK(st->regs[R_R13].address.valid &&
+          st->regs[R_R13].address.canonical.offset == 12 &&
+          st->regs[R_R13].address.producer_pc == 0x900,
+          "ADD immediate folds offset and sets producer");
+    osprey_on_reg_addsub_imm(env, R_R13, -2, 0x1000c, 0x1000a, 0x400910);
+    CHECK(st->regs[R_R13].address.canonical.offset == 10,
+          "SUB immediate folds negative delta");
+    osprey_on_reg_addsub_imm(env, R_R13, 4, 0x1000c, 0x1000a, 0x400920);
+    CHECK(!st->regs[R_R13].address.valid,
+          "reconstruction-mismatched ADD immediate kills");
+    install_addr_origin(st, R_R13, 0x10000, &H, INT64_MAX, 0x300);
+    osprey_on_reg_addsub_imm(env, R_R13, 1, 0x10000, 0x10001, 0x400930);
+    CHECK(!st->regs[R_R13].address.valid,
+          "canonical offset overflow kills ADD immediate");
+
+    /* ADD/SUB register, one-origin forms. */
+    install_addr_origin(st, R_R13, 0x1000a, &H, 10, 0x910);
+    st->regs[R_R13].address.prov_object_id = t.object_id;
+    st->regs[R_R13].address.prov_generation = t.generation;
+    memset(&st->regs[R_R14], 0, sizeof(st->regs[R_R14]));
+    env->regs[R_R14] = 1;
+    osprey_on_reg_addsub_reg(env, R_R13, R_R14, false, 0x1000b, 1,
+                             0x400a00);
+    CHECK(st->regs[R_R13].address.valid &&
+          st->regs[R_R13].address.canonical.offset == 11 &&
+          st->regs[R_R13].address.producer_pc == 0xa00,
+          "tagged-destination ADD register folds untagged source");
+    /* Untagged destination + tagged source for ADD. */
+    install_addr_origin(st, R_R14, 0x10000, &H, 0, 0x300);
+    st->regs[R_R14].address.prov_object_id = t.object_id;
+    st->regs[R_R14].address.prov_generation = t.generation;
+    memset(&st->regs[R_R15], 0, sizeof(st->regs[R_R15]));
+    osprey_on_reg_addsub_reg(env, R_R15, R_R14, false, 0x1000c, 0x10000,
+                             0x400a10);
+    CHECK(st->regs[R_R15].address.valid &&
+          st->regs[R_R15].address.canonical.offset == 12 &&
+          st->regs[R_R15].address.producer_pc == 0xa10,
+          "untagged-destination ADD with tagged source folds");
+    /* SUB with only the source tagged is rejected. */
+    memset(&st->regs[R_R15], 0, sizeof(st->regs[R_R15]));
+    osprey_on_reg_addsub_reg(env, R_R15, R_R14, true, 0xfff0, 0x10000,
+                             0x400a20);
+    CHECK(!st->regs[R_R15].address.valid,
+          "SUB with only source tagged rejected");
+    /* Two tagged operands are rejected. */
+    install_addr_origin(st, R_R14, 0x10000, &H, 0, 0x300);
+    install_addr_origin(st, R_R15, 0x10000, &H, 0, 0x300);
+    osprey_on_reg_addsub_reg(env, R_R15, R_R14, false, 0x20000, 0x10000,
+                             0x400a30);
+    CHECK(!st->regs[R_R15].address.valid,
+          "two tagged operands rejected");
+    /* Reconstruction mismatch kills. */
+    install_addr_origin(st, R_R13, 0x1000a, &H, 10, 0x910);
+    memset(&st->regs[R_R14], 0, sizeof(st->regs[R_R14]));
+    osprey_on_reg_addsub_reg(env, R_R13, R_R14, false, 0x1000c, 1,
+                             0x400a40);
+    CHECK(!st->regs[R_R13].address.valid,
+          "reconstruction-mismatched ADD register kills");
+
+    /* Full-width XCHG: channels swap with per-side validation; producer
+     * PC becomes the XCHG instruction. */
+    install_addr_origin(st, R_R13, 0x1000b, &H, 11, 0xa00);
+    st->regs[R_R13].address.prov_object_id = t.object_id;
+    st->regs[R_R13].address.prov_generation = t.generation;
+    memset(&st->regs[R_R15], 0, sizeof(st->regs[R_R15]));
+    env->regs[R_R13] = 0x1000b;
+    env->regs[R_R15] = 0;
+    osprey_on_reg_xchg(env, R_R13, R_R15, 0, 0x1000b, 0x400b00);
+    CHECK(!st->regs[R_R13].address.valid &&
+          st->regs[R_R15].address.valid &&
+          st->regs[R_R15].address.canonical.offset == 11 &&
+          st->regs[R_R15].address.producer_pc == 0xb00 &&
+          st->regs[R_R15].address.concrete_value == 0x1000b,
+          "XCHG transfers tagged channel to untagged side");
+    CHECK(st->regs[R_R15].address.prov_object_id == t.object_id,
+          "XCHG preserves heap provenance identity");
+    /* dst == src validates and refreshes once. */
+    install_addr_origin(st, R_R13, 0x10000, &H, 0, 0x300);
+    st->regs[R_R13].address.prov_object_id = t.object_id;
+    st->regs[R_R13].address.prov_generation = t.generation;
+    osprey_on_reg_xchg(env, R_R13, R_R13, 0x10000, 0x10000, 0x400b10);
+    CHECK(st->regs[R_R13].address.valid &&
+          st->regs[R_R13].address.producer_pc == 0xb10,
+          "self-XCHG validates and refreshes the single channel");
+
+    /* RSP-to-RBP: ordinary register-copy propagation. */
+    osprey_on_call(env, 0x400500, 0x7ffc0000);
+    osprey_on_reg_copy(env, R_EBP, R_ESP, 0x7ffc0000, 0x7ffc0000, 0x400c00);
+    CHECK(st->regs[R_EBP].address.valid &&
+          st->regs[R_EBP].address.canonical.region.site_offset == 0x500 &&
+          st->regs[R_EBP].address.canonical.offset == 0,
+          "RSP-to-RBP copy propagates stack origin");
+    CHECK(st->regs[R_EBP].address.producer_pc == 0xc00,
+          "RSP-to-RBP copy producer PC is the MOV");
+
+    /* Value-channel kills: every register write clears the value
+     * channel explicitly. */
+    st->regs[R_EAX].value.valid = 1;
+    osprey_on_reg_invalidate(env, R_EAX);
+    CHECK(!st->regs[R_EAX].address.valid && !st->regs[R_EAX].value.valid,
+          "invalidate kills both channels");
+    st->regs[R_R8].value.valid = 1;
+    osprey_on_reg_materialize_address(env, R_R8, 0x402010, 0x400600);
+    CHECK(!st->regs[R_R8].value.valid,
+          "materialize clears the value channel");
+
+    /* Invalid register indices are bounds-safe. */
+    osprey_on_reg_materialize_address(env, CPU_NB_REGS + 5, 0x402000,
+                                      0x400600);
+    osprey_on_reg_copy(env, CPU_NB_REGS + 5, R_R8, 0, 0, 0x400600);
+    osprey_on_reg_xchg(env, CPU_NB_REGS + 5, R_R8, 0, 0, 0x400600);
+    osprey_on_reg_invalidate(env, CPU_NB_REGS + 5);
+    install_addr_origin(st, R_R8, 0x402000, &G, 0x2000, 0x600);
+    osprey_on_reg_copy(env, R_R8, CPU_NB_REGS + 5, 0, 0, 0x400600);
+    CHECK(!st->regs[R_R8].address.valid,
+          "invalid MOV source index safely kills destination");
+    install_addr_origin(st, R_R8, 0x402000, &G, 0x2000, 0x600);
+    osprey_on_reg_lea(env, R_R8, CPU_NB_REGS + 5, 1,
+                      0x402001, 0x402000, 0x400600);
+    CHECK(!st->regs[R_R8].address.valid,
+          "invalid LEA base index safely kills destination");
+    install_addr_origin(st, R_R8, 0x402000, &G, 0x2000, 0x600);
+    osprey_on_reg_addsub_reg(env, R_R8, CPU_NB_REGS + 5, false,
+                             0x402001, 1, 0x400600);
+    CHECK(!st->regs[R_R8].address.valid,
+          "invalid arithmetic source index safely kills destination");
+    install_addr_origin(st, R_R8, 0x10000, &H, 0, 0x300);
+    CHECK(!osprey_address_origin_live(&st->regs[R_R8].address),
+          "heap origin without provenance identity is invalid");
+
+    provenance_retire_object(0x10000);
+    osprey_free(ctx);
+    g_free(run);
+    g_free(env);
+}
+
+static void test_address_shadow_reload(void)
+{
+    reset_log();
+    OspreyConfig c;
+    OspreyContext *ctx;
+    OspreySharedRun *run;
+    CPUArchState *env;
+    stage23_setup(&c, &ctx, &run, &env);
+    OspreyCpuOriginState *st = osprey_cpu_origin(env);
+    OspreyRegionId G, H;
+    memset(&G, 0, sizeof(G));
+    G.kind = OSPREY_REGION_GLOBAL;
+    memset(&H, 0, sizeof(H));
+    H.kind = OSPREY_REGION_HEAP_SITE;
+    H.site_offset = 0x300;
+
+    provenance_init();
+    PtrTag t = provenance_create_object(0x10000, 64, 0x400300,
+                                        PROV_PRODUCER_MALLOC_RETURN);
+    osprey_on_alloc_success(env, 0x10000, 64, 0x400300,
+                            t.object_id, t.generation);
+
+    /* Uninterrupted aligned pointer-width store + reload: the reload
+     * restores the origin and sets producer PC to the load. */
+    install_addr_origin(st, R_R12, 0x10000, &H, 0, 0x300);
+    st->regs[R_R12].address.prov_object_id = t.object_id;
+    st->regs[R_R12].address.prov_generation = t.generation;
+    env->regs[R_R12] = 0x10000;
+    osprey_on_mem_store_address(env, R_R12, 0x402100, 8, 0x10000);
+    memset(&st->regs[R_R13], 0, sizeof(st->regs[R_R13]));
+    env->regs[R_R13] = 0;
+    osprey_on_mem_load_address(env, R_R13, 0x402100, 0x10000, 0x400d00);
+    CHECK(st->regs[R_R13].address.valid &&
+          st->regs[R_R13].address.canonical.offset == 0 &&
+          st->regs[R_R13].address.prov_object_id == t.object_id &&
+          st->regs[R_R13].address.producer_pc == 0xd00,
+          "aligned reload restores origin with load producer PC");
+    CHECK(st->regs[R_R13].address.concrete_value == 0x10000,
+          "reload concrete value matches runtime");
+
+    /* Exact-slot value mismatch removes the slot and leaves the
+     * destination invalid. */
+    osprey_on_mem_store_address(env, R_R12, 0x402110, 8, 0x10000);
+    memset(&st->regs[R_R13], 0, sizeof(st->regs[R_R13]));
+    osprey_on_mem_load_address(env, R_R13, 0x402110, 0xdeadbeef,
+                               0x400d10);
+    CHECK(!st->regs[R_R13].address.valid,
+          "value-mismatched reload leaves destination invalid");
+    memset(&st->regs[R_R13], 0, sizeof(st->regs[R_R13]));
+    osprey_on_mem_load_address(env, R_R13, 0x402110, 0x10000, 0x400d20);
+    CHECK(!st->regs[R_R13].address.valid,
+          "stale slot removed; second reload cannot resurrect");
+
+    /* Stale heap identity: free the object, the reload rejects and
+     * removes the slot. */
+    osprey_on_mem_store_address(env, R_R12, 0x402120, 8, 0x10000);
+    osprey_on_free_identity(env, t.object_id, t.generation, 0x400400);
+    provenance_retire_object(0x10000);
+    memset(&st->regs[R_R13], 0, sizeof(st->regs[R_R13]));
+    osprey_on_mem_load_address(env, R_R13, 0x402120, 0x10000, 0x400d30);
+    CHECK(!st->regs[R_R13].address.valid,
+          "stale heap identity rejects reload");
+
+    /* Aligned unknown-source store replaces the exact slot with an
+     * invalid entry. */
+    osprey_on_mem_store_address(env, R_R12, 0x402130, 8, 0x10000);
+    memset(&st->regs[R_R12], 0, sizeof(st->regs[R_R12]));
+    osprey_on_mem_store_address(env, R_R12, 0x402130, 8, 0x1234);
+    memset(&st->regs[R_R13], 0, sizeof(st->regs[R_R13]));
+    osprey_on_mem_load_address(env, R_R13, 0x402130, 0x1234, 0x400d40);
+    CHECK(!st->regs[R_R13].address.valid,
+          "unknown-source store replaces slot with invalid entry");
+
+    /* Partial and unaligned stores into previously empty slots do not
+     * install an origin (no cross-width invalidation is asserted). */
+    install_addr_origin(st, R_R12, 0x402000, &G, 0x2000, 0x600);
+    osprey_on_mem_store_address(env, R_R12, 0x402200, 4, 0x402000);
+    memset(&st->regs[R_R13], 0, sizeof(st->regs[R_R13]));
+    osprey_on_mem_load_address(env, R_R13, 0x402200, 0x402000, 0x400d50);
+    CHECK(!st->regs[R_R13].address.valid,
+          "partial store does not install an origin");
+    osprey_on_mem_store_address(env, R_R12, 0x402204, 8, 0x402000);
+    memset(&st->regs[R_R13], 0, sizeof(st->regs[R_R13]));
+    osprey_on_mem_load_address(env, R_R13, 0x402204, 0x402000, 0x400d60);
+    CHECK(!st->regs[R_R13].address.valid,
+          "unaligned store does not install an origin");
+    osprey_on_mem_load_address(env, CPU_NB_REGS + 5, 0x402200,
+                               0x402000, 0x400d70);
+
+    /* Stage 2.3 publishes no copy/points rows from the shadow. */
+    CHECK(osprey_parent_merge_sample(ctx, run) == OSPREY_OK, "merge ok");
+    CHECK(ctx->copy_facts->len == 0, "no copy facts published");
+    CHECK(ctx->points_facts->len == 0, "no points-to facts published");
+
+    osprey_free(ctx);
+    g_free(run);
+    g_free(env);
+}
+
+static void test_f02_ea_selection(void)
+{
+    reset_log();
+    OspreyConfig c;
+    OspreyContext *ctx;
+    OspreySharedRun *run;
+    CPUArchState *env;
+    stage23_setup(&c, &ctx, &run, &env);
+    OspreyCpuOriginState *st = osprey_cpu_origin(env);
+    OspreyRegionId G, H, S;
+    memset(&G, 0, sizeof(G));
+    G.kind = OSPREY_REGION_GLOBAL;
+    memset(&H, 0, sizeof(H));
+    H.kind = OSPREY_REGION_HEAP_SITE;
+    H.site_offset = 0x300;
+    memset(&S, 0, sizeof(S));
+    S.kind = OSPREY_REGION_STACK_FUNCTION;
+    S.site_offset = 0x500;
+
+    provenance_init();
+    PtrTag t = provenance_create_object(0x10000, 64, 0x400300,
+                                        PROV_PRODUCER_MALLOC_RETURN);
+    osprey_on_alloc_success(env, 0x10000, 64, 0x400300,
+                            t.object_id, t.generation);
+
+    /* [base + disp]: base-only accepted with exact reconstruction. */
+    install_addr_origin(st, R_R12, 0x10000, &H, 0, 0x300);
+    st->regs[R_R12].address.prov_object_id = t.object_id;
+    st->regs[R_R12].address.prov_generation = t.generation;
+    env->regs[R_R12] = 0x10000;
+    st->ea.valid = true;
+    st->ea.base_reg = R_R12;
+    st->ea.index_reg = -1;
+    st->ea.scale = 0;
+    st->ea.disp = 8;
+    st->ea.base_val = 0x10000;
+    st->ea.index_val = 0;
+    st->ea.base_origin = st->regs[R_R12].address;
+    st->ea_mode = MO_64;
+    sem_mem_access(env, 0x10008, 1, 0x400e00, 0, SEM_OP_INTEGER,
+                   SEM_INTERVAL_EXACT_WIDTH, SEM_PRODUCER_INTEGER_MODRM);
+    CHECK(run->base_used == 1, "base-only F02 emitted");
+    {
+        OspreyRunIter it;
+        const void *rec;
+        memset(&it, 0, sizeof(it));
+        it.run = run;
+        it.table = OSPREY_TABLE_BASE;
+        CHECK(osprey_run_iter_next(&it, &rec) == 1, "base row present");
+        const OspreyBaseFact *bf = rec;
+        CHECK(bf->pc == 0xe00, "F02 access PC normalized");
+        CHECK(bf->base.region.kind == OSPREY_REGION_HEAP_SITE &&
+              bf->base.offset == 0, "F02 base H_site+0");
+        CHECK(bf->chunk.address.offset == 8 && bf->chunk.size == 1,
+              "F02 chunk H_site+8 size 1");
+        CHECK(bf->prov_object_id == t.object_id &&
+              bf->prov_generation == t.generation,
+              "F02 carries provenance identity");
+        CHECK(bf->producer_pc == 0x300,
+              "F02 producer PC is the allocator site");
+        CHECK(bf->sample_support == 1, "F02 support 1");
+    }
+    /* Consume-once: a second event without a fresh set-EA does not
+     * reuse the snapshot. */
+    st->ea_mode = MO_64;
+    sem_mem_access(env, 0x10010, 1, 0x400e00, 0, SEM_OP_INTEGER,
+                   SEM_INTERVAL_EXACT_WIDTH, SEM_PRODUCER_INTEGER_MODRM);
+    CHECK(run->base_used == 1, "snapshot consumed once; no duplicate F02");
+    CHECK(run->access_used == 2, "both accesses still record F01");
+
+    /* Sole-base + untagged unscaled index: accepted. */
+    install_addr_origin(st, R_R12, 0x10000, &H, 0, 0x300);
+    st->regs[R_R12].address.prov_object_id = t.object_id;
+    st->regs[R_R12].address.prov_generation = t.generation;
+    memset(&st->regs[R_ECX], 0, sizeof(st->regs[R_ECX]));
+    env->regs[R_ECX] = 3;
+    st->ea.valid = true;
+    st->ea.base_reg = R_R12;
+    st->ea.index_reg = R_ECX;
+    st->ea.scale = 0;
+    st->ea.disp = 0;
+    st->ea.base_val = 0x10000;
+    st->ea.index_val = 3;
+    st->ea.base_origin = st->regs[R_R12].address;
+    st->ea_mode = MO_64;
+    sem_mem_access(env, 0x10003, 1, 0x400e10, 0, SEM_OP_INTEGER,
+                   SEM_INTERVAL_EXACT_WIDTH, SEM_PRODUCER_INTEGER_MODRM);
+    CHECK(run->base_used == 2, "base+untagged-index F02 emitted");
+    {
+        OspreyRunIter it;
+        const void *rec;
+        memset(&it, 0, sizeof(it));
+        it.run = run;
+        it.table = OSPREY_TABLE_BASE;
+        bool found_indexed = false;
+        while (osprey_run_iter_next(&it, &rec)) {
+            const OspreyBaseFact *bf = rec;
+            if (bf->pc == 0xe10) {
+                found_indexed = true;
+                CHECK(bf->base.offset == 0 &&
+                      bf->chunk.address.offset == 3,
+                      "indexed F02 base/chunk offsets");
+            }
+        }
+        CHECK(found_indexed, "indexed F02 has its own access PC");
+    }
+
+    /* Index-only [index + disp]: no base register, shift zero. */
+    memset(&st->regs[R_R12], 0, sizeof(st->regs[R_R12]));
+    install_addr_origin(st, R_R12, 0x10000, &H, 0, 0x300);
+    st->regs[R_R12].address.prov_object_id = t.object_id;
+    st->regs[R_R12].address.prov_generation = t.generation;
+    env->regs[R_R12] = 0x10000;
+    st->ea.valid = true;
+    st->ea.base_reg = -1;
+    st->ea.index_reg = R_R12;
+    st->ea.scale = 0;
+    st->ea.disp = 4;
+    st->ea.index_val = 0x10000;
+    st->ea.index_origin = st->regs[R_R12].address;
+    st->ea_mode = MO_64;
+    sem_mem_access(env, 0x10004, 1, 0x400e20, 0, SEM_OP_INTEGER,
+                   SEM_INTERVAL_EXACT_WIDTH, SEM_PRODUCER_INTEGER_MODRM);
+    CHECK(run->base_used == 3, "index-only F02 emitted");
+
+    /* F01-without-F02 near misses. */
+    /* Two tagged origins. */
+    install_addr_origin(st, R_R12, 0x10000, &H, 0, 0x300);
+    st->regs[R_R12].address.prov_object_id = t.object_id;
+    st->regs[R_R12].address.prov_generation = t.generation;
+    install_addr_origin(st, R_ECX, 0x10000, &H, 0, 0x300);
+    st->regs[R_ECX].address.prov_object_id = t.object_id;
+    st->regs[R_ECX].address.prov_generation = t.generation;
+    st->ea.valid = true;
+    st->ea.base_reg = R_R12;
+    st->ea.index_reg = R_ECX;
+    st->ea.scale = 0;
+    st->ea.base_val = 0x10000;
+    st->ea.index_val = 0x10000;
+    st->ea.base_origin = st->regs[R_R12].address;
+    st->ea.index_origin = st->regs[R_ECX].address;
+    st->ea_mode = MO_64;
+    sem_mem_access(env, 0x20000, 1, 0x400e30, 0, SEM_OP_INTEGER,
+                   SEM_INTERVAL_EXACT_WIDTH, SEM_PRODUCER_INTEGER_MODRM);
+    CHECK(run->base_used == 3, "two-origin form emits no F02");
+    /* Scaled index (shift 1). */
+    install_addr_origin(st, R_R12, 0x10000, &H, 0, 0x300);
+    st->regs[R_R12].address.prov_object_id = t.object_id;
+    st->regs[R_R12].address.prov_generation = t.generation;
+    st->ea.valid = true;
+    st->ea.base_reg = -1;
+    st->ea.index_reg = R_R12;
+    st->ea.scale = 1;
+    st->ea.index_val = 0x10000;
+    st->ea.index_origin = st->regs[R_R12].address;
+    st->ea_mode = MO_64;
+    sem_mem_access(env, 0x20000, 1, 0x400e40, 0, SEM_OP_INTEGER,
+                   SEM_INTERVAL_EXACT_WIDTH, SEM_PRODUCER_INTEGER_MODRM);
+    CHECK(run->base_used == 3, "scaled index emits no F02");
+    /* No origin. */
+    memset(&st->regs[R_R12], 0, sizeof(st->regs[R_R12]));
+    st->ea.valid = true;
+    st->ea.base_reg = R_R12;
+    st->ea.index_reg = -1;
+    st->ea.base_val = 0x10000;
+    st->ea_mode = MO_64;
+    sem_mem_access(env, 0x10008, 1, 0x400e50, 0, SEM_OP_INTEGER,
+                   SEM_INTERVAL_EXACT_WIDTH, SEM_PRODUCER_INTEGER_MODRM);
+    CHECK(run->base_used == 3, "no-origin form emits no F02");
+    /* Concrete-value mismatch: snapshot says 0x10000, origin holds
+     * 0x20000. */
+    install_addr_origin(st, R_R12, 0x20000, &G, 0x2000, 0x600);
+    st->ea.valid = true;
+    st->ea.base_reg = R_R12;
+    st->ea.index_reg = -1;
+    st->ea.base_val = 0x10000;
+    st->ea.base_origin = st->regs[R_R12].address;
+    st->ea_mode = MO_64;
+    sem_mem_access(env, 0x10008, 1, 0x400e60, 0, SEM_OP_INTEGER,
+                   SEM_INTERVAL_EXACT_WIDTH, SEM_PRODUCER_INTEGER_MODRM);
+    CHECK(run->base_used == 3, "concrete-value mismatch emits no F02");
+    CHECK(!st->regs[R_R12].address.valid,
+          "value-mismatched snapshot invalidates authoritative channel");
+    /* A valid-tag bit with a non-pointer width is not an untagged
+     * operand and invalidates the authoritative channel. */
+    install_addr_origin(st, R_R12, 0x10000, &H, 0, 0x300);
+    st->regs[R_R12].address.prov_object_id = t.object_id;
+    st->regs[R_R12].address.prov_generation = t.generation;
+    st->regs[R_R12].address.width = 4;
+    st->ea.valid = true;
+    st->ea.base_reg = R_R12;
+    st->ea.index_reg = -1;
+    st->ea.base_val = 0x10000;
+    st->ea.base_origin = st->regs[R_R12].address;
+    st->ea_mode = MO_64;
+    sem_mem_access(env, 0x10000, 1, 0x400e65, 0, SEM_OP_INTEGER,
+                   SEM_INTERVAL_EXACT_WIDTH, SEM_PRODUCER_INTEGER_MODRM);
+    CHECK(run->base_used == 3, "width-mismatched origin emits no F02");
+    CHECK(!st->regs[R_R12].address.valid,
+          "width-mismatched snapshot invalidates authoritative channel");
+    /* A heap origin without the authoritative provenance pair is invalid. */
+    install_addr_origin(st, R_R12, 0x10000, &H, 0, 0x300);
+    st->ea.valid = true;
+    st->ea.base_reg = R_R12;
+    st->ea.index_reg = -1;
+    st->ea.base_val = 0x10000;
+    st->ea.base_origin = st->regs[R_R12].address;
+    st->ea_mode = MO_64;
+    sem_mem_access(env, 0x10000, 1, 0x400e66, 0, SEM_OP_INTEGER,
+                   SEM_INTERVAL_EXACT_WIDTH, SEM_PRODUCER_INTEGER_MODRM);
+    CHECK(run->base_used == 3, "identity-free heap origin emits no F02");
+    CHECK(!st->regs[R_R12].address.valid,
+          "identity-free heap snapshot invalidates authoritative channel");
+    /* Reconstruction mismatch: base_val + disp != addr. */
+    install_addr_origin(st, R_R12, 0x10000, &H, 0, 0x300);
+    st->regs[R_R12].address.prov_object_id = t.object_id;
+    st->regs[R_R12].address.prov_generation = t.generation;
+    st->ea.valid = true;
+    st->ea.base_reg = R_R12;
+    st->ea.index_reg = -1;
+    st->ea.disp = 8;
+    st->ea.base_val = 0x10000;
+    st->ea.base_origin = st->regs[R_R12].address;
+    st->ea_mode = MO_64;
+    sem_mem_access(env, 0x10020, 1, 0x400e70, 0, SEM_OP_INTEGER,
+                   SEM_INTERVAL_EXACT_WIDTH, SEM_PRODUCER_INTEGER_MODRM);
+    CHECK(run->base_used == 3, "reconstruction mismatch emits no F02");
+    /* Stale heap identity: freed object. */
+    install_addr_origin(st, R_R12, 0x10000, &H, 0, 0x300);
+    st->regs[R_R12].address.prov_object_id = t.object_id;
+    st->regs[R_R12].address.prov_generation = t.generation;
+    osprey_on_free_identity(env, t.object_id, t.generation, 0x400400);
+    provenance_retire_object(0x10000);
+    st->ea.valid = true;
+    st->ea.base_reg = R_R12;
+    st->ea.index_reg = -1;
+    st->ea.disp = 0;
+    st->ea.base_val = 0x10000;
+    st->ea.base_origin = st->regs[R_R12].address;
+    st->ea_mode = MO_64;
+    sem_mem_access(env, 0x10000, 1, 0x400e80, 0, SEM_OP_INTEGER,
+                   SEM_INTERVAL_EXACT_WIDTH, SEM_PRODUCER_INTEGER_MODRM);
+    CHECK(run->base_used == 3, "stale heap identity emits no F02");
+    CHECK(!st->regs[R_R12].address.valid,
+          "stale snapshot invalidates the authoritative register channel");
+    /* Canonical region mismatch: origin G, chunk H. */
+    install_addr_origin(st, R_R12, 0x10000, &G, 0x2000, 0x600);
+    st->ea.valid = true;
+    st->ea.base_reg = R_R12;
+    st->ea.index_reg = -1;
+    st->ea.base_val = 0x10000;
+    st->ea.base_origin = st->regs[R_R12].address;
+    st->ea_mode = MO_64;
+    sem_mem_access(env, 0x10000, 1, 0x400e90, 0, SEM_OP_INTEGER,
+                   SEM_INTERVAL_EXACT_WIDTH, SEM_PRODUCER_INTEGER_MODRM);
+    CHECK(run->base_used == 3, "canonical region mismatch emits no F02");
+    /* Checked offset overflow: origin at INT64_MAX, delta +1. */
+    install_addr_origin(st, R_R12, 0x10000, &G, INT64_MAX, 0x600);
+    st->ea.valid = true;
+    st->ea.base_reg = R_R12;
+    st->ea.index_reg = -1;
+    st->ea.base_val = 0x10000;
+    st->ea.base_origin = st->regs[R_R12].address;
+    st->ea_mode = MO_64;
+    sem_mem_access(env, 0x10001, 1, 0x400ea0, 0, SEM_OP_INTEGER,
+                   SEM_INTERVAL_EXACT_WIDTH, SEM_PRODUCER_INTEGER_MODRM);
+    CHECK(run->base_used == 3, "checked offset overflow emits no F02");
+
+    /* Self-overwriting load: the pre-access snapshot is used, and the
+     * loaded origin does not replace it.  R12 holds the pre-load heap
+     * origin (t2) while the access reads 8 bytes through it. */
+    PtrTag t2 = provenance_create_object(0x30000, 32, 0x400300,
+                                         PROV_PRODUCER_MALLOC_RETURN);
+    osprey_on_alloc_success(env, 0x30000, 32, 0x400300,
+                            t2.object_id, t2.generation);
+    install_addr_origin(st, R_R12, 0x30000, &H, 0, 0x300);
+    st->regs[R_R12].address.prov_object_id = t2.object_id;
+    st->regs[R_R12].address.prov_generation = t2.generation;
+    st->ea.valid = true;
+    st->ea.base_reg = R_R12;
+    st->ea.index_reg = -1;
+    st->ea.disp = 0;
+    st->ea.base_val = 0x30000;
+    st->ea.base_origin = st->regs[R_R12].address;
+    st->ea_mode = MO_64;
+    sem_mem_access(env, 0x30000, 8, 0x400eb0, 0, SEM_OP_INTEGER,
+                   SEM_INTERVAL_EXACT_WIDTH, SEM_PRODUCER_INTEGER_MODRM);
+    CHECK(run->base_used == 4, "self-overwriting load F02 from pre-load origin");
+
+    /* Mode-ineligible (16/32-bit) and segment-override modes emit
+     * neither F01 nor F02 (gated in helper_sem_mem_access). */
+    uint32_t access_before = run->access_used;
+    st->ea.valid = true;
+    st->ea.base_reg = R_R12;
+    st->ea.index_reg = -1;
+    st->ea.disp = 0;
+    st->ea.base_val = 0x10000;
+    st->ea.base_origin = st->regs[R_R12].address;
+    st->ea_mode = MO_32;
+    sem_mem_access(env, 0x10000, 1, 0x400ec0, 0, SEM_OP_INTEGER,
+                   SEM_INTERVAL_EXACT_WIDTH, SEM_PRODUCER_INTEGER_MODRM);
+    st->ea.valid = true;
+    st->ea.base_reg = R_R12;
+    st->ea.index_reg = -1;
+    st->ea.disp = 0;
+    st->ea.base_val = 0x10000;
+    st->ea.base_origin = st->regs[R_R12].address;
+    st->ea_mode = MO_64 | (R_DS + 1) << 8; /* explicit segment override */
+    sem_mem_access(env, 0x10000, 1, 0x400ed0, 0, SEM_OP_INTEGER,
+                   SEM_INTERVAL_EXACT_WIDTH, SEM_PRODUCER_INTEGER_MODRM);
+    CHECK(run->base_used == 4, "truncating/segment modes emit no F02");
+    CHECK(access_before == run->access_used, "mode-ineligible emits no F01");
+
+    /* RIP-relative (-2) never decodes as a register: a base of -2 with
+     * a valid-looking index register keeps only the index form. */
+    install_addr_origin(st, R_ECX, 0x30000, &H, 0, 0x300);
+    st->regs[R_ECX].address.prov_object_id = t2.object_id;
+    st->regs[R_ECX].address.prov_generation = t2.generation;
+    st->ea.valid = true;
+    st->ea.base_reg = -2;
+    st->ea.index_reg = R_ECX;
+    st->ea.scale = 0;
+    st->ea.disp = 0;
+    st->ea.base_val = 0x402000;
+    st->ea.index_val = 0x30000;
+    st->ea.index_origin = st->regs[R_ECX].address;
+    st->ea_mode = MO_64;
+    sem_mem_access(env, 0x30000, 1, 0x400ee0, 0, SEM_OP_INTEGER,
+                   SEM_INTERVAL_EXACT_WIDTH, SEM_PRODUCER_INTEGER_MODRM);
+    CHECK(run->base_used == 5, "RIP-relative base + tagged index keeps index form");
+
+    CHECK(osprey_parent_merge_sample(ctx, run) == OSPREY_OK, "merge ok");
+    CHECK(ctx->copy_facts->len == 0 && ctx->points_facts->len == 0,
+          "no copy/points rows in F02 fixture");
+
+    osprey_free(ctx);
+    g_free(run);
+    g_free(env);
+}
+
+static void test_base_fact_producer_merge(void)
+{
+    reset_log();
+    /* Shared version 9 layout: the base record now carries producer_pc
+     * as deterministic audit metadata. */
+    CHECK(OSPREY_SHARED_VERSION == 9u, "shared format version 9");
+    CHECK(offsetof(OspreyBaseFact, producer_pc) <
+              offsetof(OspreyBaseFact, sample_support),
+          "producer_pc precedes sample_support in the fixed record");
+
+    OspreyConfig c = test_config();
+    OspreyContext *ctx = osprey_new(&c);
+    OspreySharedRun *run = new_run(&c);
+
+    OspreyBaseFact b1, b2;
+    memset(&b1, 0, sizeof(b1));
+    b1.pc = 0x100;
+    b1.chunk.address.region.kind = OSPREY_REGION_GLOBAL;
+    b1.chunk.address.offset = 0x2000;
+    b1.chunk.size = 8;
+    b1.base.region.kind = OSPREY_REGION_GLOBAL;
+    b1.base.offset = 0x2000;
+    b1.producer_pc = 0x50;
+    b1.sample_support = 1;
+    b2 = b1;
+    b2.producer_pc = 0x30;
+
+    /* Logical duplicates with different producer PCs merge once and
+     * retain the numerically smallest producer PC. */
+    CHECK(osprey_table_insert_base(run, &b1) == 1, "insert b1");
+    CHECK(osprey_table_insert_base(run, &b2) == 0,
+          "logical duplicate merges in place");
+    {
+        OspreyRunIter it;
+        const void *rec;
+        memset(&it, 0, sizeof(it));
+        it.run = run;
+        it.table = OSPREY_TABLE_BASE;
+        CHECK(osprey_run_iter_next(&it, &rec) == 1,
+              "one base record after duplicate");
+        const OspreyBaseFact *bf = rec;
+        CHECK(bf->producer_pc == 0x30,
+              "duplicate merge retains smallest producer PC");
+        CHECK(bf->sample_support == 1, "Boolean support preserved");
+    }
+    CHECK(osprey_parent_merge_sample(ctx, run) == OSPREY_OK, "merge ok");
+    CHECK(ctx->base_facts->len == 1, "one committed base fact");
+    {
+        OspreyBaseFact *first = &g_array_index(ctx->base_facts,
+                                               OspreyBaseFact, 0);
+        CHECK(first->producer_pc == 0x30,
+              "parent merge retains smallest producer PC");
+    }
+
+    /* Zero producer PC wins over any nonzero value. */
+    memset(&b1, 0, sizeof(b1));
+    b1.pc = 0x200;
+    b1.chunk.address.region.kind = OSPREY_REGION_GLOBAL;
+    b1.chunk.address.offset = 0x2010;
+    b1.chunk.size = 8;
+    b1.base = b1.chunk.address;
+    b1.producer_pc = 0x40;
+    b1.sample_support = 1;
+    CHECK(osprey_table_insert_base(run, &b1) == 1, "insert zero test b1");
+    b2 = b1;
+    b2.producer_pc = 0;
+    CHECK(osprey_table_insert_base(run, &b2) == 0,
+          "zero-producer duplicate merges in place");
+    CHECK(osprey_parent_merge_sample(ctx, run) == OSPREY_OK, "second merge ok");
+    CHECK(ctx->base_facts->len == 2, "two committed base facts");
+    for (guint i = 0; i < ctx->base_facts->len; i++) {
+        OspreyBaseFact *d = &g_array_index(ctx->base_facts,
+                                           OspreyBaseFact, i);
+        if (d->pc == 0x200) {
+            CHECK(d->producer_pc == 0, "zero producer PC wins");
+            CHECK(d->sample_support == 1,
+                  "new fact in sample 2 has support 1");
+        }
+        if (d->pc == 0x100) {
+            CHECK(d->sample_support == 2,
+                  "repeated fact gains one support per sample");
+        }
+    }
+
+    /* Prefix/suffix order independence: a prefix fact with the larger
+     * producer PC merges into an earlier committed smaller-PC fact
+     * without changing the dump. */
+    memset(&b1, 0, sizeof(b1));
+    b1.pc = 0x300;
+    b1.chunk.address.region.kind = OSPREY_REGION_GLOBAL;
+    b1.chunk.address.offset = 0x2020;
+    b1.chunk.size = 8;
+    b1.base = b1.chunk.address;
+    b1.producer_pc = 0x60;
+    b1.sample_support = 1;
+    CHECK(osprey_table_insert_base(run, &b1) == 1, "prefix insert");
+    CHECK(osprey_shared_run_freeze_prefix(ctx, run), "prefix freeze");
+    CHECK(osprey_parent_merge_sample(ctx, run) == OSPREY_OK,
+          "prefix merge ok");
+    {
+        OspreyBaseFact *d = NULL;
+        for (guint i = 0; i < ctx->base_facts->len; i++) {
+            OspreyBaseFact *cand = &g_array_index(ctx->base_facts,
+                                                  OspreyBaseFact, i);
+            if (cand->pc == 0x300) {
+                d = cand;
+            }
+        }
+        CHECK(d != NULL, "prefix fact committed");
+        if (d != NULL) {
+            CHECK(d->producer_pc == 0x60, "prefix producer PC retained");
+            CHECK(d->sample_support == 1, "prefix support once");
+        }
+    }
+
+    osprey_free(ctx);
+    g_free(run);
 }

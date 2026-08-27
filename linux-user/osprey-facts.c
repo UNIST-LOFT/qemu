@@ -23,13 +23,6 @@
  * stack hooks above). */
 static void origin_invalidate_reg(CPUArchState *env, int reg);
 
-/* F04 points-to emission (defined below; called from the origin-shadow
- * spill/reload hooks). */
-static void record_points_to(CPUArchState *env, target_ulong addr,
-                             uint64_t size, target_ulong value,
-                             uint64_t prov_object_id,
-                             uint32_t prov_generation);
-
 #include "qemu/thread.h"
 #include "snapshot.h"
 
@@ -109,6 +102,35 @@ bool osprey_base_eq(const OspreyBaseFact *a, const OspreyBaseFact *b) {
            eq_addr(&a->base, &b->base) &&
            a->prov_object_id == b->prov_object_id &&
            a->prov_generation == b->prov_generation;
+}
+
+/* Canonical base rows sort by their printed fields.  Signed offsets are
+ * printed as two's-complement hexadecimal, so compare their uint64_t
+ * representations rather than their signed numeric values. */
+static gint osprey_base_dump_cmp(gconstpointer ap, gconstpointer bp) {
+    const OspreyBaseFact *a = ap;
+    const OspreyBaseFact *b = bp;
+#define CMP_FIELD(_a, _b) do { \
+        uint64_t av = (uint64_t)(_a); \
+        uint64_t bv = (uint64_t)(_b); \
+        if (av != bv) return av < bv ? -1 : 1; \
+    } while (0)
+    CMP_FIELD(a->pc, b->pc);
+    CMP_FIELD(a->chunk.address.region.kind,
+              b->chunk.address.region.kind);
+    CMP_FIELD(a->chunk.address.region.site_offset,
+              b->chunk.address.region.site_offset);
+    CMP_FIELD(a->chunk.address.offset, b->chunk.address.offset);
+    CMP_FIELD(a->chunk.size, b->chunk.size);
+    CMP_FIELD(a->base.region.kind, b->base.region.kind);
+    CMP_FIELD(a->base.region.site_offset, b->base.region.site_offset);
+    CMP_FIELD(a->base.offset, b->base.offset);
+    CMP_FIELD(a->prov_object_id, b->prov_object_id);
+    CMP_FIELD(a->prov_generation, b->prov_generation);
+    CMP_FIELD(a->producer_pc, b->producer_pc);
+    CMP_FIELD(a->sample_support, b->sample_support);
+#undef CMP_FIELD
+    return 0;
 }
 
 uint64_t osprey_copy_hash(const OspreyCopyFact *f) {
@@ -221,6 +243,13 @@ static int update_base_fact(void *dst, const void *src) {
     const OspreyBaseFact *s = src;
     if (s->sample_support != 0 && d->sample_support == 0) {
         d->sample_support = 1;
+    }
+    /* Deterministic audit metadata: on a logically equal fact, retain
+     * the numerically smallest producer PC (including zero) so
+     * prefix/suffix and repeated-path order cannot alter the dump.
+     * Logical F02 identity never includes producer_pc. */
+    if (s->producer_pc < d->producer_pc) {
+        d->producer_pc = s->producer_pc;
     }
     return 0;
 }
@@ -788,14 +817,17 @@ static void stack_seed_rsp_origin(CPUArchState *env,
         return;
     }
     OspreyCpuOriginState *st = osprey_cpu_origin(env);
-    OspreyRegOrigin *o = &st->regs[R_ESP];
-    memset(o, 0, sizeof(*o));
-    o->kind = OSPREY_ORIGIN_ADDRESS;
+    memset(&st->regs[R_ESP], 0, sizeof(st->regs[R_ESP]));
+    OspreyAddressOrigin *o = &st->regs[R_ESP].address;
     o->valid = 1;
+    o->width = (uint8_t)sizeof(target_ulong);
     o->concrete_value = sp;
-    o->address.region = frame->region;
-    o->address.offset = (int64_t)sp - (int64_t)frame->entry_sp;
-    o->producer_pc = 0; /* synthetic: frame identity, not an insn */
+    o->canonical.region = frame->region;
+    o->canonical.offset = (int64_t)sp - (int64_t)frame->entry_sp;
+    /* Precise stack seeds use the normalized callee/entrypoint PC as
+     * their producer identity (a real normalized producer offset, not a
+     * synthetic sentinel). */
+    o->producer_pc = frame->region.site_offset;
 }
 
 void osprey_on_call(CPUArchState *env, target_ulong callee_pc,
@@ -978,7 +1010,23 @@ void osprey_on_rsp_update(CPUArchState *env, target_ulong new_sp,
                                            f->entry_sp, f->min_sp,
                                            f->max_sp, 0, 0);
                 }
-                stack_seed_rsp_origin(env, f, new_sp);
+                /* Re-derive the canonical stack identity from the live
+                 * frame and set the producer PC to the normalized write
+                 * instruction. */
+                {
+                    OspreyCpuOriginState *st = osprey_cpu_origin(env);
+                    memset(&st->regs[R_ESP], 0,
+                           sizeof(st->regs[R_ESP]));
+                    OspreyAddressOrigin *o =
+                        &st->regs[R_ESP].address;
+                    o->valid = 1;
+                    o->width = (uint8_t)sizeof(target_ulong);
+                    o->concrete_value = new_sp;
+                    o->canonical.region = f->region;
+                    o->canonical.offset =
+                        (int64_t)new_sp - (int64_t)f->entry_sp;
+                    o->producer_pc = norm_pc;
+                }
                 return;
             }
         }
@@ -1000,23 +1048,131 @@ void osprey_on_rsp_update(CPUArchState *env, target_ulong new_sp,
 static void origin_invalidate_reg(CPUArchState *env, int reg) {
     if (reg < 0 || reg >= CPU_NB_REGS) return;
     OspreyCpuOriginState *st = osprey_cpu_origin(env);
-    st->regs[reg].valid = 0;
-    st->regs[reg].kind = OSPREY_ORIGIN_NONE;
+    memset(&st->regs[reg], 0, sizeof(st->regs[reg]));
 }
 
+/* Install one validated address origin into `dst`; always clears the
+ * destination VALUE channel (explicit two-channel write policy).  The
+ * caller must already hold a normalized producer PC. */
+static void origin_install_address(CPUArchState *env, int dst,
+                                   const OspreyAddress *canonical,
+                                   uint64_t prov_object_id,
+                                   uint32_t prov_generation,
+                                   uint64_t producer_pc,
+                                   target_ulong concrete_value) {
+    if (dst < 0 || dst >= CPU_NB_REGS) return;
+    OspreyCpuOriginState *st = osprey_cpu_origin(env);
+    memset(&st->regs[dst], 0, sizeof(st->regs[dst]));
+    OspreyAddressOrigin *o = &st->regs[dst].address;
+    o->valid = 1;
+    o->width = (uint8_t)sizeof(target_ulong);
+    o->concrete_value = concrete_value;
+    o->canonical = *canonical;
+    o->prov_object_id = prov_object_id;
+    o->prov_generation = prov_generation;
+    o->producer_pc = producer_pc;
+}
+
+/* Canonical-region identity check for a transfer. */
+static bool origin_region_eq(const OspreyRegionId *a,
+                             const OspreyRegionId *b) {
+    return a->kind == b->kind && a->code_image_id == b->code_image_id &&
+           a->site_offset == b->site_offset;
+}
+
+static bool origin_address_eq(const OspreyAddressOrigin *a,
+                              const OspreyAddressOrigin *b) {
+    return a->valid == b->valid && a->width == b->width &&
+           a->concrete_value == b->concrete_value &&
+           origin_region_eq(&a->canonical.region, &b->canonical.region) &&
+           a->canonical.offset == b->canonical.offset &&
+           a->prov_object_id == b->prov_object_id &&
+           a->prov_generation == b->prov_generation &&
+           a->producer_pc == b->producer_pc;
+}
+
+/* Invalidate a bad pre-access snapshot only when the architectural
+ * register still carries that exact channel.  A successful self-overwriting
+ * load may already have installed a newer destination origin. */
+static void origin_invalidate_snapshot(CPUArchState *env, int reg,
+                                       const OspreyAddressOrigin *snapshot) {
+    if (reg < 0 || reg >= CPU_NB_REGS || snapshot == NULL) {
+        return;
+    }
+    OspreyCpuOriginState *st = osprey_cpu_origin(env);
+    if (origin_address_eq(&st->regs[reg].address, snapshot)) {
+        origin_invalidate_reg(env, reg);
+    }
+}
+
+/* Interpret target-width wrapping subtraction as a signed x86-64 delta
+ * without performing overflowing signed subtraction. */
+static int64_t origin_wrapped_delta(target_ulong value, target_ulong base) {
+    return (int64_t)(target_long)(value - base);
+}
+
+/* A live heap ADDRESS origin must still reference the authoritative
+ * provenance object: {object_id, generation} live, concrete value
+ * within the object or its one-past address, canonical offset equal to
+ * the concrete delta, and
+ * canonical region matching the object's allocation site.  Conversely,
+ * non-heap origins must not carry a provenance identity. */
+static bool origin_heap_prov_ok(const OspreyAddressOrigin *o) {
+    if (o->canonical.region.kind != OSPREY_REGION_HEAP_SITE) {
+        return o->prov_object_id == 0 && o->prov_generation == 0;
+    }
+    if (o->prov_object_id == 0) {
+        return false;
+    }
+    ProvenanceObject *obj =
+        provenance_lookup_object(o->prov_object_id, o->prov_generation);
+    if (obj == NULL || obj->state != PROV_OBJ_LIVE) {
+        return false;
+    }
+    if (o->concrete_value < obj->base) {
+        return false;
+    }
+    uint64_t delta = (uint64_t)(o->concrete_value - obj->base);
+    if (delta > obj->requested_size || delta > INT64_MAX ||
+        o->canonical.offset != (int64_t)delta) {
+        return false;
+    }
+    uint64_t site = 0;
+    if (!osprey_normalize_pc(obj->alloc_pc, &site) ||
+        o->canonical.region.kind != OSPREY_REGION_HEAP_SITE ||
+        o->canonical.region.site_offset != site) {
+        return false;
+    }
+    return true;
+}
+
+/* Provenance-authoritative heap origin check (public; F02 selection and
+ * reload use it). */
+bool osprey_address_origin_live(const OspreyAddressOrigin *o) {
+    if (o == NULL || !o->valid || o->width != sizeof(target_ulong)) {
+        return false;
+    }
+    return origin_heap_prov_ok(o);
+}
+
+/* Replace one aligned pointer-width memory-shadow slot with the given
+ * address-origin payload (or an invalid entry).  Stage 2.3 stores only
+ * ADDRESS state; partial/unaligned/atomic/output overlap invalidation
+ * is Stage 2.4. */
 static void origin_store_mem(CPUArchState *env, target_ulong addr,
-                             target_ulong size, const OspreyRegOrigin *src) {
+                             target_ulong size,
+                             const OspreyAddressOrigin *src) {
     OspreyCpuOriginState *st = osprey_cpu_origin(env);
     if (st->mem_slots == NULL) return;
-    if (size != OSPREY_SHADOW_ALIGN || (addr & (OSPREY_SHADOW_ALIGN - 1))) {
+    if (size != OSPREY_SHADOW_ALIGN ||
+        (addr & (OSPREY_SHADOW_ALIGN - 1))) {
         return; /* unsupported store: no metadata maintained */
     }
-    OspreyMemSlotOrigin *slot = g_new0(OspreyMemSlotOrigin, 1);
-    if (src->valid) {
+    OspreyMemAddressOrigin *slot = g_new0(OspreyMemAddressOrigin, 1);
+    if (src != NULL && src->valid) {
         slot->valid = 1;
-        slot->kind = src->kind;
-        slot->chunk = src->chunk;
-        slot->address = src->address;
+        slot->width = src->width;
+        slot->canonical = src->canonical;
         slot->concrete_value = src->concrete_value;
         slot->prov_object_id = src->prov_object_id;
         slot->prov_generation = src->prov_generation;
@@ -1024,144 +1180,483 @@ static void origin_store_mem(CPUArchState *env, target_ulong addr,
     g_hash_table_replace(st->mem_slots, GSIZE_TO_POINTER(addr), slot);
 }
 
-/* Returns true when an ADDRESS origin was restored (F04 load-side
- * points-to evidence). */
-static bool origin_load_slot(CPUArchState *env, target_ulong addr,
-                             int dst_reg, target_ulong value) {
+/* Exact aligned pointer-width reload: restore an ADDRESS origin into
+ * dst_reg only when the slot is valid, its saved concrete value equals
+ * the observed runtime value, and (for heap origins) the provenance
+ * identity is still live.  Any failure removes the exact slot and
+ * leaves both destination channels invalid.  producer_pc is the
+ * normalized load instruction. */
+static void origin_load_slot(CPUArchState *env, target_ulong addr,
+                             int dst_reg, target_ulong value,
+                             uint64_t producer_pc) {
+    if (dst_reg < 0 || dst_reg >= CPU_NB_REGS) {
+        return;
+    }
     OspreyCpuOriginState *st = osprey_cpu_origin(env);
-    OspreyRegOrigin *dst = &st->regs[dst_reg];
-    dst->valid = 0;
-    dst->kind = OSPREY_ORIGIN_NONE;
-    if (st->mem_slots == NULL || dst_reg < 0) return false;
-    OspreyMemSlotOrigin *slot = g_hash_table_lookup(
+    memset(&st->regs[dst_reg], 0, sizeof(st->regs[dst_reg]));
+    if (st->mem_slots == NULL) {
+        return;
+    }
+    OspreyMemAddressOrigin *slot = g_hash_table_lookup(
         st->mem_slots, GSIZE_TO_POINTER(addr));
-    if (slot == NULL || !slot->valid) return false;
-    if (slot->concrete_value != value) return false; /* value-consistency */
-    dst->valid = 1;
-    dst->kind = slot->kind;
-    dst->chunk = slot->chunk;
-    dst->address = slot->address;
-    dst->concrete_value = value;
-    dst->prov_object_id = slot->prov_object_id;
-    dst->prov_generation = slot->prov_generation;
-    return slot->kind == OSPREY_ORIGIN_ADDRESS;
+    if (slot == NULL || !slot->valid) {
+        return;
+    }
+    if (slot->width != sizeof(target_ulong) ||
+        slot->concrete_value != value) {
+        /* Value-consistency/width failure: the slot's bytes no longer
+         * match the saved tag.  Remove the stale entry so a later
+         * coincidental byte match cannot resurrect it. */
+        g_hash_table_remove(st->mem_slots, GSIZE_TO_POINTER(addr));
+        return;
+    }
+    if (slot->prov_object_id != 0) {
+        OspreyAddressOrigin tmp;
+        memset(&tmp, 0, sizeof(tmp));
+        tmp.valid = 1;
+        tmp.width = slot->width;
+        tmp.concrete_value = slot->concrete_value;
+        tmp.canonical = slot->canonical;
+        tmp.prov_object_id = slot->prov_object_id;
+        tmp.prov_generation = slot->prov_generation;
+        if (!origin_heap_prov_ok(&tmp)) {
+            g_hash_table_remove(st->mem_slots, GSIZE_TO_POINTER(addr));
+            return;
+        }
+    }
+    origin_install_address(env, dst_reg, &slot->canonical,
+                           slot->prov_object_id, slot->prov_generation,
+                           producer_pc, value);
 }
 
-/* Full-width register copy: transfer ADDRESS/VALUE origin with a
- * value-consistency check. */
+/* Full-width register copy: transfer the ADDRESS channel with a
+ * value-consistency check and replace the producer PC with the MOV
+ * instruction.  Always clears the destination VALUE channel. */
 static void origin_mov_reg(CPUArchState *env, int dst, int src,
-                           target_ulong src_val, target_ulong dst_val) {
+                           target_ulong src_val, target_ulong dst_val,
+                           uint64_t producer_pc) {
+    if (dst < 0 || dst >= CPU_NB_REGS) {
+        return;
+    }
     OspreyCpuOriginState *st = osprey_cpu_origin(env);
-    OspreyRegOrigin *s = &st->regs[src];
-    if (!s->valid || s->concrete_value != src_val) {
+    if (src < 0 || src >= CPU_NB_REGS) {
         origin_invalidate_reg(env, dst);
         return;
     }
-    st->regs[dst] = *s;
-    st->regs[dst].concrete_value = dst_val;
+    /* Copy before installing: dst == src is a valid self-MOV, and
+     * origin_install_address() clears the destination before writing it. */
+    OspreyAddressOrigin source = st->regs[src].address;
+    if (!source.valid || source.width != sizeof(target_ulong) ||
+        source.concrete_value != src_val || src_val != dst_val) {
+        if (dst == R_ESP) {
+            /* A full-width MOV to RSP with an unknown source: preserve
+             * the immediately preceding osprey_on_rsp_update() result
+             * (a stack identity independently re-derived from the live
+             * frame and concrete RSP) instead of erasing it.  Only the
+             * VALUE channel is cleared. */
+            memset(&st->regs[dst].value, 0, sizeof(st->regs[dst].value));
+        } else {
+            origin_invalidate_reg(env, dst);
+        }
+        return;
+    }
+    if (!osprey_address_origin_live(&source)) {
+        if (dst == R_ESP) {
+            memset(&st->regs[dst].value, 0, sizeof(st->regs[dst].value));
+        } else {
+            origin_invalidate_reg(env, dst);
+        }
+        return;
+    }
+    /* A full-width MOV to RSP may replace the lifecycle seed with a
+     * proven source origin, including a heap-backed stack pivot. */
+    origin_install_address(env, dst, &source.canonical,
+                           source.prov_object_id, source.prov_generation,
+                           producer_pc, dst_val);
 }
 
-/* lea dst, [base + disp]: propagate ADDRESS origin with offset += disp
- * when the arithmetic is exact (checked). */
+/* lea dst, [base + disp]: propagate the ADDRESS origin with
+ * offset += disp when the runtime reconstruction is exact
+ * (base + disp == dst modulo target width) and the checked signed
+ * canonical-offset addition succeeds.  Preserves heap provenance
+ * identity. */
 static void origin_lea_imm(CPUArchState *env, int dst, int base,
                            int64_t disp, target_ulong dst_val,
-                           target_ulong base_val) {
+                           target_ulong base_val, uint64_t producer_pc) {
+    if (dst < 0 || dst >= CPU_NB_REGS) {
+        return;
+    }
     OspreyCpuOriginState *st = osprey_cpu_origin(env);
-    OspreyRegOrigin *b = &st->regs[base];
-    if (!b->valid || b->kind != OSPREY_ORIGIN_ADDRESS ||
-        b->concrete_value != base_val) {
+    if (base < 0 || base >= CPU_NB_REGS) {
+        origin_invalidate_reg(env, dst);
+        return;
+    }
+    /* Preserve the source across an in-place LEA (dst == base). */
+    OspreyAddressOrigin source = st->regs[base].address;
+    if (!source.valid || source.width != sizeof(target_ulong) ||
+        source.concrete_value != base_val) {
+        origin_invalidate_reg(env, dst);
+        return;
+    }
+    /* x86 address arithmetic wraps mod 2^64: exact wrapping
+     * reconstruction is required before the tracked-offset fold. */
+    target_ulong expect = base_val + (target_ulong)disp;
+    if (expect != dst_val) {
+        origin_invalidate_reg(env, dst);
+        return;
+    }
+    if (!osprey_address_origin_live(&source)) {
         origin_invalidate_reg(env, dst);
         return;
     }
     int64_t off = 0;
-    if (!osprey_check_add(b->address.offset, disp, &off)) {
+    if (!osprey_check_add(source.canonical.offset, disp, &off)) {
         origin_invalidate_reg(env, dst);
         return;
     }
-    st->regs[dst] = *b;
-    st->regs[dst].address.offset = off;
-    st->regs[dst].concrete_value = dst_val;
+    OspreyAddress canonical = source.canonical;
+    canonical.offset = off;
+    origin_install_address(env, dst, &canonical, source.prov_object_id,
+                           source.prov_generation, producer_pc, dst_val);
+}
+
+/* ADD/SUB immediate: fold `delta` into the tagged register's canonical
+ * offset after exact wrapping reconstruction. */
+static void origin_addsub_imm(CPUArchState *env, int reg, int64_t delta,
+                              target_ulong pre_val, target_ulong post_val,
+                              uint64_t producer_pc) {
+    OspreyCpuOriginState *st = osprey_cpu_origin(env);
+    if (reg < 0 || reg >= CPU_NB_REGS) return;
+    OspreyAddressOrigin *o = &st->regs[reg].address;
+    target_ulong expect = pre_val + (target_ulong)delta;
+    if (expect != post_val) {
+        origin_invalidate_reg(env, reg);
+        return;
+    }
+    /* gen_op_mov_reg_v publishes the architectural RSP lifecycle update
+     * before this arithmetic helper.  When that exact stack seed is
+     * already present, it is authoritative for the post-write value and
+     * must not be rejected for failing the pre-value comparison below. */
+    if (reg == R_ESP && o->valid &&
+        o->width == sizeof(target_ulong) &&
+        o->concrete_value == post_val &&
+        o->canonical.region.kind == OSPREY_REGION_STACK_FUNCTION &&
+        o->producer_pc == producer_pc && osprey_address_origin_live(o)) {
+        memset(&st->regs[reg].value, 0, sizeof(st->regs[reg].value));
+        return;
+    }
+    if (!o->valid || o->width != sizeof(target_ulong) ||
+        o->concrete_value != pre_val) {
+        origin_invalidate_reg(env, reg);
+        return;
+    }
+    if (!osprey_address_origin_live(o)) {
+        origin_invalidate_reg(env, reg);
+        return;
+    }
+    int64_t off = 0;
+    if (!osprey_check_add(o->canonical.offset, delta, &off)) {
+        origin_invalidate_reg(env, reg);
+        return;
+    }
+    OspreyAddress canonical = o->canonical;
+    canonical.offset = off;
+    origin_install_address(env, reg, &canonical, o->prov_object_id,
+                           o->prov_generation, producer_pc, post_val);
+}
+
+/* ADD/SUB register: accept exactly the one-origin forms — tagged
+ * destination plus untagged source for ADD or SUB, and untagged
+ * destination plus tagged source for ADD.  The untagged operand is
+ * derived from the observed post-result/source values; the signed
+ * operand is checked-folded into the tagged canonical offset.  Never
+ * negate INT64_MIN (SUB folds through osprey_check_sub). */
+static void origin_addsub_reg(CPUArchState *env, int dst, int src,
+                              bool is_sub, target_ulong dst_val,
+                              target_ulong src_val,
+                              uint64_t producer_pc) {
+    if (dst < 0 || dst >= CPU_NB_REGS) {
+        return;
+    }
+    OspreyCpuOriginState *st = osprey_cpu_origin(env);
+    if (src < 0 || src >= CPU_NB_REGS) {
+        origin_invalidate_reg(env, dst);
+        return;
+    }
+    OspreyAddressOrigin *d = &st->regs[dst].address;
+    OspreyAddressOrigin *s = &st->regs[src].address;
+    if ((d->valid && d->width != sizeof(target_ulong)) ||
+        (s->valid && s->width != sizeof(target_ulong))) {
+        origin_invalidate_reg(env, dst);
+        return;
+    }
+    bool d_tagged = d->valid;
+    bool s_tagged = s->valid;
+
+    OspreyAddressOrigin *tagged = NULL;
+    if (d_tagged && !s_tagged) {
+        /* Tagged destination plus untagged source for ADD or SUB.  The
+         * origin channel still holds the PRE-instruction concrete value
+         * (write-back invalidation was suppressed); exact wrapping
+         * reconstruction requires pre ± src == post (mod target width),
+         * then the signed operand is checked-folded into the canonical
+         * offset (ADD via check_add, SUB via check_sub — the source
+         * value is never negated, so INT64_MIN cannot wrap). */
+        tagged = d;
+        if (!tagged->valid || tagged->width != sizeof(target_ulong)) {
+            origin_invalidate_reg(env, dst);
+            return;
+        }
+        target_ulong expect = is_sub
+            ? tagged->concrete_value - (target_ulong)src_val
+            : tagged->concrete_value + (target_ulong)src_val;
+        if (expect != dst_val) {
+            origin_invalidate_reg(env, dst);
+            return;
+        }
+        if (!osprey_address_origin_live(tagged)) {
+            origin_invalidate_reg(env, dst);
+            return;
+        }
+        int64_t off = 0;
+        bool ok = is_sub
+            ? osprey_check_sub(tagged->canonical.offset,
+                               (int64_t)src_val, &off)
+            : osprey_check_add(tagged->canonical.offset,
+                               (int64_t)src_val, &off);
+        if (!ok) {
+            origin_invalidate_reg(env, dst);
+            return;
+        }
+        OspreyAddress canonical = tagged->canonical;
+        canonical.offset = off;
+        origin_install_address(env, dst, &canonical, tagged->prov_object_id,
+                               tagged->prov_generation, producer_pc,
+                               dst_val);
+        return;
+    }
+    if (!d_tagged && s_tagged && !is_sub) {
+        /* Untagged destination plus tagged source for ADD: the tagged
+         * source is the base; the untagged operand is the observed
+         * post-result minus the source value (wrapping), folded into
+         * the tagged canonical offset with checked addition. */
+        if (!s->valid || s->width != sizeof(target_ulong) ||
+            s->concrete_value != src_val) {
+            origin_invalidate_reg(env, dst);
+            return;
+        }
+        if (!osprey_address_origin_live(s)) {
+            origin_invalidate_reg(env, dst);
+            return;
+        }
+        int64_t delta = (int64_t)(dst_val - src_val);
+        OspreyAddress canonical = s->canonical;
+        int64_t off = 0;
+        if (!osprey_check_add(canonical.offset, delta, &off)) {
+            origin_invalidate_reg(env, dst);
+            return;
+        }
+        canonical.offset = off;
+        origin_install_address(env, dst, &canonical, s->prov_object_id,
+                               s->prov_generation, producer_pc, dst_val);
+        return;
+    }
+    /* Two tagged operands, SUB with only the source tagged, or no
+     * eligible tagged operand: no sound merge. */
+    origin_invalidate_reg(env, dst);
+}
+
+/* Full-width register XCHG: swap the two pre-exchange ADDRESS channels
+ * only when each channel independently matches its corresponding
+ * post-swap concrete value.  Each surviving side receives the XCHG
+ * producer PC; an invalid side stays invalid.  Both VALUE channels are
+ * killed.  dst == src validates and refreshes the single channel once. */
+static void origin_xchg_reg(CPUArchState *env, int dst, int src,
+                            target_ulong dst_val, target_ulong src_val,
+                            uint64_t producer_pc) {
+    OspreyCpuOriginState *st = osprey_cpu_origin(env);
+    if (dst < 0 || dst >= CPU_NB_REGS) return;
+    if (dst == src) {
+        OspreyAddressOrigin *o = &st->regs[dst].address;
+        if (o->valid && o->width == sizeof(target_ulong) &&
+            o->concrete_value == dst_val) {
+            if (!osprey_address_origin_live(o)) {
+                origin_invalidate_reg(env, dst);
+                return;
+            }
+            o->producer_pc = producer_pc;
+        } else {
+            origin_invalidate_reg(env, dst);
+        }
+        memset(&st->regs[dst].value, 0, sizeof(st->regs[dst].value));
+        return;
+    }
+    if (src < 0 || src >= CPU_NB_REGS) {
+        origin_invalidate_reg(env, dst);
+        return;
+    }
+    OspreyAddressOrigin da = st->regs[dst].address;
+    OspreyAddressOrigin sa = st->regs[src].address;
+    OspreyAddressOrigin new_d, new_s;
+    memset(&new_d, 0, sizeof(new_d));
+    memset(&new_s, 0, sizeof(new_s));
+    /* Post-swap, dst holds the pre-exchange src value (dst_val) and src
+     * holds the pre-exchange dst value (src_val).  The channel that
+     * lands in each register is the OTHER register's pre-exchange
+     * channel, validated independently against the post-swap concrete
+     * value; an invalid side stays invalid. */
+    bool d_ok = sa.valid && sa.width == sizeof(target_ulong) &&
+        sa.concrete_value == dst_val && osprey_address_origin_live(&sa);
+    bool s_ok = da.valid && da.width == sizeof(target_ulong) &&
+        da.concrete_value == src_val && osprey_address_origin_live(&da);
+    if (d_ok) {
+        new_d = sa;
+        new_d.concrete_value = dst_val;
+        new_d.producer_pc = producer_pc;
+    }
+    if (s_ok) {
+        new_s = da;
+        new_s.concrete_value = src_val;
+        new_s.producer_pc = producer_pc;
+    }
+    st->regs[dst].address = new_d;
+    st->regs[src].address = new_s;
+    memset(&st->regs[dst].value, 0, sizeof(st->regs[dst].value));
+    memset(&st->regs[src].value, 0, sizeof(st->regs[src].value));
+}
+
+/* Normalize a raw producer PC to its image-relative offset.  Returns
+ * false when the PC is outside the main image: the transfer must then
+ * kill the destination rather than install an origin. */
+static bool origin_normalize_producer(target_ulong raw_pc,
+                                      uint64_t *norm_pc) {
+    return osprey_normalize_pc(raw_pc, norm_pc);
 }
 
 /* Runtime helpers exposed to the translator wrappers. */
+void osprey_on_reg_materialize_address(CPUArchState *env, uint32_t dst,
+                                       target_ulong value,
+                                       target_ulong pc) {
+    uint64_t norm_pc = 0;
+    if (!origin_normalize_producer(pc, &norm_pc)) {
+        origin_invalidate_reg(env, (int)dst);
+        return;
+    }
+    /* Full-width result is guaranteed by the translator callsite; only
+     * a main-image global address may seed an origin.  Never seed heap,
+     * stack, anonymous-map, library, or merely mapped numeric values
+     * from an immediate. */
+    OspreyRegionId region;
+    int64_t off = 0;
+    if (!osprey_region_of_addr(env, value, &region, &off, false) ||
+        region.kind != OSPREY_REGION_GLOBAL) {
+        origin_invalidate_reg(env, (int)dst);
+        return;
+    }
+    OspreyAddress canonical;
+    canonical.region = region;
+    canonical.offset = off;
+    origin_install_address(env, (int)dst, &canonical, 0, 0, norm_pc,
+                           value);
+}
+
 void osprey_on_reg_copy(CPUArchState *env, uint32_t dst, uint32_t src,
-                        target_ulong src_val, target_ulong dst_val) {
-    origin_mov_reg(env, (int)dst, (int)src, src_val, dst_val);
+                        target_ulong src_value, target_ulong dst_value,
+                        target_ulong pc) {
+    uint64_t norm_pc = 0;
+    if (!origin_normalize_producer(pc, &norm_pc)) {
+        origin_invalidate_reg(env, (int)dst);
+        return;
+    }
+    origin_mov_reg(env, (int)dst, (int)src, src_value, dst_value, norm_pc);
 }
 
 void osprey_on_reg_lea(CPUArchState *env, uint32_t dst, uint32_t base,
-                       int64_t disp, target_ulong dst_val,
-                       target_ulong base_val) {
-    origin_lea_imm(env, (int)dst, (int)base, disp, dst_val, base_val);
+                       int64_t disp, target_ulong dst_value,
+                       target_ulong base_value, target_ulong pc) {
+    uint64_t norm_pc = 0;
+    if (!origin_normalize_producer(pc, &norm_pc)) {
+        origin_invalidate_reg(env, (int)dst);
+        return;
+    }
+    origin_lea_imm(env, (int)dst, (int)base, disp, dst_value, base_value,
+                   norm_pc);
+}
+
+void osprey_on_reg_addsub_imm(CPUArchState *env, uint32_t reg,
+                              int64_t delta, target_ulong pre_value,
+                              target_ulong post_value, target_ulong pc) {
+    uint64_t norm_pc = 0;
+    if (!origin_normalize_producer(pc, &norm_pc)) {
+        origin_invalidate_reg(env, (int)reg);
+        return;
+    }
+    origin_addsub_imm(env, (int)reg, delta, pre_value, post_value, norm_pc);
+}
+
+void osprey_on_reg_addsub_reg(CPUArchState *env, uint32_t dst,
+                              uint32_t src, bool is_sub,
+                              target_ulong dst_value,
+                              target_ulong src_value, target_ulong pc) {
+    uint64_t norm_pc = 0;
+    if (!origin_normalize_producer(pc, &norm_pc)) {
+        origin_invalidate_reg(env, (int)dst);
+        return;
+    }
+    origin_addsub_reg(env, (int)dst, (int)src, is_sub, dst_value,
+                      src_value, norm_pc);
+}
+
+void osprey_on_reg_xchg(CPUArchState *env, uint32_t dst, uint32_t src,
+                        target_ulong dst_value, target_ulong src_value,
+                        target_ulong pc) {
+    uint64_t norm_pc = 0;
+    if (!origin_normalize_producer(pc, &norm_pc)) {
+        origin_invalidate_reg(env, (int)dst);
+        origin_invalidate_reg(env, (int)src);
+        return;
+    }
+    origin_xchg_reg(env, (int)dst, (int)src, dst_value, src_value,
+                    norm_pc);
 }
 
 void osprey_on_reg_invalidate(CPUArchState *env, uint32_t reg) {
     origin_invalidate_reg(env, (int)reg);
 }
 
-/* Aligned native-width store of register origin into the memory shadow. */
-void osprey_on_mem_store_origin(CPUArchState *env, uint32_t src_reg,
-                                target_ulong addr, target_ulong size,
-                                target_ulong src_val) {
+/* Aligned pointer-width store of a register ADDRESS origin into the
+ * memory shadow.  An unknown/invalid source replaces any exact slot
+ * with an invalid entry; an aligned pointer-width store from a live,
+ * value-matching ADDRESS origin installs it.  No F04 is emitted in
+ * Stage 2.3. */
+void osprey_on_mem_store_address(CPUArchState *env, uint32_t src_reg,
+                                 target_ulong addr, target_ulong size,
+                                 target_ulong src_value) {
     OspreyCpuOriginState *st = osprey_cpu_origin(env);
-    OspreyRegOrigin *s = (src_reg < CPU_NB_REGS) ? &st->regs[src_reg] : NULL;
-    OspreyRegOrigin tmp;
-    memset(&tmp, 0, sizeof(tmp));
-    if (s != NULL && s->valid && s->concrete_value == src_val) {
-        tmp = *s;
-        if (s->kind == OSPREY_ORIGIN_ADDRESS && size == OSPREY_SHADOW_ALIGN) {
-            record_points_to(env, addr, size, src_val,
-                             s->prov_object_id, s->prov_generation);
+    if (src_reg < CPU_NB_REGS) {
+        OspreyAddressOrigin *s = &st->regs[src_reg].address;
+        if (s->valid && s->width == sizeof(target_ulong) &&
+            s->concrete_value == src_value &&
+            osprey_address_origin_live(s)) {
+            origin_store_mem(env, addr, size, s);
+            return;
         }
     }
-    origin_store_mem(env, addr, size, &tmp);
+    origin_store_mem(env, addr, size, NULL);
 }
 
-/* Aligned native-width load: restore the origin into dst_reg, guarded by
- * the value-consistency check. */
-void osprey_on_mem_load_origin(CPUArchState *env, uint32_t dst_reg,
-                               target_ulong addr, target_ulong value) {
-    if (origin_load_slot(env, addr, (int)dst_reg, value)) {
-        /* F04 load-side: a pointer-width slot holding an ADDRESS origin
-         * is points-to evidence: the loaded value points at that
-         * canonical address. */
-        OspreyCpuOriginState *st = osprey_cpu_origin(env);
-        OspreyRegOrigin *dst = &st->regs[dst_reg];
-        record_points_to(env, addr, 8, value,
-                         dst->prov_object_id, dst->prov_generation);
+/* Aligned pointer-width load: restore the ADDRESS origin from the
+ * memory shadow into dst_reg.  producer PC is the normalized load
+ * instruction, not the earlier store's producer. */
+void osprey_on_mem_load_address(CPUArchState *env, uint32_t dst_reg,
+                                target_ulong addr, target_ulong value,
+                                target_ulong pc) {
+    uint64_t norm_pc = 0;
+    if (!origin_normalize_producer(pc, &norm_pc)) {
+        origin_invalidate_reg(env, (int)dst_reg);
+        return;
     }
-}
-
-/* Provenance-authoritative heap origin check: the origin's identity must
- * reference a LIVE object whose base matches the origin's concrete
- * value.  Used before F02/F04 emission for heap ADDRESS origins. */
-bool osprey_origin_prov_live(const OspreyRegOrigin *o) {
-    if (o->prov_object_id == 0) {
-        return true; /* non-heap or legacy origin: numeric resolution */
-    }
-    ProvenanceObject *obj =
-        provenance_lookup_object(o->prov_object_id, o->prov_generation);
-    if (obj == NULL || obj->state != PROV_OBJ_LIVE) {
-        return false;
-    }
-    /* The concrete value and canonical offset must identify the same
-     * byte in the live object.  Subtraction after the lower-bound check
-     * avoids base+size wraparound. */
-    if (o->concrete_value < obj->base) {
-        return false;
-    }
-    uint64_t delta = (uint64_t)(o->concrete_value - obj->base);
-    if (delta >= obj->requested_size || delta > INT64_MAX ||
-        o->address.offset != (int64_t)delta) {
-        return false;
-    }
-    uint64_t site = 0;
-    if (!osprey_normalize_pc(obj->alloc_pc, &site) ||
-        o->address.region.kind != OSPREY_REGION_HEAP_SITE ||
-        o->address.region.site_offset != site) {
-        return false;
-    }
-    return true;
+    origin_load_slot(env, addr, (int)dst_reg, value, norm_pc);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1375,16 +1870,17 @@ void osprey_on_alloc_success(CPUArchState *env, target_ulong base,
     /* Seed the ADDRESS origin of the return register (RAX) so
      * subsequent loads/stores through the pointer emit F02 BaseAddr
      * facts instead of being opaque.  The origin is keyed to this heap
-     * instance (offset 0, pointer width). */
+     * instance (offset 0, pointer width) with the already-normalized
+     * allocation call site as producer PC. */
     {
         OspreyCpuOriginState *st = osprey_cpu_origin(env);
-        OspreyRegOrigin *o = &st->regs[R_EAX];
-        memset(o, 0, sizeof(*o));
-        o->kind = OSPREY_ORIGIN_ADDRESS;
+        memset(&st->regs[R_EAX], 0, sizeof(st->regs[R_EAX]));
+        OspreyAddressOrigin *o = &st->regs[R_EAX].address;
         o->valid = 1;
+        o->width = (uint8_t)sizeof(target_ulong);
         o->concrete_value = base;
-        o->address.region = h.region;
-        o->address.offset = 0;
+        o->canonical.region = h.region;
+        o->canonical.offset = 0;
         o->producer_pc = norm_pc;
         o->prov_object_id = object_id;
         o->prov_generation = generation;
@@ -1475,52 +1971,6 @@ static void record_access_fact(OspreySharedRun *run, uint64_t pc,
         sat_add_u64(run->total_dynamic_observations, 1);
 }
 
-/* F04 PointsTo: a pointer-width slot holding an ADDRESS origin at
- * `addr` pointing to `value`.  Both the slot and the target must resolve
- * to canonical regions; a target outside every modeled region records
- * nothing (never guessed from proximity). */
-static void record_points_to(CPUArchState *env, target_ulong addr,
-                             uint64_t size, target_ulong value,
-                             uint64_t prov_object_id,
-                             uint32_t prov_generation) {
-    OspreySharedRun *run = g_shared_run;
-    if (run == NULL) return;
-    OspreyRegionId preg, treg;
-    int64_t poff, toff;
-    if (!osprey_region_of_addr(env, addr, &preg, &poff, false)) {
-        return; /* ordinary skip: pointer cell outside modeled regions */
-    }
-    /* Provenance-authoritative heap targets: the origin identity must
-     * still reference a LIVE object whose base matches the concrete
-     * value; a stale identity (freed/reused) records nothing. */
-    if (prov_object_id != 0) {
-        ProvenanceObject *obj =
-            provenance_lookup_object(prov_object_id, prov_generation);
-        if (obj == NULL || obj->state != PROV_OBJ_LIVE) {
-            return;
-        }
-        /* The pointer value must lie inside the live object. */
-        if (value < obj->base ||
-            (uint64_t)(value - obj->base) >= obj->requested_size) {
-            return;
-        }
-    }
-    if (!osprey_region_of_addr(env, value, &treg, &toff, false)) {
-        return; /* pointer target not in a modeled region */
-    }
-    OspreyPointsToFact fact;
-    memset(&fact, 0, sizeof(fact));
-    fact.pointer_chunk.address.region = preg;
-    fact.pointer_chunk.address.offset = poff;
-    fact.pointer_chunk.size = size;
-    fact.target.region = treg;
-    fact.target.offset = toff;
-    fact.sample_support = 1;
-    qemu_mutex_lock(&g_shared_mutex);
-    osprey_table_insert_points(run, &fact);
-    qemu_mutex_unlock(&g_shared_mutex);
-}
-
 void osprey_on_mem_access(CPUArchState *env, target_ulong addr,
                           uint64_t size, uint64_t pc, uint32_t is_store) {
     osprey_on_mem_access_class(env, addr, size, pc, is_store,
@@ -1534,116 +1984,174 @@ void osprey_on_mem_access_class(CPUArchState *env, target_ulong addr,
     if (op_class >= SEM_OP_CLASS_COUNT ||
         !sem_op_class_valid[op_class]) {
         st->pending_helper_count = 0;
-        st->ea_valid = false;
+        memset(&st->ea, 0, sizeof(st->ea));
         st->ea_mode = 0;
         return;
     }
     OspreySharedRun *run = g_shared_run;
     if (run == NULL) {
         st->pending_helper_count = 0;
-        st->ea_valid = false;
+        memset(&st->ea, 0, sizeof(st->ea));
         st->ea_mode = 0;
         return;
     }
+
+    /* Move the complete EA snapshot into locals and clear every pending
+     * field BEFORE any PC/region/mode decision: a fault has no
+     * post-success call, and the next set-EA, no-EA event, signal/
+     * context replacement, unsupported event, or helper boundary must
+     * overwrite/clear the abandoned record. */
+    OspreyEASnapshot ea = st->ea;
+    memset(&st->ea, 0, sizeof(st->ea));
 
     /* Normalize the PC against the main image base; facts from
      * out-of-image code (libraries, interpreter) are not part of the
      * main-image model and are skipped entirely. */
     uint64_t norm_pc = 0;
     if (!osprey_normalize_pc(pc, &norm_pc)) {
-        /* Consume (clear) the EA metadata even when skipping: a stale
-         * record must never be misread by a later in-image access. */
-        st->ea_valid = false;
         return;
     }
     pc = norm_pc;
 
-    /* Consume the EA metadata: copy into locals, then clear so a stale
-     * record can never be misread by a later instruction. */
-    bool have_ea = st->ea_valid;
-    int base_reg = st->ea_base_reg;
-    int index_reg = st->ea_index_reg;
-    int scale = st->ea_scale;
-    int64_t disp = st->ea_disp;
-    target_ulong base_val = st->ea_base_val;
-    target_ulong index_val = st->ea_index_val;
-    st->ea_valid = false;
+    /* F02 candidate selection: emit only when the EA decomposition
+     * proves exactly one eligible address origin participates in the
+     * effective address.  Mode eligibility was already enforced by
+     * helper_sem_mem_access (MO_64, no segment override); -2
+     * (RIP-relative) is a proven non-GPR address form and never
+     * contributes a register origin.  Every mode-eligible failure
+     * keeps its valid F01 row; no whole-sample rejection happens here.
+     *
+     * Accepted forms:
+     *  - [base + disp]: base snapshot valid, exact wrapping
+     *    reconstruction equals the observed EA;
+     *  - [base + index + disp]: base is the SOLE valid origin, index
+     *    untagged, SIB shift zero (*1);
+     *  - [index + disp] (no base register): index is the sole valid
+     *    origin, SIB shift zero.
+     *
+     * The runtime delta is derived from the accepted origin's concrete
+     * value; origin.canonical.offset + delta must equal the accessed
+     * chunk offset with checked arithmetic and equal canonical regions.
+     * Never choose the numerically nearest register and never fall back
+     * from stale provenance to numeric heap lookup. */
+    const OspreyAddressOrigin *selected = NULL;
+    int selected_reg = -1;
+    int64_t delta = 0;
+
+    if (ea.valid) {
+        bool base_present = ea.base_reg >= 0 && ea.base_reg < CPU_NB_REGS;
+        bool index_present = ea.index_reg >= 0 &&
+            ea.index_reg < CPU_NB_REGS;
+        bool base_tagged = base_present && ea.base_origin.valid;
+        bool index_tagged = index_present && ea.index_origin.valid;
+
+        /* A tagged snapshot with the wrong width, mismatched concrete
+         * register value, stale heap identity, or inconsistent non-heap
+         * provenance is not an untagged operand.  Reject this F02
+         * candidate and invalidate the authoritative channel if the
+         * register still carries the exact snapshot. */
+        bool base_bad = base_tagged &&
+            (ea.base_origin.width != sizeof(target_ulong) ||
+             ea.base_origin.concrete_value != ea.base_val ||
+             !osprey_address_origin_live(&ea.base_origin));
+        bool index_bad = index_tagged &&
+            (ea.index_origin.width != sizeof(target_ulong) ||
+             ea.index_origin.concrete_value != ea.index_val ||
+             !osprey_address_origin_live(&ea.index_origin));
+        if (base_bad) {
+            origin_invalidate_snapshot(env, ea.base_reg, &ea.base_origin);
+        }
+        if (index_bad) {
+            origin_invalidate_snapshot(env, ea.index_reg, &ea.index_origin);
+        }
+
+        bool base_ok = base_tagged && !base_bad;
+        bool index_ok = index_tagged && !index_bad;
+        if (!base_bad && !index_bad && base_ok && !index_present) {
+            /* [base + disp] with no index register at all. */
+            target_ulong expect = ea.base_val + (target_ulong)ea.disp;
+            if (expect == addr) {
+                selected = &ea.base_origin;
+                selected_reg = ea.base_reg;
+                delta = origin_wrapped_delta(addr, ea.base_val);
+            }
+        } else if (!base_bad && !index_bad && base_ok && index_present &&
+                   !index_ok && ea.scale == 0) {
+            /* [base + index + disp]: base is the sole valid origin, the
+             * index is untagged, and the SIB shift is zero (*1). */
+            target_ulong expect = ea.base_val +
+                (target_ulong)ea.index_val + (target_ulong)ea.disp;
+            if (expect == addr) {
+                selected = &ea.base_origin;
+                selected_reg = ea.base_reg;
+                delta = origin_wrapped_delta(addr, ea.base_val);
+            }
+        } else if (!base_bad && !index_bad && !base_present && index_ok &&
+                   ea.scale == 0) {
+            /* [index + disp]: no architectural base register contributes,
+             * the index is the sole valid origin, and the SIB shift is
+             * zero. */
+            target_ulong expect = ea.index_val + (target_ulong)ea.disp;
+            if (expect == addr) {
+                selected = &ea.index_origin;
+                selected_reg = ea.index_reg;
+                delta = origin_wrapped_delta(addr, ea.index_val);
+            }
+        }
+        /* All other forms — no origin, two tagged origins, bad channel,
+         * any SIB shift greater than zero, or reconstruction mismatch —
+         * emit F01 without F02. */
+    }
 
     /* Resolve the accessed chunk to a canonical region.  Accesses that
-     * do not resolve (libraries, anonymous mmap) are counted as bad
-     * region events, never forced into a region. */
+     * do not resolve (libraries, anonymous mmap) are ordinary skipped
+     * observations, never forced into a region. */
     OspreyRegionId region;
     int64_t off;
-    if (osprey_region_of_addr(env, addr, &region, &off, false)) {
-        OspreyChunk chunk;
-        chunk.address.region = region;
-        chunk.address.offset = off;
-        chunk.size = size;
+    if (!osprey_region_of_addr(env, addr, &region, &off, false)) {
+        return;
+    }
+    OspreyChunk chunk;
+    chunk.address.region = region;
+    chunk.address.offset = off;
+    chunk.size = size;
 
-        record_access_fact(run, pc, &chunk, is_store != 0, op_class);
+    record_access_fact(run, pc, &chunk, is_store != 0, op_class);
 
-        /* F02 BaseAddr: emit only when the EA decomposition proves the
-         * base relationship: the base register carries a valid ADDRESS
-         * origin whose concrete value matches base_val.  Index-only
-         * forms (scale == 1, no base) are equivalent. */
-        if (have_ea && base_reg >= 0 && base_reg < CPU_NB_REGS) {
-            OspreyRegOrigin *b = &st->ea_base_origin;
-            if (b->valid && b->kind == OSPREY_ORIGIN_ADDRESS &&
-                b->concrete_value == base_val) {
-                /* Provenance-authoritative heap bases: the origin must
-                 * still reference a LIVE object with a matching base;
-                 * a stale identity (freed/reused) emits nothing. */
-                bool prov_ok = true;
-                if (b->address.region.kind == OSPREY_REGION_HEAP_SITE) {
-                    prov_ok = osprey_origin_prov_live(b);
-                }
-                if (prov_ok) {
-                    OspreyBaseFact bf;
-                    memset(&bf, 0, sizeof(bf));
-                    bf.pc = pc;
-                    bf.chunk = chunk;
-                    bf.base = b->address;
-                    bf.prov_object_id = b->prov_object_id;
-                    bf.prov_generation = b->prov_generation;
-                    bf.sample_support = 1;
-                    qemu_mutex_lock(&g_shared_mutex);
-                    osprey_table_insert_base(run, &bf);
-                    qemu_mutex_unlock(&g_shared_mutex);
-                }
-            }
-        } else if (have_ea && index_reg >= 0 && index_reg < CPU_NB_REGS &&
-                   scale == 1) {
-            OspreyRegOrigin *ix = &st->ea_index_origin;
-            if (ix->valid && ix->kind == OSPREY_ORIGIN_ADDRESS &&
-                ix->concrete_value == index_val) {
-                bool prov_ok = true;
-                if (ix->address.region.kind == OSPREY_REGION_HEAP_SITE) {
-                    prov_ok = osprey_origin_prov_live(ix);
-                }
-                if (prov_ok) {
-                    OspreyBaseFact bf;
-                    memset(&bf, 0, sizeof(bf));
-                    bf.pc = pc;
-                    bf.chunk = chunk;
-                    bf.base = ix->address;
-                    bf.prov_object_id = ix->prov_object_id;
-                    bf.prov_generation = ix->prov_generation;
-                    bf.sample_support = 1;
-                    qemu_mutex_lock(&g_shared_mutex);
-                    osprey_table_insert_base(run, &bf);
-                    qemu_mutex_unlock(&g_shared_mutex);
-                }
+    if (selected != NULL) {
+        /* Canonical region equality + checked offset fold. */
+        if (!origin_region_eq(&selected->canonical.region,
+                              &chunk.address.region)) {
+            selected = NULL;
+        } else {
+            int64_t folded = 0;
+            if (!osprey_check_add(selected->canonical.offset, delta,
+                                  &folded)) {
+                origin_invalidate_snapshot(env, selected_reg, selected);
+                selected = NULL;
+            } else if (folded != chunk.address.offset) {
+                selected = NULL;
             }
         }
     }
-    /* An address outside every modeled region is an ordinary skipped
-     * observation (libraries, anonymous mmap), never a sticky error. */
 
-    /* F04 PointsTo: a pointer-width stored/loaded value carrying a valid
-     * ADDRESS origin records canonical points-to.  The value-origin of
-     * the data register is tracked by osprey_on_mem_store_origin; the
-     * translator pairs that hook with this one at pointer-width sites. */
-    (void)disp;
+    if (selected != NULL) {
+        OspreyBaseFact bf;
+        memset(&bf, 0, sizeof(bf));
+        bf.pc = pc;
+        bf.chunk = chunk;
+        bf.base = selected->canonical;
+        bf.prov_object_id = selected->prov_object_id;
+        bf.prov_generation = selected->prov_generation;
+        bf.producer_pc = selected->producer_pc;
+        bf.sample_support = 1;
+        qemu_mutex_lock(&g_shared_mutex);
+        osprey_table_insert_base(run, &bf);
+        qemu_mutex_unlock(&g_shared_mutex);
+    }
+    /* An address outside every modeled region is an ordinary skipped
+     * observation (libraries, anonymous mmap), never a sticky error.
+     * Stage 2.3 emits no F04 points-to facts from store/load. */
 }
 
 /* Modeled byte copies (memcpy/memmove/strcpy family).  Records F03 as
@@ -2032,6 +2540,13 @@ static void merge_base_family(OspreyContext *ctx, const OspreySharedRun *run,
                                         (HashFn)osprey_base_hash,
                                         (VerifyFn)osprey_base_eq))) {
                     d->sample_support = sat_add_u32(d->sample_support, 1);
+                }
+                /* Deterministic audit metadata: retain the numerically
+                 * smallest producer PC (including zero) so insertion
+                 * order (prefix/suffix, repeated paths) cannot alter the
+                 * canonical dump. */
+                if (f->producer_pc < d->producer_pc) {
+                    d->producer_pc = f->producer_pc;
                 }
                 found = true;
                 break;
@@ -2487,7 +3002,11 @@ void osprey_dump_canonical(OspreyContext *ctx, const char *path) {
         g_array_free(rows, TRUE);
     }
 
-    /* Base facts: sorted by (pc, region, offset, prov id). */
+    /* Base facts: sorted by every printed field in order via a
+     * dedicated comparator (never hash/insertion order):
+     * access-pc, chunk kind, chunk site, chunk offset, chunk size,
+     * base kind, base site, base offset, prov id, generation,
+     * producer pc, support. */
     {
         GArray *rows = g_array_new(FALSE, FALSE, sizeof(OspreyBaseFact));
         for (guint i = 0; i < ctx->base_facts->len; i++) {
@@ -2495,47 +3014,23 @@ void osprey_dump_canonical(OspreyContext *ctx, const char *path) {
                                                OspreyBaseFact, i);
             g_array_append_val(rows, *b);
         }
-        for (guint i = 1; i < rows->len; i++) {
-            OspreyBaseFact key = g_array_index(rows, OspreyBaseFact, i);
-            guint j = i;
-            while (j > 0) {
-                OspreyBaseFact *prev = &g_array_index(rows,
-                                                      OspreyBaseFact, j - 1);
-                if (prev->pc < key.pc ||
-                    (prev->pc == key.pc &&
-                     prev->base.region.kind < key.base.region.kind) ||
-                    (prev->pc == key.pc &&
-                     prev->base.region.kind == key.base.region.kind &&
-                     prev->base.region.site_offset <
-                         key.base.region.site_offset) ||
-                    (prev->pc == key.pc &&
-                     prev->base.region.kind == key.base.region.kind &&
-                     prev->base.region.site_offset ==
-                         key.base.region.site_offset &&
-                     prev->base.offset < key.base.offset) ||
-                    (prev->pc == key.pc &&
-                     prev->base.region.kind == key.base.region.kind &&
-                     prev->base.region.site_offset ==
-                         key.base.region.site_offset &&
-                     prev->base.offset == key.base.offset &&
-                     prev->prov_object_id < key.prov_object_id)) {
-                    break;
-                }
-                g_array_index(rows, OspreyBaseFact, j) = *prev;
-                j--;
-            }
-            g_array_index(rows, OspreyBaseFact, j) = key;
-        }
+        g_array_sort(rows, osprey_base_dump_cmp);
         for (guint i = 0; i < rows->len; i++) {
             OspreyBaseFact *b = &g_array_index(rows, OspreyBaseFact, i);
-            fprintf(f, "base %llx %u %llx %llx %llx %u %u\n",
+            fprintf(f,
+                    "base %llx %u %llx %llx %llu %u %llx %llx %llu %u %llx %u\n",
                     (unsigned long long)b->pc,
                     (unsigned)b->chunk.address.region.kind,
                     (unsigned long long)b->chunk.address.region.site_offset,
                     (unsigned long long)b->chunk.address.offset,
+                    (unsigned long long)b->chunk.size,
+                    (unsigned)b->base.region.kind,
+                    (unsigned long long)b->base.region.site_offset,
                     (unsigned long long)b->base.offset,
-                    (unsigned)b->prov_object_id,
-                    (unsigned)b->prov_generation);
+                    (unsigned long long)b->prov_object_id,
+                    (unsigned)b->prov_generation,
+                    (unsigned long long)b->producer_pc,
+                    (unsigned)b->sample_support);
         }
         g_array_free(rows, TRUE);
     }

@@ -742,6 +742,153 @@ def helper_policy_evidence(helper_name, class_token, policy_token,
     return False
 
 
+# ------------------------------------------------------------------ #
+# Stage 2.3 bounded address-transfer inventory                       #
+# ------------------------------------------------------------------ #
+#
+# Every accepted/deferred register transfer must ride the neutral
+# gen_helper_sem_* layer: exactly one transfer helper per translator
+# wrapper, raw producer PC delivery (either a direct argument or the
+# adjacent sem_set_pc LEA scratch), `sem_reg_materialize_address` in all
+# four supporting sets, and no direct `osprey_*` call from translate.c
+# or helper.h.
+
+HELPER_H = Path(__file__).resolve().parents[2] / "target/i386/helper.h"
+
+# (wrapper, transfer helper, PC delivery mode).  `direct` = the helper
+# call carries a raw-PC TCG argument; `lea_scratch` = gen_helper_sem_set_pc
+# must precede the transfer call inside the wrapper body.
+ADDRESS_TRANSFER_WRAPPERS = (
+    ("gen_sem_reg_materialize_address",
+     "gen_helper_sem_reg_materialize_address", "direct"),
+    ("gen_sem_reg_copy", "gen_helper_sem_reg_copy", "direct"),
+    ("gen_sem_reg_lea", "gen_helper_sem_reg_lea", "lea_scratch"),
+    ("gen_sem_reg_lea_dyn", "gen_helper_sem_reg_lea_dyn", "lea_scratch"),
+    ("gen_sem_reg_addsub_imm", "gen_helper_sem_reg_addsub_imm", "direct"),
+    ("gen_sem_reg_addsub_reg", "gen_helper_sem_reg_addsub_reg", "direct"),
+    ("gen_sem_reg_xchg", "gen_helper_sem_reg_xchg", "direct"),
+    ("gen_sem_reg_invalidate", "gen_helper_sem_reg_invalidate", "direct"),
+)
+
+
+def address_transfer_inventory(translate_text, errors):
+    """Bounded Stage-2.3 transfer gate on the translator wrappers."""
+    count = 0
+    for wrapper, helper, pc_mode in ADDRESS_TRANSFER_WRAPPERS:
+        body = function_body(translate_text, wrapper)
+        if body is None:
+            fail(errors, 0, f"address-transfer wrapper {wrapper} is missing")
+            continue
+        masked = mask_c_source(body)
+        calls = call_sites(body, r"\b(gen_helper_[A-Za-z0-9_]+)\s*\(")
+        transfer_calls = [call for call in calls if call[0] == helper]
+        if len(transfer_calls) != 1:
+            fail(errors, 0,
+                 f"{wrapper} must emit exactly one {helper}")
+            continue
+        transfer_call = transfer_calls[0]
+        sig_match = re.search(
+            rf"\b{re.escape(wrapper)}\s*\(([^)]*)\)\s*\{{",
+            translate_text, re.DOTALL)
+        if sig_match is None or "target_ulong pc" not in sig_match.group(1):
+            fail(errors, 0,
+                 f"{wrapper} lacks a raw target_ulong pc parameter")
+            continue
+        allowed_extra = {"gen_helper_sem_set_pc"} if pc_mode == "lea_scratch" \
+            else set()
+        for call in calls:
+            if call[0] != helper and call[0].startswith("gen_helper_sem_"):
+                if call[0] not in allowed_extra:
+                    fail(errors, 0,
+                         f"{wrapper} emits extra semantic helper {call[0]}")
+        transfer_text = masked[transfer_call[1]:transfer_call[2]]
+        if pc_mode == "direct":
+            if "t_pc" not in transfer_text:
+                fail(errors, 0,
+                     f"{wrapper} does not deliver the raw PC argument")
+        else:
+            set_pc_calls = [call for call in calls
+                            if call[0] == "gen_helper_sem_set_pc"]
+            if len(set_pc_calls) != 1 or \
+                    set_pc_calls[0][1] > transfer_call[1]:
+                fail(errors, 0,
+                     f"{wrapper} requires gen_helper_sem_set_pc "
+                     "immediately before the transfer helper")
+            elif "t_pc" in transfer_text:
+                fail(errors, 0,
+                     f"{wrapper} must deliver the PC through the "
+                     "sem_set_pc scratch, not a direct argument")
+        count += 1
+    return count
+
+
+def materialize_membership(errors):
+    """sem_reg_materialize_address must exist in the helper declaration,
+    the runtime class table, the emittable set, the symbolic helper
+    whitelist, and the manual helper prototype."""
+    ok = True
+    try:
+        helper_h = HELPER_H.read_text()
+        sem_events = SEM_EVENTS.read_text()
+        symbolic = SYMBOLIC.read_text()
+    except OSError as exc:
+        errors.append(f"semantic inventory: cannot read gate inputs: {exc}")
+        return 0
+    if not re.search(
+            r"DEF_HELPER_FLAGS_4\(\s*sem_reg_materialize_address\s*,"
+            r"\s*TCG_CALL_NO_RWG\s*,\s*void\s*,\s*env\s*,\s*i32\s*,"
+            r"\s*tl\s*,\s*tl\s*\)", helper_h):
+        errors.append("helper.h lacks DEF_HELPER_FLAGS_4 "
+                      "sem_reg_materialize_address (env, i32, tl, tl)")
+        ok = False
+    if not re.search(
+            r'\{?\s*"sem_reg_materialize_address"\s*,\s*SEM_OP_INTEGER\s*\}?',
+            sem_events):
+        errors.append("sem-events.c class table lacks "
+                      "sem_reg_materialize_address")
+        ok = False
+    emittable = re.search(
+        r"const\s+char\s+\*const\s+sem_emittable_helpers\[\]\s*=\s*"
+        r"\{(?P<body>.*?)\};", sem_events, re.DOTALL)
+    if emittable is None or not re.search(
+            r'"sem_reg_materialize_address"', emittable.group("body")):
+        errors.append("sem-events.c emittable set lacks "
+                      "sem_reg_materialize_address")
+        ok = False
+    if not re.search(
+            r"void\s+helper_sem_reg_materialize_address\s*\("
+            r"\s*CPUArchState\s*\*\s*env\s*,\s*uint32_t\s+dst_idx\s*,"
+            r"\s*target_ulong\s+value\s*,\s*target_ulong\s+pc\s*\)",
+            sem_events):
+        errors.append("sem-events.c lacks the manual "
+                      "helper_sem_reg_materialize_address prototype")
+        ok = False
+    if not re.search(r'"sem_reg_materialize_address"', symbolic):
+        errors.append("symbolic.c helper whitelist lacks "
+                      "sem_reg_materialize_address")
+        ok = False
+    return 1 if ok else 0
+
+
+def no_direct_osprey(translate_text, errors):
+    """translate.c and helper.h must contain no direct osprey_* calls:
+    every OSPREY consumer is reached through the neutral sem helper
+    layer.  (DisasContext fields such as osprey_skip_rsp_update are
+    assignments, not calls, and do not match.)"""
+    try:
+        helper_h = HELPER_H.read_text()
+    except OSError as exc:
+        errors.append(f"semantic inventory: cannot read {HELPER_H}: {exc}")
+        return
+    for label, text in (("translate.c", translate_text),
+                        ("helper.h", helper_h)):
+        masked = mask_c_source(text)
+        for match in re.finditer(r"\bosprey_[A-Za-z0-9_]+\s*\(", masked):
+            fail(errors, 0,
+                 f"{label} calls {match.group(0).rstrip('(')} directly; "
+                 "route through the shared gen_helper_sem_* layer")
+
+
 def main():
     try:
         translate_text = TRANSLATE.read_text()
@@ -944,6 +1091,15 @@ def main():
     masked_translate = mask_c_source(translate_text)
     translate_spans = function_spans(translate_text)
     emitted_events = event_sites(translate_text)
+
+    # Stage 2.3 bounded address-transfer inventory: every accepted and
+    # deferred register transfer rides exactly one neutral semantic
+    # helper with raw producer-PC delivery; the materialization helper
+    # exists in every supporting set; no direct OSPREY translator calls.
+    address_transfer_count = address_transfer_inventory(translate_text,
+                                                        errors)
+    materialize_ok = materialize_membership(errors)
+    no_direct_osprey(translate_text, errors)
 
     # Every fixed manifest token must resolve not only to a spelling in the
     # source tree, but to an event carrying that row's class and interval
@@ -1444,7 +1600,9 @@ def main():
         f"{helper_body_count} helper-body memory operations, "
         f"{literal_event_count} literal translator events, "
         f"{helper_event_count} helper publisher events, "
-        f"{dynamic_event_count} dynamic producer events)"
+        f"{dynamic_event_count} dynamic producer events, "
+        f"{address_transfer_count} address-transfer wrappers, "
+        f"{materialize_ok} materialization set)"
     )
     return 0
 

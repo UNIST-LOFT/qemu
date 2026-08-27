@@ -128,6 +128,8 @@ typedef struct OspreyBaseFact {
     OspreyAddress base;        /* tracked base address (region+offset) */
     uint64_t prov_object_id;   /* heap bases: provenance identity */
     uint32_t prov_generation;
+    uint64_t producer_pc;      /* normalized origin producer PC (audit
+                                * metadata; not part of logical identity) */
     uint32_t sample_support;
     uint32_t reserved;
 } OspreyBaseFact;
@@ -187,37 +189,65 @@ typedef struct OspreyRegionInstance {
 /* Origin shadows (per-CPU, process-local; never shared)               */
 /* ------------------------------------------------------------------ */
 
-typedef enum OspreyOriginKind {
-    OSPREY_ORIGIN_NONE = 0,
-    OSPREY_ORIGIN_ADDRESS,   /* register holds a canonical address */
-    OSPREY_ORIGIN_VALUE,     /* register holds a value loaded from a chunk */
-} OspreyOriginKind;
-
-typedef struct OspreyRegOrigin {
-    uint8_t kind;              /* OspreyOriginKind */
+/* Stage 2.3 address channel: a register holds a canonical address.
+ * Every valid Stage 2.3 origin is pointer-width
+ * (width == sizeof(target_ulong)); heap origins carry the authoritative
+ * provenance identity pair.  producer_pc is main-image-relative. */
+typedef struct OspreyAddressOrigin {
     uint8_t valid;
-    uint8_t reserved[2];
+    uint8_t width;             /* sizeof(target_ulong) when valid */
+    uint8_t reserved[6];
     target_ulong concrete_value; /* value-consistency check */
-    OspreyChunk chunk;           /* VALUE: source chunk */
-    OspreyAddress address;       /* ADDRESS: base address */
-    uint64_t prov_object_id;     /* heap ADDRESS origins: provenance
-                                  * identity (object_id, generation) */
+    OspreyAddress canonical;     /* region + signed offset */
+    uint64_t prov_object_id;     /* heap origins: provenance identity
+                                  * (object_id, generation) */
     uint32_t prov_generation;
     uint32_t reserved2;
-    uint64_t producer_pc;
-} OspreyRegOrigin;
+    uint64_t producer_pc;        /* normalized producer instruction */
+} OspreyAddressOrigin;
 
-typedef struct OspreyMemSlotOrigin {
+/* Stage 2.4 value channel.  Stays invalid throughout Stage 2.3; the
+ * type exists so every register write updates or kills BOTH channels
+ * explicitly. */
+typedef struct OspreyValueOrigin {
     uint8_t valid;
-    uint8_t kind;              /* OspreyOriginKind */
+    uint8_t reserved[7];
+} OspreyValueOrigin;
+
+typedef struct OspreyRegisterOrigins {
+    OspreyAddressOrigin address;
+    OspreyValueOrigin value;
+} OspreyRegisterOrigins;
+
+/* Sparse aligned memory shadow: ADDRESS state only in Stage 2.3. */
+typedef struct OspreyMemAddressOrigin {
+    uint8_t valid;
+    uint8_t width;             /* sizeof(target_ulong) when valid */
     uint8_t reserved[6];
-    OspreyChunk chunk;
-    OspreyAddress address;
+    OspreyAddress canonical;
     target_ulong concrete_value;
     uint64_t prov_object_id;
     uint32_t prov_generation;
     uint32_t reserved2;
-} OspreyMemSlotOrigin;
+} OspreyMemAddressOrigin;
+
+/* Pre-access effective-address snapshot (taken at set_ea time; the
+ * base/index registers may be overwritten by the access itself, e.g.
+ * mov (%rax),%rax, so F02 selection must use the pre-access origins).
+ * base_reg/index_reg retain -1 (absent) and -2 (RIP-relative) exactly;
+ * they are never repacked into bytes. */
+typedef struct OspreyEASnapshot {
+    uint8_t valid;
+    uint8_t reserved[7];
+    int32_t base_reg;
+    int32_t index_reg;
+    int32_t scale;
+    int64_t disp;
+    target_ulong base_val;
+    target_ulong index_val;
+    OspreyAddressOrigin base_origin;
+    OspreyAddressOrigin index_origin;
+} OspreyEASnapshot;
 
 #define OSPREY_SHADOW_ALIGN 8
 
@@ -235,31 +265,26 @@ typedef struct OspreyPendingHelperInterval {
 } OspreyPendingHelperInterval;
 
 typedef struct OspreyCpuOriginState {
-    OspreyRegOrigin regs[CPU_NB_REGS];
+    OspreyRegisterOrigins regs[CPU_NB_REGS];
     /* Aligned native-width memory-shadow hash table.  Key = guest
-     * address (aligned slot); value = OspreyMemSlotOrigin*. */
+     * address (aligned slot); value = OspreyMemAddressOrigin*. */
     GHashTable *mem_slots;
     /* Pending effective-address metadata (set before the guest access,
      * consumed after it succeeds). */
-    uint8_t ea_valid;
-    int32_t ea_base_reg;
-    int32_t ea_index_reg;
-    int32_t ea_scale;
-    int64_t ea_disp;
-    target_ulong ea_base_val;
-    target_ulong ea_index_val;
+    OspreyEASnapshot ea;
     /* Address-mode state of the current instruction (aflags | (override
      * + 1) << 8) recorded by helper_sem_set_ea / helper_sem_mem_access.
      * The F01 eligibility gate (aflag == MO_64 && override < 0) is
      * consumer-side policy in helper_sem_mem_access; push/pop emit no
      * set_ea, so the mem-access event carries the mode itself. */
     uint32_t ea_mode;
-    /* Origin snapshots taken at set_ea time: the base/index register may
-     * be overwritten between set_ea and mem_access (e.g. mov (%rax),%rax
-     * kills RAX); the F02 BaseAddr decision must use the pre-access
-     * origin, never the post-access one. */
-    OspreyRegOrigin ea_base_origin;
-    OspreyRegOrigin ea_index_origin;
+    /* Pending raw transfer PC for the two-helper LEA sequence: QEMU
+     * 4.1.1 helper declarations stop at six total arguments, so
+     * helper_sem_set_pc records the instruction PC immediately before
+     * sem_reg_lea / sem_reg_lea_dyn consume and clear it. */
+    target_ulong pending_transfer_pc;
+    uint8_t pending_transfer_pc_valid;
+    uint8_t reserved2[7];
     /* Helper-backed multipart accesses are committed only after their
      * final constituent succeeds.  A fault or producer-family change
      * between parts therefore cannot publish a partial F01 aggregate. */
@@ -272,7 +297,7 @@ typedef struct OspreyCpuOriginState {
 /* Shared run (fixed layout, no pointers)                              */
 /* ------------------------------------------------------------------ */
 
-#define OSPREY_SHARED_VERSION 8u
+#define OSPREY_SHARED_VERSION 9u
 
 struct OspreySharedRun {
     uint32_t version;
@@ -386,7 +411,7 @@ bool osprey_access_eq(const OspreyAccessFact *a, const OspreyAccessFact *b);
 uint64_t osprey_base_hash(const OspreyBaseFact *f);
 bool osprey_base_eq(const OspreyBaseFact *a, const OspreyBaseFact *b);
 /* Provenance-authoritative heap origin check (osprey-facts.c). */
-bool osprey_origin_prov_live(const OspreyRegOrigin *o);
+bool osprey_address_origin_live(const OspreyAddressOrigin *o);
 uint64_t osprey_copy_hash(const OspreyCopyFact *f);
 bool osprey_copy_eq(const OspreyCopyFact *a, const OspreyCopyFact *b);
 uint64_t osprey_points_hash(const OspreyPointsToFact *f);
