@@ -192,4 +192,6 @@ void snapshot_maybe_forkserver(CPUState *cpu, CPUArchState *cpu_env, target_ulon
 
 uint8_t snapshot_on_entrypoint_hit(target_ulong pc);
 
+void snapshot_load_inferred_types(uint8_t *analyze_result);
+
 #endif /* BINRADAR_SNAPSHOT_H */
