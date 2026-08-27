@@ -10,8 +10,11 @@
  *    halves merged into one 8-byte fact);
  *  - SSE 16-byte stores (movaps) and 8-byte halves (movsd);
  *  - x87 stores: fstl (8), fstpt (10), fbstp (10);
- *  - fnstenv (14) and fsave (94) 16-bit-mode sizes are exercised on
- *    the i386 build; on x86_64 the same opcodes store 28/108 bytes;
+ *  - 16-bit-mode fnstenv (14) and fsave (94) are intentionally omitted:
+ *    this fixture is x86-64 only, and the alternate-width experiment makes
+ *    its exact component exceed the configured inference limit.  The
+ *    translator inventory records those legacy forms as target-gated;
+ *    x86-64 coverage uses the architectural 28/108-byte forms below.
  *  - lock/non-lock xchg, bit-test RMW, lock not/neg, cmpxchg16b;
  *  - MOVD, PEXTR/EXTRACTPS, INSERTPS/PINSR loads, SIMD loads;
  *  - x87 loads, frstor, MXCSR, FXSAVE/FXRSTOR;

@@ -266,7 +266,167 @@ TESTS = [
         },
         timeout=60,
     ),
+    dict(
+        name="t04_mpx",
+        mode="dump_compare",
+        memcheck=0,
+        qemu_args=["-cpu", "qemu64,+xsave,+xsaveopt,+mpx"],
+        dump_stem="t04_mpx_dump",
+        expected="t04_mpx.expected",
+        rc=(2,),
+        dump_assert={
+            "access_widths_allowed": [1, 8, 16, 24, 64],
+            "access_classes_min": {4: 1, 10: 1},
+            "access_symbols_expected": {
+                "t04_mpx_enable": {
+                    "class": 4, "is_store": 0,
+                    "sizes": {16: 1, 24: 1, 64: 1},
+                    "direction_counts": {0: 3},
+                    "min_rows": 3, "max_rows": 3,
+                },
+                "t04_bndmov_load": {
+                    "class": 10, "is_store": 0, "size": 16,
+                    "min_rows": 1, "max_rows": 1,
+                },
+                "t04_bndmov_store": {
+                    "class": 10, "is_store": 1, "size": 16,
+                    "min_rows": 1, "max_rows": 1,
+                },
+                "t04_bndstx": {
+                    "class": 10,
+                    "sizes": {8: 1, 24: 1},
+                    "direction_counts": {0: 1, 1: 1},
+                    "min_rows": 2, "max_rows": 2,
+                },
+                "t04_bndldx": {
+                    "class": 10, "is_store": 0,
+                    "sizes": {8: 1, 24: 1},
+                    "min_rows": 2, "max_rows": 2,
+                },
+                "t04_bndmov_after_load": {
+                    "class": 10, "is_store": 1, "size": 16,
+                    "min_rows": 1, "max_rows": 1,
+                },
+            },
+        },
+        timeout=60,
+    ),
+    dict(
+        name="t04_mpx_combined",
+        guest="t04_mpx",
+        mode="dump_compare",
+        memcheck=1,
+        qemu_args=["-cpu", "qemu64,+xsave,+xsaveopt,+mpx"],
+        dump_stem="t04_mpx_combined_dump",
+        expected="t04_mpx.expected",
+        rc=(2,),
+        dump_assert={
+            "access_widths_allowed": [1, 8, 16, 24, 64],
+            "access_classes_min": {4: 1, 10: 1},
+            "access_symbols_expected": {
+                "t04_mpx_enable": {
+                    "class": 4, "is_store": 0,
+                    "sizes": {16: 1, 24: 1, 64: 1},
+                    "direction_counts": {0: 3},
+                    "min_rows": 3, "max_rows": 3,
+                },
+                "t04_bndmov_load": {
+                    "class": 10, "is_store": 0, "size": 16,
+                    "min_rows": 1, "max_rows": 1,
+                },
+                "t04_bndmov_store": {
+                    "class": 10, "is_store": 1, "size": 16,
+                    "min_rows": 1, "max_rows": 1,
+                },
+                "t04_bndstx": {
+                    "class": 10,
+                    "sizes": {8: 1, 24: 1},
+                    "direction_counts": {0: 1, 1: 1},
+                    "min_rows": 2, "max_rows": 2,
+                },
+                "t04_bndldx": {
+                    "class": 10, "is_store": 0,
+                    "sizes": {8: 1, 24: 1},
+                    "min_rows": 2, "max_rows": 2,
+                },
+                "t04_bndmov_after_load": {
+                    "class": 10, "is_store": 1, "size": 16,
+                    "min_rows": 1, "max_rows": 1,
+                },
+            },
+        },
+        timeout=60,
+    ),
+    dict(
+        name="t05_enter_fault",
+        mode="dump_compare",
+        memcheck=0,
+        dump_stem="t05_enter_fault_dump",
+        expected=None,
+        biases=[None],
+        compare_biases=False,
+        rc=(2,),
+        dump_assert={
+            "access_symbols_absent": ["t05_enter_fault"],
+        },
+        timeout=60,
+    ),
+    dict(
+        name="t05_enter_fault_combined",
+        guest="t05_enter_fault",
+        mode="dump_compare",
+        memcheck=1,
+        dump_stem="t05_enter_fault_combined_dump",
+        expected=None,
+        biases=[None],
+        compare_biases=False,
+        rc=(2,),
+        dump_assert={
+            "access_symbols_absent": ["t05_enter_fault"],
+        },
+        timeout=60,
+    ),
+    dict(
+        name="t06_control_reject",
+        mode="binradar",
+        memcheck=0,
+        rc=(2,),
+        expect_rows=[
+            ("reject", "[stage merge] [reason unsupported guest execution]"),
+        ],
+        expect_inferred=0,
+        expect_inferred_max=0,
+        expect_queue_min=1,
+        timeout=60,
+    ),
+    dict(
+        name="t07_legacy_width_reject",
+        mode="binradar",
+        memcheck=0,
+        rc=(2,),
+        expect_rows=[
+            ("reject", "[stage merge] [reason unsupported guest execution]"),
+        ],
+        expect_inferred=0,
+        expect_inferred_max=0,
+        expect_queue_min=1,
+        timeout=60,
+    ),
+    dict(
+        name="t08_bound_reject",
+        mode="binradar",
+        memcheck=0,
+        rc=(2,),
+        expect_rows=[
+            ("reject", "[stage merge] [reason unsupported guest execution]"),
+        ],
+        expect_inferred=0,
+        expect_inferred_max=0,
+        expect_queue_min=1,
+        timeout=60,
+    ),
 ]
+
 
 BASE_ENV = {
     "BINRADAR_TRACE_FILE": "none",
@@ -492,13 +652,15 @@ def run_dump_compare(test, workdir, qemu, solver):
         return (None, f"guest binary missing: {guest} (run 'make guests')")
     if not os.path.isfile(guest + ".plt"):
         return (None, f"plt file missing: {guest}.plt (run 'make plts')")
-    expected_path = os.path.join(os.path.dirname(__file__),
-                                 test.get("expected", "t01_regions.expected"))
-    if not os.path.isfile(expected_path):
-        return (None, f"expected dump missing: {expected_path}")
-    with open(expected_path, "r", errors="replace") as f:
-        expected = f.read()
-    biases = [None, "0x4100000000", "0x4200000000"]
+    expected = None
+    expected_name = test.get("expected", "t01_regions.expected")
+    if expected_name is not None:
+        expected_path = os.path.join(os.path.dirname(__file__), expected_name)
+        if not os.path.isfile(expected_path):
+            return (None, f"expected dump missing: {expected_path}")
+        with open(expected_path, "r", errors="replace") as f:
+            expected = f.read()
+    biases = test.get("biases", [None, "0x4100000000", "0x4200000000"])
     dump_stem = test.get("dump_stem", "t01_dump")
     dumps = []
     outs = []
@@ -530,14 +692,15 @@ def run_dump_compare(test, workdir, qemu, solver):
             return (None, out + f"\nmissing dump file: {dump_path}")
         with open(dump_path, "r", errors="replace") as f:
             dumps.append(f.read())
-    for i in range(1, len(dumps)):
-        if dumps[i] != dumps[0]:
+    if test.get("compare_biases", True):
+        for i in range(1, len(dumps)):
+            if dumps[i] != dumps[0]:
+                return (None, outs[0] +
+                        f"\nDUMP MISMATCH between bias runs {0} and {i}")
+        if len(set(observed_biases)) != len(observed_biases):
             return (None, outs[0] +
-                    f"\nDUMP MISMATCH between bias runs {0} and {i}")
-    if len(set(observed_biases)) != len(observed_biases):
-        return (None, outs[0] +
-                f"\nPIE load biases were not distinct: {observed_biases}")
-    if dumps[0] != expected:
+                    f"\nPIE load biases were not distinct: {observed_biases}")
+    if expected is not None and dumps[0] != expected:
         return (None, outs[0] + "\nDUMP MISMATCH vs checked-in expected")
     problems = check_dump(test, dumps[0], guest)
     if problems:
@@ -632,6 +795,10 @@ def check_dump(test, dump, guest):
             if got[w] < n:
                 problems.append(
                     f"access facts of width {w}: {got[w]} < {n}")
+        for w in want.get("access_widths_absent", []):
+            if got[w] != 0:
+                problems.append(
+                    f"forbidden access facts of width {w}: {got[w]}")
 
     access_rows = [ln.split() for ln in dump.splitlines()
                    if ln.startswith("access ")]

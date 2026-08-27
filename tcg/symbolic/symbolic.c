@@ -4664,6 +4664,7 @@ static inline OPKIND get_opkind(TCGOpcode opc)
             return REMU;
         case INDEX_op_and_i64:
             return AND;
+        case INDEX_op_or_i32:
         case INDEX_op_or_i64:
             return OR;
         case INDEX_op_xor_i64:
@@ -6958,6 +6959,7 @@ int        parse_translation_block(TranslationBlock* tb, uintptr_t tb_pc,
             case INDEX_op_rem_i64:
             case INDEX_op_remu_i64:
             case INDEX_op_and_i64:
+            case INDEX_op_or_i32:
             case INDEX_op_or_i64:
             case INDEX_op_xor_i64:
             case INDEX_op_shl_i64:
@@ -7317,6 +7319,7 @@ int        parse_translation_block(TranslationBlock* tb, uintptr_t tb_pc,
                 }
                 break;
 
+            case INDEX_op_ld_i32:
             case INDEX_op_ld_i64:
             case INDEX_op_ld32s_i64:
             case INDEX_op_ld32u_i64:

@@ -1104,16 +1104,16 @@ static void gen_check_io(DisasContext *s, TCGMemOp ot, target_ulong cur_eip,
         tcg_gen_trunc_tl_i32(s->tmp2_i32, s->T0);
         switch (ot) {
         case MO_8:
-            gen_helper_check_iob(cpu_env, s->tmp2_i32);
             gen_sem_mem_unsupported(s->pc_start, 6);
+            gen_helper_check_iob(cpu_env, s->tmp2_i32);
             break;
         case MO_16:
-            gen_helper_check_iow(cpu_env, s->tmp2_i32);
             gen_sem_mem_unsupported(s->pc_start, 6);
+            gen_helper_check_iow(cpu_env, s->tmp2_i32);
             break;
         case MO_32:
-            gen_helper_check_iol(cpu_env, s->tmp2_i32);
             gen_sem_mem_unsupported(s->pc_start, 6);
+            gen_helper_check_iol(cpu_env, s->tmp2_i32);
             break;
         default:
             tcg_abort();
@@ -2909,11 +2909,11 @@ static void gen_movl_seg_T0(DisasContext *s, int seg_reg)
 {
     if (s->pe && !s->vm86) {
         tcg_gen_trunc_tl_i32(s->tmp2_i32, s->T0);
-        gen_helper_load_seg(cpu_env, tcg_const_i32(seg_reg), s->tmp2_i32);
         /* Descriptor-table helper accesses are dynamic and have no exact
-         * user-mode F01 interval; invalidate any pending semantic EA state
-         * rather than publishing an invented width. */
+         * user-mode F01 interval.  Reject before the helper so a helper
+         * fault cannot silently turn this producer into a complete sample. */
         gen_sem_mem_unsupported(s->pc_start, 3);
+        gen_helper_load_seg(cpu_env, tcg_const_i32(seg_reg), s->tmp2_i32);
         /* abort translation because the addseg value may change or
            because ss32 may change. For R_SS, translation must always
            stop as a special handling must be done to disable hardware
@@ -5903,6 +5903,10 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
             gen_add_A0_im(s, 1 << ot);
             gen_op_ld_v(s, MO_16, s->T0, s->A0);
         do_lcall:
+            /* The helper may touch dynamic privilege/task-state stack
+             * memory; reject before it executes so a helper fault cannot
+             * silently turn this producer into a complete F01 sample. */
+            gen_sem_mem_unsupported(s->pc_start, 1);
             if (s->pe && !s->vm86) {
                 tcg_gen_trunc_tl_i32(s->tmp2_i32, s->T0);
                 gen_helper_lcall_protected(cpu_env, s->tmp2_i32, s->T1,
@@ -5914,9 +5918,6 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                                       tcg_const_i32(dflag - 1),
                                       tcg_const_i32(s->pc - s->cs_base));
             }
-            /* The helper may touch dynamic privilege/task-state stack
-             * memory; keep this producer explicitly fail-closed for F01. */
-            gen_sem_mem_unsupported(s->pc_start, 1);
             tcg_gen_ld_tl(s->tmp4, cpu_env, offsetof(CPUX86State, eip));
             gen_jr(s, s->tmp4);
             break;
@@ -5961,9 +5962,9 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
         do_ljmp:
             if (s->pe && !s->vm86) {
                 tcg_gen_trunc_tl_i32(s->tmp2_i32, s->T0);
+                gen_sem_mem_unsupported(s->pc_start, 1);
                 gen_helper_ljmp_protected(cpu_env, s->tmp2_i32, s->T1,
                                           tcg_const_tl(s->pc - s->cs_base));
-                gen_sem_mem_unsupported(s->pc_start, 1);
             } else {
                 gen_op_movl_seg_T0_vm(s, R_CS);
                 gen_op_jmp_v(s->T1);
@@ -7026,11 +7027,20 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                 }
                 break;
             case 0x0c: /* fldenv mem */
+                if (CODE64(s) && dflag == MO_16) {
+                    /* The x86-64 fixture has no i386 user target.  Keep
+                     * this legacy-width form fail-closed instead of
+                     * publishing a 14-byte F01 fact that can destabilize
+                     * exact inference. */
+                    gen_sem_mem_unsupported(s->pc_start, 9);
+                }
                 gen_helper_fldenv(cpu_env, s->A0, tcg_const_i32(dflag - 1));
-                gen_sem_mem_access_f01_raw_class(s->A0,
-                                                 dflag == MO_16 ? 14 : 28,
-                                                 s->pc_start, false,
-                                                 SEM_OP_X87_HELPER);
+                if (!(CODE64(s) && dflag == MO_16)) {
+                    gen_sem_mem_access_f01_raw_class(s->A0,
+                                                     dflag == MO_16 ? 14 : 28,
+                                                     s->pc_start, false,
+                                                     SEM_OP_X87_HELPER);
+                }
                 break;
             case 0x0d: /* fldcw mem */
                 tcg_gen_qemu_ld_i32(s->tmp2_i32, s->A0,
@@ -7040,10 +7050,15 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                                              false, SEM_OP_X87_HELPER);
                 break;
             case 0x0e: /* fnstenv m14/28 */
+                if (CODE64(s) && dflag == MO_16) {
+                    /* See fldenv: legacy 14-byte mode is target-gated on
+                     * the x86-64 fixture and must never publish F01. */
+                    gen_sem_mem_unsupported(s->pc_start, 9);
+                }
                 gen_helper_fstenv(cpu_env, s->A0, tcg_const_i32(dflag - 1));
                 /* Helper writes 14/28 bytes; invalidate the overlapping
-                 * shadow slots, then record ONE F01 event (14/28 bytes)
-                 * after the helper. */
+                 * shadow slots, then record ONE F01 event (28 bytes) only
+                 * for the supported x86-64 form. */
                 gen_sem_set_ea_mode(s);
                 gen_sem_on_store_x87(OR_TMP0, s->A0, MO_64);
                 tcg_gen_addi_tl(s->tmp0, s->A0, 8);
@@ -7054,9 +7069,6 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                     tcg_gen_addi_tl(s->tmp0, s->A0, 24);
                     gen_sem_on_store_x87(OR_TMP0, s->tmp0, MO_32);
                     gen_sem_mem_access_f01_raw_class(s->A0, 28, s->pc_start,
-                                                     true, SEM_OP_X87_HELPER);
-                } else {
-                    gen_sem_mem_access_f01_raw_class(s->A0, 14, s->pc_start,
                                                      true, SEM_OP_X87_HELPER);
                 }
                 break;
@@ -7088,13 +7100,25 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                 gen_helper_fpop(cpu_env);
                 break;
             case 0x2c: /* frstor mem */
+                if (CODE64(s) && dflag == MO_16) {
+                    /* Legacy 94-byte state requires the i386 user target;
+                     * reject the x86-64 experiment without publishing F01. */
+                    gen_sem_mem_unsupported(s->pc_start, 9);
+                }
                 gen_helper_frstor(cpu_env, s->A0, tcg_const_i32(dflag - 1));
-                gen_sem_mem_access_f01_raw_class(s->A0,
-                                                 dflag == MO_16 ? 94 : 108,
-                                                 s->pc_start, false,
-                                                 SEM_OP_X87_HELPER);
+                if (!(CODE64(s) && dflag == MO_16)) {
+                    gen_sem_mem_access_f01_raw_class(s->A0,
+                                                     dflag == MO_16 ? 94 : 108,
+                                                     s->pc_start, false,
+                                                     SEM_OP_X87_HELPER);
+                }
                 break;
             case 0x2e: /* fnsave m94/108 */
+                if (CODE64(s) && dflag == MO_16) {
+                    /* The 94-byte operand-size form is only a positive
+                     * producer on an i386 user target. */
+                    gen_sem_mem_unsupported(s->pc_start, 9);
+                }
                 gen_helper_fsave(cpu_env, s->A0, tcg_const_i32(dflag - 1));
                 /* Helper writes env (14/28) + 8x10 ST bytes; invalidate
                  * exactly the overlapping pointer-shadow slots, then
@@ -7132,7 +7156,7 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                     gen_sem_mem_access_f01_raw_class(s->tmp4, 108,
                                                      s->pc_start, true,
                                                      SEM_OP_X87_HELPER);
-                } else {
+                } else if (!CODE64(s)) {
                     gen_sem_mem_access_f01_raw_class(s->tmp4, 94,
                                                      s->pc_start, true,
                                                      SEM_OP_X87_HELPER);
@@ -7711,9 +7735,9 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
         if (s->pe && !s->vm86) {
             gen_update_cc_op(s);
             gen_jmp_im(s, pc_start - s->cs_base);
+            gen_sem_mem_unsupported(s->pc_start, 1);
             gen_helper_lret_protected(cpu_env, tcg_const_i32(dflag - 1),
                                       tcg_const_i32(val));
-            gen_sem_mem_unsupported(s->pc_start, 1);
         } else {
             gen_stack_A0(s);
             /* pop offset */
@@ -7737,21 +7761,21 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
         gen_svm_check_intercept(s, pc_start, SVM_EXIT_IRET);
         if (!s->pe) {
             /* real mode */
-            gen_helper_iret_real(cpu_env, tcg_const_i32(dflag - 1));
             gen_sem_mem_unsupported(s->pc_start, 2);
+            gen_helper_iret_real(cpu_env, tcg_const_i32(dflag - 1));
             set_cc_op(s, CC_OP_EFLAGS);
         } else if (s->vm86) {
             if (s->iopl != 3) {
                 gen_exception(s, EXCP0D_GPF, pc_start - s->cs_base);
             } else {
-                gen_helper_iret_real(cpu_env, tcg_const_i32(dflag - 1));
                 gen_sem_mem_unsupported(s->pc_start, 2);
+                gen_helper_iret_real(cpu_env, tcg_const_i32(dflag - 1));
                 set_cc_op(s, CC_OP_EFLAGS);
             }
         } else {
+            gen_sem_mem_unsupported(s->pc_start, 2);
             gen_helper_iret_protected(cpu_env, tcg_const_i32(dflag - 1),
                                       tcg_const_i32(s->pc - s->cs_base));
-            gen_sem_mem_unsupported(s->pc_start, 2);
             set_cc_op(s, CC_OP_EFLAGS);
         }
         gen_eob(s);
@@ -8358,8 +8382,14 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
         }
         break;
     case 0x62: /* bound */
-        if (CODE64(s))
+        if (CODE64(s)) {
+            /* BOUND is a legacy i386 instruction (0x62 is an EVEX
+             * prefix in long mode).  Reject the attempted producer before
+             * the architectural illegal-op exit so the x86-64 fixture does
+             * not silently accept a missing F01 read. */
+            gen_sem_mem_unsupported(s->pc_start, 10);
             goto illegal_op;
+        }
         ot = dflag;
         modrm = x86_ldub_code(env, s);
         reg = (modrm >> 3) & 7;
@@ -8373,8 +8403,14 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
         TCGv t_bound_pc = tcg_const_tl(s->pc_start);
         if (ot == MO_16) {
             gen_helper_boundw(cpu_env, s->A0, s->tmp2_i32, t_bound_pc);
+            /* boundw reads two 16-bit bounds as one 4-byte interval. */
+            gen_sem_mem_access_f01_raw_class(s->A0, 4, s->pc_start,
+                                             false, SEM_OP_INTEGER);
         } else {
             gen_helper_boundl(cpu_env, s->A0, s->tmp2_i32, t_bound_pc);
+            /* boundl reads two 32-bit bounds as one 8-byte interval. */
+            gen_sem_mem_access_f01_raw_class(s->A0, 8, s->pc_start,
+                                             false, SEM_OP_INTEGER);
         }
         tcg_temp_free(t_bound_pc);
         break;
@@ -8573,8 +8609,8 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                 gen_svm_check_intercept(s, pc_start, SVM_EXIT_LDTR_WRITE);
                 gen_ldst_modrm(env, s, modrm, MO_16, OR_TMP0, 0);
                 tcg_gen_trunc_tl_i32(s->tmp2_i32, s->T0);
-                gen_helper_lldt(cpu_env, s->tmp2_i32);
                 gen_sem_mem_unsupported(s->pc_start, 4);
+                gen_helper_lldt(cpu_env, s->tmp2_i32);
             }
             break;
         case 1: /* str */
@@ -8595,8 +8631,8 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                 gen_svm_check_intercept(s, pc_start, SVM_EXIT_TR_WRITE);
                 gen_ldst_modrm(env, s, modrm, MO_16, OR_TMP0, 0);
                 tcg_gen_trunc_tl_i32(s->tmp2_i32, s->T0);
-                gen_helper_ltr(cpu_env, s->tmp2_i32);
                 gen_sem_mem_unsupported(s->pc_start, 5);
+                gen_helper_ltr(cpu_env, s->tmp2_i32);
             }
             break;
         case 4: /* verr */
@@ -8605,12 +8641,12 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                 goto illegal_op;
             gen_ldst_modrm(env, s, modrm, MO_16, OR_TMP0, 0);
             gen_update_cc_op(s);
+            gen_sem_mem_unsupported(s->pc_start, 7);
             if (op == 4) {
                 gen_helper_verr(cpu_env, s->T0);
             } else {
                 gen_helper_verw(cpu_env, s->T0);
             }
-            gen_sem_mem_unsupported(s->pc_start, 7);
             set_cc_op(s, CC_OP_EFLAGS);
             break;
         default:
@@ -9083,12 +9119,12 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
             gen_ldst_modrm(env, s, modrm, MO_16, OR_TMP0, 0);
             t0 = tcg_temp_local_new();
             gen_update_cc_op(s);
+            gen_sem_mem_unsupported(s->pc_start, 8);
             if (b == 0x102) {
                 gen_helper_lar(t0, cpu_env, s->T0);
             } else {
                 gen_helper_lsl(t0, cpu_env, s->T0);
             }
-            gen_sem_mem_unsupported(s->pc_start, 8);
             tcg_gen_andi_tl(s->tmp0, cpu_cc_src, CC_Z);
             label1 = gen_new_label();
             tcg_gen_brcondi_tl(TCG_COND_EQ, s->tmp0, 0, label1);
@@ -9119,6 +9155,7 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
         break;
     case 0x11a:
         modrm = x86_ldub_code(env, s);
+        target_ulong modrm_end_11a = s->pc;
         if (s->flags & HF_MPX_EN_MASK) {
             mod = (modrm >> 6) & 3;
             reg = ((modrm >> 3) & 7) | rex_r;
@@ -9198,26 +9235,31 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                 } else {
                     tcg_gen_movi_tl(s->T0, 0);
                 }
+                TCGv t_mpx_pc = tcg_const_tl(s->pc_start);
                 if (CODE64(s)) {
                     gen_sem_set_ea_mode(s);
                     gen_helper_bndldx64(cpu_bndl[reg], cpu_env, s->A0, s->T0,
-                                        tcg_const_tl(s->pc_start));
+                                        t_mpx_pc);
                     tcg_gen_ld_i64(cpu_bndu[reg], cpu_env,
                                    offsetof(CPUX86State, mmx_t0.MMX_Q(0)));
                 } else {
                     gen_sem_set_ea_mode(s);
                     gen_helper_bndldx32(cpu_bndu[reg], cpu_env, s->A0, s->T0,
-                                        tcg_const_tl(s->pc_start));
+                                        t_mpx_pc);
                     tcg_gen_ext32u_i64(cpu_bndl[reg], cpu_bndu[reg]);
                     tcg_gen_shri_i64(cpu_bndu[reg], cpu_bndu[reg], 32);
                 }
+                tcg_temp_free(t_mpx_pc);
                 gen_set_hflag(s, HF_MPX_IU_MASK);
             }
         }
-        gen_nop_modrm(env, s, modrm);
+        if (s->pc == modrm_end_11a) {
+            gen_nop_modrm(env, s, modrm);
+        }
         break;
     case 0x11b:
         modrm = x86_ldub_code(env, s);
+        target_ulong modrm_end_11b = s->pc;
         if (s->flags & HF_MPX_EN_MASK) {
             mod = (modrm >> 6) & 3;
             reg = ((modrm >> 3) & 7) | rex_r;
@@ -9329,20 +9371,24 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                 } else {
                     tcg_gen_movi_tl(s->T0, 0);
                 }
+                TCGv t_mpx_pc = tcg_const_tl(s->pc_start);
                 if (CODE64(s)) {
                     gen_sem_set_ea_mode(s);
                     gen_helper_bndstx64(cpu_env, s->A0, s->T0,
                                         cpu_bndl[reg], cpu_bndu[reg],
-                                        tcg_const_tl(s->pc_start));
+                                        t_mpx_pc);
                 } else {
                     gen_sem_set_ea_mode(s);
                     gen_helper_bndstx32(cpu_env, s->A0, s->T0,
                                         cpu_bndl[reg], cpu_bndu[reg],
-                                        tcg_const_tl(s->pc_start));
+                                        t_mpx_pc);
                 }
+                tcg_temp_free(t_mpx_pc);
             }
         }
-        gen_nop_modrm(env, s, modrm);
+        if (s->pc == modrm_end_11b) {
+            gen_nop_modrm(env, s, modrm);
+        }
         break;
     case 0x119: case 0x11c ... 0x11f: /* nop (multi byte) */
         modrm = x86_ldub_code(env, s);

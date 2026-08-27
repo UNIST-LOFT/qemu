@@ -109,6 +109,7 @@ const bool sem_op_class_valid[SEM_OP_CLASS_COUNT] = {
     [SEM_OP_UNKNOWN]    = false, /* fail-closed: never producer-labeled */
 };
 
+static const uint32_t widths_1[] = { 1 };
 static const uint32_t widths_1_2_4_8[] = { 1, 2, 4, 8 };
 static const uint32_t widths_1_2_4[] = { 1, 2, 4 };
 static const uint32_t widths_2_4_8[] = { 2, 4, 8 };
@@ -163,15 +164,19 @@ const SemProducerSpec sem_producer_table[] = {
     PRODUCER("simd.vector", SEM_OP_SIMD, SEM_INTERVAL_PAIRED,
              widths_8_16, true, "gen_ldst_modrm_simd"),
     PRODUCER("simd.special", SEM_OP_SIMD, SEM_INTERVAL_EXACT_WIDTH,
-             widths_4_8, true, "gen_ldst_modrm_simd"),
+             widths_1_2_4_8, true, "gen_ldst_modrm_simd"),
     PRODUCER("x87.scalar", SEM_OP_X87_HELPER, SEM_INTERVAL_EXACT_WIDTH,
-             widths_1_2_4_8, true, "gen_helper_fldl_ST0,gen_helper_fstl_ST0"),
+             widths_2_4_8, true, "gen_helper_fldl_ST0,gen_helper_fstl_ST0"),
     PRODUCER("x87.raw", SEM_OP_X87_HELPER, SEM_INTERVAL_RAW,
              widths_10, true, "gen_helper_fldt_ST0,gen_helper_fstt_ST0,gen_helper_fbld_ST0,gen_helper_fbst_ST0"),
     PRODUCER("x87.environment", SEM_OP_X87_HELPER, SEM_INTERVAL_RAW,
              widths_14_28, true, "gen_helper_fstenv,gen_helper_fldenv"),
     PRODUCER("x87.saved-state", SEM_OP_X87_HELPER, SEM_INTERVAL_RAW,
              widths_94_108, true, "gen_helper_fsave,gen_helper_frstor"),
+    UNSUPPORTED("x87.legacy-width-x86_64",
+                 "target=x86_64:14/94-byte forms require an i386 user target"),
+    UNSUPPORTED("bound.legacy-x86_64",
+                 "target=x86_64:BOUND requires an i386 user target"),
     PRODUCER("mpx.bndmov", SEM_OP_MPX, SEM_INTERVAL_PAIRED,
              widths_8_16, true, "gen_ldst_modrm"),
     PRODUCER("mpx.bndx-helper", SEM_OP_MPX, SEM_INTERVAL_MULTIPART,
@@ -183,17 +188,17 @@ const SemProducerSpec sem_producer_table[] = {
              widths_4_6_8_10_16_24_64_128_256, true,
              "gen_helper_xsave,gen_helper_xsaveopt,gen_helper_xrstor"),
     DYNAMIC_PRODUCER("model.output", SEM_OP_LIBC_MODEL,
-                     "sem_mem_overwrite"),
+                     "file=symbolic.c,sem_mem_overwrite"),
     DYNAMIC_PRODUCER("syscall.output", SEM_OP_SYSCALL,
-                     "sem_mem_overwrite"),
+                     "file=syscall.c,file=snapshot.c,sem_mem_overwrite"),
     DYNAMIC_PRODUCER("mapping.output", SEM_OP_MAPPING,
-                     "sem_mem_overwrite"),
+                     "file=snapshot.c,sem_mem_overwrite"),
     DYNAMIC_PRODUCER("signal.frame", SEM_OP_SIGNAL,
-                     "sem_context_replace"),
+                     "file=signal.c,sem_mem_overwrite,sem_context_replace"),
     DYNAMIC_PRODUCER("snapshot.write", SEM_OP_SNAPSHOT,
-                     "sem_mem_overwrite"),
-    PRODUCER("simd.maskmov", SEM_OP_SIMD, SEM_INTERVAL_EXACT_WIDTH,
-             widths_8_16, true, "gen_helper_maskmov_mmx,gen_helper_maskmov_xmm"),
+                     "file=snapshot.c,sem_mem_overwrite"),
+    PRODUCER("simd.maskmov", SEM_OP_SIMD, SEM_INTERVAL_SPARSE,
+             widths_1, true, "gen_helper_maskmov_mmx,gen_helper_maskmov_xmm"),
     UNSUPPORTED("control.far", "gen_helper_lcall_real,gen_helper_lcall_protected,gen_helper_ljmp_protected,gen_helper_lret_protected:protected far-control/task-state helpers are unsupported in user F01"),
     UNSUPPORTED("control.iret", "gen_helper_iret_real,gen_helper_iret_protected:IRET helper has dynamic privilege/task-state accesses"),
     UNSUPPORTED("control.seg-load", "gen_helper_load_seg:descriptor-table segment loads are dynamic"),
@@ -201,6 +206,8 @@ const SemProducerSpec sem_producer_table[] = {
     UNSUPPORTED("control.ltr", "gen_helper_ltr:descriptor-table TR loads/stores are dynamic"),
     UNSUPPORTED("control.seg-query", "gen_helper_lar,gen_helper_lsl,gen_helper_verr,gen_helper_verw:descriptor-table queries are dynamic"),
     UNSUPPORTED("control.io-bitmap", "gen_helper_check_iob,gen_helper_check_iow,gen_helper_check_iol:I/O bitmap accesses are dynamic"),
+    UNSUPPORTED("control.seg-helper",
+                 "file=seg_helper.c:all cpu_ld*/cpu_st* accesses are privilege/task-state dependent"),
     PRODUCER("bound.legacy", SEM_OP_INTEGER, SEM_INTERVAL_EXACT_WIDTH,
              widths_4_8, true, "gen_helper_boundw,gen_helper_boundl"),
     { NULL, 0, 0, NULL, 0, false, NULL },
@@ -305,6 +312,12 @@ void sem_reg_overwrite(CPUArchState *env, int reg_idx, SemOpClass cls) {
         osprey_on_reg_invalidate(env, (uint32_t)reg_idx);
     }
     (void)valid_class;
+}
+
+void sem_mark_unsupported_execution(void) {
+    if (osprey_collect_enabled) {
+        osprey_mark_unsupported_execution();
+    }
 }
 
 void sem_context_replace(CPUArchState *env) {
@@ -801,7 +814,7 @@ void helper_sem_mem_unsupported(CPUArchState *env, target_ulong pc,
         /* An explicitly unsupported guest-memory producer makes the sample
          * incomplete.  Clearing EA state alone would silently accept a fact
          * set known to omit architectural accesses. */
-        osprey_mark_unsupported_execution();
+        sem_mark_unsupported_execution();
     }
 }
 
@@ -843,10 +856,11 @@ void sem_mem_helper_access_part(CPUArchState *env, target_ulong addr,
     }
     if (st->pending_helper_count >= OSPREY_MAX_PENDING_HELPER_INTERVALS) {
         /* No supported producer currently needs this many intervals.  A
-         * future helper must not wrap the fixed pending array and publish
-         * an incomplete or unrelated fact set. */
+         * future helper must not wrap the fixed pending array or let an
+         * incomplete fact set reach merge as a supported sample. */
         osprey_clear_pending_helper(st);
         osprey_clear_ea(st, true);
+        sem_mark_unsupported_execution();
         return;
     }
     OspreyPendingHelperInterval *pending =

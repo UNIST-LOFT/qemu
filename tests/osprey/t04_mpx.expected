@@ -1,0 +1,71 @@
+region 0 0 0 1 302020
+region 2 0 684 2 8
+region 2 40 713 3 28
+region 2 50 697 4 0
+region 2 90 715 3 0
+region 2 100 712 6 10
+region 2 140 685 2 0
+region 2 149 696 8 30
+region 2 244 698 8 8
+region 2 262 699 8 8
+region 2 2ae 695 11 10
+region 2 2dc 716 6 8
+access 8 0 0 0 2fe8 8 1
+access 44 0 0 0 2ff8 8 1
+access 54 0 0 0 2fd0 8 1
+access 7f 0 0 0 2fd8 8 1
+access b8 0 2 100 fffffffffffffff0 8 1
+access 104 0 0 0 ff000 1 1
+access 10d 1 2 100 fffffffffffffff8 8 1
+access 10e 0 0 0 2ff8 8 1
+access 11b 0 0 0 3008 8 1
+access 122 1 2 100 fffffffffffffff0 8 1
+access 127 1 2 100 fffffffffffffff0 8 1
+access 12c 1 0 0 ff000 1 1
+access 133 0 2 100 fffffffffffffff8 8 1
+access 14d 1 2 149 fffffffffffffff8 8 1
+access 15c 1 2 149 fffffffffffffff0 8 1
+access 167 1 2 149 ffffffffffffffe8 8 1
+access 16b 1 2 149 ffffffffffffffe0 8 1
+access 187 1 2 149 ffffffffffffffd0 8 1
+access 18c 0 2 149 fffffffffffffff0 8 1
+access 190 0 2 149 ffffffffffffffe0 8 1
+access 194 1 0 0 1ff240 8 1
+access 1a9 0 2 149 ffffffffffffffe8 8 1
+access 1ad 1 0 0 1ff440 8 1
+access 1b7 0 2 149 ffffffffffffffe0 8 1
+access 1bd 0 2 149 ffffffffffffffe0 8 1
+access 1c9 0 0 0 1ff240 24 1 4
+access 1c9 0 0 0 1ff400 64 1 4
+access 1c9 0 0 0 1ff440 16 1 4
+access 1de 1 0 0 2ff000 8 1
+access 1ef 1 0 0 300000 8 1
+access 207 1 0 0 300008 8 1
+access 218 1 0 0 300010 8 1
+access 222 1 0 0 302000 8 1
+access 236 1 0 0 302008 8 1
+access 242 0 2 149 fffffffffffffff8 8 1
+access 243 0 2 2ae fffffffffffffff0 8 1
+access 248 1 2 244 fffffffffffffff8 8 1
+access 253 0 0 0 302000 16 1 10
+access 257 1 0 0 302010 16 1 10
+access 260 0 2 244 fffffffffffffff8 8 1
+access 261 0 2 2ae fffffffffffffff0 8 1
+access 266 1 2 262 fffffffffffffff8 8 1
+access 279 0 0 0 2ff000 8 1 10
+access 279 1 0 0 300000 24 1 10
+access 27d 0 0 0 2ff000 8 1 10
+access 27d 0 0 0 300000 24 1 10
+access 281 1 0 0 302010 16 1 10
+access 289 0 0 0 302010 8 1
+access 290 0 0 0 302018 8 1
+access 29a 0 0 0 1ff000 8 1
+access 2a4 1 0 0 1ff000 8 1
+access 2ac 0 2 262 fffffffffffffff8 8 1
+access 2ad 0 2 2ae fffffffffffffff0 8 1
+access 2b2 1 2 2ae fffffffffffffff8 8 1
+access 2b6 1 2 2ae fffffffffffffff0 8 1
+access 2c6 1 2 2ae fffffffffffffff0 8 1
+access 2cb 1 2 2ae fffffffffffffff0 8 1
+access 2d0 0 0 0 1ff000 8 1
+access 2da 0 2 2ae fffffffffffffff8 8 1

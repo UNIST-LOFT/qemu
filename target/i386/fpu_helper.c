@@ -1150,6 +1150,7 @@ static void sem_xsave_publish(CPUX86State *env, target_ulong ptr,
     }
     SemXsaveInterval intervals[32];
     size_t count = 0;
+    bool interval_overflow = false;
     int nb_xmm = (env->hflags & HF_CS64_MASK) ? 16 : 8;
     bool fx_sse = (env->cr[4] & CR4_OSFXSR_MASK) != 0;
     bool fx_sse_regs = fx_sse &&
@@ -1157,10 +1158,14 @@ static void sem_xsave_publish(CPUX86State *env, target_ulong ptr,
          (env->hflags & HF_CPL_MASK) || !(env->hflags & HF_LMA_MASK));
 
 #define ADD_INTERVAL(_offset, _size, _is_store) do { \
-        intervals[count].offset = (_offset); \
-        intervals[count].size = (_size); \
-        intervals[count].is_store = (_is_store); \
-        count++; \
+        if (count >= G_N_ELEMENTS(intervals)) { \
+            interval_overflow = true; \
+        } else { \
+            intervals[count].offset = (_offset); \
+            intervals[count].size = (_size); \
+            intervals[count].is_store = (_is_store); \
+            count++; \
+        } \
     } while (0)
 
     if (xsave_format && restore) {
@@ -1223,12 +1228,16 @@ static void sem_xsave_publish(CPUX86State *env, target_ulong ptr,
         }
     }
 
-    for (size_t i = 0; i < count; i++) {
-        target_ulong addr = ptr + intervals[i].offset;
-        if (publish_f01) {
-            sem_mem_helper_access_part(env, addr, intervals[i].size, pc,
-                                       intervals[i].is_store, SEM_OP_PAIRED,
-                                       i + 1 == count);
+    if (interval_overflow) {
+        sem_mark_unsupported_execution();
+    } else {
+        for (size_t i = 0; i < count; i++) {
+            target_ulong addr = ptr + intervals[i].offset;
+            if (publish_f01) {
+                sem_mem_helper_access_part(env, addr, intervals[i].size, pc,
+                                           intervals[i].is_store, SEM_OP_PAIRED,
+                                           i + 1 == count);
+            }
         }
     }
 #undef ADD_INTERVAL

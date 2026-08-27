@@ -14,11 +14,11 @@
  * label their events.  The helper manifest below records the neutral TCG
  * surface; unit tests require the classified and emittable sets to match.
  * UNKNOWN-class runtime events are fail-closed: conservative invalidation,
- * never a recorded OSPREY fact.  The producer matrix and bounded source
- * inventory sanity-check direct, atomic, helper-backed, function-pointer,
- * and explicitly unsupported dynamic producer families.  The source check
- * is bounded and does not replace control-flow or ordering review.  Multipart
- * events are buffered until their final post-success constituent.
+ * never a recorded OSPREY fact.  The producer matrix and structure-aware
+ * source inventory cover direct, atomic, helper-backed, function-pointer,
+ * helper-body, and explicitly unsupported dynamic producer families.  The
+ * source gate still does not replace full control-flow/cardinality review.
+ * Multipart events are buffered until their final post-success constituent.
  */
 
 #include "qemu/osdep.h"
@@ -139,6 +139,11 @@ void sem_reg_overwrite(CPUArchState *env, int reg_idx, SemOpClass cls);
 /* Full-register context replacement (signal delivery): kills every
  * register origin/tag and any in-flight EA metadata in both consumers. */
 void sem_context_replace(CPUArchState *env);
+
+/* Mark a successfully decoded but intentionally unsupported guest-memory
+ * producer.  The active OSPREY sample is rejected; provenance remains
+ * independent and continues its own conservative invalidation. */
+void sem_mark_unsupported_execution(void);
 
 /* Modeled-call boundary: invalidate the ABI caller-saved registers in
  * each active consumer before installing any explicit return origin. */

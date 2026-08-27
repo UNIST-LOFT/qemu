@@ -2074,6 +2074,27 @@ static void test_sem_access_class_and_flags(void)
     CHECK(run->access_used == 4,
           "multipart final part publishes all intervals");
 
+    /* Exceeding the fixed multipart buffer must reject the sample, not
+     * silently discard a known-incomplete helper footprint. */
+    run->unsupported_execution = 0;
+    st->ea_mode = MO_64;
+    for (uint32_t i = 0; i < OSPREY_MAX_PENDING_HELPER_INTERVALS; i++) {
+        sem_mem_helper_access_part(env, 0x402100 + i, 1, 0x400128,
+                                   true, SEM_OP_SIMD, false);
+    }
+    CHECK(st->pending_helper_count == OSPREY_MAX_PENDING_HELPER_INTERVALS,
+          "multipart buffer accepts its exact bounded capacity");
+    sem_mem_helper_access_part(env, 0x402200, 1, 0x400128, true,
+                               SEM_OP_SIMD, false);
+    CHECK(st->pending_helper_count == 0 && st->ea_mode == 0,
+          "multipart overflow clears buffered semantic state");
+    CHECK(run->unsupported_execution == 1,
+          "multipart overflow rejects incomplete sample");
+    CHECK(run->access_used == 4,
+          "multipart overflow publishes no partial F01 rows");
+
+    run->unsupported_execution = 0;
+    osprey_collect_enabled = 1;
     st->ea_mode = MO_64;
     st->ea_valid = true;
     st->pending_helper_count = 1;
