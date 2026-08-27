@@ -1151,6 +1151,8 @@ static void sem_xsave_publish(CPUX86State *env, target_ulong ptr,
     SemXsaveInterval intervals[32];
     size_t count = 0;
     bool interval_overflow = false;
+    SemProducerId producer = xsave_format ? SEM_PRODUCER_XSAVE_XSAVE
+                                           : SEM_PRODUCER_XSAVE_FXSAVE;
     int nb_xmm = (env->hflags & HF_CS64_MASK) ? 16 : 8;
     bool fx_sse = (env->cr[4] & CR4_OSFXSR_MASK) != 0;
     bool fx_sse_regs = fx_sse &&
@@ -1236,6 +1238,7 @@ static void sem_xsave_publish(CPUX86State *env, target_ulong ptr,
             if (publish_f01) {
                 sem_mem_helper_access_part(env, addr, intervals[i].size, pc,
                                            intervals[i].is_store, SEM_OP_PAIRED,
+                                           SEM_INTERVAL_SPARSE, producer,
                                            i + 1 == count);
             }
         }

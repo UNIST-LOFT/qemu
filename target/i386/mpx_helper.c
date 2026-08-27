@@ -94,8 +94,12 @@ uint64_t helper_bndldx64(CPUX86State *env, target_ulong base,
         lb = ub = 0;
     }
     env->mmx_t0.MMX_Q(0) = ub;
-    sem_mem_helper_access_part(env, bde, 8, pc, false, SEM_OP_MPX, false);
-    sem_mem_helper_access_part(env, bte, 24, pc, false, SEM_OP_MPX, true);
+    sem_mem_helper_access_part(env, bde, 8, pc, false, SEM_OP_MPX,
+                                SEM_INTERVAL_MULTIPART,
+                                SEM_PRODUCER_MPX_BNDX_HELPER, false);
+    sem_mem_helper_access_part(env, bte, 24, pc, false, SEM_OP_MPX,
+                                SEM_INTERVAL_MULTIPART,
+                                SEM_PRODUCER_MPX_BNDX_HELPER, true);
     return lb;
 }
 
@@ -113,8 +117,12 @@ uint64_t helper_bndldx32(CPUX86State *env, target_ulong base,
     if (pt != ptr) {
         lb = ub = 0;
     }
-    sem_mem_helper_access_part(env, bde, 4, pc, false, SEM_OP_MPX, false);
-    sem_mem_helper_access_part(env, bte, 12, pc, false, SEM_OP_MPX, true);
+    sem_mem_helper_access_part(env, bde, 4, pc, false, SEM_OP_MPX,
+                                SEM_INTERVAL_MULTIPART,
+                                SEM_PRODUCER_MPX_BNDX_HELPER, false);
+    sem_mem_helper_access_part(env, bte, 12, pc, false, SEM_OP_MPX,
+                                SEM_INTERVAL_MULTIPART,
+                                SEM_PRODUCER_MPX_BNDX_HELPER, true);
     return ((uint64_t)ub << 32) | lb;
 }
 
@@ -131,8 +139,12 @@ void helper_bndstx64(CPUX86State *env, target_ulong base, target_ulong ptr,
     cpu_stq_data_ra(env, bte + 8, ub, ra);
     sem_mem_overwrite(bte + 16, 8, SEM_OP_MPX);
     cpu_stq_data_ra(env, bte + 16, ptr, ra);
-    sem_mem_helper_access_part(env, bde, 8, pc, false, SEM_OP_MPX, false);
-    sem_mem_helper_access_part(env, bte, 24, pc, true, SEM_OP_MPX, true);
+    sem_mem_helper_access_part(env, bde, 8, pc, false, SEM_OP_MPX,
+                                SEM_INTERVAL_MULTIPART,
+                                SEM_PRODUCER_MPX_BNDX_HELPER, false);
+    sem_mem_helper_access_part(env, bte, 24, pc, true, SEM_OP_MPX,
+                                SEM_INTERVAL_MULTIPART,
+                                SEM_PRODUCER_MPX_BNDX_HELPER, true);
 }
 
 void helper_bndstx32(CPUX86State *env, target_ulong base, target_ulong ptr,
@@ -148,8 +160,12 @@ void helper_bndstx32(CPUX86State *env, target_ulong base, target_ulong ptr,
     cpu_stl_data_ra(env, bte + 4, ub, ra);
     sem_mem_overwrite(bte + 8, 4, SEM_OP_MPX);
     cpu_stl_data_ra(env, bte + 8, ptr, ra);
-    sem_mem_helper_access_part(env, bde, 4, pc, false, SEM_OP_MPX, false);
-    sem_mem_helper_access_part(env, bte, 12, pc, true, SEM_OP_MPX, true);
+    sem_mem_helper_access_part(env, bde, 4, pc, false, SEM_OP_MPX,
+                                SEM_INTERVAL_MULTIPART,
+                                SEM_PRODUCER_MPX_BNDX_HELPER, false);
+    sem_mem_helper_access_part(env, bte, 12, pc, true, SEM_OP_MPX,
+                                SEM_INTERVAL_MULTIPART,
+                                SEM_PRODUCER_MPX_BNDX_HELPER, true);
 }
 
 void helper_bnd_jmp(CPUX86State *env)

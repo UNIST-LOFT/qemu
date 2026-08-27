@@ -7434,6 +7434,8 @@ int        parse_translation_block(TranslationBlock* tb, uintptr_t tb_pc,
                 }
                 break;
 
+            case INDEX_op_st8_i64:
+            case INDEX_op_st16_i64:
             case INDEX_op_st32_i64:
             case INDEX_op_st_i32:
             case INDEX_op_st_i64:
@@ -7517,11 +7519,34 @@ int        parse_translation_block(TranslationBlock* tb, uintptr_t tb_pc,
                             prev_op->opc != INDEX_op_ld_i64) {
 
                             TCGTemp* t_value = arg_temp(op->args[0]);
-                            if (temp_static_state[temp_idx(t_value)].is_alive &&
-                                temp_static_state[temp_idx(t_value)].is_const) {
-                                // clear the xmm reg
-                                uintptr_t size =
-                                    op->opc == INDEX_op_st_i64 ? 8 : 4;
+                            bool subword_store =
+                                op->opc == INDEX_op_st8_i64 ||
+                                op->opc == INDEX_op_st16_i64;
+                            if (subword_store ||
+                                (temp_static_state[temp_idx(t_value)].is_alive &&
+                                 temp_static_state[temp_idx(t_value)].is_const)) {
+                                /* Byte/word lane inserts are not modeled by
+                                 * the symbolic XMM shadow.  Drop only the
+                                 * overwritten lane instead of aborting the
+                                 * tracer; retaining it would be unsound. */
+                                uintptr_t size;
+                                switch (op->opc) {
+                                case INDEX_op_st8_i64:
+                                    size = 1;
+                                    break;
+                                case INDEX_op_st16_i64:
+                                    size = 2;
+                                    break;
+                                case INDEX_op_st32_i64:
+                                case INDEX_op_st_i32:
+                                    size = 4;
+                                    break;
+                                case INDEX_op_st_i64:
+                                    size = 8;
+                                    break;
+                                default:
+                                    g_assert_not_reached();
+                                }
                                 TCGTemp* t_size =
                                     new_non_conflicting_temp(TCG_TYPE_PTR);
                                 tcg_movi(t_size, size, 0, op, NULL, tcg_ctx);

@@ -119,13 +119,18 @@ TESTS = [
         # translator dispatch must not depend on memcheck being enabled.
         memcheck=0,
         qemu_args=["-cpu", "qemu64,+xsave,+xsaveopt,+mpx"],
+        # This fixture validates the merged F01 dump, not the known-invalid
+        # later inference stages.  Reject immediately after fact collection
+        # so one extra producer cannot trigger unbounded legacy graph work.
+        env={"BINRADAR_OSPREY_MAX_VARIABLES": "1"},
         dump_stem="t02_dump",
         expected="t02_chunk_widths.expected",
         rc=(2,),
         # Exact canonical rows asserted against the checked-in dump
         # (t02_chunk_widths.expected), byte-identical across three PIE
         # load biases.  The fixture forces selected integer, atomic, paired,
-        # SIMD, x87, descriptor, MXCSR, and FXSAVE/FXRSTOR producers.
+        # SIMD (including two-byte PINSRW), x87, descriptor, MXCSR, and
+        # FXSAVE/FXRSTOR producers.
         # The explicit qemu64 feature set makes XSAVE/XSAVEOPT deterministic
         # without enabling unrelated SSE4 paths unsupported by the symbolic
         # engine.  MPX is advertised but remains disabled by guest state; its
@@ -153,6 +158,10 @@ TESTS = [
             },
             "access_classes_min": {0: 1, 1: 1, 2: 1, 3: 1, 4: 1},
             "access_symbols_expected": {
+                "t02_pinsrw_load": {
+                    "class": 1, "is_store": 0, "size": 2,
+                    "min_rows": 1, "max_rows": 1,
+                },
                 "t02_maskmov": {
                     "class": 1, "is_store": 1, "size": 1,
                     "min_rows": 4, "max_rows": 4,
@@ -205,6 +214,7 @@ TESTS = [
         # OSPREY consume the neutral events together.
         memcheck=1,
         qemu_args=["-cpu", "qemu64,+xsave,+xsaveopt,+mpx"],
+        env={"BINRADAR_OSPREY_MAX_VARIABLES": "1"},
         dump_stem="t02_combined_dump",
         expected="t02_chunk_widths.expected",
         rc=(2,),
@@ -222,6 +232,10 @@ TESTS = [
             },
             "access_classes_min": {0: 1, 1: 1, 2: 1, 3: 1, 4: 1},
             "access_symbols_expected": {
+                "t02_pinsrw_load": {
+                    "class": 1, "is_store": 0, "size": 2,
+                    "min_rows": 1, "max_rows": 1,
+                },
                 "t02_maskmov": {
                     "class": 1, "is_store": 1, "size": 1,
                     "min_rows": 4, "max_rows": 4,
@@ -363,6 +377,10 @@ TESTS = [
         memcheck=0,
         dump_stem="t05_enter_fault_dump",
         expected=None,
+        # This rejection fixture pivots to an mmap-backed stack.  The
+        # translator's call/RSP identity is not a cross-bias-stable contract
+        # for that pivot, so compare one deterministic run only; t02 owns
+        # successful cross-bias stack coverage.
         biases=[None],
         compare_biases=False,
         rc=(2,),
@@ -378,6 +396,7 @@ TESTS = [
         memcheck=1,
         dump_stem="t05_enter_fault_combined_dump",
         expected=None,
+        # Same custom-stack limitation as the OSPREY-only rejection case.
         biases=[None],
         compare_biases=False,
         rc=(2,),

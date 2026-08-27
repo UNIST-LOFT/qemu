@@ -16,7 +16,8 @@
  *    translator inventory records those legacy forms as target-gated;
  *    x86-64 coverage uses the architectural 28/108-byte forms below.
  *  - lock/non-lock xchg, bit-test RMW, lock not/neg, cmpxchg16b;
- *  - MOVD, PEXTR/EXTRACTPS, INSERTPS/PINSR loads, SIMD loads;
+ *  - MOVD, PEXTR/EXTRACTPS, INSERTPS/PINSR loads, including an exact
+ *    two-byte PINSRW scalar-family event, and SIMD loads;
  *  - x87 loads, frstor, MXCSR, FXSAVE/FXRSTOR;
  *  - SGDT/SIDT descriptor stores and MPX BNDMOV where supported;
  *  - an SSE2 MASKMOVDQU with a sparse byte mask (only selected bytes may
@@ -402,5 +403,13 @@ int main(void) {
     fxsave_state();
     deep_enter();
     mpx_pair();
+    /* PINSRW is available with SSE and drives gen_ldst_modrm_simd's
+     * otherwise-uncovered two-byte memory form without adding another
+     * stack-frame identity to the F01 fixture. */
+    __asm__ volatile(
+        ".globl t02_pinsrw_load\n"
+        "t02_pinsrw_load:\n"
+        "pinsrw $1, %0, %%xmm0\n"
+        : : "m"(*(const uint16_t *)(buf + 16)) : "xmm0", "memory");
     return (int)(g_sink & 1);
 }

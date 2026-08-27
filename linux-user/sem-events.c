@@ -113,7 +113,7 @@ static const uint32_t widths_1[] = { 1 };
 static const uint32_t widths_1_2_4_8[] = { 1, 2, 4, 8 };
 static const uint32_t widths_1_2_4[] = { 1, 2, 4 };
 static const uint32_t widths_2_4_8[] = { 2, 4, 8 };
-static const uint32_t widths_2_4_6_8_10[] = { 2, 4, 6, 8, 10 };
+static const uint32_t widths_6_10[] = { 6, 10 };
 static const uint32_t widths_4_8[] = { 4, 8 };
 static const uint32_t widths_8[] = { 8 };
 static const uint32_t widths_16[] = { 16 };
@@ -140,53 +140,73 @@ static const uint32_t widths_4_6_8_10_16_24_64_128_256[] = {
 
 const SemProducerSpec sem_producer_table[] = {
     PRODUCER("integer.modrm", SEM_OP_INTEGER, SEM_INTERVAL_EXACT_WIDTH,
-             widths_1_2_4_8, true, "gen_op_ld_v_class,gen_op_st_v_class"),
+             widths_1_2_4_8, true,
+             "gen_ldst_modrm@SEM_INTERVAL_EXACT_WIDTH"),
     PRODUCER("integer.moffs", SEM_OP_INTEGER, SEM_INTERVAL_EXACT_WIDTH,
-             widths_1_2_4_8, true, "gen_op_ld_v,gen_op_st_v"),
+             widths_1_2_4_8, true,
+             "gen_op_ld_v_moffs@SEM_INTERVAL_EXACT_WIDTH,gen_op_st_v_moffs@SEM_INTERVAL_EXACT_WIDTH"),
     PRODUCER("integer.string", SEM_OP_INTEGER, SEM_INTERVAL_EXACT_WIDTH,
-             widths_1_2_4_8, true, "gen_string_movl_A0_ESI,gen_string_movl_A0_EDI"),
+             widths_1_2_4_8, true,
+             "gen_movs@SEM_INTERVAL_EXACT_WIDTH,gen_stos@SEM_INTERVAL_EXACT_WIDTH,gen_lods@SEM_INTERVAL_EXACT_WIDTH,gen_scas@SEM_INTERVAL_EXACT_WIDTH,gen_cmps@SEM_INTERVAL_EXACT_WIDTH"),
     PRODUCER("integer.ins-outs", SEM_OP_INTEGER, SEM_INTERVAL_EXACT_WIDTH,
-             widths_1_2_4, true, "gen_ins,gen_outs"),
-    PRODUCER("integer.stack-control", SEM_OP_INTEGER, SEM_INTERVAL_EXACT_WIDTH,
-             widths_2_4_8, true, "gen_push_v,gen_pop_T0,gen_enter,gen_leave"),
+             widths_1_2_4, true,
+             "gen_ins@SEM_INTERVAL_EXACT_WIDTH,gen_outs@SEM_INTERVAL_EXACT_WIDTH"),
+    PRODUCER("integer.stack", SEM_OP_INTEGER, SEM_INTERVAL_EXACT_WIDTH,
+             widths_2_4_8, true,
+             "gen_push_v@SEM_INTERVAL_EXACT_WIDTH,gen_pop_T0@SEM_INTERVAL_EXACT_WIDTH,gen_leave@SEM_INTERVAL_EXACT_WIDTH"),
+    PRODUCER("integer.enter", SEM_OP_INTEGER, SEM_INTERVAL_MULTIPART,
+             widths_2_4_8, true, "gen_enter@SEM_INTERVAL_MULTIPART"),
     PRODUCER("integer.descriptor", SEM_OP_INTEGER, SEM_INTERVAL_MULTIPART,
-             widths_2_4_6_8_10, true, "gen_ldst_modrm"),
+             widths_6_10, true,
+             "gen_sem_descriptor_access_f01@SEM_INTERVAL_MULTIPART"),
     PRODUCER("atomic.lock-rmw", SEM_OP_ATOMIC_RMW, SEM_INTERVAL_EXACT_WIDTH,
-             widths_1_2_4_8, true, "gen_op"),
+             widths_1_2_4_8, true, "gen_op@SEM_INTERVAL_EXACT_WIDTH"),
     PRODUCER("atomic.xchg", SEM_OP_ATOMIC_RMW, SEM_INTERVAL_EXACT_WIDTH,
-             widths_1_2_4_8, true, "gen_op"),
+             widths_1_2_4_8, true,
+             "gen_sem_mem_xchg_f01@SEM_INTERVAL_EXACT_WIDTH"),
     PRODUCER("paired.cmpxchg8b", SEM_OP_PAIRED, SEM_INTERVAL_PAIRED,
-             widths_8, true, "gen_helper_cmpxchg8b,gen_helper_cmpxchg8b_unlocked"),
+             widths_8, true,
+             "gen_helper_cmpxchg8b@SEM_INTERVAL_PAIRED,gen_helper_cmpxchg8b_unlocked@SEM_INTERVAL_PAIRED"),
     PRODUCER("paired.cmpxchg16b", SEM_OP_PAIRED, SEM_INTERVAL_PAIRED,
-             widths_16, true, "gen_helper_cmpxchg16b,gen_helper_cmpxchg16b_unlocked"),
+             widths_16, true,
+             "gen_helper_cmpxchg16b@SEM_INTERVAL_PAIRED,gen_helper_cmpxchg16b_unlocked@SEM_INTERVAL_PAIRED"),
     PRODUCER("simd.scalar", SEM_OP_SIMD, SEM_INTERVAL_EXACT_WIDTH,
-             widths_4_8, true, "gen_ldst_modrm_simd"),
+             widths_2_4_8, true,
+             "gen_ldst_modrm_simd@SEM_INTERVAL_EXACT_WIDTH,gen_ldq_env_A0@SEM_INTERVAL_EXACT_WIDTH,gen_stq_env_A0@SEM_INTERVAL_EXACT_WIDTH"),
     PRODUCER("simd.vector", SEM_OP_SIMD, SEM_INTERVAL_PAIRED,
-             widths_8_16, true, "gen_ldst_modrm_simd"),
+             widths_16, true,
+             "gen_ldo_env_A0@SEM_INTERVAL_PAIRED,gen_sto_env_A0@SEM_INTERVAL_PAIRED"),
     PRODUCER("simd.special", SEM_OP_SIMD, SEM_INTERVAL_EXACT_WIDTH,
-             widths_1_2_4_8, true, "gen_ldst_modrm_simd"),
+             widths_1_2_4_8, true,
+             "gen_sem_qemu_ld_tl@SEM_INTERVAL_EXACT_WIDTH,gen_sem_qemu_ld_i32@SEM_INTERVAL_EXACT_WIDTH,gen_sem_qemu_ld_i64@SEM_INTERVAL_EXACT_WIDTH,gen_sem_qemu_st_tl@SEM_INTERVAL_EXACT_WIDTH,gen_sem_qemu_st_i32@SEM_INTERVAL_EXACT_WIDTH,gen_sem_qemu_st_i64@SEM_INTERVAL_EXACT_WIDTH"),
     PRODUCER("x87.scalar", SEM_OP_X87_HELPER, SEM_INTERVAL_EXACT_WIDTH,
-             widths_2_4_8, true, "gen_helper_fldl_ST0,gen_helper_fstl_ST0"),
+             widths_2_4_8, true,
+             "gen_helper_fldl_ST0@SEM_INTERVAL_EXACT_WIDTH,gen_helper_fstl_ST0@SEM_INTERVAL_EXACT_WIDTH"),
     PRODUCER("x87.raw", SEM_OP_X87_HELPER, SEM_INTERVAL_RAW,
-             widths_10, true, "gen_helper_fldt_ST0,gen_helper_fstt_ST0,gen_helper_fbld_ST0,gen_helper_fbst_ST0"),
+             widths_10, true,
+             "gen_helper_fldt_ST0@SEM_INTERVAL_RAW,gen_helper_fstt_ST0@SEM_INTERVAL_RAW,gen_helper_fbld_ST0@SEM_INTERVAL_RAW,gen_helper_fbst_ST0@SEM_INTERVAL_RAW"),
     PRODUCER("x87.environment", SEM_OP_X87_HELPER, SEM_INTERVAL_RAW,
-             widths_14_28, true, "gen_helper_fstenv,gen_helper_fldenv"),
+             widths_14_28, true,
+             "gen_helper_fstenv@SEM_INTERVAL_RAW,gen_helper_fldenv@SEM_INTERVAL_RAW"),
     PRODUCER("x87.saved-state", SEM_OP_X87_HELPER, SEM_INTERVAL_RAW,
-             widths_94_108, true, "gen_helper_fsave,gen_helper_frstor"),
+             widths_94_108, true,
+             "gen_helper_fsave@SEM_INTERVAL_RAW,gen_helper_frstor@SEM_INTERVAL_RAW"),
     UNSUPPORTED("x87.legacy-width-x86_64",
                  "target=x86_64:14/94-byte forms require an i386 user target"),
     UNSUPPORTED("bound.legacy-x86_64",
                  "target=x86_64:BOUND requires an i386 user target"),
     PRODUCER("mpx.bndmov", SEM_OP_MPX, SEM_INTERVAL_PAIRED,
-             widths_8_16, true, "gen_ldst_modrm"),
+             widths_8_16, true,
+             "gen_sem_mpx_bndmov_access@SEM_INTERVAL_PAIRED"),
     PRODUCER("mpx.bndx-helper", SEM_OP_MPX, SEM_INTERVAL_MULTIPART,
-             widths_4_8_12_24, true, "gen_helper_bndldx32,gen_helper_bndldx64,gen_helper_bndstx32,gen_helper_bndstx64"),
+             widths_4_8_12_24, true,
+             "gen_helper_bndldx32@SEM_INTERVAL_MULTIPART,gen_helper_bndldx64@SEM_INTERVAL_MULTIPART,gen_helper_bndstx32@SEM_INTERVAL_MULTIPART,gen_helper_bndstx64@SEM_INTERVAL_MULTIPART"),
     PRODUCER("xsave.fxsave", SEM_OP_PAIRED, SEM_INTERVAL_SPARSE,
              widths_4_6_8_10_16_128_256, true,
-             "gen_helper_fxsave,gen_helper_fxrstor"),
+             "gen_helper_fxsave@SEM_INTERVAL_SPARSE,gen_helper_fxrstor@SEM_INTERVAL_SPARSE"),
     PRODUCER("xsave.xsave", SEM_OP_PAIRED, SEM_INTERVAL_SPARSE,
              widths_4_6_8_10_16_24_64_128_256, true,
-             "gen_helper_xsave,gen_helper_xsaveopt,gen_helper_xrstor"),
+             "gen_helper_xsave@SEM_INTERVAL_SPARSE,gen_helper_xsaveopt@SEM_INTERVAL_SPARSE,gen_helper_xrstor@SEM_INTERVAL_SPARSE"),
     DYNAMIC_PRODUCER("model.output", SEM_OP_LIBC_MODEL,
                      "file=symbolic.c,sem_mem_overwrite"),
     DYNAMIC_PRODUCER("syscall.output", SEM_OP_SYSCALL,
@@ -198,7 +218,8 @@ const SemProducerSpec sem_producer_table[] = {
     DYNAMIC_PRODUCER("snapshot.write", SEM_OP_SNAPSHOT,
                      "file=snapshot.c,sem_mem_overwrite"),
     PRODUCER("simd.maskmov", SEM_OP_SIMD, SEM_INTERVAL_SPARSE,
-             widths_1, true, "gen_helper_maskmov_mmx,gen_helper_maskmov_xmm"),
+             widths_1, true,
+             "gen_helper_maskmov_mmx@SEM_INTERVAL_SPARSE,gen_helper_maskmov_xmm@SEM_INTERVAL_SPARSE"),
     UNSUPPORTED("control.far", "gen_helper_lcall_real,gen_helper_lcall_protected,gen_helper_ljmp_protected,gen_helper_lret_protected:protected far-control/task-state helpers are unsupported in user F01"),
     UNSUPPORTED("control.iret", "gen_helper_iret_real,gen_helper_iret_protected:IRET helper has dynamic privilege/task-state accesses"),
     UNSUPPORTED("control.seg-load", "gen_helper_load_seg:descriptor-table segment loads are dynamic"),
@@ -209,13 +230,56 @@ const SemProducerSpec sem_producer_table[] = {
     UNSUPPORTED("control.seg-helper",
                  "file=seg_helper.c:all cpu_ld*/cpu_st* accesses are privilege/task-state dependent"),
     PRODUCER("bound.legacy", SEM_OP_INTEGER, SEM_INTERVAL_EXACT_WIDTH,
-             widths_4_8, true, "gen_helper_boundw,gen_helper_boundl"),
+             widths_4_8, true,
+             "gen_helper_boundw@SEM_INTERVAL_EXACT_WIDTH,gen_helper_boundl@SEM_INTERVAL_EXACT_WIDTH"),
     { NULL, 0, 0, NULL, 0, false, NULL },
 };
 
 #undef UNSUPPORTED
 #undef DYNAMIC_PRODUCER
 #undef PRODUCER
+
+static bool sem_op_class_is_valid(SemOpClass cls);
+
+/* Keep helper-side interval metadata fail-closed.  Translator wrappers carry
+ * the producer family and policy in packed event flags, and helper publishers
+ * receive the same family explicitly.  Runtime validation selects one
+ * manifest row, so a class-wide width union cannot authorize another family;
+ * the source inventory independently binds each annotated coverage token to
+ * that same row. */
+static const SemProducerSpec *sem_producer_for_id(SemProducerId producer)
+{
+    if ((unsigned int)producer >= SEM_PRODUCER_COUNT) {
+        return NULL;
+    }
+    if (sem_producer_table[(unsigned int)producer].producer == NULL) {
+        return NULL;
+    }
+    return &sem_producer_table[(unsigned int)producer];
+}
+
+static bool sem_interval_policy_declared(SemProducerId producer,
+                                          SemOpClass cls,
+                                          SemIntervalPolicy policy,
+                                          target_ulong size)
+{
+    const SemProducerSpec *spec = sem_producer_for_id(producer);
+
+    if (spec == NULL || !spec->supported ||
+        !sem_op_class_is_valid(cls) || size == 0 ||
+        spec->op_class != cls || spec->interval_policy != policy) {
+        return false;
+    }
+    if (policy == SEM_INTERVAL_DYNAMIC) {
+        return true;
+    }
+    for (uint32_t i = 0; i < spec->interval_width_count; i++) {
+        if (spec->interval_widths[i] == size) {
+            return true;
+        }
+    }
+    return false;
+}
 
 const SemHelperClass sem_helper_class_table[] = {
     { "sem_reg_invalidate",  SEM_OP_INTEGER },
@@ -741,8 +805,11 @@ void helper_sem_set_ea_vals(CPUArchState *env, target_ulong base_val,
 
 void sem_mem_access(CPUArchState *env, target_ulong addr,
                     target_ulong size, target_ulong pc, uint32_t flags,
-                    SemOpClass cls) {
+                    SemOpClass cls, SemIntervalPolicy policy,
+                    SemProducerId producer) {
     bool valid_class = sem_op_class_is_valid(cls);
+    bool valid_policy = sem_interval_policy_declared(producer, cls, policy,
+                                                     size);
     uint32_t is_store = flags & 1;
     /* The provenance access check runs only at sites that emitted it
      * historically (check bit set): those are exactly the EA-decomposed
@@ -764,6 +831,18 @@ void sem_mem_access(CPUArchState *env, target_ulong addr,
     if (!valid_class || (flags & 4)) {
         osprey_clear_pending_helper(st);
         osprey_clear_ea(st, true);
+        if (!valid_class) {
+            /* A successfully dispatched access with no declared class makes
+             * F01 incomplete.  Suppression alone would accept a known-bad
+             * sample, so reject the transaction after clearing state. */
+            sem_mark_unsupported_execution();
+        }
+        return;
+    }
+    if (!valid_policy) {
+        osprey_clear_pending_helper(st);
+        osprey_clear_ea(st, true);
+        sem_mark_unsupported_execution();
         return;
     }
     /* F01 gate: the current instruction must be mode-eligible.  The EA
@@ -784,7 +863,13 @@ void sem_mem_access(CPUArchState *env, target_ulong addr,
 void helper_sem_mem_access(CPUArchState *env, target_ulong addr,
                            target_ulong size, target_ulong pc,
                            uint32_t flags, uint32_t cls) {
-    sem_mem_access(env, addr, size, pc, flags, (SemOpClass)cls);
+    SemIntervalPolicy policy = (SemIntervalPolicy)(
+        (flags & SEM_MEM_POLICY_MASK) >> SEM_MEM_POLICY_SHIFT);
+    SemProducerId producer = (SemProducerId)(
+        (flags & SEM_MEM_PRODUCER_MASK) >> SEM_MEM_PRODUCER_SHIFT);
+    flags &= ~(SEM_MEM_POLICY_MASK | SEM_MEM_PRODUCER_MASK);
+    sem_mem_access(env, addr, size, pc, flags, (SemOpClass)cls, policy,
+                   producer);
 }
 
 void helper_sem_mem_overwrite(CPUArchState *env, target_ulong addr,
@@ -820,15 +905,21 @@ void helper_sem_mem_unsupported(CPUArchState *env, target_ulong pc,
 
 void sem_mem_helper_access(CPUArchState *env, target_ulong addr,
                            target_ulong size, target_ulong pc,
-                           bool is_store, SemOpClass cls) {
-    sem_mem_helper_access_part(env, addr, size, pc, is_store, cls, true);
+                           bool is_store, SemOpClass cls,
+                           SemIntervalPolicy policy,
+                           SemProducerId producer) {
+    sem_mem_helper_access_part(env, addr, size, pc, is_store, cls, policy,
+                               producer, true);
 }
 
 void sem_mem_helper_access_part(CPUArchState *env, target_ulong addr,
                                 target_ulong size, target_ulong pc,
                                 bool is_store, SemOpClass cls,
-                                bool final_part) {
+                                SemIntervalPolicy policy,
+                                SemProducerId producer, bool final_part) {
     bool valid_class = sem_op_class_is_valid(cls);
+    bool valid_policy = sem_interval_policy_declared(producer, cls, policy,
+                                                     size);
     /* Helper-backed operations publish after the helper succeeds.  If the
      * translator supplied provenance EA metadata, consume it for the first
      * ordered interval even when OSPREY is disabled.  Later parts have no
@@ -852,6 +943,22 @@ void sem_mem_helper_access_part(CPUArchState *env, target_ulong addr,
     if (!valid_class || !osprey_mode_ok(mode)) {
         osprey_clear_pending_helper(st);
         osprey_clear_ea(st, true);
+        if (!valid_class) {
+            sem_mark_unsupported_execution();
+        }
+        return;
+    }
+    if (!valid_policy ||
+        (st->pending_helper_count != 0 &&
+         (st->pending_helper[0].interval_policy != (uint32_t)policy ||
+          st->pending_helper[0].producer_id != (uint32_t)producer))) {
+        /* A helper that lies about its class/policy/family, or mixes
+         * contracts in one ordered aggregate, would otherwise publish a fact
+         * with no manifest contract.  Reject the whole sample rather than
+         * retaining a partial footprint. */
+        osprey_clear_pending_helper(st);
+        osprey_clear_ea(st, true);
+        sem_mark_unsupported_execution();
         return;
     }
     if (st->pending_helper_count >= OSPREY_MAX_PENDING_HELPER_INTERVALS) {
@@ -869,6 +976,8 @@ void sem_mem_helper_access_part(CPUArchState *env, target_ulong addr,
     pending->size = size;
     pending->pc = pc;
     pending->op_class = (uint32_t)cls;
+    pending->interval_policy = (uint32_t)policy;
+    pending->producer_id = (uint32_t)producer;
     pending->is_store = is_store;
     if (final_part) {
         for (uint32_t i = 0; i < st->pending_helper_count; i++) {
@@ -884,8 +993,10 @@ void sem_mem_helper_access_part(CPUArchState *env, target_ulong addr,
 
 void sem_mem_maskmov(CPUArchState *env, target_ulong addr,
                      uint32_t selected_mask, uint32_t width,
-                     target_ulong pc, SemOpClass cls) {
+                     target_ulong pc, SemOpClass cls,
+                     SemIntervalPolicy policy, SemProducerId producer) {
     bool valid_class = sem_op_class_is_valid(cls);
+    bool valid_policy = sem_interval_policy_declared(producer, cls, policy, 1);
     if (binradar_memcheck_enabled && (width == 8 || width == 16)) {
         for (uint32_t i = 0; i < width; i++) {
             if (selected_mask & (1u << i)) {
@@ -902,8 +1013,12 @@ void sem_mem_maskmov(CPUArchState *env, target_ulong addr,
      * before publishing selected-byte intervals. */
     osprey_clear_pending_helper(st);
     osprey_clear_ea(st, true);
-    if (!valid_class || (width != 8 && width != 16) ||
+    bool valid_width = width == 8 || width == 16;
+    if (!valid_class || !valid_policy || !valid_width ||
         !osprey_mode_ok(mode)) {
+        if (!valid_class || !valid_policy || !valid_width) {
+            sem_mark_unsupported_execution();
+        }
         return;
     }
     for (uint32_t i = 0; i < width; i++) {

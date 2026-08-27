@@ -17,8 +17,10 @@
  * never a recorded OSPREY fact.  The producer matrix and structure-aware
  * source inventory cover direct, atomic, helper-backed, function-pointer,
  * helper-body, and explicitly unsupported dynamic producer families.  The
- * source gate still does not replace full control-flow/cardinality review.
- * Multipart events are buffered until their final post-success constituent.
+ * source gate is paired with runtime family validation and deterministic
+ * control-region/cardinality checks; it is not a theorem about arbitrary
+ * compiler-generated control flow.  Multipart events are buffered until their
+ * final post-success constituent.
  */
 
 #include "qemu/osdep.h"
@@ -59,6 +61,67 @@ typedef enum SemIntervalPolicy {
     SEM_INTERVAL_UNSUPPORTED,
 } SemIntervalPolicy;
 
+/* Stable IDs for the rows in sem_producer_table.  A translator/helper event
+ * carries one ID in addition to its class and interval policy, so runtime
+ * validation selects one manifest family instead of accepting a class-wide
+ * width union.  The C unit test checks that table order and IDs stay aligned.
+ */
+typedef enum SemProducerId {
+    SEM_PRODUCER_INTEGER_MODRM,
+    SEM_PRODUCER_INTEGER_MOFFS,
+    SEM_PRODUCER_INTEGER_STRING,
+    SEM_PRODUCER_INTEGER_INS_OUTS,
+    SEM_PRODUCER_INTEGER_STACK,
+    SEM_PRODUCER_INTEGER_ENTER,
+    SEM_PRODUCER_INTEGER_DESCRIPTOR,
+    SEM_PRODUCER_ATOMIC_LOCK_RMW,
+    SEM_PRODUCER_ATOMIC_XCHG,
+    SEM_PRODUCER_PAIRED_CMPXCHG8B,
+    SEM_PRODUCER_PAIRED_CMPXCHG16B,
+    SEM_PRODUCER_SIMD_SCALAR,
+    SEM_PRODUCER_SIMD_VECTOR,
+    SEM_PRODUCER_SIMD_SPECIAL,
+    SEM_PRODUCER_X87_SCALAR,
+    SEM_PRODUCER_X87_RAW,
+    SEM_PRODUCER_X87_ENVIRONMENT,
+    SEM_PRODUCER_X87_SAVED_STATE,
+    SEM_PRODUCER_X87_LEGACY_WIDTH_X86_64,
+    SEM_PRODUCER_BOUND_LEGACY_X86_64,
+    SEM_PRODUCER_MPX_BNDMOV,
+    SEM_PRODUCER_MPX_BNDX_HELPER,
+    SEM_PRODUCER_XSAVE_FXSAVE,
+    SEM_PRODUCER_XSAVE_XSAVE,
+    SEM_PRODUCER_MODEL_OUTPUT,
+    SEM_PRODUCER_SYSCALL_OUTPUT,
+    SEM_PRODUCER_MAPPING_OUTPUT,
+    SEM_PRODUCER_SIGNAL_FRAME,
+    SEM_PRODUCER_SNAPSHOT_WRITE,
+    SEM_PRODUCER_SIMD_MASKMOV,
+    SEM_PRODUCER_CONTROL_FAR,
+    SEM_PRODUCER_CONTROL_IRET,
+    SEM_PRODUCER_CONTROL_SEG_LOAD,
+    SEM_PRODUCER_CONTROL_LLDT,
+    SEM_PRODUCER_CONTROL_LTR,
+    SEM_PRODUCER_CONTROL_SEG_QUERY,
+    SEM_PRODUCER_CONTROL_IO_BITMAP,
+    SEM_PRODUCER_CONTROL_SEG_HELPER,
+    SEM_PRODUCER_BOUND_LEGACY,
+    SEM_PRODUCER_COUNT,
+    SEM_PRODUCER_INVALID = 0xff,
+} SemProducerId;
+
+/* The TCG helper ABI has six arguments.  Pack the producer's interval policy
+ * and manifest-family ID into the unused high flags bits so runtime dispatch
+ * validates the exact class/policy/width row that the source inventory checks.
+ */
+#define SEM_MEM_POLICY_SHIFT 8
+#define SEM_MEM_POLICY_MASK  (0x7u << SEM_MEM_POLICY_SHIFT)
+#define SEM_MEM_PRODUCER_SHIFT 11
+#define SEM_MEM_PRODUCER_MASK  (0x3fu << SEM_MEM_PRODUCER_SHIFT)
+#define SEM_MEM_FLAGS_WITH_POLICY(_flags, _policy, _producer) \
+    ((_flags) | ((uint32_t)(_policy) << SEM_MEM_POLICY_SHIFT) | \
+     ((uint32_t)(_producer) << SEM_MEM_PRODUCER_SHIFT))
+
 typedef struct SemProducerSpec {
     const char *producer;
     SemOpClass op_class;
@@ -66,6 +129,9 @@ typedef struct SemProducerSpec {
     const uint32_t *interval_widths;
     uint32_t interval_width_count;
     bool supported;
+    /* Comma-separated source ownership tokens.  Supported tokens carry
+     * @SEM_INTERVAL_* so the source inventory binds each row to its event
+     * policy; dynamic rows carry explicit file/API tokens. */
     const char *coverage;
 } SemProducerSpec;
 
@@ -105,18 +171,21 @@ bool sem_events_active(void);
 void sem_mem_overwrite(target_ulong addr, target_ulong size,
                        SemOpClass cls);
 
-/* The translator carries the operation class on every memory event.  The
- * default wrappers use SEM_OP_INTEGER; special helpers use the explicit
- * class variant in translate.c. */
+/* The translator carries the operation class, interval policy, and manifest
+ * family on every memory event.  The family is validated independently from
+ * the class so overlapping producer rows cannot authorize one another. */
 void sem_mem_access(CPUArchState *env, target_ulong addr,
                     target_ulong size, target_ulong pc, uint32_t flags,
-                    SemOpClass cls);
+                    SemOpClass cls, SemIntervalPolicy policy,
+                    SemProducerId producer);
 
 /* Helper-backed guest memory operation.  The helper calls this only after
  * its complete architectural interval succeeds. */
 void sem_mem_helper_access(CPUArchState *env, target_ulong addr,
                            target_ulong size, target_ulong pc,
-                           bool is_store, SemOpClass cls);
+                           bool is_store, SemOpClass cls,
+                           SemIntervalPolicy policy,
+                           SemProducerId producer);
 
 /* Publish one part of a helper-backed operation.  Parts are emitted only
  * after the helper's complete architectural operation succeeds.  A false
@@ -124,14 +193,16 @@ void sem_mem_helper_access(CPUArchState *env, target_ulong addr,
 void sem_mem_helper_access_part(CPUArchState *env, target_ulong addr,
                                 target_ulong size, target_ulong pc,
                                 bool is_store, SemOpClass cls,
-                                bool final_part);
+                                SemIntervalPolicy policy,
+                                SemProducerId producer, bool final_part);
 
 /* MASKMOV writes only bytes whose mask MSB is set.  The helper publishes
  * one-byte intervals only after the complete helper succeeds; no partial
  * or contiguous full-width fact is invented for the sparse write. */
 void sem_mem_maskmov(CPUArchState *env, target_ulong addr,
                      uint32_t selected_mask, uint32_t width,
-                     target_ulong pc, SemOpClass cls);
+                     target_ulong pc, SemOpClass cls,
+                     SemIntervalPolicy policy, SemProducerId producer);
 
 /* Register overwrite (snapshot reg mutation).  Same fail-closed rule. */
 void sem_reg_overwrite(CPUArchState *env, int reg_idx, SemOpClass cls);

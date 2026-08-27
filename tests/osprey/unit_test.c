@@ -1829,10 +1829,22 @@ static void test_sem_manifest_integrity(void)
     }
     CHECK(n_emittable == n_helpers, "semantic helper sets have equal size");
 
+    CHECK(SEM_PRODUCER_COUNT <=
+              (SEM_MEM_PRODUCER_MASK >> SEM_MEM_PRODUCER_SHIFT) + 1,
+          "producer IDs fit packed event flags");
+    CHECK(SEM_INTERVAL_UNSUPPORTED <=
+              (SEM_MEM_POLICY_MASK >> SEM_MEM_POLICY_SHIFT),
+          "interval policies fit packed event flags");
     int n_producers = 0;
     bool seen_class[SEM_OP_CLASS_COUNT] = { false };
     for (const SemProducerSpec *p = sem_producer_table;
          p->producer != NULL; p++, n_producers++) {
+        CHECK((unsigned int)n_producers < SEM_PRODUCER_COUNT &&
+              (SemProducerId)n_producers != SEM_PRODUCER_INVALID,
+              "producer row has a representable family ID");
+        CHECK((unsigned int)n_producers ==
+                  (unsigned int)(p - sem_producer_table),
+              "producer row ID follows manifest order");
         CHECK(p->producer[0] != '\0', "producer name non-empty");
         int name_matches = 0;
         for (const SemProducerSpec *q = sem_producer_table;
@@ -1878,7 +1890,8 @@ static void test_sem_manifest_integrity(void)
         }
         seen_class[(unsigned int)p->op_class] = true;
     }
-    CHECK(n_producers != 0, "producer matrix is non-empty");
+    CHECK(n_producers == SEM_PRODUCER_COUNT,
+          "manifest rows have one family ID each");
     for (int i = 0; i < SEM_OP_UNKNOWN; i++) {
         CHECK(seen_class[i], "producer matrix covers operation class");
     }
@@ -1986,7 +1999,8 @@ static void test_sem_access_class_and_flags(void)
     /* A valid SIMD class on a plain F01 event records exactly one access. */
     OspreyCpuOriginState *st = osprey_cpu_origin(env);
     st->ea_mode = MO_64;
-    sem_mem_access(env, 0x402008, 8, 0x400100, 8, SEM_OP_SIMD);
+    sem_mem_access(env, 0x402008, 8, 0x400100, 8, SEM_OP_SIMD,
+                   SEM_INTERVAL_EXACT_WIDTH, SEM_PRODUCER_SIMD_SCALAR);
     CHECK(run->access_used == 1, "valid class records F01 access");
     CHECK(!st->ea_valid && st->ea_mode == 0,
           "plain event consumes EA state");
@@ -1994,14 +2008,97 @@ static void test_sem_access_class_and_flags(void)
     /* Operation class is part of F01 identity: the same PC/address/width
      * under two classes yields two rows, while an exact duplicate merges. */
     st->ea_mode = MO_64;
-    sem_mem_access(env, 0x402008, 8, 0x400100, 8, SEM_OP_ATOMIC_RMW);
+    sem_mem_access(env, 0x402008, 8, 0x400100, 8, SEM_OP_ATOMIC_RMW,
+                   SEM_INTERVAL_EXACT_WIDTH,
+                   SEM_PRODUCER_ATOMIC_LOCK_RMW);
     CHECK(run->access_used == 2, "different classes remain distinct facts");
     st->ea_mode = MO_64;
-    sem_mem_access(env, 0x402008, 8, 0x400100, 8, SEM_OP_ATOMIC_RMW);
+    sem_mem_access(env, 0x402008, 8, 0x400100, 8, SEM_OP_ATOMIC_RMW,
+                   SEM_INTERVAL_EXACT_WIDTH,
+                   SEM_PRODUCER_ATOMIC_LOCK_RMW);
     CHECK(run->access_used == 2, "same class fact merges exactly");
 
-    /* Unknown classes are rejected without recording, and still consume
+    /* Probe every fixed manifest row through the actual runtime dispatcher.
+     * Unique PCs keep rows independent; a valid width/policy pair must
+     * publish, while dynamic rows are intentionally covered by their
+     * class-carrying overwrite API. */
+    uint32_t policy_probe = 0;
+    uint32_t expected_accesses = run->access_used;
+    for (const SemProducerSpec *p = sem_producer_table;
+         p->producer != NULL; p++) {
+        if (!p->supported || p->interval_policy == SEM_INTERVAL_DYNAMIC) {
+            continue;
+        }
+        for (uint32_t i = 0; i < p->interval_width_count; i++) {
+            st->ea_mode = MO_64;
+            sem_mem_access(env, 0x402100 + policy_probe,
+                           p->interval_widths[i],
+                           0x400200 + policy_probe, 8, p->op_class,
+                           p->interval_policy,
+                           (SemProducerId)(p - sem_producer_table));
+            expected_accesses++;
+            policy_probe++;
+        }
+    }
+    CHECK(run->access_used == expected_accesses &&
+          run->unsupported_execution == 0,
+          "every fixed manifest policy/width pair publishes");
+    /* Keep the following rejection/cardinality assertions focused on their
+     * original two-row fixture rather than coupling them to probe volume. */
+    osprey_shared_run_reset(run, 1, &c);
+    osprey_child_use_shared_run(ctx, run);
+    fill_two_access_facts(run);
+    st->ea_valid = false;
+    st->ea_mode = 0;
+    st->pending_helper_count = 0;
+
+    /* A class/policy pair absent from the manifest rejects the sample rather
+     * than publishing a fact under a class-unioned width contract. */
+    run->unsupported_execution = 0;
+    st->ea_mode = MO_64;
+    sem_mem_access(env, 0x40200c, 8, 0x400104, 8, SEM_OP_INTEGER,
+                   SEM_INTERVAL_RAW, SEM_PRODUCER_INTEGER_MODRM);
+    CHECK(run->access_used == 2,
+          "undeclared policy suppresses F01 access");
+    CHECK(run->unsupported_execution == 1,
+          "undeclared policy rejects the sample");
+    CHECK(!st->ea_valid && st->ea_mode == 0,
+          "undeclared policy clears EA state");
+    osprey_collect_enabled = 1;
+
+    run->unsupported_execution = 0;
+    st->ea_mode = MO_64;
+    sem_mem_access(env, 0x40200c, 8, 0x400104, 8, SEM_OP_INTEGER,
+                   SEM_INTERVAL_EXACT_WIDTH, SEM_PRODUCER_INVALID);
+    CHECK(run->access_used == 2 && run->unsupported_execution == 1,
+          "invalid producer family rejects F01 access");
+    CHECK(!st->ea_valid && st->ea_mode == 0,
+          "invalid producer family clears EA state");
+    osprey_collect_enabled = 1;
+
+    run->unsupported_execution = 0;
+    st->ea_mode = MO_64;
+    sem_mem_access(env, 0x40200c, 24, 0x400108, 8, SEM_OP_PAIRED,
+                   SEM_INTERVAL_SPARSE, SEM_PRODUCER_XSAVE_FXSAVE);
+    CHECK(run->access_used == 2 && run->unsupported_execution == 1,
+          "cross-family width rejects F01 access");
+    CHECK(!st->ea_valid && st->ea_mode == 0,
+          "cross-family width clears EA state");
+    osprey_collect_enabled = 1;
+
+    run->unsupported_execution = 0;
+    st->ea_mode = MO_64;
+    sem_mem_maskmov(env, 0x40200c, 1, 32, 0x40010c, SEM_OP_SIMD,
+                    SEM_INTERVAL_SPARSE, SEM_PRODUCER_SIMD_MASKMOV);
+    CHECK(run->access_used == 2 && run->unsupported_execution == 1,
+          "invalid sparse width rejects F01 access");
+    CHECK(!st->ea_valid && st->ea_mode == 0,
+          "invalid sparse width clears EA state");
+    osprey_collect_enabled = 1;
+
+    /* Unknown classes reject the sample without recording, and still consume
      * the state left by a preceding failed/unsupported path. */
+    run->unsupported_execution = 0;
     st->ea_valid = true;
     st->ea_mode = MO_64;
     st->ea_base_reg = R_EAX;
@@ -2009,7 +2106,8 @@ static void test_sem_access_class_and_flags(void)
     st->ea_base_origin.valid = 1;
     st->pending_helper_count = 1;
     sem_mem_access(env, 0x402010, 8, 0x400100, 8,
-                   (SemOpClass)-1);
+                   (SemOpClass)-1, SEM_INTERVAL_EXACT_WIDTH,
+                   SEM_PRODUCER_INTEGER_MODRM);
     CHECK(run->access_used == 2, "invalid class suppresses F01 access");
     CHECK(!st->ea_valid && st->ea_mode == 0,
           "invalid class clears EA state");
@@ -2018,12 +2116,17 @@ static void test_sem_access_class_and_flags(void)
           "invalid class clears all EA metadata");
     CHECK(st->pending_helper_count == 0,
           "invalid class clears multipart state");
+    CHECK(run->unsupported_execution == 1,
+          "invalid class rejects incomplete F01 sample");
+    osprey_collect_enabled = 1;
 
     /* Bit 4 is the provenance-only follow-up for an EA-decomposed
      * operation; it must not create a duplicate F01 row. */
     st->ea_valid = true;
     st->ea_mode = MO_64;
-    sem_mem_access(env, 0x402018, 8, 0x400100, 4, SEM_OP_ATOMIC_RMW);
+    sem_mem_access(env, 0x402018, 8, 0x400100, 4, SEM_OP_ATOMIC_RMW,
+                   SEM_INTERVAL_EXACT_WIDTH,
+                   SEM_PRODUCER_ATOMIC_LOCK_RMW);
     CHECK(run->access_used == 2, "EA follow-up suppresses duplicate F01");
     CHECK(!st->ea_valid && st->ea_mode == 0,
           "EA follow-up clears pending state");
@@ -2033,7 +2136,8 @@ static void test_sem_access_class_and_flags(void)
     st->ea_index_reg = R_ECX;
     st->ea_index_val = 0x402020;
     st->ea_index_origin.valid = 1;
-    sem_mem_access(env, 0x402020, 8, 0x400100, 4, SEM_OP_SIMD);
+    sem_mem_access(env, 0x402020, 8, 0x400100, 4, SEM_OP_SIMD,
+                   SEM_INTERVAL_EXACT_WIDTH, SEM_PRODUCER_SIMD_SCALAR);
     CHECK(st->ea_index_reg == 0 && st->ea_index_val == 0 &&
           !st->ea_index_origin.valid,
           "provenance-only follow-up clears all EA metadata");
@@ -2041,7 +2145,8 @@ static void test_sem_access_class_and_flags(void)
     st->ea_valid = true;
     st->ea_mode = MO_32;
     st->ea_base_origin.valid = 1;
-    sem_mem_access(env, 0x402028, 8, 0x400100, 8, SEM_OP_INTEGER);
+    sem_mem_access(env, 0x402028, 8, 0x400100, 8, SEM_OP_INTEGER,
+                   SEM_INTERVAL_EXACT_WIDTH, SEM_PRODUCER_INTEGER_MODRM);
     CHECK(run->access_used == 2, "ineligible address mode suppresses F01");
     CHECK(!st->ea_valid && st->ea_mode == 0 &&
           !st->ea_base_origin.valid,
@@ -2055,9 +2160,21 @@ static void test_sem_access_class_and_flags(void)
     prov->ea_meta.valid = true;
     prov->ea_meta.aflags = MO_32;
     sem_mem_helper_access(env, 0x402030, 8, 0x400110, false,
-                          SEM_OP_INTEGER);
+                          SEM_OP_INTEGER, SEM_INTERVAL_EXACT_WIDTH,
+                          SEM_PRODUCER_INTEGER_MODRM);
     CHECK(!prov->ea_meta.valid,
           "provenance-only helper event consumes EA metadata");
+
+    osprey_collect_enabled = 1;
+    run->unsupported_execution = 0;
+    st->ea_mode = MO_64;
+    sem_mem_helper_access(env, 0x402038, 8, 0x400118, false,
+                          SEM_OP_MPX, SEM_INTERVAL_EXACT_WIDTH,
+                          SEM_PRODUCER_MPX_BNDX_HELPER);
+    CHECK(run->access_used == 2,
+          "helper undeclared policy suppresses F01 access");
+    CHECK(run->unsupported_execution == 1,
+          "helper undeclared policy rejects the sample");
 
     /* Multipart helpers buffer every constituent until the final
      * post-success callback.  A first successful part must not publish a
@@ -2066,13 +2183,27 @@ static void test_sem_access_class_and_flags(void)
     osprey_collect_enabled = 1;
     st->ea_mode = MO_64;
     sem_mem_helper_access_part(env, 0x402040, 8, 0x400120, false,
-                               SEM_OP_MPX, false);
+                               SEM_OP_MPX, SEM_INTERVAL_MULTIPART,
+                               SEM_PRODUCER_MPX_BNDX_HELPER, false);
     CHECK(run->access_used == 2,
           "multipart first part remains unpublished");
     sem_mem_helper_access_part(env, 0x402080, 24, 0x400120, false,
-                               SEM_OP_MPX, true);
+                               SEM_OP_MPX, SEM_INTERVAL_MULTIPART,
+                               SEM_PRODUCER_MPX_BNDX_HELPER, true);
     CHECK(run->access_used == 4,
           "multipart final part publishes all intervals");
+
+    run->unsupported_execution = 0;
+    st->ea_mode = MO_64;
+    sem_mem_helper_access_part(env, 0x4020a0, 4, 0x400124, true,
+                               SEM_OP_PAIRED, SEM_INTERVAL_SPARSE,
+                               SEM_PRODUCER_XSAVE_FXSAVE, false);
+    sem_mem_helper_access_part(env, 0x4020a8, 4, 0x400124, true,
+                               SEM_OP_PAIRED, SEM_INTERVAL_SPARSE,
+                               SEM_PRODUCER_XSAVE_XSAVE, false);
+    CHECK(st->pending_helper_count == 0 && run->unsupported_execution == 1,
+          "mixed multipart producer rows reject the aggregate");
+    osprey_collect_enabled = 1;
 
     /* Exceeding the fixed multipart buffer must reject the sample, not
      * silently discard a known-incomplete helper footprint. */
@@ -2080,12 +2211,14 @@ static void test_sem_access_class_and_flags(void)
     st->ea_mode = MO_64;
     for (uint32_t i = 0; i < OSPREY_MAX_PENDING_HELPER_INTERVALS; i++) {
         sem_mem_helper_access_part(env, 0x402100 + i, 1, 0x400128,
-                                   true, SEM_OP_SIMD, false);
+                                   true, SEM_OP_SIMD, SEM_INTERVAL_SPARSE,
+                                   SEM_PRODUCER_SIMD_MASKMOV, false);
     }
     CHECK(st->pending_helper_count == OSPREY_MAX_PENDING_HELPER_INTERVALS,
           "multipart buffer accepts its exact bounded capacity");
     sem_mem_helper_access_part(env, 0x402200, 1, 0x400128, true,
-                               SEM_OP_SIMD, false);
+                               SEM_OP_SIMD, SEM_INTERVAL_SPARSE,
+                               SEM_PRODUCER_SIMD_MASKMOV, false);
     CHECK(st->pending_helper_count == 0 && st->ea_mode == 0,
           "multipart overflow clears buffered semantic state");
     CHECK(run->unsupported_execution == 1,

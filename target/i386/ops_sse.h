@@ -497,7 +497,8 @@ void glue(helper_maskmov, SUFFIX)(CPUX86State *env, Reg *d, Reg *s,
             selected_mask |= 1u << i;
         }
     }
-    sem_mem_maskmov(env, a0, selected_mask, 8 << SHIFT, pc, SEM_OP_SIMD);
+    sem_mem_maskmov(env, a0, selected_mask, 8 << SHIFT, pc, SEM_OP_SIMD,
+                   SEM_INTERVAL_SPARSE, SEM_PRODUCER_SIMD_MASKMOV);
 }
 
 void glue(helper_movl_mm_T0, SUFFIX)(Reg *d, uint32_t val)

@@ -179,7 +179,9 @@ void helper_boundw(CPUX86State *env, target_ulong a0, int v,
         }
         raise_exception_ra(env, EXCP05_BOUND, ra);
     }
-    sem_mem_helper_access(env, a0, 4, pc, false, SEM_OP_INTEGER);
+    sem_mem_helper_access(env, a0, 4, pc, false, SEM_OP_INTEGER,
+                           SEM_INTERVAL_EXACT_WIDTH,
+                           SEM_PRODUCER_BOUND_LEGACY);
 }
 
 void helper_boundl(CPUX86State *env, target_ulong a0, int v,
@@ -196,5 +198,7 @@ void helper_boundl(CPUX86State *env, target_ulong a0, int v,
         }
         raise_exception_ra(env, EXCP05_BOUND, ra);
     }
-    sem_mem_helper_access(env, a0, 8, pc, false, SEM_OP_INTEGER);
+    sem_mem_helper_access(env, a0, 8, pc, false, SEM_OP_INTEGER,
+                           SEM_INTERVAL_EXACT_WIDTH,
+                           SEM_PRODUCER_BOUND_LEGACY);
 }

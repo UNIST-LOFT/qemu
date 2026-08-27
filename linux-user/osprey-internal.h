@@ -228,8 +228,10 @@ typedef struct OspreyPendingHelperInterval {
     target_ulong size;
     target_ulong pc;
     uint32_t op_class;
+    uint32_t interval_policy;
+    uint32_t producer_id;
     uint8_t is_store;
-    uint8_t reserved[4];
+    uint8_t reserved[3];
 } OspreyPendingHelperInterval;
 
 typedef struct OspreyCpuOriginState {
@@ -259,8 +261,8 @@ typedef struct OspreyCpuOriginState {
     OspreyRegOrigin ea_base_origin;
     OspreyRegOrigin ea_index_origin;
     /* Helper-backed multipart accesses are committed only after their
-     * final constituent succeeds.  A fault between parts therefore
-     * cannot publish a partial F01 aggregate. */
+     * final constituent succeeds.  A fault or producer-family change
+     * between parts therefore cannot publish a partial F01 aggregate. */
     OspreyPendingHelperInterval pending_helper[
         OSPREY_MAX_PENDING_HELPER_INTERVALS];
     uint32_t pending_helper_count;

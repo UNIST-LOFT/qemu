@@ -225,17 +225,35 @@ static void gen_sem_reg_xchg(int dst_idx, int src_idx) {
     tcg_temp_free_i32(t_dst);
     tcg_temp_free_i32(t_src);
 }
+static SemProducerId sem_default_producer(SemOpClass cls)
+{
+    switch (cls) {
+    case SEM_OP_SIMD:
+        return SEM_PRODUCER_SIMD_SCALAR;
+    case SEM_OP_X87_HELPER:
+        return SEM_PRODUCER_X87_SCALAR;
+    case SEM_OP_ATOMIC_RMW:
+        return SEM_PRODUCER_ATOMIC_LOCK_RMW;
+    case SEM_OP_PAIRED:
+        return SEM_PRODUCER_PAIRED_CMPXCHG8B;
+    case SEM_OP_INTEGER:
+    default:
+        return SEM_PRODUCER_INTEGER_MODRM;
+    }
+}
+
 /* Runtime access event.  Emitted AFTER the guest load/store.  Bit 0 is
  * is_store, bit 1 requests the provenance EA check, bit 2 marks the
  * provenance-only follow-up (no duplicate F01), and bit 3 marks a plain
  * F01 event that consumes no EA decomposition. */
-static void gen_sem_mem_access_flags_class(TCGv t_addr, TCGMemOp ot,
-                                           target_ulong pc, uint32_t flags,
-                                           SemOpClass cls) {
+static void gen_sem_mem_access_flags_class_producer(
+    TCGv t_addr, TCGMemOp ot, target_ulong pc, uint32_t flags,
+    SemOpClass cls, SemProducerId producer) {
     if (!sem_events_active()) return;
     TCGv t_size = tcg_const_tl(1 << (ot & MO_SIZE));
     TCGv t_pc = tcg_const_tl(pc);
-    TCGv_i32 t_flags = tcg_const_i32(flags);
+    TCGv_i32 t_flags = tcg_const_i32(SEM_MEM_FLAGS_WITH_POLICY(
+        flags, SEM_INTERVAL_EXACT_WIDTH, producer));
     TCGv_i32 t_cls = tcg_const_i32(cls);
     gen_helper_sem_mem_access(cpu_env, t_addr, t_size, t_pc, t_flags,
                               t_cls);
@@ -243,6 +261,13 @@ static void gen_sem_mem_access_flags_class(TCGv t_addr, TCGMemOp ot,
     tcg_temp_free(t_pc);
     tcg_temp_free_i32(t_flags);
     tcg_temp_free_i32(t_cls);
+}
+
+static void gen_sem_mem_access_flags_class(TCGv t_addr, TCGMemOp ot,
+                                           target_ulong pc, uint32_t flags,
+                                           SemOpClass cls) {
+    gen_sem_mem_access_flags_class_producer(
+        t_addr, ot, pc, flags, cls, sem_default_producer(cls));
 }
 
 /* EA-decomposed provenance follow-up.  The generic load/store wrapper has
@@ -260,15 +285,19 @@ static void gen_sem_mem_access(TCGv t_addr, TCGMemOp ot,
     gen_sem_mem_access_class(t_addr, ot, pc, is_store, SEM_OP_INTEGER);
 }
 
-/* Raw-size variant for non-power-of-two x87 helper intervals
- * (fstenv 14/28, fsave 94/108, fstpt/fbstp 10). */
-static void gen_sem_mem_access_f01_raw_class(TCGv t_addr, target_ulong size,
-                                             target_ulong pc, bool is_store,
-                                             SemOpClass cls) {
+/* Raw-size variant for non-power-of-two x87/helper intervals.  The
+ * policy-only suffix is intentional: it keeps interval policy visible at
+ * every non-default producer callsite and packs it into the shared event's
+ * flags for runtime validation without changing the TCG helper ABI.  The
+ * class wrapper below is the common exact-width path. */
+static void gen_sem_mem_access_f01_raw_class_policy(
+    TCGv t_addr, target_ulong size, target_ulong pc, bool is_store,
+    SemOpClass cls, SemIntervalPolicy policy, SemProducerId producer) {
     if (!sem_events_active()) return;
     TCGv t_size = tcg_const_tl(size);
     TCGv t_pc = tcg_const_tl(pc);
-    TCGv_i32 t_flags = tcg_const_i32((is_store ? 1 : 0) | 8);
+    TCGv_i32 t_flags = tcg_const_i32(SEM_MEM_FLAGS_WITH_POLICY(
+        (is_store ? 1 : 0) | 8, policy, producer));
     TCGv_i32 t_cls = tcg_const_i32(cls);
     gen_helper_sem_mem_access(cpu_env, t_addr, t_size, t_pc, t_flags,
                               t_cls);
@@ -278,11 +307,46 @@ static void gen_sem_mem_access_f01_raw_class(TCGv t_addr, target_ulong size,
     tcg_temp_free_i32(t_cls);
 }
 
+static void gen_sem_mem_access_f01_class_policy(
+    TCGv t_addr, TCGMemOp ot, target_ulong pc, bool is_store,
+    SemOpClass cls, SemIntervalPolicy policy, SemProducerId producer) {
+    gen_sem_mem_access_f01_raw_class_policy(
+        t_addr, 1 << (ot & MO_SIZE), pc, is_store, cls, policy, producer);
+}
+
+static void gen_sem_mem_access_f01_class_policy_default(
+    TCGv t_addr, TCGMemOp ot, target_ulong pc, bool is_store,
+    SemOpClass cls, SemIntervalPolicy policy) {
+    gen_sem_mem_access_f01_class_policy(
+        t_addr, ot, pc, is_store, cls, policy, sem_default_producer(cls));
+}
+
+static void gen_sem_descriptor_access_f01(TCGv addr, target_ulong size,
+                                          target_ulong pc, bool is_store) {
+    gen_sem_mem_access_f01_raw_class_policy(
+        addr, size, pc, is_store, SEM_OP_INTEGER, SEM_INTERVAL_MULTIPART,
+        SEM_PRODUCER_INTEGER_DESCRIPTOR);
+}
+
+static void gen_sem_mpx_bndmov_access(TCGv addr, target_ulong size,
+                                      target_ulong pc, bool is_store) {
+    gen_sem_mem_access_f01_raw_class_policy(
+        addr, size, pc, is_store, SEM_OP_MPX, SEM_INTERVAL_PAIRED,
+        SEM_PRODUCER_MPX_BNDMOV);
+}
+
 static void gen_sem_mem_access_f01_class(TCGv t_addr, TCGMemOp ot,
                                          target_ulong pc, bool is_store,
                                          SemOpClass cls) {
-    gen_sem_mem_access_f01_raw_class(t_addr, 1 << (ot & MO_SIZE), pc,
-                                     is_store, cls);
+    gen_sem_mem_access_f01_class_policy_default(
+        t_addr, ot, pc, is_store, cls, SEM_INTERVAL_EXACT_WIDTH);
+}
+
+static void gen_sem_mem_xchg_f01(TCGv addr, TCGMemOp ot, target_ulong pc)
+{
+    gen_sem_mem_access_f01_class_policy(
+        addr, ot, pc, true, SEM_OP_ATOMIC_RMW,
+        SEM_INTERVAL_EXACT_WIDTH, SEM_PRODUCER_ATOMIC_XCHG);
 }
 
 /* Explicit fail-closed boundary for helper-backed operations whose guest
@@ -418,6 +482,10 @@ struct DisasContext {
      * write so the return hook owns the activation pop exactly once
      * (including ret imm). */
     bool osprey_skip_rsp_update;
+    /* Manifest family for generic memory events in this instruction.  An
+     * INVALID value selects the class-specific default; stack/string/I/O
+     * translators override it so their narrower width rows are enforced. */
+    SemProducerId sem_producer;
     /* The next generic memory primitive has an explicit EA record. */
     bool sem_ea_pending;
     /* RMW instructions publish one architectural interval after the
@@ -495,44 +563,63 @@ static void gen_sem_set_ea(DisasContext *s, int base_reg, int index_reg,
 }
 
 /* Direct TCG memory primitives must use these wrappers.  They emit one
- * post-success interval and carry the operation class; paired helpers use
- * the raw event functions so constituent stores do not create F01 rows. */
+ * post-success interval and carry the operation class and manifest family;
+ * paired helpers use raw event functions so constituent stores do not create
+ * F01 rows. */
+static SemProducerId sem_instruction_producer(const DisasContext *s,
+                                              SemOpClass cls)
+{
+    return s->sem_producer == SEM_PRODUCER_INVALID
+        ? sem_default_producer(cls) : s->sem_producer;
+}
+
 static void gen_sem_mem_access_f01_auto_class(DisasContext *s, TCGv t_addr,
                                               TCGMemOp ot, target_ulong pc,
                                               bool is_store, SemOpClass cls)
 {
+    SemProducerId producer = sem_instruction_producer(s, cls);
     if (s->sem_ea_pending) {
-        gen_sem_mem_access_flags_class(t_addr, ot, pc,
-                                       (is_store ? 1 : 0) | 8, cls);
+        gen_sem_mem_access_flags_class_producer(
+            t_addr, ot, pc, (is_store ? 1 : 0) | 8, cls, producer);
     } else {
-        gen_sem_mem_access_f01_raw_class(t_addr, 1 << (ot & MO_SIZE), pc,
-                                         is_store, cls);
+        gen_sem_mem_access_f01_raw_class_policy(
+            t_addr, 1 << (ot & MO_SIZE), pc, is_store, cls,
+            SEM_INTERVAL_EXACT_WIDTH, producer);
     }
     s->sem_ea_pending = false;
+}
+
+static SemProducerId sem_qemu_producer(SemOpClass cls)
+{
+    return cls == SEM_OP_SIMD ? SEM_PRODUCER_SIMD_SPECIAL
+                               : SEM_PRODUCER_INTEGER_MODRM;
 }
 
 static void gen_sem_qemu_ld_tl(DisasContext *s, TCGv dst, TCGv addr,
                                TCGMemOp ot, SemOpClass cls) {
     gen_sem_set_ea_mode(s);
     tcg_gen_qemu_ld_tl(dst, addr, s->mem_index, ot);
-    gen_sem_mem_access_f01_raw_class(addr, 1 << (ot & MO_SIZE),
-                                     s->pc_start, false, cls);
+    gen_sem_mem_access_f01_raw_class_policy(
+        addr, 1 << (ot & MO_SIZE), s->pc_start, false, cls,
+        SEM_INTERVAL_EXACT_WIDTH, sem_qemu_producer(cls));
 }
 
 static void gen_sem_qemu_ld_i32(DisasContext *s, TCGv_i32 dst, TCGv addr,
                                 TCGMemOp ot, SemOpClass cls) {
     gen_sem_set_ea_mode(s);
     tcg_gen_qemu_ld_i32(dst, addr, s->mem_index, ot);
-    gen_sem_mem_access_f01_raw_class(addr, 1 << (ot & MO_SIZE), s->pc_start,
-                                     false, cls);
+    gen_sem_mem_access_f01_raw_class_policy(
+        addr, 1 << (ot & MO_SIZE), s->pc_start, false, cls,
+        SEM_INTERVAL_EXACT_WIDTH, sem_qemu_producer(cls));
 }
 
 static void gen_sem_qemu_ld_i64(DisasContext *s, TCGv_i64 dst, TCGv addr,
                                 TCGMemOp ot, SemOpClass cls) {
     gen_sem_set_ea_mode(s);
     tcg_gen_qemu_ld_i64(dst, addr, s->mem_index, ot);
-    gen_sem_mem_access_f01_raw_class(addr, 1 << (ot & MO_SIZE), s->pc_start,
-                                     false, cls);
+    gen_sem_mem_access_f01_raw_class_policy(
+        addr, 1 << (ot & MO_SIZE), s->pc_start, false, cls,
+        SEM_INTERVAL_EXACT_WIDTH, sem_qemu_producer(cls));
 }
 
 static void gen_sem_qemu_st_tl(DisasContext *s, TCGv src, TCGv addr,
@@ -540,8 +627,9 @@ static void gen_sem_qemu_st_tl(DisasContext *s, TCGv src, TCGv addr,
     gen_sem_set_ea_mode(s);
     tcg_gen_qemu_st_tl(src, addr, s->mem_index, ot);
     gen_sem_on_store_class(-1, addr, ot, cls);
-    gen_sem_mem_access_f01_raw_class(addr, 1 << (ot & MO_SIZE),
-                                     s->pc_start, true, cls);
+    gen_sem_mem_access_f01_raw_class_policy(
+        addr, 1 << (ot & MO_SIZE), s->pc_start, true, cls,
+        SEM_INTERVAL_EXACT_WIDTH, sem_qemu_producer(cls));
 }
 
 static void gen_sem_qemu_st_i32(DisasContext *s, TCGv_i32 src, TCGv addr,
@@ -549,8 +637,9 @@ static void gen_sem_qemu_st_i32(DisasContext *s, TCGv_i32 src, TCGv addr,
     gen_sem_set_ea_mode(s);
     tcg_gen_qemu_st_i32(src, addr, s->mem_index, ot);
     gen_sem_on_store_class(-1, addr, ot, cls);
-    gen_sem_mem_access_f01_raw_class(addr, 1 << (ot & MO_SIZE), s->pc_start,
-                                     true, cls);
+    gen_sem_mem_access_f01_raw_class_policy(
+        addr, 1 << (ot & MO_SIZE), s->pc_start, true, cls,
+        SEM_INTERVAL_EXACT_WIDTH, sem_qemu_producer(cls));
 }
 
 static void gen_sem_qemu_st_i64(DisasContext *s, TCGv_i64 src, TCGv addr,
@@ -558,8 +647,9 @@ static void gen_sem_qemu_st_i64(DisasContext *s, TCGv_i64 src, TCGv addr,
     gen_sem_set_ea_mode(s);
     tcg_gen_qemu_st_i64(src, addr, s->mem_index, ot);
     gen_sem_on_store_class(-1, addr, ot, cls);
-    gen_sem_mem_access_f01_raw_class(addr, 1 << (ot & MO_SIZE), s->pc_start,
-                                     true, cls);
+    gen_sem_mem_access_f01_raw_class_policy(
+        addr, 1 << (ot & MO_SIZE), s->pc_start, true, cls,
+        SEM_INTERVAL_EXACT_WIDTH, sem_qemu_producer(cls));
 }
 
 static void gen_eob(DisasContext *s);
@@ -878,6 +968,13 @@ static inline void gen_op_ld_v(DisasContext *s, int idx, TCGv t0, TCGv a0)
     gen_op_ld_v_class(s, idx, t0, a0, SEM_OP_INTEGER);
 }
 
+static inline void gen_op_ld_v_moffs(DisasContext *s, int idx, TCGv t0,
+                                     TCGv a0)
+{
+    s->sem_producer = SEM_PRODUCER_INTEGER_MOFFS;
+    gen_op_ld_v(s, idx, t0, a0);
+}
+
 static inline void gen_op_st_v_raw_class(DisasContext *s, int idx, TCGv t0,
                                          TCGv a0, SemOpClass cls)
 {
@@ -915,6 +1012,13 @@ static inline void gen_op_st_v_class(DisasContext *s, int idx, TCGv t0,
 static inline void gen_op_st_v(DisasContext *s, int idx, TCGv t0, TCGv a0)
 {
     gen_op_st_v_class(s, idx, t0, a0, SEM_OP_INTEGER);
+}
+
+static inline void gen_op_st_v_moffs(DisasContext *s, int idx, TCGv t0,
+                                     TCGv a0)
+{
+    s->sem_producer = SEM_PRODUCER_INTEGER_MOFFS;
+    gen_op_st_v(s, idx, t0, a0);
 }
 
 static inline void gen_op_st_rm_T0_A0(DisasContext *s, int idx, int d)
@@ -1133,6 +1237,7 @@ static void gen_check_io(DisasContext *s, TCGMemOp ot, target_ulong cur_eip,
 
 static inline void gen_movs(DisasContext *s, TCGMemOp ot)
 {
+    s->sem_producer = SEM_PRODUCER_INTEGER_STRING;
     gen_string_movl_A0_ESI(s);
     gen_sem_set_ea(s, R_ESI, -1, 0, 0);
     gen_op_ld_v(s, ot, s->T0, s->A0);
@@ -1570,6 +1675,7 @@ static TCGLabel *gen_jz_ecx_string(DisasContext *s, target_ulong next_eip)
 
 static inline void gen_stos(DisasContext *s, TCGMemOp ot)
 {
+    s->sem_producer = SEM_PRODUCER_INTEGER_STRING;
     gen_op_mov_v_reg(s, MO_32, s->T0, R_EAX);
     gen_string_movl_A0_EDI(s);
     gen_sem_set_ea(s, R_EDI, -1, 0, 0);
@@ -1583,6 +1689,7 @@ static inline void gen_stos(DisasContext *s, TCGMemOp ot)
 
 static inline void gen_lods(DisasContext *s, TCGMemOp ot)
 {
+    s->sem_producer = SEM_PRODUCER_INTEGER_STRING;
     gen_string_movl_A0_ESI(s);
     gen_sem_set_ea(s, R_ESI, -1, 0, 0);
     gen_op_ld_v(s, ot, s->T0, s->A0);
@@ -1597,6 +1704,7 @@ static inline void gen_lods(DisasContext *s, TCGMemOp ot)
 
 static inline void gen_scas(DisasContext *s, TCGMemOp ot)
 {
+    s->sem_producer = SEM_PRODUCER_INTEGER_STRING;
     gen_string_movl_A0_EDI(s);
     gen_sem_set_ea(s, R_EDI, -1, 0, 0);
     gen_op_ld_v(s, ot, s->T1, s->A0);
@@ -1608,6 +1716,7 @@ static inline void gen_scas(DisasContext *s, TCGMemOp ot)
 
 static inline void gen_cmps(DisasContext *s, TCGMemOp ot)
 {
+    s->sem_producer = SEM_PRODUCER_INTEGER_STRING;
     gen_string_movl_A0_EDI(s);
     gen_sem_set_ea(s, R_EDI, -1, 0, 0);
     gen_op_ld_v(s, ot, s->T1, s->A0);
@@ -1637,6 +1746,7 @@ static void gen_bpt_io(DisasContext *s, TCGv_i32 t_port, int ot)
 
 static inline void gen_ins(DisasContext *s, TCGMemOp ot)
 {
+    s->sem_producer = SEM_PRODUCER_INTEGER_INS_OUTS;
     if (tb_cflags(s->base.tb) & CF_USE_ICOUNT) {
         gen_io_start();
     }
@@ -1644,6 +1754,10 @@ static inline void gen_ins(DisasContext *s, TCGMemOp ot)
     /* Note: we must do this dummy write first to be restartable in
        case of page fault. */
     tcg_gen_movi_tl(s->T0, 0);
+    /* The restartability write is an implementation pre-store, not the
+     * completed INS result.  Invalidate its shadow but publish exactly one
+     * F01 event only after the port read and architectural result store. */
+    s->sem_skip_f01_store = sem_events_active();
     gen_op_st_v(s, ot, s->T0, s->A0);
     tcg_gen_trunc_tl_i32(s->tmp2_i32, cpu_regs[R_EDX]);
     tcg_gen_andi_i32(s->tmp2_i32, s->tmp2_i32, 0xffff);
@@ -1659,6 +1773,7 @@ static inline void gen_ins(DisasContext *s, TCGMemOp ot)
 
 static inline void gen_outs(DisasContext *s, TCGMemOp ot)
 {
+    s->sem_producer = SEM_PRODUCER_INTEGER_INS_OUTS;
     if (tb_cflags(s->base.tb) & CF_USE_ICOUNT) {
         gen_io_start();
     }
@@ -2961,6 +3076,7 @@ static inline void gen_stack_update(DisasContext *s, int addend)
 /* Generate a push. It depends on ss32, addseg and dflag.  */
 static void gen_push_v(DisasContext *s, TCGv val)
 {
+    s->sem_producer = SEM_PRODUCER_INTEGER_STACK;
     TCGMemOp d_ot = mo_pushpop(s, s->dflag);
     TCGMemOp a_ot = mo_stacksize(s);
     int size = 1 << d_ot;
@@ -2983,6 +3099,7 @@ static void gen_push_v(DisasContext *s, TCGv val)
 /* two step pop is necessary for precise exceptions */
 static TCGMemOp gen_pop_T0(DisasContext *s)
 {
+    s->sem_producer = SEM_PRODUCER_INTEGER_STACK;
     TCGMemOp d_ot = mo_pushpop(s, s->dflag);
 
     gen_lea_v_seg(s, mo_stacksize(s), cpu_regs[R_ESP], R_SS, -1);
@@ -3003,6 +3120,7 @@ static inline void gen_stack_A0(DisasContext *s)
 
 static void gen_pusha(DisasContext *s)
 {
+    s->sem_producer = SEM_PRODUCER_INTEGER_STACK;
     TCGMemOp s_ot = s->ss32 ? MO_32 : MO_16;
     TCGMemOp d_ot = s->dflag;
     int size = 1 << d_ot;
@@ -3019,6 +3137,7 @@ static void gen_pusha(DisasContext *s)
 
 static void gen_popa(DisasContext *s)
 {
+    s->sem_producer = SEM_PRODUCER_INTEGER_STACK;
     TCGMemOp s_ot = s->ss32 ? MO_32 : MO_16;
     TCGMemOp d_ot = s->dflag;
     int size = 1 << d_ot;
@@ -3040,6 +3159,7 @@ static void gen_popa(DisasContext *s)
 
 static void gen_enter(DisasContext *s, int esp_addend, int level)
 {
+    s->sem_producer = SEM_PRODUCER_INTEGER_ENTER;
     TCGMemOp d_ot = mo_pushpop(s, s->dflag);
     TCGMemOp a_ot = CODE64(s) ? MO_64 : s->ss32 ? MO_32 : MO_16;
     int size = 1 << d_ot;
@@ -3100,27 +3220,31 @@ static void gen_enter(DisasContext *s, int esp_addend, int level)
         tcg_gen_subi_tl(s->A0, old_sp, size);
         gen_lea_v_seg(s, a_ot, s->A0, R_SS, -1);
         gen_sem_set_ea_mode(s);
-        gen_sem_mem_access_f01_raw_class(s->A0, size, s->pc_start, true,
-                                         SEM_OP_INTEGER);
+        gen_sem_mem_access_f01_raw_class_policy(
+            s->A0, size, s->pc_start, true, SEM_OP_INTEGER,
+            SEM_INTERVAL_MULTIPART, SEM_PRODUCER_INTEGER_ENTER);
         if (level != 0) {
             for (int i = 1; i < level; ++i) {
                 tcg_gen_subi_tl(s->A0, old_bp, size * i);
                 gen_lea_v_seg(s, a_ot, s->A0, R_SS, -1);
                 gen_sem_set_ea_mode(s);
-                gen_sem_mem_access_f01_raw_class(s->A0, size, s->pc_start,
-                                                 false, SEM_OP_INTEGER);
+                gen_sem_mem_access_f01_raw_class_policy(
+                    s->A0, size, s->pc_start, false, SEM_OP_INTEGER,
+                    SEM_INTERVAL_MULTIPART, SEM_PRODUCER_INTEGER_ENTER);
 
                 tcg_gen_subi_tl(s->A0, old_sp, size + size * i);
                 gen_lea_v_seg(s, a_ot, s->A0, R_SS, -1);
                 gen_sem_set_ea_mode(s);
-                gen_sem_mem_access_f01_raw_class(s->A0, size, s->pc_start,
-                                                 true, SEM_OP_INTEGER);
+                gen_sem_mem_access_f01_raw_class_policy(
+                    s->A0, size, s->pc_start, true, SEM_OP_INTEGER,
+                    SEM_INTERVAL_MULTIPART, SEM_PRODUCER_INTEGER_ENTER);
             }
             tcg_gen_subi_tl(s->A0, old_sp, size + size * level);
             gen_lea_v_seg(s, a_ot, s->A0, R_SS, -1);
             gen_sem_set_ea_mode(s);
-            gen_sem_mem_access_f01_raw_class(s->A0, size, s->pc_start, true,
-                                             SEM_OP_INTEGER);
+            gen_sem_mem_access_f01_raw_class_policy(
+                s->A0, size, s->pc_start, true, SEM_OP_INTEGER,
+                SEM_INTERVAL_MULTIPART, SEM_PRODUCER_INTEGER_ENTER);
         }
         tcg_temp_free(old_bp);
         tcg_temp_free(old_sp);
@@ -3129,6 +3253,7 @@ static void gen_enter(DisasContext *s, int esp_addend, int level)
 
 static void gen_leave(DisasContext *s)
 {
+    s->sem_producer = SEM_PRODUCER_INTEGER_STACK;
     TCGMemOp d_ot = mo_pushpop(s, s->dflag);
     TCGMemOp a_ot = mo_stacksize(s);
 
@@ -3326,8 +3451,9 @@ static inline void gen_ldo_env_A0(DisasContext *s, int offset)
     tcg_gen_addi_tl(s->tmp0, s->A0, 8);
     tcg_gen_qemu_ld_i64(s->tmp1_i64, s->tmp0, mem_index, MO_LEQ);
     tcg_gen_st_i64(s->tmp1_i64, cpu_env, offset + offsetof(ZMMReg, ZMM_Q(1)));
-    gen_sem_mem_access_f01_raw_class(s->A0, 16, s->pc_start, false,
-                                     SEM_OP_SIMD);
+    gen_sem_mem_access_f01_raw_class_policy(
+        s->A0, 16, s->pc_start, false, SEM_OP_SIMD,
+        SEM_INTERVAL_PAIRED, SEM_PRODUCER_SIMD_VECTOR);
 }
 
 static inline void gen_sto_env_A0(DisasContext *s, int offset)
@@ -3345,8 +3471,9 @@ static inline void gen_sto_env_A0(DisasContext *s, int offset)
     tcg_gen_ld_i64(s->tmp1_i64, cpu_env, offset + offsetof(ZMMReg, ZMM_Q(1)));
     tcg_gen_qemu_st_i64(s->tmp1_i64, s->tmp0, mem_index, MO_LEQ);
     gen_sem_on_store_class(OR_TMP0, s->tmp0, MO_64, SEM_OP_SIMD);
-    gen_sem_mem_access_f01_raw_class(s->A0, 16, s->pc_start, true,
-                                     SEM_OP_SIMD);
+    gen_sem_mem_access_f01_raw_class_policy(
+        s->A0, 16, s->pc_start, true, SEM_OP_SIMD,
+        SEM_INTERVAL_PAIRED, SEM_PRODUCER_SIMD_VECTOR);
 }
 
 static inline void gen_op_movo(DisasContext *s, int d_offset, int s_offset)
@@ -5339,6 +5466,7 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
     s->prefix = prefixes;
     s->aflag = aflag;
     s->dflag = dflag;
+    s->sem_producer = SEM_PRODUCER_INVALID;
 
     /* now check op code */
  reswitch:
@@ -6240,8 +6368,9 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                 tcg_gen_addi_tl(s->tmp0, s->A0, 8);
                 gen_sem_on_store_class(OR_TMP0, s->tmp0, MO_64,
                                        SEM_OP_PAIRED);
-                gen_sem_mem_access_f01_raw_class(s->A0, 16, s->pc_start,
-                                                 true, SEM_OP_PAIRED);
+                gen_sem_mem_access_f01_raw_class_policy(
+                    s->A0, 16, s->pc_start, true, SEM_OP_PAIRED,
+                    SEM_INTERVAL_PAIRED, SEM_PRODUCER_PAIRED_CMPXCHG16B);
                 gen_sem_reg_invalidate(R_EAX, s->pc_start);
                 gen_sem_reg_invalidate(R_EDX, s->pc_start);
                 set_cc_op(s, CC_OP_EFLAGS);
@@ -6265,8 +6394,9 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
             gen_sem_set_ea_mode(s);
             gen_sem_on_store_class(OR_TMP0, s->A0, MO_64,
                                    SEM_OP_PAIRED);
-            gen_sem_mem_access_f01_class(s->A0, MO_64, s->pc_start, true,
-                                         SEM_OP_PAIRED);
+            gen_sem_mem_access_f01_raw_class_policy(
+                s->A0, 8, s->pc_start, true, SEM_OP_PAIRED,
+                SEM_INTERVAL_PAIRED, SEM_PRODUCER_PAIRED_CMPXCHG8B);
             gen_sem_reg_invalidate(R_EAX, s->pc_start);
             gen_sem_reg_invalidate(R_EDX, s->pc_start);
             set_cc_op(s, CC_OP_EFLAGS);
@@ -6597,6 +6727,7 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
     case 0xa2: /* mov Ov, EAX */
     case 0xa3:
         {
+            s->sem_producer = SEM_PRODUCER_INTEGER_MOFFS;
             target_ulong offset_addr;
 
             ot = mo_b_d(b, dflag);
@@ -6613,11 +6744,11 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
             tcg_gen_movi_tl(s->A0, offset_addr);
             gen_add_A0_ds_seg(s);
             if ((b & 2) == 0) {
-                gen_op_ld_v(s, ot, s->T0, s->A0);
+                gen_op_ld_v_moffs(s, ot, s->T0, s->A0);
                 gen_op_mov_reg_v(s, ot, R_EAX, s->T0);
             } else {
                 gen_op_mov_v_reg(s, ot, s->T0, R_EAX);
-                gen_op_st_v(s, ot, s->T0, s->A0);
+                gen_op_st_v_moffs(s, ot, s->T0, s->A0);
             }
         }
         break;
@@ -6703,8 +6834,7 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
             gen_sem_reg_invalidate(reg, s->pc_start);
             gen_sem_on_store_class(OR_TMP0, s->A0, ot,
                                    SEM_OP_ATOMIC_RMW);
-            gen_sem_mem_access_f01_class(s->A0, ot, s->pc_start, true,
-                                         SEM_OP_ATOMIC_RMW);
+            gen_sem_mem_xchg_f01(s->A0, ot, s->pc_start);
         }
         break;
     case 0xc4: /* les Gv */
@@ -7036,10 +7166,10 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                 }
                 gen_helper_fldenv(cpu_env, s->A0, tcg_const_i32(dflag - 1));
                 if (!(CODE64(s) && dflag == MO_16)) {
-                    gen_sem_mem_access_f01_raw_class(s->A0,
-                                                     dflag == MO_16 ? 14 : 28,
-                                                     s->pc_start, false,
-                                                     SEM_OP_X87_HELPER);
+                    gen_sem_mem_access_f01_raw_class_policy(
+                        s->A0, dflag == MO_16 ? 14 : 28, s->pc_start, false,
+                        SEM_OP_X87_HELPER, SEM_INTERVAL_RAW,
+                        SEM_PRODUCER_X87_ENVIRONMENT);
                 }
                 break;
             case 0x0d: /* fldcw mem */
@@ -7068,8 +7198,9 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                     gen_sem_on_store_x87(OR_TMP0, s->tmp0, MO_64);
                     tcg_gen_addi_tl(s->tmp0, s->A0, 24);
                     gen_sem_on_store_x87(OR_TMP0, s->tmp0, MO_32);
-                    gen_sem_mem_access_f01_raw_class(s->A0, 28, s->pc_start,
-                                                     true, SEM_OP_X87_HELPER);
+                    gen_sem_mem_access_f01_raw_class_policy(
+                        s->A0, 28, s->pc_start, true, SEM_OP_X87_HELPER,
+                        SEM_INTERVAL_RAW, SEM_PRODUCER_X87_ENVIRONMENT);
                 }
                 break;
             case 0x0f: /* fnstcw mem */
@@ -7084,8 +7215,9 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                 break;
             case 0x1d: /* fldt mem */
                 gen_helper_fldt_ST0(cpu_env, s->A0);
-                gen_sem_mem_access_f01_raw_class(s->A0, 10, s->pc_start,
-                                                 false, SEM_OP_X87_HELPER);
+                gen_sem_mem_access_f01_raw_class_policy(
+                    s->A0, 10, s->pc_start, false, SEM_OP_X87_HELPER,
+                    SEM_INTERVAL_RAW, SEM_PRODUCER_X87_RAW);
                 break;
             case 0x1f: /* fstpt m80 */
                 gen_helper_fstt_ST0(cpu_env, s->A0);
@@ -7095,8 +7227,9 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                 gen_sem_on_store_x87(OR_TMP0, s->A0, MO_64);
                 tcg_gen_addi_tl(s->tmp0, s->A0, 8);
                 gen_sem_on_store_x87(OR_TMP0, s->tmp0, MO_16);
-                gen_sem_mem_access_f01_raw_class(s->A0, 10, s->pc_start,
-                                                 true, SEM_OP_X87_HELPER);
+                gen_sem_mem_access_f01_raw_class_policy(
+                    s->A0, 10, s->pc_start, true, SEM_OP_X87_HELPER,
+                    SEM_INTERVAL_RAW, SEM_PRODUCER_X87_RAW);
                 gen_helper_fpop(cpu_env);
                 break;
             case 0x2c: /* frstor mem */
@@ -7107,10 +7240,10 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                 }
                 gen_helper_frstor(cpu_env, s->A0, tcg_const_i32(dflag - 1));
                 if (!(CODE64(s) && dflag == MO_16)) {
-                    gen_sem_mem_access_f01_raw_class(s->A0,
-                                                     dflag == MO_16 ? 94 : 108,
-                                                     s->pc_start, false,
-                                                     SEM_OP_X87_HELPER);
+                    gen_sem_mem_access_f01_raw_class_policy(
+                        s->A0, dflag == MO_16 ? 94 : 108, s->pc_start, false,
+                        SEM_OP_X87_HELPER, SEM_INTERVAL_RAW,
+                        SEM_PRODUCER_X87_SAVED_STATE);
                 }
                 break;
             case 0x2e: /* fnsave m94/108 */
@@ -7153,13 +7286,13 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                     gen_sem_on_store_x87(OR_TMP0, s->tmp0, MO_64);
                     tcg_gen_addi_tl(s->tmp0, s->A0, 104);
                     gen_sem_on_store_x87(OR_TMP0, s->tmp0, MO_32);
-                    gen_sem_mem_access_f01_raw_class(s->tmp4, 108,
-                                                     s->pc_start, true,
-                                                     SEM_OP_X87_HELPER);
+                    gen_sem_mem_access_f01_raw_class_policy(
+                        s->tmp4, 108, s->pc_start, true, SEM_OP_X87_HELPER,
+                        SEM_INTERVAL_RAW, SEM_PRODUCER_X87_SAVED_STATE);
                 } else if (!CODE64(s)) {
-                    gen_sem_mem_access_f01_raw_class(s->tmp4, 94,
-                                                     s->pc_start, true,
-                                                     SEM_OP_X87_HELPER);
+                    gen_sem_mem_access_f01_raw_class_policy(
+                        s->tmp4, 94, s->pc_start, true, SEM_OP_X87_HELPER,
+                        SEM_INTERVAL_RAW, SEM_PRODUCER_X87_SAVED_STATE);
                 }
                 break;
             case 0x2f: /* fnstsw m */
@@ -7174,8 +7307,9 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                 break;
             case 0x3c: /* fbld m80 */
                 gen_helper_fbld_ST0(cpu_env, s->A0);
-                gen_sem_mem_access_f01_raw_class(s->A0, 10, s->pc_start,
-                                                 false, SEM_OP_X87_HELPER);
+                gen_sem_mem_access_f01_raw_class_policy(
+                    s->A0, 10, s->pc_start, false, SEM_OP_X87_HELPER,
+                    SEM_INTERVAL_RAW, SEM_PRODUCER_X87_RAW);
                 break;
             case 0x3e: /* fbstp m80 */
                 gen_helper_fbst_ST0(cpu_env, s->A0);
@@ -7185,8 +7319,9 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                 gen_sem_on_store_x87(OR_TMP0, s->A0, MO_64);
                 tcg_gen_addi_tl(s->tmp0, s->A0, 8);
                 gen_sem_on_store_x87(OR_TMP0, s->tmp0, MO_16);
-                gen_sem_mem_access_f01_raw_class(s->A0, 10, s->pc_start,
-                                                 true, SEM_OP_X87_HELPER);
+                gen_sem_mem_access_f01_raw_class_policy(
+                    s->A0, 10, s->pc_start, true, SEM_OP_X87_HELPER,
+                    SEM_INTERVAL_RAW, SEM_PRODUCER_X87_RAW);
                 gen_helper_fpop(cpu_env);
                 break;
             case 0x3d: /* fildll m64 */
@@ -8402,15 +8537,13 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
         gen_sem_set_ea_mode(s);
         TCGv t_bound_pc = tcg_const_tl(s->pc_start);
         if (ot == MO_16) {
+            /* helper_boundw publishes one exact 4-byte F01 interval only
+             * after both bound loads and the architectural check succeed. */
             gen_helper_boundw(cpu_env, s->A0, s->tmp2_i32, t_bound_pc);
-            /* boundw reads two 16-bit bounds as one 4-byte interval. */
-            gen_sem_mem_access_f01_raw_class(s->A0, 4, s->pc_start,
-                                             false, SEM_OP_INTEGER);
         } else {
+            /* helper_boundl publishes one exact 8-byte F01 interval only
+             * after both bound loads and the architectural check succeed. */
             gen_helper_boundl(cpu_env, s->A0, s->tmp2_i32, t_bound_pc);
-            /* boundl reads two 32-bit bounds as one 8-byte interval. */
-            gen_sem_mem_access_f01_raw_class(s->A0, 8, s->pc_start,
-                                             false, SEM_OP_INTEGER);
         }
         tcg_temp_free(t_bound_pc);
         break;
@@ -8672,10 +8805,8 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
             }
             gen_op_st_v_raw_class(s, CODE64(s) + MO_32, s->T0, s->A0,
                                   SEM_OP_INTEGER);
-            gen_sem_mem_access_f01_raw_class(s->tmp4,
-                                             CODE64(s) ? 10 : 6,
-                                             s->pc_start, true,
-                                             SEM_OP_INTEGER);
+            gen_sem_descriptor_access_f01(s->tmp4, CODE64(s) ? 10 : 6,
+                                           s->pc_start, true);
             break;
 
         case 0xc8: /* monitor */
@@ -8734,10 +8865,8 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
             }
             gen_op_st_v_raw_class(s, CODE64(s) + MO_32, s->T0, s->A0,
                                   SEM_OP_INTEGER);
-            gen_sem_mem_access_f01_raw_class(s->tmp4,
-                                             CODE64(s) ? 10 : 6,
-                                             s->pc_start, true,
-                                             SEM_OP_INTEGER);
+            gen_sem_descriptor_access_f01(s->tmp4, CODE64(s) ? 10 : 6,
+                                           s->pc_start, true);
             break;
 
         case 0xd0: /* xgetbv */
@@ -8895,10 +9024,8 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
             }
             tcg_gen_st_tl(s->T0, cpu_env, offsetof(CPUX86State, gdt.base));
             tcg_gen_st32_tl(s->T1, cpu_env, offsetof(CPUX86State, gdt.limit));
-            gen_sem_mem_access_f01_raw_class(s->tmp4,
-                                             CODE64(s) ? 10 : 6,
-                                             s->pc_start, false,
-                                             SEM_OP_INTEGER);
+            gen_sem_descriptor_access_f01(s->tmp4, CODE64(s) ? 10 : 6,
+                                           s->pc_start, false);
             break;
 
         CASE_MODRM_MEM_OP(3): /* lidt */
@@ -8919,10 +9046,8 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
             }
             tcg_gen_st_tl(s->T0, cpu_env, offsetof(CPUX86State, idt.base));
             tcg_gen_st32_tl(s->T1, cpu_env, offsetof(CPUX86State, idt.limit));
-            gen_sem_mem_access_f01_raw_class(s->tmp4,
-                                             CODE64(s) ? 10 : 6,
-                                             s->pc_start, false,
-                                             SEM_OP_INTEGER);
+            gen_sem_descriptor_access_f01(s->tmp4, CODE64(s) ? 10 : 6,
+                                           s->pc_start, false);
             break;
 
         CASE_MODRM_OP(4): /* smsw */
@@ -9209,9 +9334,8 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                         tcg_gen_qemu_ld_i64(cpu_bndu[reg], s->A0,
                                             s->mem_index, MO_LEUL);
                     }
-                    gen_sem_mem_access_f01_raw_class(
-                        s->tmp4, CODE64(s) ? 16 : 8, s->pc_start, false,
-                        SEM_OP_MPX);
+                    gen_sem_mpx_bndmov_access(s->tmp4, CODE64(s) ? 16 : 8,
+                                               s->pc_start, false);
                     /* bnd registers are now in-use */
                     gen_set_hflag(s, HF_MPX_IU_MASK);
                 }
@@ -9330,9 +9454,8 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                                                SEM_OP_MPX);
                         /* 16-byte bound pair: ONE F01 event after both
                          * qemu stores (fault on the second → nothing). */
-                        gen_sem_mem_access_f01_raw_class(s->tmp4, 16,
-                                                         s->pc_start, true,
-                                                         SEM_OP_MPX);
+                        gen_sem_mpx_bndmov_access(s->tmp4, 16, s->pc_start,
+                                                   true);
                     } else {
                         tcg_gen_qemu_st_i64(cpu_bndl[reg], s->A0,
                                             s->mem_index, MO_LEUL);
@@ -9346,9 +9469,8 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                         gen_sem_on_store_class(OR_TMP0, s->A0, MO_32,
                                                SEM_OP_MPX);
                         /* 8-byte bound pair: ONE F01 event. */
-                        gen_sem_mem_access_f01_class(s->tmp4, MO_64,
-                                                     s->pc_start, true,
-                                                     SEM_OP_MPX);
+                        gen_sem_mpx_bndmov_access(s->tmp4, 8, s->pc_start,
+                                                   true);
                     }
                 }
             } else if (mod != 3) {
@@ -9556,8 +9678,9 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
             gen_lea_modrm(env, s, modrm);
             gen_sem_set_ea_mode(s);
             tcg_gen_qemu_ld_i32(s->tmp2_i32, s->A0, s->mem_index, MO_LEUL);
-            gen_sem_mem_access_f01_raw_class(s->A0, 4, s->pc_start, false,
-                                             SEM_OP_SIMD);
+            gen_sem_mem_access_f01_raw_class_policy(
+                s->A0, 4, s->pc_start, false, SEM_OP_SIMD,
+                SEM_INTERVAL_EXACT_WIDTH, SEM_PRODUCER_SIMD_SCALAR);
             gen_helper_ldmxcsr(cpu_env, s->tmp2_i32);
             break;
 
