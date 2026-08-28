@@ -87,259 +87,6 @@ static void insertion_sort_i64(GArray *a) {
     }
 }
 
-/* ------------------------------------------------------------------ */
-/* Graph lifecycle                                                     */
-/* ------------------------------------------------------------------ */
-
-OspreyGraph *osprey_graph_new(void) {
-    OspreyGraph *g = g_new0(OspreyGraph, 1);
-    g->vars = g_array_new(FALSE, FALSE, sizeof(OspreyVar));
-    g->var_index = g_hash_table_new_full(osprey_key_hash, osprey_key_equal,
-                                         osprey_key_free, NULL);
-    g->hints = g_array_new(FALSE, FALSE, sizeof(OspreyHint));
-    g->factors = g_array_new(FALSE, FALSE, sizeof(OspreyFactor *));
-    g->factor_index = g_hash_table_new_full(osprey_factor_key_hash,
-                                            osprey_factor_key_equal,
-                                            g_free, NULL);
-    g->kind_region = g_hash_table_new_full(osprey_key_hash, osprey_key_equal,
-                                           osprey_key_free, g_free);
-    g->uf_parent = NULL;
-    g->uf_size = 0;
-    return g;
-}
-
-/* Free a factor graph and everything it owns (Stage 0/1 ownership). */
-void osprey_graph_free(OspreyGraph *g) {
-    if (g == NULL) return;
-    if (g->factors != NULL) {
-        for (guint i = 0; i < g->factors->len; i++) {
-            OspreyFactor *f = g_array_index(g->factors, OspreyFactor *, i);
-            if (f != NULL) {
-                g_free(f->var_ids);
-                g_free(f);
-            }
-        }
-        g_array_free(g->factors, TRUE);
-    }
-    if (g->vars != NULL) g_array_free(g->vars, TRUE);
-    if (g->var_index != NULL) g_hash_table_destroy(g->var_index);
-    if (g->hints != NULL) g_array_free(g->hints, TRUE);
-    if (g->factor_index != NULL) g_hash_table_destroy(g->factor_index);
-    if (g->kind_region != NULL) g_hash_table_destroy(g->kind_region);
-    g_free(g->uf_parent);
-    g_free(g);
-}
-
-/* Full-field variable identity key (kind + payload).  A hash is only a
- * bucket selector; identity is the struct itself. */
-static OspreyKey var_key_of(uint8_t kind, const OspreyVarPayload *p) {
-    OspreyKey k;
-    memset(&k, 0, sizeof(k));
-    k.tag = 0x564152ULL; /* "VAR" */
-    k.w[0] = kind;
-    switch (kind) {
-    case OSPREY_PRED_PRIMITIVE_VAR:
-    case OSPREY_PRED_SCALAR: {
-        OspreyKey ck = osprey_chunk_key(&p->chunk);
-        k.w[1] = ck.w[0]; k.w[2] = ck.w[1]; k.w[3] = ck.w[2];
-        k.w[4] = ck.w[3]; k.w[5] = ck.w[4];
-        break;
-    }
-    case OSPREY_PRED_PRIMITIVE_ACCESS: {
-        OspreyKey ck = osprey_chunk_key(&p->prim_access.chunk);
-        k.w[1] = ck.w[0]; k.w[2] = ck.w[1]; k.w[3] = ck.w[2];
-        k.w[4] = ck.w[3]; k.w[5] = ck.w[4];
-        k.w[6] = p->prim_access.insn_pc;
-        break;
-    }
-    case OSPREY_PRED_UNFOLDABLE_HEAP:
-    case OSPREY_PRED_FOLDABLE_HEAP: {
-        OspreyKey rk = osprey_region_key(&p->heap_fold.region);
-        k.w[1] = rk.w[0]; k.w[2] = rk.w[1]; k.w[3] = rk.w[2];
-        k.w[4] = p->heap_fold.size;
-        break;
-    }
-    case OSPREY_PRED_HOMO_SEGMENT:
-    case OSPREY_PRED_ARRAY: {
-        OspreyKey r1 = osprey_region_key(&p->segment.a1.region);
-        OspreyKey r2 = osprey_region_key(&p->segment.a2.region);
-        k.w[1] = r1.w[0]; k.w[2] = r1.w[1]; k.w[3] = r1.w[2];
-        k.w[4] = (uint64_t)p->segment.a1.offset;
-        k.w[5] = r2.w[0]; k.w[6] = r2.w[1]; k.w[7] = r2.w[2];
-        k.w[8] = (uint64_t)p->segment.a2.offset;
-        k.w[9] = (uint64_t)p->segment.size;
-        break;
-    }
-    case OSPREY_PRED_ARRAY_START: {
-        OspreyKey rk = osprey_region_key(&p->addr.region);
-        k.w[1] = rk.w[0]; k.w[2] = rk.w[1]; k.w[3] = rk.w[2];
-        k.w[4] = (uint64_t)p->addr.offset;
-        break;
-    }
-    case OSPREY_PRED_FIELD_OF:
-    case OSPREY_PRED_POINTER: {
-        OspreyKey ck = osprey_chunk_key(&p->attached.chunk);
-        OspreyKey rk = osprey_region_key(&p->attached.base.region);
-        k.w[1] = ck.w[0]; k.w[2] = ck.w[1]; k.w[3] = ck.w[2];
-        k.w[4] = ck.w[3]; k.w[5] = ck.w[4];
-        k.w[6] = rk.w[0]; k.w[7] = rk.w[1];
-        k.w[8] = rk.w[2];
-        k.w[9] = (uint64_t)p->attached.base.offset;
-        break;
-    }
-    default:
-        break;
-    }
-    return k;
-}
-
-/* Intern a predicate variable; returns UINT32_MAX on cap overflow. */
-uint32_t osprey_intern_var(OspreyContext *ctx, uint8_t kind,
-                           const OspreyVarPayload *payload) {
-    OspreyGraph *g = ctx->graph;
-    OspreyKey key = var_key_of(kind, payload);
-    gpointer existing = g_hash_table_lookup(g->var_index, &key);
-    if (existing != NULL) {
-        return (uint32_t)(uintptr_t)existing - 1;
-    }
-    if (g->vars->len >= ctx->config.max_variables) {
-        ctx->last_status = OSPREY_LIMIT_EXCEEDED;
-        return UINT32_MAX;
-    }
-    OspreyVar v;
-    memset(&v, 0, sizeof(v));
-    v.id = g->vars->len;
-    v.kind = kind;
-    v.payload = *payload;
-    g_array_append_val(g->vars, v);
-    g_hash_table_insert(g->var_index, osprey_key_new(&key),
-                        GSIZE_TO_POINTER((gsize)v.id + 1));
-    /* Grow the union-find parent array lazily. */
-    if (g->uf_size <= v.id) {
-        uint32_t new_size = v.id + 1;
-        g->uf_parent = g_realloc(g->uf_parent,
-                                 new_size * sizeof(uint32_t));
-        for (uint32_t i = g->uf_size; i < new_size; i++) {
-            g->uf_parent[i] = i;
-        }
-        g->uf_size = new_size;
-    }
-    return v.id;
-}
-
-static uint32_t uf_find(OspreyGraph *g, uint32_t x) {
-    while (g->uf_parent[x] != x) {
-        g->uf_parent[x] = g->uf_parent[g->uf_parent[x]];
-        x = g->uf_parent[x];
-    }
-    return x;
-}
-
-static void uf_union(OspreyGraph *g, uint32_t a, uint32_t b) {
-    uint32_t ra = uf_find(g, a);
-    uint32_t rb = uf_find(g, b);
-    if (ra != rb) {
-        g->uf_parent[ra] = rb;
-    }
-}
-
-/* ------------------------------------------------------------------ */
-/* Factor creation                                                     */
-/* ------------------------------------------------------------------ */
-
-void osprey_factor_add(OspreyContext *ctx, uint16_t rule, uint16_t head_idx,
-                       bool negative, double p, const uint32_t *var_ids,
-                       uint32_t num_vars) {
-    OspreyGraph *g = ctx->graph;
-    if (g->factors->len >= ctx->config.max_factors) {
-        ctx->last_status = OSPREY_LIMIT_EXCEEDED;
-        return;
-    }
-    /* Deterministic factor identity: full-field key over rule, head,
-     * polarity, stage, probability, and the sorted variable set.  The
-     * head index is remapped after sorting so bidirectional rules
-     * (A→B and B→A) do not dedup-collapse. */
-    uint32_t sorted[8] = {0};
-    if (num_vars > 8) num_vars = 8;
-    for (uint32_t i = 0; i < num_vars; i++) sorted[i] = var_ids[i];
-    bool unary_prior = (head_idx == UINT16_MAX);
-    uint32_t head_id = unary_prior ? 0 : sorted[head_idx];
-    for (uint32_t i = 1; i < num_vars; i++) {
-        uint32_t v = sorted[i];
-        uint32_t j = i;
-        while (j > 0 && sorted[j - 1] > v) {
-            sorted[j] = sorted[j - 1];
-            j--;
-        }
-        sorted[j] = v;
-    }
-    uint32_t sorted_head = 0;
-    if (!unary_prior) {
-        for (uint32_t i = 0; i < num_vars; i++) {
-            if (sorted[i] == head_id) {
-                sorted_head = i;
-                break;
-            }
-        }
-    } else {
-        sorted_head = UINT16_MAX;
-    }
-    OspreyFactorKey fk;
-    memset(&fk, 0, sizeof(fk));
-    fk.rule = rule;
-    fk.head_idx = (uint16_t)sorted_head;
-    fk.negative = negative ? 1 : 0;
-    fk.stage = 1;
-    memcpy(&fk.p_bits, &p, sizeof(fk.p_bits));
-    fk.num_vars = num_vars;
-    for (uint32_t i = 0; i < num_vars; i++) fk.var_ids[i] = sorted[i];
-    if (g_hash_table_lookup(g->factor_index, &fk) != NULL) {
-        return; /* duplicate instance: deterministic merge keeps first */
-    }
-    OspreyFactor *f = g_new0(OspreyFactor, 1);
-    f->id = g->factors->len;
-    f->rule = rule;
-    f->head_idx = (uint16_t)sorted_head;
-    f->negative = negative ? 1 : 0;
-    f->stage = 1;
-    f->p = p;
-    f->num_vars = num_vars;
-    f->var_ids = g_memdup(sorted, num_vars * sizeof(uint32_t));
-    g_array_append_val(g->factors, f);
-    OspreyFactorKey *fk_copy = g_memdup(&fk, sizeof(fk));
-    g_hash_table_insert(g->factor_index, fk_copy,
-                        GSIZE_TO_POINTER((gsize)f->id + 1));
-    for (uint32_t i = 0; i < num_vars; i++) {
-        for (uint32_t j = i + 1; j < num_vars; j++) {
-            uf_union(g, sorted[i], sorted[j]);
-        }
-    }
-}
-
-guint osprey_factor_key_hash(gconstpointer p) {
-    const OspreyFactorKey *k = p;
-    uint64_t h = ((uint64_t)k->rule << 48) ^ ((uint64_t)k->head_idx << 32) ^
-                 ((uint64_t)k->negative << 16) ^ ((uint64_t)k->stage << 8) ^
-                 k->p_bits;
-    for (uint32_t i = 0; i < k->num_vars; i++) {
-        h ^= (uint64_t)k->var_ids[i] + 0x9e3779b97f4a7c15ULL +
-             (h << 6) + (h >> 2);
-    }
-    return (guint)h;
-}
-
-gboolean osprey_factor_key_equal(gconstpointer a, gconstpointer b) {
-    const OspreyFactorKey *x = a;
-    const OspreyFactorKey *y = b;
-    if (x->rule != y->rule || x->head_idx != y->head_idx ||
-        x->negative != y->negative || x->stage != y->stage ||
-        x->p_bits != y->p_bits || x->num_vars != y->num_vars) {
-        return FALSE;
-    }
-    return memcmp(x->var_ids, y->var_ids,
-                  x->num_vars * sizeof(uint32_t)) == 0;
-}
-
 /* p_k per §7.2: distinct supporting samples over total sampled paths. */
 static double support_ratio(OspreyContext *ctx, uint32_t sample_support) {
     if (ctx->total_samples == 0) return 1.0;
@@ -590,7 +337,7 @@ static void instantiate_ca01(OspreyContext *ctx) {
         OspreyVarPayload pv;
         memset(&pv, 0, sizeof(pv));
         pv.chunk = a->chunk;
-        uint32_t v = osprey_intern_var(ctx, OSPREY_PRED_PRIMITIVE_VAR, &pv);
+        uint32_t v = osprey_intern_var_id(ctx, OSPREY_PRED_PRIMITIVE_VAR, &pv);
         if (v == UINT32_MAX) continue;
         double pk = support_ratio(ctx, a->sample_support);
         uint32_t ids[1] = { v };
@@ -615,8 +362,8 @@ static void instantiate_ca02_ca03(OspreyContext *ctx) {
             OspreyVarPayload pa, pb;
             memset(&pa, 0, sizeof(pa)); pa.chunk = a->chunk;
             memset(&pb, 0, sizeof(pb)); pb.chunk = b->chunk;
-            uint32_t va = osprey_intern_var(ctx, OSPREY_PRED_PRIMITIVE_VAR, &pa);
-            uint32_t vb = osprey_intern_var(ctx, OSPREY_PRED_PRIMITIVE_VAR, &pb);
+            uint32_t va = osprey_intern_var_id(ctx, OSPREY_PRED_PRIMITIVE_VAR, &pa);
+            uint32_t vb = osprey_intern_var_id(ctx, OSPREY_PRED_PRIMITIVE_VAR, &pb);
             if (va == UINT32_MAX || vb == UINT32_MAX) continue;
             uint32_t ids[2] = { va, vb };
             if (adjacent) {
@@ -640,13 +387,13 @@ static void instantiate_ca04_ca05(OspreyContext *ctx) {
         OspreyVarPayload pv;
         memset(&pv, 0, sizeof(pv));
         pv.chunk = a->chunk;
-        uint32_t v = osprey_intern_var(ctx, OSPREY_PRED_PRIMITIVE_VAR, &pv);
+        uint32_t v = osprey_intern_var_id(ctx, OSPREY_PRED_PRIMITIVE_VAR, &pv);
         if (v == UINT32_MAX) continue;
         OspreyVarPayload pa;
         memset(&pa, 0, sizeof(pa));
         pa.prim_access.chunk = a->chunk;
         pa.prim_access.insn_pc = a->pc;
-        uint32_t acc = osprey_intern_var(ctx, OSPREY_PRED_PRIMITIVE_ACCESS, &pa);
+        uint32_t acc = osprey_intern_var_id(ctx, OSPREY_PRED_PRIMITIVE_ACCESS, &pa);
         if (acc == UINT32_MAX) continue;
         double pk = support_ratio(ctx, a->sample_support);
         uint32_t ids[2] = { acc, v };
@@ -678,13 +425,13 @@ static void instantiate_ca06(OspreyContext *ctx) {
         OspreyVarPayload pv;
         memset(&pv, 0, sizeof(pv));
         pv.chunk = a->chunk;
-        uint32_t v = osprey_intern_var(ctx, OSPREY_PRED_SCALAR, &pv);
+        uint32_t v = osprey_intern_var_id(ctx, OSPREY_PRED_SCALAR, &pv);
         if (v == UINT32_MAX) continue;
         OspreyVarPayload pa;
         memset(&pa, 0, sizeof(pa));
         pa.prim_access.chunk = a->chunk;
         pa.prim_access.insn_pc = a->pc;
-        uint32_t acc = osprey_intern_var(ctx, OSPREY_PRED_PRIMITIVE_ACCESS, &pa);
+        uint32_t acc = osprey_intern_var_id(ctx, OSPREY_PRED_PRIMITIVE_ACCESS, &pa);
         if (acc == UINT32_MAX) continue;
         double pk = support_ratio(ctx, a->sample_support);
         uint32_t ids[2] = { acc, v };
@@ -728,8 +475,8 @@ static void instantiate_ca07(OspreyContext *ctx) {
             OspreyVarPayload pva, pvb;
             memset(&pva, 0, sizeof(pva)); pva.chunk = a->chunk;
             memset(&pvb, 0, sizeof(pvb)); pvb.chunk = b->chunk;
-            uint32_t va = osprey_intern_var(ctx, OSPREY_PRED_SCALAR, &pva);
-            uint32_t vb = osprey_intern_var(ctx, OSPREY_PRED_SCALAR, &pvb);
+            uint32_t va = osprey_intern_var_id(ctx, OSPREY_PRED_SCALAR, &pva);
+            uint32_t vb = osprey_intern_var_id(ctx, OSPREY_PRED_SCALAR, &pvb);
             if (va == UINT32_MAX || vb == UINT32_MAX) continue;
             double pk_a = support_ratio(ctx, a->sample_support);
             double pk_b = support_ratio(ctx, b->sample_support);
@@ -766,12 +513,12 @@ static void instantiate_cb01(OspreyContext *ctx) {
         pa.segment.a1 = m->start;
         pa.segment.a2 = a2;
         pa.segment.size = s;
-        uint32_t v_arr = osprey_intern_var(ctx, OSPREY_PRED_ARRAY, &pa);
+        uint32_t v_arr = osprey_intern_var_id(ctx, OSPREY_PRED_ARRAY, &pa);
         if (v_arr == UINT32_MAX) continue;
         OspreyVarPayload ps;
         memset(&ps, 0, sizeof(ps));
         ps.addr = m->start;
-        uint32_t v_start = osprey_intern_var(ctx, OSPREY_PRED_ARRAY_START, &ps);
+        uint32_t v_start = osprey_intern_var_id(ctx, OSPREY_PRED_ARRAY_START, &ps);
         if (v_start == UINT32_MAX) continue;
         double pk = support_ratio(ctx, m->sample_support);
         uint32_t ids[2] = { v_arr, v_start };
@@ -804,7 +551,7 @@ static void instantiate_cc01_cc02(OspreyContext *ctx) {
         memset(&pf, 0, sizeof(pf));
         pf.heap_fold.region = h;
         pf.heap_fold.size = (uint64_t)unit;
-        uint32_t vfold = osprey_intern_var(ctx, OSPREY_PRED_FOLDABLE_HEAP, &pf);
+        uint32_t vfold = osprey_intern_var_id(ctx, OSPREY_PRED_FOLDABLE_HEAP, &pf);
         if (vfold == UINT32_MAX) continue;
         uint32_t ids[1] = { vfold };
         /* CC02: FoldableHeap(i,s) prior (positive support); CC01's
@@ -819,12 +566,12 @@ static void instantiate_cc01_cc02(OspreyContext *ctx) {
             memset(&pu, 0, sizeof(pu));
             pu.heap_fold.region = h;
             pu.heap_fold.size = (uint64_t)unit;
-            uint32_t vunf = osprey_intern_var(ctx, OSPREY_PRED_UNFOLDABLE_HEAP, &pu);
+            uint32_t vunf = osprey_intern_var_id(ctx, OSPREY_PRED_UNFOLDABLE_HEAP, &pu);
             OspreyVarPayload pz;
             memset(&pz, 0, sizeof(pz));
             pz.heap_fold.region = h;
             pz.heap_fold.size = 0; /* FoldableHeap(i,0): no foldable tail */
-            uint32_t vzero = osprey_intern_var(ctx, OSPREY_PRED_FOLDABLE_HEAP, &pz);
+            uint32_t vzero = osprey_intern_var_id(ctx, OSPREY_PRED_FOLDABLE_HEAP, &pz);
             if (vunf != UINT32_MAX) {
                 uint32_t ids1[1] = { vunf };
                 osprey_factor_add(ctx, OSPREY_RULE_CC01, UINT16_MAX, false, P_UP,
@@ -852,7 +599,7 @@ static void instantiate_cc03(OspreyContext *ctx) {
         OspreyVarPayload pv;
         memset(&pv, 0, sizeof(pv));
         pv.chunk = a->chunk;
-        uint32_t v = osprey_intern_var(ctx, OSPREY_PRED_PRIMITIVE_VAR, &pv);
+        uint32_t v = osprey_intern_var_id(ctx, OSPREY_PRED_PRIMITIVE_VAR, &pv);
         if (v == UINT32_MAX) continue;
         int64_t end;
         if (!osprey_check_add(a->chunk.address.offset,
@@ -862,7 +609,7 @@ static void instantiate_cc03(OspreyContext *ctx) {
         memset(&ph, 0, sizeof(ph));
         ph.heap_fold.region = a->chunk.address.region;
         ph.heap_fold.size = (uint64_t)end;
-        uint32_t u = osprey_intern_var(ctx, OSPREY_PRED_UNFOLDABLE_HEAP, &ph);
+        uint32_t u = osprey_intern_var_id(ctx, OSPREY_PRED_UNFOLDABLE_HEAP, &ph);
         if (u == UINT32_MAX) continue;
         uint32_t ids[2] = { v, u };
         osprey_factor_add(ctx, OSPREY_RULE_CC03, 1, false, P_UP, ids, 2);
@@ -877,13 +624,13 @@ static void instantiate_cd06(OspreyContext *ctx) {
         OspreyVarPayload pv;
         memset(&pv, 0, sizeof(pv));
         pv.chunk = b->chunk;
-        uint32_t v = osprey_intern_var(ctx, OSPREY_PRED_PRIMITIVE_VAR, &pv);
+        uint32_t v = osprey_intern_var_id(ctx, OSPREY_PRED_PRIMITIVE_VAR, &pv);
         if (v == UINT32_MAX) continue;
         OspreyVarPayload pf;
         memset(&pf, 0, sizeof(pf));
         pf.attached.chunk = b->chunk;
         pf.attached.base = b->base;
-        uint32_t f = osprey_intern_var(ctx, OSPREY_PRED_FIELD_OF, &pf);
+        uint32_t f = osprey_intern_var_id(ctx, OSPREY_PRED_FIELD_OF, &pf);
         if (f == UINT32_MAX) continue;
         uint32_t ids[2] = { v, f };
         /* CD06: BaseAddr(i,v1,v2.a) ∧ Accessed(v1) ∧ Accessed(v2)
@@ -903,13 +650,13 @@ static void instantiate_cd11(OspreyContext *ctx) {
         OspreyVarPayload pv;
         memset(&pv, 0, sizeof(pv));
         pv.chunk = p->pointer_chunk;
-        uint32_t v1 = osprey_intern_var(ctx, OSPREY_PRED_PRIMITIVE_VAR, &pv);
+        uint32_t v1 = osprey_intern_var_id(ctx, OSPREY_PRED_PRIMITIVE_VAR, &pv);
         if (v1 == UINT32_MAX) continue;
         OspreyVarPayload pp;
         memset(&pp, 0, sizeof(pp));
         pp.attached.chunk = p->pointer_chunk;
         pp.attached.base = p->target;
-        uint32_t po = osprey_intern_var(ctx, OSPREY_PRED_POINTER, &pp);
+        uint32_t po = osprey_intern_var_id(ctx, OSPREY_PRED_POINTER, &pp);
         if (po == UINT32_MAX) continue;
         uint32_t ids[2] = { v1, po };
         /* CD11: PointsTo(v1,v2.a) ∧ Accessed(v1) ∧ Accessed(v2)
@@ -970,7 +717,7 @@ static void instantiate_cd01_03(OspreyContext *ctx) {
         pv.segment.a1 = h->a1;
         pv.segment.a2 = h->a2;
         pv.segment.size = h->size;
-        uint32_t v = osprey_intern_var(ctx, OSPREY_PRED_HOMO_SEGMENT, &pv);
+        uint32_t v = osprey_intern_var_id(ctx, OSPREY_PRED_HOMO_SEGMENT, &pv);
         if (v == UINT32_MAX) continue;
         double ps = P_UP;
         if (ctx->total_samples > 0) {
@@ -1025,7 +772,7 @@ static void closure_cd04(OspreyContext *ctx) {
             pv.segment.a1 = h1->a1;
             pv.segment.a2 = a1p;
             pv.segment.size = len;
-            uint32_t v = osprey_intern_var(ctx, OSPREY_PRED_HOMO_SEGMENT, &pv);
+            uint32_t v = osprey_intern_var_id(ctx, OSPREY_PRED_HOMO_SEGMENT, &pv);
             if (v == UINT32_MAX) continue;
             uint32_t ids[1] = { v };
             osprey_factor_add(ctx, OSPREY_RULE_CD04, 0, false, P_UP, ids, 1);
@@ -1163,9 +910,9 @@ static void secondary_cb02(OspreyContext *ctx)
         parr.segment.a1 = a1;
         parr.segment.a2 = a2;
         parr.segment.size = (uint64_t)stride;
-        uint32_t v1 = osprey_intern_var(ctx, OSPREY_PRED_PRIMITIVE_ACCESS, &pa1);
-        uint32_t v2 = osprey_intern_var(ctx, OSPREY_PRED_PRIMITIVE_ACCESS, &pa2);
-        uint32_t varr = osprey_intern_var(ctx, OSPREY_PRED_ARRAY, &parr);
+        uint32_t v1 = osprey_intern_var_id(ctx, OSPREY_PRED_PRIMITIVE_ACCESS, &pa1);
+        uint32_t v2 = osprey_intern_var_id(ctx, OSPREY_PRED_PRIMITIVE_ACCESS, &pa2);
+        uint32_t varr = osprey_intern_var_id(ctx, OSPREY_PRED_ARRAY, &parr);
         if (v1 == UINT32_MAX || v2 == UINT32_MAX ||
             varr == UINT32_MAX) continue;
         uint32_t ids[3] = { v1, v2, varr };
@@ -1220,7 +967,7 @@ static void cb03_cb04_pairs(OspreyContext *ctx, GArray *arrays)
                         pc.segment.a1 = *a1l;
                         pc.segment.a2 = *a2h;
                         pc.segment.size = (uint64_t)s1;
-                        uint32_t vc = osprey_intern_var(ctx, OSPREY_PRED_ARRAY, &pc);
+                        uint32_t vc = osprey_intern_var_id(ctx, OSPREY_PRED_ARRAY, &pc);
                         if (vc != UINT32_MAX) {
                             uint32_t ids3[3] = { A->id, B->id, vc };
                             osprey_factor_add(ctx, OSPREY_RULE_CB03, 2, false,
@@ -1245,7 +992,7 @@ static void cb03_cb04_pairs(OspreyContext *ctx, GArray *arrays)
                         pc.segment.a1 = *a1l;
                         pc.segment.a2 = *a2l;
                         pc.segment.size = (uint64_t)s1;
-                        uint32_t vc = osprey_intern_var(ctx, OSPREY_PRED_ARRAY, &pc);
+                        uint32_t vc = osprey_intern_var_id(ctx, OSPREY_PRED_ARRAY, &pc);
                         if (vc != UINT32_MAX) {
                             uint32_t ids2[2] = { A->id, vc };
                             osprey_factor_add(ctx, OSPREY_RULE_CB04, 1, false,
@@ -1263,7 +1010,7 @@ static void cb03_cb04_pairs(OspreyContext *ctx, GArray *arrays)
                         pc2.segment.a1 = *a1h;
                         pc2.segment.a2 = *a2h;
                         pc2.segment.size = (uint64_t)s2;
-                        uint32_t vc = osprey_intern_var(ctx, OSPREY_PRED_ARRAY,
+                        uint32_t vc = osprey_intern_var_id(ctx, OSPREY_PRED_ARRAY,
                                                  &pc2);
                         if (vc != UINT32_MAX) {
                             uint32_t ids2[2] = { B->id, vc };
@@ -1309,7 +1056,7 @@ static void cb05_scalars(OspreyContext *ctx, GArray *arrays, GArray *scalars)
                 pc.segment.a1 = *a1;
                 pc.segment.a2 = S->payload.chunk.address;
                 pc.segment.size = (uint64_t)s;
-                uint32_t vc = osprey_intern_var(ctx, OSPREY_PRED_ARRAY, &pc);
+                uint32_t vc = osprey_intern_var_id(ctx, OSPREY_PRED_ARRAY, &pc);
                 if (vc != UINT32_MAX) {
                     uint32_t ids3[3] = { A->id, S->id, vc };
                     osprey_factor_add(ctx, OSPREY_RULE_CB05, 2, false, P_UP, ids3, 3);
@@ -1325,7 +1072,7 @@ static void cb05_scalars(OspreyContext *ctx, GArray *arrays, GArray *scalars)
                 pb.segment.a1 = a2l;
                 pb.segment.a2 = *a2;
                 pb.segment.size = (uint64_t)s;
-                uint32_t vc = osprey_intern_var(ctx, OSPREY_PRED_ARRAY, &pb);
+                uint32_t vc = osprey_intern_var_id(ctx, OSPREY_PRED_ARRAY, &pb);
                 if (vc != UINT32_MAX) {
                     uint32_t ids3[3] = { A->id, S->id, vc };
                     osprey_factor_add(ctx, OSPREY_RULE_CB05, 3, false, P_UP, ids3, 3);
@@ -1361,11 +1108,11 @@ static void cb07_cb08(OspreyContext *ctx)
         memset(&pa, 0, sizeof(pa));
         pa.prim_access.chunk = b->chunk;
         pa.prim_access.insn_pc = b->pc;
-        uint32_t v = osprey_intern_var(ctx, OSPREY_PRED_PRIMITIVE_ACCESS, &pa);
+        uint32_t v = osprey_intern_var_id(ctx, OSPREY_PRED_PRIMITIVE_ACCESS, &pa);
         if (v == UINT32_MAX) continue;
         memset(&ps, 0, sizeof(ps));
         ps.addr = b->base;
-        uint32_t vs = osprey_intern_var(ctx, OSPREY_PRED_ARRAY_START, &ps);
+        uint32_t vs = osprey_intern_var_id(ctx, OSPREY_PRED_ARRAY_START, &ps);
         if (vs == UINT32_MAX) continue;
         uint32_t ids[2] = { v, vs };
         osprey_factor_add(ctx, OSPREY_RULE_CB07, 1, false, P_UP, ids, 2);
@@ -1405,11 +1152,11 @@ static void cb07_cb08(OspreyContext *ctx)
         memset(&pa, 0, sizeof(pa));
         pa.prim_access.chunk = best->chunk;
         pa.prim_access.insn_pc = best->pc;
-        uint32_t v = osprey_intern_var(ctx, OSPREY_PRED_PRIMITIVE_ACCESS, &pa);
+        uint32_t v = osprey_intern_var_id(ctx, OSPREY_PRED_PRIMITIVE_ACCESS, &pa);
         if (v == UINT32_MAX) continue;
         memset(&ps, 0, sizeof(ps));
         ps.addr = best->chunk.address;
-        uint32_t vs = osprey_intern_var(ctx, OSPREY_PRED_ARRAY_START, &ps);
+        uint32_t vs = osprey_intern_var_id(ctx, OSPREY_PRED_ARRAY_START, &ps);
         if (vs == UINT32_MAX) continue;
         double pk = support_ratio(ctx, best->sample_support);
         uint32_t ids[2] = { v, vs };
@@ -1457,14 +1204,14 @@ static void cd07_heap_fields(OspreyContext *ctx)
         OspreyVarPayload pv;
         memset(&pv, 0, sizeof(pv));
         pv.chunk = a->chunk;
-        uint32_t v = osprey_intern_var(ctx, OSPREY_PRED_PRIMITIVE_VAR, &pv);
+        uint32_t v = osprey_intern_var_id(ctx, OSPREY_PRED_PRIMITIVE_VAR, &pv);
         if (v == UINT32_MAX) continue;
         OspreyVarPayload pf;
         memset(&pf, 0, sizeof(pf));
         pf.attached.chunk = a->chunk;
         pf.attached.base.region = a->chunk.address.region;
         pf.attached.base.offset = 0;
-        uint32_t f = osprey_intern_var(ctx, OSPREY_PRED_FIELD_OF, &pf);
+        uint32_t f = osprey_intern_var_id(ctx, OSPREY_PRED_FIELD_OF, &pf);
         if (f == UINT32_MAX) continue;
         uint32_t ids[2] = { v, f };
         osprey_factor_add(ctx, OSPREY_RULE_CD07, 1, false, P_UP, ids, 2);
@@ -1519,7 +1266,7 @@ static void cd08_fields(OspreyContext *ctx)
             memset(&pf, 0, sizeof(pf));
             pf.attached.chunk = c2;
             pf.attached.base = *a2;
-            uint32_t f2 = osprey_intern_var(ctx, OSPREY_PRED_FIELD_OF, &pf);
+            uint32_t f2 = osprey_intern_var_id(ctx, OSPREY_PRED_FIELD_OF, &pf);
             if (f2 == UINT32_MAX) continue;
             kr_account(ctx, OSPREY_PRED_FIELD_OF, &a2->region, 1, 0);
             uint32_t ids[3] = { fid, hid, f2 };
@@ -1554,6 +1301,7 @@ OspreyStatus osprey_stage3_secondary(OspreyContext *ctx)
 {
     if (ctx == NULL || !ctx->config.enabled) return OSPREY_DISABLED;
     if (ctx->graph == NULL) return OSPREY_INCOMPLETE_FACTS;
+    osprey_graph_set_stage(ctx->graph, OSPREY_GRAPH_SECONDARY);
 
     /* CB02 first (creates Array vars), then interval-pair rules */
     secondary_cb02(ctx);
@@ -1636,6 +1384,7 @@ OspreyStatus osprey_stage3_base(OspreyContext *ctx) {
         ctx->graph = osprey_graph_new();
     }
     OspreyGraph *g = ctx->graph;
+    osprey_graph_set_stage(g, OSPREY_GRAPH_BASE_CA);
 
     /* R10-R12 hint extraction (deterministic closure) */
     closure_r10(ctx);
@@ -1662,16 +1411,7 @@ OspreyStatus osprey_stage3_base(OspreyContext *ctx) {
     instantiate_cd10(ctx);
 
     /* distinct union-find roots over interned vars */
-    uint32_t components = 0;
-    GHashTable *roots = g_hash_table_new(g_direct_hash, g_direct_equal);
-    for (uint32_t i = 0; i < g->vars->len; i++) {
-        uint32_t r = uf_find(g, i);
-        if (g_hash_table_lookup(roots, GSIZE_TO_POINTER(r)) == NULL) {
-            g_hash_table_insert(roots, GSIZE_TO_POINTER(r), GSIZE_TO_POINTER(1));
-            components++;
-        }
-    }
-    g_hash_table_destroy(roots);
+    uint32_t components = osprey_graph_component_count(g);
 
     /* Propagate any limit/error status set during interning or factor
      * instantiation (fail-closed transaction). */

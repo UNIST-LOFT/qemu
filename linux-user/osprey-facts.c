@@ -3958,6 +3958,13 @@ OspreyStatus osprey_analyze(OspreyContext *ctx) {
                          "stage-3 secondary construction failed");
         goto fail;
     }
+    if (ctx->config.graph_dump_file[0] != '\0' &&
+        !osprey_graph_dump(ctx, ctx->config.graph_dump_file)) {
+        osprey_tx_reject(ctx, OSPREY_INVALID_GRAPH, "graph",
+                         "canonical graph dump failed");
+        st = OSPREY_INVALID_GRAPH;
+        goto fail;
+    }
     /* Stage 3b: exact component solving + loopy BP + CC07 folding. */
     st = osprey_infer(ctx);
     if (st != OSPREY_OK && st != OSPREY_DISABLED) {

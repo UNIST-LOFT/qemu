@@ -23,6 +23,7 @@ WORK      := $(CURDIR)/work
 # build against a stub environment (see unit_test.c).
 OSPREY_OBJS := ../../build/x86_64-linux-user/linux-user/osprey.o \
                ../../build/x86_64-linux-user/linux-user/osprey-facts.o \
+               ../../build/x86_64-linux-user/linux-user/osprey-graph.o \
                ../../build/x86_64-linux-user/linux-user/osprey-rules.o \
                ../../build/x86_64-linux-user/linux-user/osprey-infer.o \
                ../../build/x86_64-linux-user/linux-user/osprey-decode.o \
@@ -33,8 +34,11 @@ UNIT_BIN   := $(WORK)/osprey_unit
 UNIT_ASAN_BIN := $(WORK)/osprey_unit_asan
 REL_UNIT_BIN := $(WORK)/stage3_relations
 REL_ASAN_BIN := $(WORK)/stage3_relations_asan
+GRAPH_UNIT_BIN := $(WORK)/stage3_graph
+GRAPH_ASAN_BIN := $(WORK)/stage3_graph_asan
 OSPREY_SRCS := ../../linux-user/osprey.c \
                ../../linux-user/osprey-facts.c \
+               ../../linux-user/osprey-graph.c \
                ../../linux-user/osprey-rules.c \
                ../../linux-user/osprey-infer.c \
                ../../linux-user/osprey-decode.c \
@@ -70,10 +74,12 @@ GUEST_BINS := $(addprefix $(WORK)/,$(TESTS))
 PLT_FILES  := $(addprefix $(WORK)/,$(addsuffix .plt,$(TESTS)))
 
 .PHONY: check inventory run unit unit-asan unit-asan-osprey \
-        unit-stage3-relations unit-stage3-relations-asan guests plts clean
+        unit-stage3-relations unit-stage3-relations-asan \
+        unit-stage3-graph unit-stage3-graph-asan guests plts clean
 check: inventory run unit unit-asan-osprey unit-stage3-relations \
-       unit-stage3-relations-asan
-run unit unit-asan-osprey unit-stage3-relations unit-stage3-relations-asan: inventory
+       unit-stage3-relations-asan unit-stage3-graph unit-stage3-graph-asan
+run unit unit-asan-osprey unit-stage3-relations unit-stage3-relations-asan \
+unit-stage3-graph unit-stage3-graph-asan: inventory
 inventory:
 	@python3 $(INVENTORY)
 run: guests plts
@@ -160,6 +166,22 @@ $(REL_ASAN_BIN): stage3_relations_test.c stage3_reference.c \
 	$(CC) $(ASAN_CFLAGS) -o $@ stage3_relations_test.c \
 		stage3_reference.c stage3_test_support.c $(OSPREY_ASAN_OBJS) \
 		-lglib-2.0 -lpthread -lm
+
+unit-stage3-graph: $(GRAPH_UNIT_BIN)
+	@$(GRAPH_UNIT_BIN)
+
+$(GRAPH_UNIT_BIN): stage3_graph_test.c stage3_test_support.c \
+		$(OSPREY_OBJS) | $(WORK)
+	$(CC) $(UNIT_CFLAGS) -o $@ stage3_graph_test.c \
+		stage3_test_support.c $(OSPREY_OBJS) -lglib-2.0 -lpthread -lm
+
+unit-stage3-graph-asan: $(GRAPH_ASAN_BIN)
+	@ASAN_OPTIONS=detect_leaks=1 $(GRAPH_ASAN_BIN)
+
+$(GRAPH_ASAN_BIN): stage3_graph_test.c stage3_test_support.c \
+		$(OSPREY_ASAN_OBJS) | $(WORK)
+	$(CC) $(ASAN_CFLAGS) -o $@ stage3_graph_test.c \
+		stage3_test_support.c $(OSPREY_ASAN_OBJS) -lglib-2.0 -lpthread -lm
 
 $(UNIT_ASAN_BIN): unit_test.c $(OSPREY_OBJS) | $(WORK)
 	$(CC) $(UNIT_CFLAGS) -fsanitize=address -fno-omit-frame-pointer \

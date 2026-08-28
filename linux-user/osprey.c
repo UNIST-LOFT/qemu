@@ -130,6 +130,10 @@ bool osprey_config_from_env(OspreyConfig *config) {
     if (v != NULL && v[0] != '\0') {
         snprintf(config->dump_file, sizeof(config->dump_file), "%s", v);
     }
+    v = getenv("BINRADAR_OSPREY_GRAPH_DUMP_FILE");
+    if (v != NULL && v[0] != '\0') {
+        snprintf(config->graph_dump_file, sizeof(config->graph_dump_file), "%s", v);
+    }
     return true;
 }
 

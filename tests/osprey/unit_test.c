@@ -657,8 +657,8 @@ static void test_key_collision_fixtures(void)
     OspreyVarPayload pa, pb;
     memset(&pa, 0, sizeof(pa)); pa.chunk = a;
     memset(&pb, 0, sizeof(pb)); pb.chunk = b;
-    uint32_t va = osprey_intern_var(ctx, OSPREY_PRED_PRIMITIVE_VAR, &pa);
-    uint32_t vb = osprey_intern_var(ctx, OSPREY_PRED_PRIMITIVE_VAR, &pb);
+    uint32_t va = osprey_intern_var_id(ctx, OSPREY_PRED_PRIMITIVE_VAR, &pa);
+    uint32_t vb = osprey_intern_var_id(ctx, OSPREY_PRED_PRIMITIVE_VAR, &pb);
     CHECK(va != UINT32_MAX && vb != UINT32_MAX, "intern both chunks");
     CHECK(va != vb, "colliding chunks distinct vars");
 
@@ -672,8 +672,8 @@ static void test_key_collision_fixtures(void)
     fa.attached.base.offset = 4;
     fb = fa;
     fb.attached.base.region.site_offset = 0x222;
-    uint32_t vfa = osprey_intern_var(ctx, OSPREY_PRED_FIELD_OF, &fa);
-    uint32_t vfb = osprey_intern_var(ctx, OSPREY_PRED_FIELD_OF, &fb);
+    uint32_t vfa = osprey_intern_var_id(ctx, OSPREY_PRED_FIELD_OF, &fa);
+    uint32_t vfb = osprey_intern_var_id(ctx, OSPREY_PRED_FIELD_OF, &fb);
     CHECK(vfa != vfb, "field bases at different sites remain distinct");
 
     /* HomoSegment identity includes both regions, not only a1 and the
@@ -688,8 +688,8 @@ static void test_key_collision_fixtures(void)
     sa.segment.size = 8;
     sb = sa;
     sb.segment.a2.region.site_offset = 0x444;
-    uint32_t vsa = osprey_intern_var(ctx, OSPREY_PRED_HOMO_SEGMENT, &sa);
-    uint32_t vsb = osprey_intern_var(ctx, OSPREY_PRED_HOMO_SEGMENT, &sb);
+    uint32_t vsa = osprey_intern_var_id(ctx, OSPREY_PRED_HOMO_SEGMENT, &sa);
+    uint32_t vsb = osprey_intern_var_id(ctx, OSPREY_PRED_HOMO_SEGMENT, &sb);
     CHECK(vsa != vsb, "segment partner regions remain distinct");
     osprey_free(ctx);
 }
@@ -710,8 +710,8 @@ static void test_factor_key_bidirectional(void)
     pb.chunk.address.region.kind = OSPREY_REGION_GLOBAL;
     pb.chunk.address.offset = 8;
     pb.chunk.size = 8;
-    uint32_t va = osprey_intern_var(ctx, OSPREY_PRED_PRIMITIVE_VAR, &pa);
-    uint32_t vb = osprey_intern_var(ctx, OSPREY_PRED_PRIMITIVE_VAR, &pb);
+    uint32_t va = osprey_intern_var_id(ctx, OSPREY_PRED_PRIMITIVE_VAR, &pa);
+    uint32_t vb = osprey_intern_var_id(ctx, OSPREY_PRED_PRIMITIVE_VAR, &pb);
     CHECK(va != UINT32_MAX && vb != UINT32_MAX, "intern factor vars");
     uint32_t ids[2] = { vb, va };
     osprey_factor_add(ctx, OSPREY_RULE_CA02, 0, false, 0.8, ids, 2);

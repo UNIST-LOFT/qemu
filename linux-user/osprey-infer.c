@@ -17,11 +17,11 @@
  *    CA01/CC03 stage-2 factors and CC07 implications; BP reruns until
  *    no new variables (metadata: [osprey] [infer] rows).
  *
- * Generic factor potential (§7.1): weight p everywhere except the
- * penalized assignment (all antecedents true, head violates the
- * implication direction), which gets 1-p.  Unary factors (head_idx ==
- * UINT16_MAX) are priors: p on the preferred truth value.  CB06
- * hard-false pins Array beliefs at zero.
+ * Generic factor potential (§7.1) is owned by osprey-graph.c.  Priors use
+ * {false:1-p,true:p}; implications use max(p,1-p) while an antecedent is
+ * false and {head-false:1-p,head-true:p} once all antecedents hold.  Polarity
+ * is metadata and never inverts p a second time.  CB06 hard-false uses its
+ * distinct exact-zero potential.
  */
 
 #include "osprey.h"
@@ -57,28 +57,14 @@ static bool region_eq(const OspreyRegionId *a, const OspreyRegionId *b) {
 /* ------------------------------------------------------------------ */
 
 static double factor_value(const OspreyFactor *f, const uint32_t *bits) {
-    if (f->head_idx == UINT16_MAX) {
-        bool on = bits[0] != 0;
-        if (f->negative) {
-            return on ? 1.0 - f->p : f->p;
-        }
-        return on ? f->p : 1.0 - f->p;
-    }
-    uint32_t head = bits[f->head_idx];
-    bool antecedents = true;
+    uint8_t assignment[OSPREY_FACTOR_MAX_ARITY];
+    double log_weight;
+    if (f == NULL || f->num_vars > OSPREY_FACTOR_MAX_ARITY) return 0.0;
     for (uint32_t i = 0; i < f->num_vars; i++) {
-        if (i == f->head_idx) continue;
-        if (bits[i] == 0) { antecedents = false; break; }
+        assignment[i] = bits[i] != 0;
     }
-    bool violated;
-    if (!antecedents) {
-        violated = false;
-    } else if (f->negative) {
-        violated = (head != 0);
-    } else {
-        violated = (head == 0);
-    }
-    return violated ? 1.0 - f->p : f->p;
+    if (!osprey_factor_log_weight(f, assignment, &log_weight)) return 0.0;
+    return isinf(log_weight) && log_weight < 0.0 ? 0.0 : exp(log_weight);
 }
 
 /* ------------------------------------------------------------------ */
@@ -435,7 +421,7 @@ static uint32_t cc07_fold_pass(OspreyContext *ctx) {
                 OspreyVarPayload pv;
                 memset(&pv, 0, sizeof(pv));
                 pv.chunk = fc;
-                uint32_t nv = osprey_intern_var(ctx,
+                uint32_t nv = osprey_intern_var_id(ctx,
                                                 OSPREY_PRED_PRIMITIVE_VAR,
                                                 &pv);
                 if (nv == UINT32_MAX) continue;

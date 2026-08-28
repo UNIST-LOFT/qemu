@@ -75,6 +75,8 @@ typedef struct OspreyConfig {
     char dump_file[512];        /* BINRADAR_OSPREY_DUMP_FILE: canonical
                                  * fact dump written after each
                                  * successful merge (empty = off) */
+    char graph_dump_file[512];  /* BINRADAR_OSPREY_GRAPH_DUMP_FILE:
+                                 * canonical Stage-3 graph dump (empty = off) */
 } OspreyConfig;
 
 /* ------------------------------------------------------------------ */
@@ -95,6 +97,8 @@ typedef enum OspreyStatus {
     OSPREY_INVALID_MODEL,
     OSPREY_UNSUPPORTED_EXECUTION,
     OSPREY_RELATION_ARITHMETIC,
+    OSPREY_INVALID_GRAPH,
+    OSPREY_GRAPH_ARITHMETIC,
 } OspreyStatus;
 
 typedef struct OspreyDecodedObject {

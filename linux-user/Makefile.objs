@@ -1,6 +1,6 @@
 obj-y = main.o syscall.o strace.o mmap.o signal.o \
 	elfload.o linuxload.o uaccess.o uname.o \
-	safe-syscall.o snapshot.o provenance.o osprey.o osprey-facts.o osprey-rules.o \
+	safe-syscall.o snapshot.o provenance.o osprey.o osprey-facts.o osprey-graph.o osprey-rules.o \
 	osprey-infer.o osprey-decode.o osprey-relations.o sem-events.o \
 	$(TARGET_ABI_DIR)/signal.o \
         $(TARGET_ABI_DIR)/cpu_loop.o exit.o fd-trans.o \

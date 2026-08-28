@@ -38,7 +38,13 @@ static inline guint osprey_key_hash(gconstpointer p) {
 }
 
 static inline gboolean osprey_key_equal(gconstpointer p, gconstpointer q) {
-    return memcmp(p, q, sizeof(OspreyKey)) == 0;
+    const OspreyKey *a = p;
+    const OspreyKey *b = q;
+    if (a->tag != b->tag) return FALSE;
+    for (size_t i = 0; i < G_N_ELEMENTS(a->w); i++) {
+        if (a->w[i] != b->w[i]) return FALSE;
+    }
+    return TRUE;
 }
 
 static inline OspreyKey osprey_region_key(const OspreyRegionId *r) {
@@ -92,17 +98,22 @@ static inline OspreyKey osprey_base_key(const OspreyRegionId *r, int64_t off) {
     return k;
 }
 
-/* Factor identity key: full-field equality (rule, head, polarity,
- * stage, probability, variable set).  A hash is only a bucket
- * selector; identity is the struct itself. */
+#define OSPREY_FACTOR_MAX_ARITY 4u
+
+/* Factor identity key: full-field equality over the semantic formula.
+ * Variable order is meaningful: it is never sorted or reconstructed from
+ * numeric variable IDs.  Unused words are zeroed before hashing. */
 typedef struct OspreyFactorKey {
     uint16_t rule;
-    uint16_t head_idx;   /* index into var_ids (sorted) */
-    uint8_t negative;
     uint8_t stage;
-    uint64_t p_bits;     /* exact double bits of p */
+    uint8_t potential_kind;
+    uint8_t negative;
+    uint8_t reserved;
+    uint16_t head_idx;       /* 0 for prior; UINT16_MAX for hard false */
+    uint16_t reserved2;
+    uint64_t p_bits;         /* exact double bits of target-true p */
     uint32_t num_vars;
-    uint32_t var_ids[8];
+    uint32_t var_ids[OSPREY_FACTOR_MAX_ARITY];
 } OspreyFactorKey;
 
 guint osprey_factor_key_hash(gconstpointer p);
@@ -774,7 +785,18 @@ typedef enum OspreyDecodedKind {
 /* Stage 3+: predicate interning and factor graph                      */
 /* ------------------------------------------------------------------ */
 
-/* Predicate kinds (P01-P11 of the reference).  Each concrete predicate
+typedef enum OspreyGraphStage {
+    OSPREY_GRAPH_BASE_CA = 1,
+    OSPREY_GRAPH_SECONDARY = 2,
+} OspreyGraphStage;
+
+typedef enum OspreyPotentialKind {
+    OSPREY_POTENTIAL_IMPLICATION = 1,
+    OSPREY_POTENTIAL_PRIOR = 2,
+    OSPREY_POTENTIAL_HARD_FALSE = 3,
+} OspreyPotentialKind;
+
+/* Predicate kinds (P01-P10 of the reference).  Each concrete predicate
  * instance is one Boolean random variable. */
 typedef enum OspreyPredicateKind {
     OSPREY_PRED_NONE = 0,
@@ -820,9 +842,38 @@ typedef struct OspreyVar {
     uint8_t hard_false;            /* CB06-style hard constraint */
     uint8_t region_limit_hit;      /* per-region candidate cap exceeded */
     uint8_t reserved;
+    uint64_t direct_support;       /* saturated merged proposal evidence */
+    uint64_t source_rule_bits;     /* OspreyRuleCode bitset, Stage 3 */
+    double prior;                  /* maximum exact proposal prior */
     double belief;                 /* current marginal (Stages 4/5 fill) */
     OspreyVarPayload payload;
 } OspreyVar;
+
+typedef struct OspreyInternResult {
+    uint32_t id;                   /* UINT32_MAX on rejection */
+    bool inserted;                 /* false for duplicates and rejection */
+} OspreyInternResult;
+
+typedef struct OspreyFactorResult {
+    OspreyStatus status;
+    uint32_t id;                   /* UINT32_MAX on rejection */
+    bool inserted;                 /* false for duplicates and rejection */
+} OspreyFactorResult;
+
+typedef struct OspreyFactorBatchResult {
+    OspreyStatus status;
+    uint32_t inserted;             /* exact newly inserted factor count */
+} OspreyFactorBatchResult;
+
+/* Candidate evidence is collected before interning so cap selection is
+ * independent of witness/input order. */
+typedef struct OspreyCandidateProposal {
+    uint8_t predicate_kind;
+    OspreyVarPayload payload;
+    uint64_t direct_support;
+    double prior;
+    uint16_t source_rule;
+} OspreyCandidateProposal;
 
 /* Rule codes for factor provenance. */
 typedef enum OspreyRuleCode {
@@ -836,22 +887,24 @@ typedef enum OspreyRuleCode {
     OSPREY_RULE_CD01, OSPREY_RULE_CD02, OSPREY_RULE_CD03, OSPREY_RULE_CD04,
     OSPREY_RULE_CD05, OSPREY_RULE_CD06, OSPREY_RULE_CD07, OSPREY_RULE_CD08,
     OSPREY_RULE_CD09, OSPREY_RULE_CD10, OSPREY_RULE_CD11,
+    OSPREY_RULE_COUNT,
 } OspreyRuleCode;
 
-/* One instantiated rule instance: a factor over its variables.  The
- * generic convention (§7.1): weight p everywhere except the penalized
- * assignment "all antecedents true AND head violates the implication
- * direction" which gets weight 1-p.  head_idx indexes var_ids; for
- * multi-head rules each head gets its own factor (split). */
+/* One instantiated rule instance: a factor over semantic variables.
+ * Prior factors have one variable and head_idx == 0.  Implications keep
+ * their printed antecedent order and head position.  Hard-false factors
+ * have head_idx == UINT16_MAX and no probability semantics. */
 typedef struct OspreyFactor {
     uint32_t id;
     uint16_t rule;                 /* OspreyRuleCode */
-    uint16_t head_idx;             /* index into var_ids; UINT16_MAX=unary */
-    uint8_t negative;              /* 1 = negative implication */
-    uint8_t stage;                 /* 1 = base (static), 2 = secondary */
-    double p;                      /* support weight */
+    uint16_t head_idx;             /* prior=0; hard-false=UINT16_MAX */
+    uint8_t negative;              /* explicit rule polarity metadata */
+    uint8_t stage;                 /* OspreyGraphStage */
+    uint8_t potential_kind;        /* OspreyPotentialKind */
+    uint8_t reserved;
+    double p;                      /* exact target-true probability */
     uint32_t num_vars;
-    uint32_t *var_ids;
+    uint32_t *var_ids;             /* semantic order, never sorted */
 } OspreyFactor;
 
 /* Candidate/limit accounting per (kind, region). */
@@ -859,6 +912,12 @@ typedef struct OspreyKindRegionCount {
     uint64_t kept;
     uint64_t dropped;
 } OspreyKindRegionCount;
+
+typedef struct OspreyRegionExtent {
+    OspreyRegionId region;
+    int64_t lo;
+    int64_t hi;                    /* exclusive; lo <= hi */
+} OspreyRegionExtent;
 
 /* R10-R12 hint instances: parallel-copy / unified-access / points-to
  * evidence for homomorphic segments.  a1 and a2 are region-anchor
@@ -880,6 +939,9 @@ struct OspreyGraph {
     GHashTable *factor_index;      /* OspreyKey* → (factor_id+1) */
     /* per (kind, region-key) candidate accounting */
     GHashTable *kind_region;       /* OspreyKey* → OspreyKindRegionCount* */
+    GArray *extents;               /* sorted immutable candidate bounds */
+    bool extents_built;             /* facts were snapshotted into extents */
+    uint8_t construction_stage;    /* OspreyGraphStage for legacy rule calls */
     /* union-find over vars (component partition for inference) */
     uint32_t *uf_parent;
     uint32_t uf_size;
@@ -908,13 +970,69 @@ OspreyStatus osprey_stage3_secondary(OspreyContext *ctx);
  * by secondary loopy BP.  The current implementation is non-conformant. */
 OspreyStatus osprey_infer(OspreyContext *ctx);
 
-/* Shared graph builders (osprey-rules.c); used by Stage 3 construction
+/* Shared graph builders (osprey-graph.c); used by Stage 3 construction
  * and the Stage 5 dynamic closure. */
-uint32_t osprey_intern_var(OspreyContext *ctx, uint8_t kind,
-                           const OspreyVarPayload *payload);
-void osprey_factor_add(OspreyContext *ctx, uint16_t rule, uint16_t head_idx,
-                        bool negative, double p, const uint32_t *var_ids,
-                        uint32_t num_vars);
+OspreyKey osprey_var_key(uint8_t kind, const OspreyVarPayload *payload);
+OspreyInternResult osprey_intern_var(OspreyContext *ctx, uint8_t kind,
+                                     const OspreyVarPayload *payload);
+
+/* Existing rule compilers use the base-stage convenience form.  It infers
+ * PRIOR for one-variable calls and IMPLICATION otherwise, while honoring
+ * the graph's current construction stage. */
+OspreyFactorResult osprey_factor_add(OspreyContext *ctx, uint16_t rule,
+                                     uint16_t head_idx, bool negative,
+                                     double p, const uint32_t *var_ids,
+                                     uint32_t num_vars);
+/* Explicit Stage-3 form used by focused graph tests and future compilers. */
+OspreyFactorResult osprey_factor_add_ex(OspreyContext *ctx, uint16_t rule,
+                                        uint8_t stage, uint8_t potential_kind,
+                                        uint16_t head_idx, bool negative,
+                                        double p, const uint32_t *var_ids,
+                                        uint32_t num_vars);
+OspreyFactorResult osprey_factor_add_prior(OspreyContext *ctx, uint16_t rule,
+                                           uint8_t stage, bool negative,
+                                           double p, uint32_t head_id);
+OspreyFactorResult osprey_factor_add_implication(
+    OspreyContext *ctx, uint16_t rule, uint8_t stage, bool negative, double p,
+    const uint32_t *antecedent_ids, uint32_t num_antecedents,
+    uint32_t head_id);
+OspreyFactorResult osprey_factor_add_hard_false(OspreyContext *ctx,
+                                                uint16_t rule, uint8_t stage,
+                                                uint32_t var_id);
+OspreyFactorBatchResult osprey_factor_add_bidirectional(
+    OspreyContext *ctx, uint16_t rule, uint8_t stage, bool negative, double p,
+    uint32_t left_id, uint32_t right_id);
+OspreyFactorBatchResult osprey_factor_add_conjunction_bidirectional(
+    OspreyContext *ctx, uint16_t rule, uint8_t stage, bool negative, double p,
+    const uint32_t *antecedent_ids, uint32_t num_antecedents,
+    uint32_t head_id);
+OspreyFactorBatchResult osprey_factor_add_multi_head(
+    OspreyContext *ctx, uint16_t rule, uint8_t stage, bool negative, double p,
+    const uint32_t *antecedent_ids, uint32_t num_antecedents,
+    const uint32_t *head_ids, uint32_t num_heads);
+void osprey_graph_set_stage(OspreyGraph *graph, uint8_t stage);
+uint32_t osprey_graph_component_count(const OspreyGraph *graph);
+
+static inline uint32_t osprey_intern_var_id(OspreyContext *ctx, uint8_t kind,
+                                            const OspreyVarPayload *payload)
+{
+    return osprey_intern_var(ctx, kind, payload).id;
+}
+
+/* Deterministic candidate proposal selection and exact cap accounting. */
+OspreyStatus osprey_candidate_select(OspreyContext *ctx,
+                                     const OspreyCandidateProposal *proposals,
+                                     size_t count);
+
+/* Pure generic potential evaluator shared with inference and tests. */
+bool osprey_factor_log_weight(const OspreyFactor *factor,
+                              const uint8_t *assignment,
+                              double *log_weight);
+
+/* Canonical Stage-3 graph dump.  The path and FILE forms are intentionally
+ * explicit so tests do not depend on environment configuration. */
+bool osprey_graph_dump(const OspreyContext *ctx, const char *path);
+bool osprey_graph_dump_file(const OspreyContext *ctx, FILE *out);
 
 /* One raw-address span mapping back to a decoded object (built at
  * decode time from the merged region instances). */
