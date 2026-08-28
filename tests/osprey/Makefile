@@ -36,6 +36,8 @@ REL_UNIT_BIN := $(WORK)/stage3_relations
 REL_ASAN_BIN := $(WORK)/stage3_relations_asan
 GRAPH_UNIT_BIN := $(WORK)/stage3_graph
 GRAPH_ASAN_BIN := $(WORK)/stage3_graph_asan
+RULES_UNIT_BIN := $(WORK)/stage3_rules
+RULES_ASAN_BIN := $(WORK)/stage3_rules_asan
 OSPREY_SRCS := ../../linux-user/osprey.c \
                ../../linux-user/osprey-facts.c \
                ../../linux-user/osprey-graph.c \
@@ -75,11 +77,14 @@ PLT_FILES  := $(addprefix $(WORK)/,$(addsuffix .plt,$(TESTS)))
 
 .PHONY: check inventory run unit unit-asan unit-asan-osprey \
         unit-stage3-relations unit-stage3-relations-asan \
-        unit-stage3-graph unit-stage3-graph-asan guests plts clean
+        unit-stage3-graph unit-stage3-graph-asan \
+        unit-stage3-rules-ca-cb unit-stage3-rules-ca-cb-asan guests plts clean
 check: inventory run unit unit-asan-osprey unit-stage3-relations \
-       unit-stage3-relations-asan unit-stage3-graph unit-stage3-graph-asan
+       unit-stage3-relations-asan unit-stage3-graph unit-stage3-graph-asan \
+       unit-stage3-rules-ca-cb unit-stage3-rules-ca-cb-asan
 run unit unit-asan-osprey unit-stage3-relations unit-stage3-relations-asan \
-unit-stage3-graph unit-stage3-graph-asan: inventory
+unit-stage3-graph unit-stage3-graph-asan unit-stage3-rules-ca-cb \
+unit-stage3-rules-ca-cb-asan: inventory
 inventory:
 	@python3 $(INVENTORY)
 run: guests plts
@@ -182,6 +187,24 @@ $(GRAPH_ASAN_BIN): stage3_graph_test.c stage3_test_support.c \
 		$(OSPREY_ASAN_OBJS) | $(WORK)
 	$(CC) $(ASAN_CFLAGS) -o $@ stage3_graph_test.c \
 		stage3_test_support.c $(OSPREY_ASAN_OBJS) -lglib-2.0 -lpthread -lm
+
+unit-stage3-rules-ca-cb: $(RULES_UNIT_BIN)
+	@$(RULES_UNIT_BIN)
+
+$(RULES_UNIT_BIN): stage3_rules_test.c stage3_test_support.c \
+		$(OSPREY_OBJS) | $(WORK)
+	$(CC) $(UNIT_CFLAGS) -o $@ stage3_rules_test.c \
+		stage3_test_support.c $(OSPREY_OBJS) \
+		-lglib-2.0 -lpthread -lm
+
+unit-stage3-rules-ca-cb-asan: $(RULES_ASAN_BIN)
+	@ASAN_OPTIONS=detect_leaks=1 $(RULES_ASAN_BIN)
+
+$(RULES_ASAN_BIN): stage3_rules_test.c stage3_test_support.c \
+		$(OSPREY_ASAN_OBJS) | $(WORK)
+	$(CC) $(ASAN_CFLAGS) -o $@ stage3_rules_test.c \
+		stage3_test_support.c $(OSPREY_ASAN_OBJS) \
+		-lglib-2.0 -lpthread -lm
 
 $(UNIT_ASAN_BIN): unit_test.c $(OSPREY_OBJS) | $(WORK)
 	$(CC) $(UNIT_CFLAGS) -fsanitize=address -fno-omit-frame-pointer \
