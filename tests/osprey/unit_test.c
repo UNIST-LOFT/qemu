@@ -123,6 +123,11 @@ static void test_address_origin_channels_and_producers(void);
 static void test_address_shadow_reload(void);
 static void test_f02_ea_selection(void);
 static void test_base_fact_producer_merge(void);
+static void test_value_origin_creation_and_transfer(void);
+static void test_ordinary_f03_f04_publication(void);
+static void test_osprey_shadow_overlap_invalidation(void);
+static void test_modeled_copy_origins_and_facts(void);
+static void test_copy_points_merge_and_dump(void);
 
 void helper_sem_on_load(CPUArchState *env, uint32_t dst_idx,
                         target_ulong addr, target_ulong size,
@@ -1782,12 +1787,17 @@ int main(void)
     test_address_shadow_reload();
     test_f02_ea_selection();
     test_base_fact_producer_merge();
+    test_value_origin_creation_and_transfer();
+    test_ordinary_f03_f04_publication();
+    test_osprey_shadow_overlap_invalidation();
+    test_modeled_copy_origins_and_facts();
+    test_copy_points_merge_and_dump();
 
     if (failures != 0) {
         fprintf(stderr, "%d unit test check(s) FAILED\n", failures);
         return 1;
     }
-    printf("PASS osprey_unit (41/41)\n");
+    printf("PASS osprey_unit (46/46)\n");
     return 0;
 }
 
@@ -1931,7 +1941,7 @@ static void test_sem_overwrite_fail_closed(void)
     binradar_memcheck_enabled = 0;
     osprey_collect_enabled = 0;
     sem_reg_overwrite(&env, R_EAX, SEM_OP_SNAPSHOT);
-    sem_mem_overwrite(0x1000, 8, SEM_OP_SNAPSHOT);
+    sem_mem_overwrite(&env, 0x1000, 8, SEM_OP_SNAPSHOT);
     CHECK(provenance_get_reg_tag(&env, R_EAX).valid,
           "inactive provenance register unchanged");
     CHECK(provenance_mem_load_tag(0x1000).valid,
@@ -1943,7 +1953,7 @@ static void test_sem_overwrite_fail_closed(void)
      * active consumer by invalidating, never by preserving metadata. */
     binradar_memcheck_enabled = 1;
     sem_reg_overwrite(&env, R_EAX, (SemOpClass)SEM_OP_CLASS_COUNT);
-    sem_mem_overwrite(0x1000, 8, (SemOpClass)-1);
+    sem_mem_overwrite(&env, 0x1000, 8, (SemOpClass)-1);
     CHECK(!provenance_get_reg_tag(&env, R_EAX).valid,
           "invalid class kills provenance register");
     CHECK(!provenance_mem_load_tag(0x1000).valid,
@@ -2629,10 +2639,10 @@ static void test_address_shadow_reload(void)
     st->regs[R_R12].address.prov_object_id = t.object_id;
     st->regs[R_R12].address.prov_generation = t.generation;
     env->regs[R_R12] = 0x10000;
-    osprey_on_mem_store_address(env, R_R12, 0x402100, 8, 0x10000);
+    osprey_on_mem_store(env, R_R12, 0x402100, 8, 0x10000, 0x400d00);
     memset(&st->regs[R_R13], 0, sizeof(st->regs[R_R13]));
-    env->regs[R_R13] = 0;
-    osprey_on_mem_load_address(env, R_R13, 0x402100, 0x10000, 0x400d00);
+    env->regs[R_R13] = 0x10000;
+    osprey_on_mem_load(env, R_R13, 0x402100, 8, 0x400d00);
     CHECK(st->regs[R_R13].address.valid &&
           st->regs[R_R13].address.canonical.offset == 0 &&
           st->regs[R_R13].address.prov_object_id == t.object_id &&
@@ -2643,57 +2653,100 @@ static void test_address_shadow_reload(void)
 
     /* Exact-slot value mismatch removes the slot and leaves the
      * destination invalid. */
-    osprey_on_mem_store_address(env, R_R12, 0x402110, 8, 0x10000);
+    env->regs[R_R12] = 0x10000;
+    osprey_on_mem_store(env, R_R12, 0x402110, 8, 0x10000, 0x400d00);
     memset(&st->regs[R_R13], 0, sizeof(st->regs[R_R13]));
-    osprey_on_mem_load_address(env, R_R13, 0x402110, 0xdeadbeef,
-                               0x400d10);
+    env->regs[R_R13] = 0xdeadbeef;
+    osprey_on_mem_load(env, R_R13, 0x402110, 8, 0x400d10);
     CHECK(!st->regs[R_R13].address.valid,
           "value-mismatched reload leaves destination invalid");
     memset(&st->regs[R_R13], 0, sizeof(st->regs[R_R13]));
-    osprey_on_mem_load_address(env, R_R13, 0x402110, 0x10000, 0x400d20);
+    env->regs[R_R13] = 0x10000;
+    osprey_on_mem_load(env, R_R13, 0x402110, 8, 0x400d20);
     CHECK(!st->regs[R_R13].address.valid,
           "stale slot removed; second reload cannot resurrect");
 
     /* Stale heap identity: free the object, the reload rejects and
      * removes the slot. */
-    osprey_on_mem_store_address(env, R_R12, 0x402120, 8, 0x10000);
+    env->regs[R_R12] = 0x10000;
+    osprey_on_mem_store(env, R_R12, 0x402120, 8, 0x10000, 0x400d00);
     osprey_on_free_identity(env, t.object_id, t.generation, 0x400400);
     provenance_retire_object(0x10000);
     memset(&st->regs[R_R13], 0, sizeof(st->regs[R_R13]));
-    osprey_on_mem_load_address(env, R_R13, 0x402120, 0x10000, 0x400d30);
+    env->regs[R_R13] = 0x10000;
+    osprey_on_mem_load(env, R_R13, 0x402120, 8, 0x400d30);
     CHECK(!st->regs[R_R13].address.valid,
           "stale heap identity rejects reload");
 
     /* Aligned unknown-source store replaces the exact slot with an
      * invalid entry. */
-    osprey_on_mem_store_address(env, R_R12, 0x402130, 8, 0x10000);
+    env->regs[R_R12] = 0x10000;
+    osprey_on_mem_store(env, R_R12, 0x402130, 8, 0x10000, 0x400d00);
     memset(&st->regs[R_R12], 0, sizeof(st->regs[R_R12]));
-    osprey_on_mem_store_address(env, R_R12, 0x402130, 8, 0x1234);
+    env->regs[R_R12] = 0x1234;
+    osprey_on_mem_store(env, R_R12, 0x402130, 8, 0x10000, 0x400d00);
     memset(&st->regs[R_R13], 0, sizeof(st->regs[R_R13]));
-    osprey_on_mem_load_address(env, R_R13, 0x402130, 0x1234, 0x400d40);
+    env->regs[R_R13] = 0x1234;
+    osprey_on_mem_load(env, R_R13, 0x402130, 8, 0x400d40);
     CHECK(!st->regs[R_R13].address.valid,
           "unknown-source store replaces slot with invalid entry");
 
     /* Partial and unaligned stores into previously empty slots do not
      * install an origin (no cross-width invalidation is asserted). */
     install_addr_origin(st, R_R12, 0x402000, &G, 0x2000, 0x600);
-    osprey_on_mem_store_address(env, R_R12, 0x402200, 4, 0x402000);
+    env->regs[R_R12] = 0x402000;
+    osprey_on_mem_store(env, R_R12, 0x402200, 4, 0x402000, 0x400d00);
     memset(&st->regs[R_R13], 0, sizeof(st->regs[R_R13]));
-    osprey_on_mem_load_address(env, R_R13, 0x402200, 0x402000, 0x400d50);
+    env->regs[R_R13] = 0x402000;
+    osprey_on_mem_load(env, R_R13, 0x402200, 8, 0x400d50);
     CHECK(!st->regs[R_R13].address.valid,
-          "partial store does not install an origin");
-    osprey_on_mem_store_address(env, R_R12, 0x402204, 8, 0x402000);
+          "partial store invalidates and does not install an origin");
+    env->regs[R_R12] = 0x402000;
+    osprey_on_mem_store(env, R_R12, 0x402204, 8, 0x402000, 0x400d00);
     memset(&st->regs[R_R13], 0, sizeof(st->regs[R_R13]));
-    osprey_on_mem_load_address(env, R_R13, 0x402204, 0x402000, 0x400d60);
+    env->regs[R_R13] = 0x402000;
+    osprey_on_mem_load(env, R_R13, 0x402204, 8, 0x400d60);
     CHECK(!st->regs[R_R13].address.valid,
           "unaligned store does not install an origin");
-    osprey_on_mem_load_address(env, CPU_NB_REGS + 5, 0x402200,
-                               0x402000, 0x400d70);
+    env->regs[R_R13] = 0x402000;
+    osprey_on_mem_load(env, CPU_NB_REGS + 5, 0x402200, 8, 0x400d70);
 
-    /* Stage 2.3 publishes no copy/points rows from the shadow. */
+    /* Stage 2.4: every live pointer-width store to a canonical cell is
+     * a valid F04 observation: the heap-pointer stores at 0x402100,
+     * 0x402110, 0x402120, and the unaligned global-pointer store at
+     * 0x402204 (F04 needs no alignment; only shadow installation
+     * does).  The retired-heap and unknown-source stores at 0x402130
+     * publish nothing, and no copy facts exist because no VALUE
+     * channel was ever stored back to memory. */
     CHECK(osprey_parent_merge_sample(ctx, run) == OSPREY_OK, "merge ok");
     CHECK(ctx->copy_facts->len == 0, "no copy facts published");
-    CHECK(ctx->points_facts->len == 0, "no points-to facts published");
+    CHECK(ctx->points_facts->len == 4,
+          "live pointer stores publish exactly four F04 rows");
+    OspreyPointsToFact *heap_row = NULL;
+    OspreyPointsToFact *unaligned_row = NULL;
+    for (guint i = 0; i < ctx->points_facts->len; i++) {
+        OspreyPointsToFact *p = &g_array_index(ctx->points_facts,
+                                               OspreyPointsToFact, i);
+        if (p->pointer_chunk.address.offset == 0x2100) {
+            heap_row = p;
+        }
+        if (p->pointer_chunk.address.offset == 0x2204) {
+            unaligned_row = p;
+        }
+    }
+    CHECK(heap_row != NULL &&
+          heap_row->pointer_chunk.address.region.kind == 0 &&
+          heap_row->pointer_chunk.size == 8 &&
+          heap_row->target.region.kind == 1 &&
+          heap_row->target.region.site_offset == 0x300 &&
+          heap_row->target.offset == 0 &&
+          heap_row->weak_numeric_evidence == 0,
+          "F04 points at the exact canonical heap target");
+    CHECK(unaligned_row != NULL &&
+          unaligned_row->pointer_chunk.size == 8 &&
+          unaligned_row->target.region.kind == 0 &&
+          unaligned_row->target.offset == 0x2000,
+          "unaligned pointer store publishes F04 without installing a slot");
 
     osprey_free(ctx);
     g_free(run);
@@ -3038,6 +3091,957 @@ static void test_f02_ea_selection(void)
     osprey_free(ctx);
     g_free(run);
     g_free(env);
+}
+
+/* ------------------------------------------------------------------ */
+/* Stage 2.4: VALUE origins, F03/F04, shadow invalidation, modeled     */
+/* copies, and copy/points merge/dump                                  */
+/* ------------------------------------------------------------------ */
+
+/* Install a VALUE origin directly (the load hook builds these; tests
+ * that focus on store publication need a known-good channel). */
+static void install_value_origin(OspreyCpuOriginState *st, int reg,
+                                 target_ulong value, uint8_t width,
+                                 const OspreyChunk *source) {
+    OspreyValueOrigin *v = &st->regs[reg].value;
+    memset(v, 0, sizeof(*v));
+    v->valid = 1;
+    v->width = width;
+    v->concrete_value = value;
+    if (source != NULL) {
+        v->source = *source;
+    }
+}
+
+static void fill_copy_fact(OspreyCopyFact *f, int64_t soff, uint64_t ssize,
+                           int64_t doff, uint64_t dsize) {
+    memset(f, 0, sizeof(*f));
+    f->source.address.region.kind = OSPREY_REGION_GLOBAL;
+    f->source.address.offset = soff;
+    f->source.size = ssize;
+    f->destination.address.region.kind = OSPREY_REGION_GLOBAL;
+    f->destination.address.offset = doff;
+    f->destination.size = dsize;
+    f->sample_support = 1;
+}
+
+static void fill_points_fact(OspreyPointsToFact *f, int64_t cell_off,
+                             uint64_t cell_size, int64_t tgt_off) {
+    memset(f, 0, sizeof(*f));
+    f->pointer_chunk.address.region.kind = OSPREY_REGION_GLOBAL;
+    f->pointer_chunk.address.offset = cell_off;
+    f->pointer_chunk.size = cell_size;
+    f->target.region.kind = OSPREY_REGION_GLOBAL;
+    f->target.offset = tgt_off;
+    f->sample_support = 1;
+    f->weak_numeric_evidence = 0;
+}
+
+/* Canonical 1/2/4/8-byte load origins, MOV/self-MOV/XCHG/self-XCHG
+ * VALUE preservation, and every Stage 2.4 kill path. */
+static void test_value_origin_creation_and_transfer(void)
+{
+    reset_log();
+    OspreyConfig c;
+    OspreyContext *ctx;
+    OspreySharedRun *run;
+    CPUArchState *env;
+    stage23_setup(&c, &ctx, &run, &env);
+    OspreyCpuOriginState *st = osprey_cpu_origin(env);
+    OspreyRegionId G, H;
+    memset(&G, 0, sizeof(G));
+    G.kind = OSPREY_REGION_GLOBAL;
+    memset(&H, 0, sizeof(H));
+    H.kind = OSPREY_REGION_HEAP_SITE;
+    H.site_offset = 0x300;
+
+    /* Canonical 1/2/4/8-byte loads create VALUE origins with the
+     * complete post-load GPR value and the exact source chunk. */
+    for (int w = 0; w < 4; w++) {
+        static const uint8_t widths[4] = { 1, 2, 4, 8 };
+        static const uint8_t shifts[4] = { 0, 1, 2, 3 };
+        uint8_t width = widths[w];
+        target_ulong addr = 0x402100 + (target_ulong)(w * 0x10);
+        target_ulong mem_val = 0x1122334455667788ULL &
+            ((width == 8) ? ~0ULL
+                          : ((1ULL << (width * 8)) - 1));
+        env->regs[R_R12] = mem_val;
+        osprey_on_mem_load(env, R_R12, addr, width, 0x400e00 + w);
+        CHECK(st->regs[R_R12].value.valid &&
+              st->regs[R_R12].value.width == width &&
+              st->regs[R_R12].value.concrete_value == mem_val,
+              "canonical width load creates VALUE origin");
+        CHECK(st->regs[R_R12].value.source.address.region.kind == 0 &&
+              st->regs[R_R12].value.source.address.offset ==
+                  0x2100 + (int64_t)(w * 0x10) &&
+              st->regs[R_R12].value.source.size == width,
+              "VALUE source chunk exact for width");
+        /* 32-bit zero-extension: the complete GPR value is recorded. */
+        if (width == 4) {
+            CHECK(st->regs[R_R12].value.concrete_value ==
+                  (mem_val & 0xffffffffULL),
+                  "dword load records zero-extended GPR value");
+        }
+        (void)shifts;
+        osprey_on_reg_invalidate(env, R_R12);
+    }
+
+    /* A byte load followed by a byte store is a valid F03 flow;
+     * full-width store after a smaller load is rejected (extension
+     * bytes were not copied from the smaller source chunk). */
+    env->regs[R_R12] = 0x7a;
+    osprey_on_mem_load(env, R_R12, 0x402140, 1, 0x400e10);
+    CHECK(st->regs[R_R12].value.valid, "byte load VALUE origin");
+    env->regs[R_R12] = 0x7a;
+    osprey_on_mem_store(env, R_R12, 0x402148, 1, 0x7a, 0x400d00);
+    CHECK(run->copy_used == 1, "matching-width byte store publishes F03");
+    env->regs[R_R12] = 0x7a;
+    osprey_on_mem_store(env, R_R12, 0x402150, 8, 0x7a, 0x400d00);
+    CHECK(run->copy_used == 1,
+          "full-width store after byte load publishes no F03");
+
+    /* Simultaneous ADDRESS+VALUE pointer reload: the shadow slot
+     * restores ADDRESS while the load creates VALUE independently. */
+    {
+        provenance_init();
+        PtrTag t = provenance_create_object(0x10000, 64, 0x400300,
+                                            PROV_PRODUCER_MALLOC_RETURN);
+        osprey_on_alloc_success(env, 0x10000, 64, 0x400300,
+                                t.object_id, t.generation);
+        install_addr_origin(st, R_R13, 0x10000, &H, 0, 0x300);
+        st->regs[R_R13].address.prov_object_id = t.object_id;
+        st->regs[R_R13].address.prov_generation = t.generation;
+        env->regs[R_R13] = 0x10000;
+        osprey_on_mem_store(env, R_R13, 0x402160, 8, 0x10000, 0x400d00);
+        memset(&st->regs[R_R12], 0, sizeof(st->regs[R_R12]));
+        env->regs[R_R12] = 0x10000;
+        osprey_on_mem_load(env, R_R12, 0x402160, 8, 0x400e20);
+        CHECK(st->regs[R_R12].address.valid &&
+              st->regs[R_R12].address.canonical.offset == 0 &&
+              st->regs[R_R12].address.prov_object_id == t.object_id,
+              "pointer reload restores ADDRESS channel");
+        CHECK(st->regs[R_R12].value.valid &&
+              st->regs[R_R12].value.source.address.offset == 0x2160 &&
+              st->regs[R_R12].value.concrete_value == 0x10000,
+              "pointer reload also creates VALUE channel independently");
+        /* Missing/stale ADDRESS slot never erases a valid VALUE. */
+        memset(&st->regs[R_R12], 0, sizeof(st->regs[R_R12]));
+        env->regs[R_R12] = 0x10000;
+        osprey_on_mem_load(env, R_R12, 0x402168, 8, 0x400e21);
+        CHECK(!st->regs[R_R12].address.valid &&
+              st->regs[R_R12].value.valid &&
+              st->regs[R_R12].value.source.address.offset == 0x2168,
+              "missing slot keeps VALUE channel");
+        /* A pointer-width load from an untagged cell must replace a
+         * pre-existing ADDRESS channel even when the loaded number
+         * happens to equal the old pointer.  Numeric coincidence is not
+         * ADDRESS evidence. */
+        install_addr_origin(st, R_R12, 0x10000, &H, 0, 0x300);
+        st->regs[R_R12].address.prov_object_id = t.object_id;
+        st->regs[R_R12].address.prov_generation = t.generation;
+        env->regs[R_R12] = 0x10000;
+        osprey_on_mem_load(env, R_R12, 0x402170, 8, 0x400e22);
+        CHECK(!st->regs[R_R12].address.valid &&
+              st->regs[R_R12].value.valid,
+              "missing slot clears stale ADDRESS but keeps VALUE");
+
+        /* F02 stale-origin cleanup is ADDRESS-only.  It must not erase
+         * a valid VALUE channel created by the same successful load. */
+        install_addr_origin(st, R_R12, 0x10000, &H, 0, 0x300);
+        st->regs[R_R12].address.prov_object_id = t.object_id;
+        st->regs[R_R12].address.prov_generation = t.generation + 1;
+        install_value_origin(st, R_R12, 0x55, 4, NULL);
+        memset(&st->ea, 0, sizeof(st->ea));
+        st->ea.valid = 1;
+        st->ea.base_reg = R_R12;
+        st->ea.index_reg = -1;
+        st->ea.base_val = 0x10000;
+        st->ea.base_origin = st->regs[R_R12].address;
+        osprey_on_mem_access_class(env, 0x402180, 4, 0x400e23, false,
+                                   SEM_OP_INTEGER);
+        CHECK(!st->regs[R_R12].address.valid &&
+              st->regs[R_R12].value.valid,
+              "stale F02 cleanup preserves independent VALUE");
+    }
+
+    /* Full-width MOV preserves VALUE with a concrete-value check;
+     * self-MOV preserves once. */
+    install_value_origin(st, R_R12, 0x1234, 4, NULL);
+    env->regs[R_R12] = 0x1234;
+    env->regs[R_R13] = 0x1234;
+    osprey_on_reg_copy(env, R_R13, R_R12, 0x1234, 0x1234, 0x400e30);
+    CHECK(st->regs[R_R13].value.valid &&
+          st->regs[R_R13].value.concrete_value == 0x1234,
+          "MOV64 preserves VALUE channel");
+    env->regs[R_R12] = 0x1234;
+    osprey_on_reg_copy(env, R_R12, R_R12, 0x1234, 0x1234, 0x400e31);
+    CHECK(st->regs[R_R12].value.valid,
+          "self-MOV preserves VALUE channel");
+    /* Value-mismatched MOV kills the channel. */
+    install_value_origin(st, R_R12, 0x1111, 4, NULL);
+    env->regs[R_R12] = 0x1111;
+    env->regs[R_R13] = 0x2222;
+    osprey_on_reg_copy(env, R_R13, R_R12, 0x1111, 0x2222, 0x400e32);
+    CHECK(!st->regs[R_R13].value.valid,
+          "value-mismatched MOV kills VALUE channel");
+
+    /* XCHG swaps VALUE channels under post-swap validation; self-XCHG
+     * refreshes once.  A VALUE-only self-XCHG must not depend on an
+     * unrelated ADDRESS channel. */
+    install_value_origin(st, R_R12, 0x9999, 8, NULL);
+    env->regs[R_R12] = 0x9999;
+    osprey_on_reg_xchg(env, R_R12, R_R12, 0x9999, 0x9999, 0x400e3f);
+    CHECK(st->regs[R_R12].value.valid &&
+          st->regs[R_R12].value.concrete_value == 0x9999,
+          "VALUE-only self-XCHG preserves its channel");
+    install_value_origin(st, R_R12, 0xaaaa, 4, NULL);
+    install_value_origin(st, R_R13, 0xbbbb, 8, NULL);
+    env->regs[R_R12] = 0xbbbb;
+    env->regs[R_R13] = 0xaaaa;
+    osprey_on_reg_xchg(env, R_R12, R_R13, 0xbbbb, 0xaaaa, 0x400e40);
+    CHECK(st->regs[R_R12].value.valid &&
+          st->regs[R_R12].value.concrete_value == 0xbbbb &&
+          st->regs[R_R12].value.width == 8 &&
+          st->regs[R_R13].value.valid &&
+          st->regs[R_R13].value.concrete_value == 0xaaaa &&
+          st->regs[R_R13].value.width == 4,
+          "XCHG swaps both VALUE channels");
+    env->regs[R_R12] = 0xcccc;
+    osprey_on_reg_xchg(env, R_R12, R_R12, 0xcccc, 0xcccc, 0x400e41);
+    CHECK(!st->regs[R_R12].value.valid,
+          "self-XCHG kills a value-mismatched channel");
+
+    /* Kill paths: arithmetic, LEA, conditional/partial, caller-saved
+     * clobber, context replacement, invalid register index. */
+    install_value_origin(st, R_R12, 0x1000, 8, NULL);
+    env->regs[R_R12] = 0x1008;
+    osprey_on_reg_addsub_imm(env, R_R12, 8, 0x1000, 0x1008, 0x400e50);
+    CHECK(!st->regs[R_R12].value.valid,
+          "ADD/SUB immediate kills VALUE channel");
+    install_value_origin(st, R_R12, 0x1000, 8, NULL);
+    env->regs[R_R12] = 0x1008;
+    osprey_on_reg_lea(env, R_R12, R_R12, 8, 0x1008, 0x1000, 0x400e51);
+    CHECK(!st->regs[R_R12].value.valid, "LEA kills VALUE channel");
+    install_value_origin(st, R_R12, 0x1000, 8, NULL);
+    osprey_on_reg_invalidate(env, R_R12);
+    CHECK(!st->regs[R_R12].value.valid,
+          "generic register invalidation kills VALUE");
+    install_value_origin(st, R_EAX, 0x1000, 8, NULL);
+    install_value_origin(st, R_R12, 0x2000, 8, NULL);
+    sem_clobber_caller_saved(env);
+    CHECK(!st->regs[R_EAX].value.valid,
+          "caller-saved clobber kills VALUE");
+    CHECK(st->regs[R_R12].value.valid,
+          "callee-saved register survives clobber");
+    install_value_origin(st, R_R12, 0x1000, 8, NULL);
+    sem_context_replace(env);
+    CHECK(!st->regs[R_R12].value.valid &&
+          !st->regs[R_R12].address.valid,
+          "context replacement clears both channels");
+    /* Out-of-image producer PC: transfer metadata fails closed. */
+    install_value_origin(st, R_R12, 0x1000, 8, NULL);
+    env->regs[R_R12] = 0x1000;
+    osprey_on_reg_copy(env, R_R13, R_R12, 0x1000, 0x1000, 0x7f000000);
+    CHECK(!st->regs[R_R13].value.valid,
+          "out-of-image MOV metadata fails closed");
+    /* Invalid register indices are bounds-safe. */
+    osprey_on_mem_load(env, CPU_NB_REGS + 3, 0x402140, 8, 0x400e60);
+    osprey_on_mem_store(env, CPU_NB_REGS + 3, 0x402148, 8, 0, 0x400d00);
+
+    osprey_free(ctx);
+    g_free(run);
+    g_free(env);
+}
+
+/* Ordinary F03/F04 publication: matching-width requirement, combined
+ * channels, global/stack/live-heap targets, and the negative matrix. */
+static void test_ordinary_f03_f04_publication(void)
+{
+    reset_log();
+    OspreyConfig c;
+    OspreyContext *ctx;
+    OspreySharedRun *run;
+    CPUArchState *env;
+    stage23_setup(&c, &ctx, &run, &env);
+    OspreyCpuOriginState *st = osprey_cpu_origin(env);
+    OspreyRegionId G, H;
+    memset(&G, 0, sizeof(G));
+    G.kind = OSPREY_REGION_GLOBAL;
+    memset(&H, 0, sizeof(H));
+    H.kind = OSPREY_REGION_HEAP_SITE;
+    H.site_offset = 0x300;
+
+    provenance_init();
+    PtrTag t = provenance_create_object(0x10000, 64, 0x400300,
+                                        PROV_PRODUCER_MALLOC_RETURN);
+    osprey_on_alloc_success(env, 0x10000, 64, 0x400300,
+                            t.object_id, t.generation);
+
+    /* Global-to-global F03 with a matching-width VALUE channel. */
+    env->regs[R_R12] = 0x41414141;
+    osprey_on_mem_load(env, R_R12, 0x402100, 4, 0x400f00);
+    env->regs[R_R12] = 0x41414141;
+    osprey_on_mem_store(env, R_R12, 0x402200, 4, 0x41414141, 0x400d00);
+    CHECK(run->copy_used == 1, "G->G F03 published");
+    {
+        OspreyRunIter it;
+        const void *rec;
+        memset(&it, 0, sizeof(it));
+        it.run = run;
+        it.table = OSPREY_TABLE_COPY;
+        CHECK(osprey_run_iter_next(&it, &rec) == 1, "copy row present");
+        const OspreyCopyFact *cf = rec;
+        CHECK(cf->source.address.offset == 0x2100 &&
+              cf->source.size == 4 &&
+              cf->destination.address.offset == 0x2200 &&
+              cf->destination.size == 4 &&
+              cf->sample_support == 1,
+              "F03 source/destination chunks exact");
+    }
+
+    /* Stack source to heap destination F03. */
+    {
+        OspreyRegionId S;
+        memset(&S, 0, sizeof(S));
+        S.kind = OSPREY_REGION_STACK_FUNCTION;
+        S.site_offset = 0x500;
+        osprey_on_entrypoint(env, 0x400500, 0x7ffc0000);
+        osprey_on_rsp_update(env, 0x7ffbff00, 0x400501);
+        env->regs[R_R12] = 0xdeadbeefdeadbeefULL;
+        osprey_on_mem_load(env, R_R12, 0x7ffbfe80, 8, 0x400f10);
+        CHECK(st->regs[R_R12].value.valid &&
+              st->regs[R_R12].value.source.address.region.kind == 2,
+              "stack load VALUE origin");
+        env->regs[R_R12] = 0xdeadbeefdeadbeefULL;
+        osprey_on_mem_store(env, R_R12, 0x10000, 8, 0xdeadbeefdeadbeefULL, 0x400d00);
+        CHECK(run->copy_used == 2, "S->H F03 published");
+    }
+
+    /* Simultaneous F03+F04: a tagged pointer value loaded from a cell
+     * carries both channels; storing it to a second cell publishes
+     * both facts. */
+    install_addr_origin(st, R_R12, 0x10000, &H, 0, 0x300);
+    st->regs[R_R12].address.prov_object_id = t.object_id;
+    st->regs[R_R12].address.prov_generation = t.generation;
+    {
+        OspreyChunk src_cell;
+        memset(&src_cell, 0, sizeof(src_cell));
+        src_cell.address.region.kind = OSPREY_REGION_GLOBAL;
+        src_cell.address.offset = 0x2100;
+        src_cell.size = 8;
+        install_value_origin(st, R_R12, 0x10000, 8, &src_cell);
+    }
+    env->regs[R_R12] = 0x10000;
+    osprey_on_mem_store(env, R_R12, 0x402300, 8, 0x10000, 0x400d00);
+    CHECK(run->copy_used == 3, "F03 for pointer-value store");
+    CHECK(run->points_used == 1, "F04 for pointer-cell store");
+    {
+        OspreyRunIter it;
+        const void *rec;
+        memset(&it, 0, sizeof(it));
+        it.run = run;
+        it.table = OSPREY_TABLE_POINTS;
+        CHECK(osprey_run_iter_next(&it, &rec) == 1, "points row present");
+        const OspreyPointsToFact *pf = rec;
+        CHECK(pf->pointer_chunk.address.offset == 0x2300 &&
+              pf->pointer_chunk.size == 8 &&
+              pf->target.region.kind == 1 &&
+              pf->target.region.site_offset == 0x300 &&
+              pf->target.offset == 0 &&
+              pf->sample_support == 1 &&
+              pf->weak_numeric_evidence == 0,
+              "F04 points at live heap target");
+    }
+
+    /* Unaligned F04: publication allowed, shadow installation not.  The
+     * register still carries the VALUE channel, so this store also
+     * publishes F03 (alignment is irrelevant to the logical F03 fact). */
+    env->regs[R_R12] = 0x10000;
+    osprey_on_mem_store(env, R_R12, 0x402304, 8, 0x10000, 0x400d00);
+    CHECK(run->points_used == 2,
+          "unaligned pointer store publishes F04");
+    CHECK(run->copy_used == 4,
+          "unaligned pointer store still publishes F03");
+    {
+        OspreyRunIter it;
+        const void *rec;
+        memset(&it, 0, sizeof(it));
+        it.run = run;
+        it.table = OSPREY_TABLE_POINTS;
+        CHECK(osprey_run_iter_next(&it, &rec) == 1, "first points row");
+        CHECK(osprey_run_iter_next(&it, &rec) == 1, "second points row");
+        const OspreyPointsToFact *pf = rec;
+        CHECK(pf->pointer_chunk.address.offset == 0x2304,
+              "unaligned F04 cell offset exact");
+    }
+    {
+        OspreyRunIter it;
+        const void *rec;
+        memset(&it, 0, sizeof(it));
+        it.run = run;
+        it.table = OSPREY_TABLE_POINTS;
+        (void)osprey_run_iter_next(&it, &rec);
+        (void)osprey_run_iter_next(&it, &rec);
+    }
+
+    /* Negative matrix: null, numeric-map, stale generation, wrong
+     * width, value mismatch, unresolved destination. */
+    env->regs[R_R12] = 0;
+    osprey_on_mem_store(env, R_R12, 0x402310, 8, 0, 0x400d00);
+    CHECK(run->points_used == 2, "null store publishes no F04");
+    env->regs[R_R12] = 0x7f0000000000ULL; /* unmapped numeric */
+    osprey_on_mem_store(env, R_R12, 0x402318, 8, 0x7f0000000000ULL, 0x400d00);
+    CHECK(run->points_used == 2, "numeric-map store publishes no F04");
+    /* Stale generation: retire the object, keep the origin channel. */
+    osprey_on_free_identity(env, t.object_id, t.generation, 0x400400);
+    provenance_retire_object(0x10000);
+    env->regs[R_R12] = 0x10000;
+    osprey_on_mem_store(env, R_R12, 0x402320, 8, 0x10000, 0x400d00);
+    CHECK(run->points_used == 2, "stale-generation store publishes no F04");
+    /* One-byte-short store: F04 requires pointer width. */
+    provenance_init();
+    PtrTag t2 = provenance_create_object(0x20000, 64, 0x400300,
+                                         PROV_PRODUCER_MALLOC_RETURN);
+    osprey_on_alloc_success(env, 0x20000, 64, 0x400300,
+                            t2.object_id, t2.generation);
+    install_addr_origin(st, R_R12, 0x20000, &H, 0, 0x300);
+    st->regs[R_R12].address.prov_object_id = t2.object_id;
+    st->regs[R_R12].address.prov_generation = t2.generation;
+    env->regs[R_R12] = 0x20000;
+    osprey_on_mem_store(env, R_R12, 0x402328, 4, 0x20000, 0x400d00);
+    CHECK(run->points_used == 2, "one-byte-short store publishes no F04");
+    /* Value mismatch: register holds a different value than the tag. */
+    env->regs[R_R12] = 0x20000;
+    osprey_on_mem_store(env, R_R12, 0x402330, 8, 0x9999, 0x400d00);
+    CHECK(run->points_used == 2, "value-mismatched store publishes no F04");
+    /* A malformed VALUE record whose chunk width disagrees with its
+     * channel width cannot authorize a copy fact. */
+    OspreyChunk bad_source;
+    memset(&bad_source, 0, sizeof(bad_source));
+    bad_source.address.region = G;
+    bad_source.address.offset = 0x2100;
+    bad_source.size = 4;
+    install_value_origin(st, R_R13, 0x1234, 8, &bad_source);
+    osprey_on_mem_store(env, R_R13, 0x402338, 8, 0x1234, 0x400d00);
+    CHECK(run->copy_used == 5,
+          "F03 rejects inconsistent source and channel widths");
+
+    OspreyStatus mst = osprey_parent_merge_sample(ctx, run);
+    CHECK(mst == OSPREY_OK, "merge ok");
+    /* Five F03 rows: G->G, S->H, 0x2300, unaligned 0x2304, and the
+     * stale-generation store at 0x2320 (F03 is historical data flow;
+     * retiring the source region instance does not falsify the past
+     * load-to-store flow). */
+    CHECK(ctx->copy_facts->len == 5, "five committed F03 rows");
+    CHECK(ctx->points_facts->len == 2, "two committed F04 rows");
+    CHECK(g_array_index(ctx->points_facts, OspreyPointsToFact, 1)
+              .weak_numeric_evidence == 0,
+          "no weak-numeric evidence in Stage 2.4");
+
+    osprey_free(ctx);
+    g_free(run);
+    g_free(env);
+}
+
+/* Exact sparse overlap invalidation: first/middle/final-byte overlap,
+ * adjacent and zero-length no-ops, same-value partial writes, atomic,
+ * MASKMOV selected bytes, external outputs, wrapping clears, and
+ * exact reinstallation after a valid typed store. */
+static void test_osprey_shadow_overlap_invalidation(void)
+{
+    reset_log();
+    OspreyConfig c;
+    OspreyContext *ctx;
+    OspreySharedRun *run;
+    CPUArchState *env;
+    stage23_setup(&c, &ctx, &run, &env);
+    OspreyCpuOriginState *st = osprey_cpu_origin(env);
+    OspreyRegionId G, H;
+    memset(&G, 0, sizeof(G));
+    G.kind = OSPREY_REGION_GLOBAL;
+    memset(&H, 0, sizeof(H));
+    H.kind = OSPREY_REGION_HEAP_SITE;
+    H.site_offset = 0x300;
+
+    provenance_init();
+    PtrTag t = provenance_create_object(0x10000, 64, 0x400300,
+                                        PROV_PRODUCER_MALLOC_RETURN);
+    osprey_on_alloc_success(env, 0x10000, 64, 0x400300,
+                            t.object_id, t.generation);
+
+    /* Install a live slot at 0x402100. */
+    install_addr_origin(st, R_R12, 0x10000, &H, 0, 0x300);
+    st->regs[R_R12].address.prov_object_id = t.object_id;
+    st->regs[R_R12].address.prov_generation = t.generation;
+    env->regs[R_R12] = 0x10000;
+    osprey_on_mem_store(env, R_R12, 0x402100, 8, 0x10000, 0x400d00);
+    CHECK(g_hash_table_size(st->mem_slots) == 1, "slot installed");
+
+    /* Helper pre-store attempts preserve OSPREY state; only the
+     * complete post-success MASKMOV/multipart boundary invalidates. */
+    sem_mem_helper_write_attempt(env, 0x402103, 1, SEM_OP_SIMD);
+    CHECK(g_hash_table_size(st->mem_slots) == 1,
+          "helper write attempt does not invalidate OSPREY early");
+    st->ea_mode = MO_64;
+    sem_mem_maskmov(env, 0x402100, 1u << 3, 8, 0x400d00,
+                    SEM_OP_SIMD, SEM_INTERVAL_SPARSE,
+                    SEM_PRODUCER_SIMD_MASKMOV);
+    CHECK(g_hash_table_size(st->mem_slots) == 0,
+          "successful MASKMOV invalidates selected bytes");
+    env->regs[R_R12] = 0x10000;
+    osprey_on_mem_store(env, R_R12, 0x402100, 8, 0x10000, 0x400d00);
+    sem_mem_helper_write_attempt(env, 0x402100, 8, SEM_OP_PAIRED);
+    CHECK(g_hash_table_size(st->mem_slots) == 1,
+          "multipart write attempt preserves OSPREY state");
+    st->ea_mode = MO_64;
+    sem_mem_helper_access_part(env, 0x402100, 8, 0x400d00, true,
+                               SEM_OP_PAIRED, SEM_INTERVAL_SPARSE,
+                               SEM_PRODUCER_XSAVE_XSAVE, true);
+    CHECK(g_hash_table_size(st->mem_slots) == 0,
+          "successful multipart commit invalidates OSPREY state");
+    env->regs[R_R12] = 0x10000;
+    osprey_on_mem_store(env, R_R12, 0x402100, 8, 0x10000, 0x400d00);
+
+    /* Overlap at the first byte: same-value byte write invalidates. */
+    osprey_on_mem_store(env, CPU_NB_REGS, 0x402100, 1, 0, 0x400d00);
+    CHECK(g_hash_table_size(st->mem_slots) == 0,
+          "first-byte overlap removes slot (no byte-equality retention)");
+
+    /* Reinstall, then middle and final byte overlap. */
+    env->regs[R_R12] = 0x10000;
+    osprey_on_mem_store(env, R_R12, 0x402100, 8, 0x10000, 0x400d00);
+    osprey_on_mem_store(env, CPU_NB_REGS, 0x402104, 1, 0, 0x400d00);
+    CHECK(g_hash_table_size(st->mem_slots) == 0,
+          "middle-byte overlap removes slot");
+    env->regs[R_R12] = 0x10000;
+    osprey_on_mem_store(env, R_R12, 0x402100, 8, 0x10000, 0x400d00);
+    osprey_on_mem_store(env, CPU_NB_REGS, 0x402107, 1, 0, 0x400d00);
+    CHECK(g_hash_table_size(st->mem_slots) == 0,
+          "final-byte overlap removes slot");
+
+    /* Adjacent and zero-length writes preserve the slot. */
+    env->regs[R_R12] = 0x10000;
+    osprey_on_mem_store(env, R_R12, 0x402100, 8, 0x10000, 0x400d00);
+    osprey_on_mem_store(env, CPU_NB_REGS, 0x402108, 8, 0, 0x400d00);
+    CHECK(g_hash_table_size(st->mem_slots) == 1,
+          "adjacent interval does not invalidate");
+    osprey_on_mem_overwrite(env, 0x402100, 0);
+    CHECK(g_hash_table_size(st->mem_slots) == 1,
+          "zero-length overwrite is a no-op");
+
+    /* Atomic RMW and unaligned qword writes invalidate overlap. */
+    osprey_on_mem_store(env, CPU_NB_REGS, 0x402100, 8, 0x10000, 0x400d00);
+    CHECK(g_hash_table_size(st->mem_slots) == 0,
+          "unknown-source qword store invalidates");
+    env->regs[R_R12] = 0x10000;
+    osprey_on_mem_store(env, R_R12, 0x402100, 8, 0x10000, 0x400d00);
+    osprey_on_mem_store(env, CPU_NB_REGS, 0x4020fe, 8, 0, 0x400d00);
+    CHECK(g_hash_table_size(st->mem_slots) == 0,
+          "unaligned qword spanning slot invalidates");
+
+    /* Selected MASKMOV bytes and external outputs invalidate the exact
+     * intervals they changed. */
+    env->regs[R_R12] = 0x10000;
+    osprey_on_mem_store(env, R_R12, 0x402100, 8, 0x10000, 0x400d00);
+    osprey_on_mem_overwrite(env, 0x402103, 2);
+    CHECK(g_hash_table_size(st->mem_slots) == 0,
+          "external overwrite invalidates overlap");
+
+    /* Wrapping interval clears the entire shadow. */
+    env->regs[R_R12] = 0x10000;
+    osprey_on_mem_store(env, R_R12, 0x402100, 8, 0x10000, 0x400d00);
+    osprey_on_mem_store(env, R_R12, 0x402110, 8, 0x10000, 0x400d00);
+    CHECK(g_hash_table_size(st->mem_slots) == 2, "two slots installed");
+    osprey_on_mem_overwrite(env, (target_ulong)-8, 16);
+    CHECK(g_hash_table_size(st->mem_slots) == 0,
+          "wrapping interval clears the whole shadow");
+
+    /* A valid aligned typed store reinstalls exactly one slot after
+     * invalidation. */
+    env->regs[R_R12] = 0x10000;
+    osprey_on_mem_store(env, R_R12, 0x402100, 8, 0x10000, 0x400d00);
+    CHECK(g_hash_table_size(st->mem_slots) == 1,
+          "typed store reinstalls exactly one slot");
+    {
+        OspreyMemAddressOrigin *slot = g_hash_table_lookup(
+            st->mem_slots, GSIZE_TO_POINTER(0x402100));
+        CHECK(slot != NULL && slot->valid &&
+              slot->concrete_value == 0x10000 &&
+              slot->prov_object_id == t.object_id,
+              "reinstalled slot carries the exact origin");
+    }
+
+    osprey_free(ctx);
+    g_free(run);
+    g_free(env);
+}
+
+/* Modeled copies: exact F03 widths, overlapping memmove snapshots,
+ * pointer-slot relocation + F04, strcpy NUL, strncpy padding, memset
+ * overwrite-only, and rejection paths. */
+static void test_modeled_copy_origins_and_facts(void)
+{
+    reset_log();
+    OspreyConfig c;
+    OspreyContext *ctx;
+    OspreySharedRun *run;
+    CPUArchState *env;
+    stage23_setup(&c, &ctx, &run, &env);
+    OspreyCpuOriginState *st = osprey_cpu_origin(env);
+    OspreyRegionId H;
+    memset(&H, 0, sizeof(H));
+    H.kind = OSPREY_REGION_HEAP_SITE;
+    H.site_offset = 0x300;
+
+    provenance_init();
+    PtrTag t = provenance_create_object(0x10000, 64, 0x400300,
+                                        PROV_PRODUCER_MALLOC_RETURN);
+    osprey_on_alloc_success(env, 0x10000, 64, 0x400300,
+                            t.object_id, t.generation);
+
+    /* Invalid copy classes are invalidation-only: they may remove a
+     * destination slot but cannot authorize F03/F04 or relocation. */
+    OspreyMemAddressOrigin *invalid_dst =
+        g_new0(OspreyMemAddressOrigin, 1);
+    invalid_dst->valid = 1;
+    invalid_dst->width = sizeof(target_ulong);
+    invalid_dst->concrete_value = 0x10000;
+    invalid_dst->canonical.region = H;
+    invalid_dst->prov_object_id = t.object_id;
+    invalid_dst->prov_generation = t.generation;
+    g_hash_table_replace(st->mem_slots, GSIZE_TO_POINTER(0x402200),
+                         invalid_dst);
+    sem_mem_copy(env, 0x402100, 0x402200, 8, (SemOpClass)-1);
+    CHECK(run->copy_used == 0 && run->points_used == 0,
+          "invalid copy class publishes no F03/F04");
+    CHECK(g_hash_table_lookup(st->mem_slots,
+                              GSIZE_TO_POINTER(0x402200)) == NULL,
+          "invalid copy class still invalidates destination");
+
+    /* Exact 13-byte memcpy F03 (source/destination canonical). */
+    osprey_on_mem_copy(env, 0x402100, 0x402200, 13);
+    CHECK(run->copy_used == 1, "memcpy 13-byte F03");
+    {
+        OspreyRunIter it;
+        const void *rec;
+        memset(&it, 0, sizeof(it));
+        it.run = run;
+        it.table = OSPREY_TABLE_COPY;
+        CHECK(osprey_run_iter_next(&it, &rec) == 1, "copy row");
+        const OspreyCopyFact *cf = rec;
+        CHECK(cf->source.address.offset == 0x2100 &&
+              cf->source.size == 13 &&
+              cf->destination.address.offset == 0x2200 &&
+              cf->destination.size == 13,
+              "13-byte F03 exact");
+    }
+
+    /* Overlapping memmove: a live source slot inside the source range
+     * is snapshotted before destination invalidation and relocated. */
+    install_addr_origin(st, R_R12, 0x10000, &H, 0, 0x300);
+    st->regs[R_R12].address.prov_object_id = t.object_id;
+    st->regs[R_R12].address.prov_generation = t.generation;
+    env->regs[R_R12] = 0x10000;
+    /* Store the pointer at 0x402108 (inside the 16-byte source range
+     * starting at 0x402100). */
+    osprey_on_mem_store(env, R_R12, 0x402108, 8, 0x10000, 0x400d00);
+    CHECK(g_hash_table_size(st->mem_slots) == 1, "source slot live");
+    /* memmove(buf+8, buf, 16): source [0x402100, 0x402110), dest
+     * [0x402108, 0x402118).  The slot at 0x402108 relocates to
+     * 0x402110. */
+    osprey_on_mem_copy(env, 0x402100, 0x402108, 16);
+    CHECK(run->copy_used == 2, "memmove F03");
+    {
+        OspreyMemAddressOrigin *slot = g_hash_table_lookup(
+            st->mem_slots, GSIZE_TO_POINTER(0x402110));
+        CHECK(slot != NULL && slot->valid &&
+              slot->concrete_value == 0x10000 &&
+              slot->prov_object_id == t.object_id,
+              "overlapping memmove relocates snapshotted slot");
+        CHECK(g_hash_table_lookup(st->mem_slots,
+                                  GSIZE_TO_POINTER(0x402108)) == NULL,
+              "destination-overlap slot removed");
+    }
+    /* F04 for the original cell store and the relocated canonical
+     * destination cell. */
+    CHECK(run->points_used == 2,
+          "original store and relocated slot publish F04");
+
+    /* strcpy includes the NUL: 4-byte F03 for "abc". */
+    osprey_on_mem_copy(env, 0x402300, 0x402400, 4);
+    CHECK(run->copy_used == 3, "strcpy 4-byte F03");
+    {
+        OspreyRunIter it;
+        const void *rec;
+        memset(&it, 0, sizeof(it));
+        it.run = run;
+        it.table = OSPREY_TABLE_COPY;
+        (void)osprey_run_iter_next(&it, &rec);
+        (void)osprey_run_iter_next(&it, &rec);
+        CHECK(osprey_run_iter_next(&it, &rec) == 1, "strcpy copy row");
+        const OspreyCopyFact *cf = rec;
+        CHECK(cf->source.address.offset == 0x2300 &&
+              cf->source.size == 4 &&
+              cf->destination.address.offset == 0x2400,
+              "strcpy F03 includes terminating NUL");
+    }
+
+    /* strncpy with padding: 4-byte F03 prefix + full-8 overwrite
+     * invalidation (no copy row for the padding). */
+    osprey_on_mem_copy(env, 0x402300, 0x402408, 4);   /* copied prefix */
+    CHECK(run->copy_used == 4, "strncpy prefix F03");
+    osprey_on_mem_overwrite(env, 0x40240c, 4);        /* padding tail */
+    CHECK(run->copy_used == 4, "padding tail is not a copy");
+
+    /* strncpy with no padding: full n F03. */
+    osprey_on_mem_copy(env, 0x402300, 0x402410, 8);
+    CHECK(run->copy_used == 5, "unpadded strncpy full F03");
+
+    /* memset: overwrite-only. */
+    osprey_on_mem_overwrite(env, 0x402420, 16);
+    CHECK(run->copy_used == 5, "memset publishes no F03");
+
+    /* Zero length: no fact, no shadow mutation. */
+    osprey_on_mem_copy(env, 0x402100, 0x402200, 0);
+    CHECK(run->copy_used == 5, "zero-length copy publishes no F03");
+
+    /* Region-boundary crossing: a copy whose source spans the heap
+     * region end cannot canonicalize as one chunk; no F03, but the
+     * destination is still invalidated. */
+    env->regs[R_R12] = 0x10000;
+    osprey_on_mem_store(env, R_R12, 0x402500, 8, 0x10000, 0x400d00);
+    /* Heap H+60..H+64: [0x1003c, 0x10040) crosses the 64-byte object
+     * end (H+64) into unmapped space.  The destination [0x402504,
+     * 0x40250c) overlaps the slot at 0x402500. */
+    osprey_on_mem_copy(env, 0x1003c, 0x402504, 8);
+    CHECK(run->copy_used == 5, "boundary-crossing copy publishes no F03");
+    CHECK(g_hash_table_lookup(st->mem_slots,
+                              GSIZE_TO_POINTER(0x402500)) == NULL,
+          "boundary-crossing copy still invalidates destination");
+
+    /* Stale source slot: retiring the heap identity drops the tag; no
+     * relocation. */
+    env->regs[R_R12] = 0x10000;
+    osprey_on_mem_store(env, R_R12, 0x402700, 8, 0x10000, 0x400d00);
+    CHECK(g_hash_table_lookup(st->mem_slots,
+                              GSIZE_TO_POINTER(0x402700)) != NULL,
+          "source slot installed before retirement");
+    osprey_on_free_identity(env, t.object_id, t.generation, 0x400400);
+    provenance_retire_object(0x10000);
+    osprey_on_mem_copy(env, 0x402700, 0x402800, 8);
+    CHECK(g_hash_table_lookup(st->mem_slots,
+                              GSIZE_TO_POINTER(0x402708)) == NULL,
+          "stale source slot not relocated");
+    CHECK(g_hash_table_lookup(st->mem_slots,
+                              GSIZE_TO_POINTER(0x402700)) == NULL,
+          "stale source slot removed");
+    /* The memmove-relocated slot (0x402110) predates the retirement
+     * and stays live; only the stale source is gone. */
+    CHECK(g_hash_table_size(st->mem_slots) == 1,
+          "only the earlier relocated slot remains");
+
+    /* Wrapping copy interval clears the destination shadow and
+     * publishes no F03 (no canonical representation). */
+    env->regs[R_R12] = 0x10000;
+    osprey_on_mem_store(env, R_R12, 0x402900, 8, 0x10000, 0x400d00);
+    osprey_on_mem_copy(env, 0x402910, (target_ulong)-16, 32);
+    CHECK(g_hash_table_size(st->mem_slots) == 0,
+          "wrapping copy clears destination shadow");
+    CHECK(run->copy_used == 6, "wrapping copy publishes no F03");
+
+    /* Relocation is complete for every live source slot.  A fixed local
+     * snapshot cap must not drop the 65th tag or mutate disjoint source
+     * metadata. */
+    PtrTag many = provenance_create_object(0x11000, 64, 0x400300,
+                                           PROV_PRODUCER_MALLOC_RETURN);
+    osprey_on_alloc_success(env, 0x11000, 64, 0x400300,
+                            many.object_id, many.generation);
+    install_addr_origin(st, R_R12, 0x11000, &H, 0, 0x300);
+    st->regs[R_R12].address.prov_object_id = many.object_id;
+    st->regs[R_R12].address.prov_generation = many.generation;
+    env->regs[R_R12] = 0x11000;
+    g_hash_table_remove_all(st->mem_slots);
+    for (target_ulong i = 0; i < 65; i++) {
+        osprey_on_mem_store(env, R_R12, 0x402a00 + i * 8, 8,
+                            0x11000, 0x400d00);
+    }
+    CHECK(g_hash_table_size(st->mem_slots) == 65,
+          "65 source pointer slots installed");
+    uint32_t copies_before_many = run->copy_used;
+    uint32_t points_before_many = run->points_used;
+    osprey_on_mem_copy(env, 0x402a00, 0x402d00, 65 * 8);
+    CHECK(run->copy_used == copies_before_many + 1,
+          "large modeled copy publishes one full-width F03");
+    CHECK(run->points_used == points_before_many + 65,
+          "large modeled copy relocates every pointer slot");
+    CHECK(g_hash_table_size(st->mem_slots) == 130,
+          "large disjoint copy preserves all sources and destinations");
+    CHECK(g_hash_table_lookup(st->mem_slots,
+                              GSIZE_TO_POINTER(0x402a00 + 64 * 8)) != NULL &&
+          g_hash_table_lookup(st->mem_slots,
+                              GSIZE_TO_POINTER(0x402d00 + 64 * 8)) != NULL,
+          "large modeled copy keeps and relocates the final slot");
+
+    osprey_free(ctx);
+    g_free(run);
+    g_free(env);
+}
+
+/* Copy/points identity, Boolean support, prefix/suffix union, capacity
+ * failure, canonical sort order, and exact row schema. */
+static void test_copy_points_merge_and_dump(void)
+{
+    reset_log();
+    CHECK(OSPREY_SHARED_VERSION == 9u,
+          "shared version unchanged by Stage 2.4");
+    CHECK(sizeof(OspreyValueOrigin) > 8,
+          "VALUE origin carries the full source chunk record");
+
+    OspreyConfig c = test_config();
+    snprintf(c.dump_file, sizeof(c.dump_file), "/tmp/osprey_cp_dump.txt");
+    unlink(c.dump_file);
+    OspreyContext *ctx = osprey_new(&c);
+    OspreySharedRun *run = new_run(&c);
+
+    /* Duplicate insertion in both orders merges in place; support stays
+     * Boolean inside one sample. */
+    OspreyCopyFact cf1, cf2;
+    fill_copy_fact(&cf1, 0x2100, 8, 0x2200, 8);
+    fill_copy_fact(&cf2, 0x2110, 4, 0x2210, 4);
+    CHECK(osprey_table_insert_copy(run, &cf1) == 1, "insert copy 1");
+    CHECK(osprey_table_insert_copy(run, &cf2) == 1, "insert copy 2");
+    CHECK(osprey_table_insert_copy(run, &cf1) == 0,
+          "copy duplicate merges in place");
+    CHECK(run->copy_used == 2, "two unique copy records");
+    OspreyPointsToFact pf1, pf2;
+    fill_points_fact(&pf1, 0x2200, 8, 0x3000);
+    fill_points_fact(&pf2, 0x2210, 8, 0x3010);
+    CHECK(osprey_table_insert_points(run, &pf1) == 1, "insert points 1");
+    CHECK(osprey_table_insert_points(run, &pf2) == 1, "insert points 2");
+    CHECK(osprey_table_insert_points(run, &pf1) == 0,
+          "points duplicate merges in place");
+    CHECK(run->points_used == 2, "two unique points records");
+
+    /* Signed offsets print as two's-complement hex.  Within one stack
+     * region the positive row therefore sorts before the -8 row. */
+    OspreyCopyFact cf_stack_pos, cf_stack_neg;
+    fill_copy_fact(&cf_stack_pos, 8, 8, 0x18, 8);
+    cf_stack_pos.source.address.region.kind = OSPREY_REGION_STACK_FUNCTION;
+    cf_stack_pos.source.address.region.site_offset = 0x500;
+    cf_stack_pos.destination.address.region =
+        cf_stack_pos.source.address.region;
+    cf_stack_neg = cf_stack_pos;
+    cf_stack_neg.source.address.offset = -8;
+    cf_stack_neg.destination.address.offset = -0x18;
+    CHECK(osprey_table_insert_copy(run, &cf_stack_pos) == 1,
+          "insert positive stack copy");
+    CHECK(osprey_table_insert_copy(run, &cf_stack_neg) == 1,
+          "insert negative stack copy");
+    OspreyPointsToFact pf_stack_pos, pf_stack_neg;
+    fill_points_fact(&pf_stack_pos, 8, 8, 0x18);
+    pf_stack_pos.pointer_chunk.address.region.kind =
+        OSPREY_REGION_STACK_FUNCTION;
+    pf_stack_pos.pointer_chunk.address.region.site_offset = 0x500;
+    pf_stack_pos.target.region = pf_stack_pos.pointer_chunk.address.region;
+    pf_stack_neg = pf_stack_pos;
+    pf_stack_neg.pointer_chunk.address.offset = -8;
+    pf_stack_neg.target.offset = -0x18;
+    CHECK(osprey_table_insert_points(run, &pf_stack_pos) == 1,
+          "insert positive stack points");
+    CHECK(osprey_table_insert_points(run, &pf_stack_neg) == 1,
+          "insert negative stack points");
+    CHECK(run->copy_used == 4 && run->points_used == 4,
+          "four unique copy and points records");
+
+    /* Prefix/suffix union: the same copy fact in both families commits
+     * once with one support. */
+    OspreySharedRun *run2 = new_run(&c);
+    CHECK(osprey_table_insert_copy(run2, &cf1) == 1, "prefix copy");
+    CHECK(osprey_shared_run_freeze_prefix(ctx, run2),
+          "prefix freeze with copy fact");
+    osprey_shared_run_prepare(ctx, run2, 1);
+    CHECK(osprey_table_insert_copy(run2, &cf1) == 1,
+          "suffix re-observation of prefix copy");
+    CHECK(run2->copy_used == 1, "union has one copy record");
+    CHECK(osprey_parent_merge_sample(ctx, run2) == OSPREY_OK,
+          "prefix/suffix copy union merges");
+    CHECK(ctx->copy_facts->len == 1 &&
+          g_array_index(ctx->copy_facts, OspreyCopyFact, 0)
+                  .sample_support == 1,
+          "prefix/suffix duplicate contributes one support");
+    g_free(run2);
+
+    /* Capacity exhaustion rejects fail-closed. */
+    reset_log();
+    OspreyConfig c2 = test_config();
+    c2.max_facts = 1;
+    OspreyContext *ctx2 = osprey_new(&c2);
+    OspreySharedRun *run3 = new_run(&c2);
+    OspreyCopyFact cf3;
+    fill_copy_fact(&cf3, 0x3000, 8, 0x3100, 8);
+    CHECK(osprey_table_insert_copy(run3, &cf3) == 1, "copy fills cap");
+    OspreyCopyFact cf4;
+    fill_copy_fact(&cf4, 0x3010, 8, 0x3110, 8);
+    CHECK(osprey_table_insert_copy(run3, &cf4) == -1,
+          "second copy exceeds cap");
+    CHECK(run3->overflow == 1, "copy cap overflow sticky");
+    CHECK(osprey_parent_merge_sample(ctx2, run3) ==
+              OSPREY_INCOMPLETE_FACTS,
+          "copy cap merge rejects fail-closed");
+    CHECK(ctx2->copy_facts->len == 0, "copy cap no partial merge");
+    osprey_free(ctx2);
+    g_free(run3);
+
+    /* Canonical dump: copy/points rows sorted by every printed field
+     * with the exact 10-token schema and zero weak-numeric evidence. */
+    CHECK(osprey_parent_merge_sample(ctx, run) == OSPREY_OK,
+          "dump merge ok");
+    FILE *f = fopen(c.dump_file, "r");
+    CHECK(f != NULL, "dump file written");
+    if (f != NULL) {
+        char line[256];
+        char copy_lines[8][256];
+        char points_lines[8][256];
+        int n_copy = 0, n_points = 0;
+        while (fgets(line, sizeof(line), f)) {
+            if (strncmp(line, "copy ", 5) == 0 && n_copy < 8) {
+                snprintf(copy_lines[n_copy++], sizeof(copy_lines[0]),
+                         "%s", line);
+            }
+            if (strncmp(line, "points ", 7) == 0 && n_points < 8) {
+                snprintf(points_lines[n_points++], sizeof(points_lines[0]),
+                         "%s", line);
+            }
+        }
+        fclose(f);
+        CHECK(n_copy == 4, "dump has four copy rows");
+        CHECK(n_points == 4, "dump has four points rows");
+        /* Sorted by all printed fields.  Global rows precede stack rows;
+         * inside S_0x500, +8 precedes -8 because the printed hex order
+         * compares the uint64_t representation.  cf1 was committed once
+         * by the prefix/suffix union and once by the dump merge, so its
+         * support is 2. */
+        CHECK(n_copy == 4 &&
+              strstr(copy_lines[0], "0 0 2100 8 0 0 2200 8 2") != NULL &&
+              strstr(copy_lines[1], "0 0 2110 4 0 0 2210 4 1") != NULL &&
+              strstr(copy_lines[2], "2 500 8 8 2 500 18 8 1") != NULL &&
+              strstr(copy_lines[3],
+                     "2 500 fffffffffffffff8 8 2 500 "
+                     "ffffffffffffffe8 8 1") != NULL,
+              "copy rows use exact two's-complement field order");
+        CHECK(n_points == 4 &&
+              strstr(points_lines[0], "0 0 2200 8 0 0 3000 1 0") != NULL &&
+              strstr(points_lines[1], "0 0 2210 8 0 0 3010 1 0") != NULL &&
+              strstr(points_lines[2], "2 500 8 8 2 500 18 1 0") != NULL &&
+              strstr(points_lines[3],
+                     "2 500 fffffffffffffff8 8 2 500 "
+                     "ffffffffffffffe8 1 0") != NULL,
+              "points rows use exact two's-complement field order");
+    }
+    unlink(c.dump_file);
+
+    osprey_free(ctx);
+    g_free(run);
 }
 
 static void test_base_fact_producer_merge(void)

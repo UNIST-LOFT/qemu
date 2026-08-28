@@ -2257,18 +2257,20 @@ set_timeout:
 /* Shared event for the exact getsockopt output ranges.
  * optval_bytes is the number of bytes QEMU actually wrote to optval; the
  * 4-byte optlen word is always written back on success. */
-static inline void sem_overwrite_getsockopt(abi_ulong optval_addr,
-                                              abi_ulong optlen_addr,
-                                              abi_ulong optval_bytes)
+static inline void sem_overwrite_getsockopt(CPUArchState *env,
+                                            abi_ulong optval_addr,
+                                            abi_ulong optlen_addr,
+                                            abi_ulong optval_bytes)
 {
     if (optval_bytes > 0) {
-        sem_mem_overwrite(optval_addr, optval_bytes, SEM_OP_SYSCALL);
+        sem_mem_overwrite(env, optval_addr, optval_bytes, SEM_OP_SYSCALL);
     }
-    sem_mem_overwrite(optlen_addr, sizeof(uint32_t), SEM_OP_SYSCALL);
+    sem_mem_overwrite(env, optlen_addr, sizeof(uint32_t), SEM_OP_SYSCALL);
 }
 
-static abi_long do_getsockopt(int sockfd, int level, int optname,
-                              abi_ulong optval_addr, abi_ulong optlen)
+static abi_long do_getsockopt(CPUArchState *env, int sockfd, int level,
+                              int optname, abi_ulong optval_addr,
+                              abi_ulong optlen)
 {
     abi_long ret;
     int len, val;
@@ -2314,7 +2316,7 @@ static abi_long do_getsockopt(int sockfd, int level, int optname,
             if (put_user_u32(len, optlen)) {
                 return -TARGET_EFAULT;
             }
-            sem_overwrite_getsockopt(optval_addr, optlen,
+            sem_overwrite_getsockopt(env, optval_addr, optlen,
                                         sizeof(struct target_ucred));
             break;
         }
@@ -2349,7 +2351,7 @@ static abi_long do_getsockopt(int sockfd, int level, int optname,
             if (put_user_u32(len, optlen)) {
                 return -TARGET_EFAULT;
             }
-            sem_overwrite_getsockopt(optval_addr, optlen,
+            sem_overwrite_getsockopt(env, optval_addr, optlen,
                                         sizeof(struct target_linger));
             break;
         }
@@ -2441,7 +2443,7 @@ static abi_long do_getsockopt(int sockfd, int level, int optname,
         }
         if (put_user_u32(len, optlen))
             return -TARGET_EFAULT;
-        sem_overwrite_getsockopt(optval_addr, optlen,
+        sem_overwrite_getsockopt(env, optval_addr, optlen,
                                     (abi_ulong)(len == 4 ? 4 : 1));
         break;
     case SOL_IP:
@@ -2474,14 +2476,14 @@ static abi_long do_getsockopt(int sockfd, int level, int optname,
                 if (put_user_u32(len, optlen)
                     || put_user_u8(val, optval_addr))
                     return -TARGET_EFAULT;
-                sem_overwrite_getsockopt(optval_addr, optlen, 1);
+                sem_overwrite_getsockopt(env, optval_addr, optlen, 1);
             } else {
                 if (len > sizeof(int))
                     len = sizeof(int);
                 if (put_user_u32(len, optlen)
                     || put_user_u32(val, optval_addr))
                     return -TARGET_EFAULT;
-                sem_overwrite_getsockopt(optval_addr, optlen, 4);
+                sem_overwrite_getsockopt(env, optval_addr, optlen, 4);
             }
             break;
         default:
@@ -2537,14 +2539,14 @@ static abi_long do_getsockopt(int sockfd, int level, int optname,
                 if (put_user_u32(len, optlen)
                     || put_user_u8(val, optval_addr))
                     return -TARGET_EFAULT;
-                sem_overwrite_getsockopt(optval_addr, optlen, 1);
+                sem_overwrite_getsockopt(env, optval_addr, optlen, 1);
             } else {
                 if (len > sizeof(int))
                     len = sizeof(int);
                 if (put_user_u32(len, optlen)
                     || put_user_u32(val, optval_addr))
                     return -TARGET_EFAULT;
-                sem_overwrite_getsockopt(optval_addr, optlen, 4);
+                sem_overwrite_getsockopt(env, optval_addr, optlen, 4);
             }
             break;
         default:
@@ -2691,8 +2693,8 @@ static void unlock_iovec(struct iovec *vec, abi_ulong count, int copy)
  * syscall.  The guest iovec array may overlap an output buffer and be
  * overwritten by a successful read, so reconstructing destinations from it
  * afterward is not correct. */
-static void sem_overwrite_iovec(struct iovec *vec, abi_ulong count,
-                                       abi_long written)
+static void sem_overwrite_iovec(CPUArchState *env, struct iovec *vec,
+                                abi_ulong count, abi_long written)
 {
     abi_ulong *guest_bases;
     target_ulong left;
@@ -2710,7 +2712,7 @@ static void sem_overwrite_iovec(struct iovec *vec, abi_ulong count,
             n = left;
         }
         if (n > 0) {
-            sem_mem_overwrite(guest_bases[i], n, SEM_OP_SYSCALL);
+            sem_mem_overwrite(env, guest_bases[i], n, SEM_OP_SYSCALL);
             left -= n;
         }
     }
@@ -2860,7 +2862,8 @@ static abi_long do_connect(int sockfd, abi_ulong target_addr,
 }
 
 /* do_sendrecvmsg_locked() Must return target values and target errnos. */
-static abi_long do_sendrecvmsg_locked(int fd, abi_ulong target_msg,
+static abi_long do_sendrecvmsg_locked(CPUArchState *env, int fd,
+                                      abi_ulong target_msg,
                                       struct target_msghdr *msgp,
                                       int flags, int send)
 {
@@ -2943,7 +2946,7 @@ static abi_long do_sendrecvmsg_locked(int fd, abi_ulong target_msg,
              * target ancillary/name conversion can fail.  Invalidate from
              * the pre-syscall locked vector immediately so an EFAULT during
              * those conversions cannot leave stale payload provenance. */
-            sem_overwrite_iovec(vec, count, len);
+            sem_overwrite_iovec(env, vec, count, len);
             if (fd_trans_host_to_target_data(fd)) {
                 ret = fd_trans_host_to_target_data(fd)(msg.msg_iov->iov_base,
                                                MIN(msg.msg_iov->iov_len, len));
@@ -2954,9 +2957,11 @@ static abi_long do_sendrecvmsg_locked(int fd, abi_ulong target_msg,
 
                     if (ctrl > 0) {
                         sem_mem_overwrite(
-                            tswapal(msgp->msg_control), ctrl, SEM_OP_SYSCALL);
+                            env, tswapal(msgp->msg_control), ctrl,
+                            SEM_OP_SYSCALL);
                     }
                     sem_mem_overwrite(
+                        env,
                         target_msg + offsetof(struct target_msghdr,
                                               msg_controllen),
                         sizeof(abi_long), SEM_OP_SYSCALL);
@@ -2966,12 +2971,12 @@ static abi_long do_sendrecvmsg_locked(int fd, abi_ulong target_msg,
                 msgp->msg_namelen = tswap32(msg.msg_namelen);
                 msgp->msg_flags = tswap32(msg.msg_flags);
                 sem_mem_overwrite(
-                    target_msg + offsetof(struct target_msghdr,
-                                          msg_namelen),
+                    env, target_msg + offsetof(struct target_msghdr,
+                                               msg_namelen),
                     sizeof(int), SEM_OP_SYSCALL);
                 sem_mem_overwrite(
-                    target_msg + offsetof(struct target_msghdr,
-                                          msg_flags),
+                    env, target_msg + offsetof(struct target_msghdr,
+                                               msg_flags),
                     sizeof(unsigned int), SEM_OP_SYSCALL);
                 if (msg.msg_name != NULL && msg.msg_name != (void *)-1) {
                     ret = host_to_target_sockaddr(tswapal(msgp->msg_name),
@@ -2979,7 +2984,7 @@ static abi_long do_sendrecvmsg_locked(int fd, abi_ulong target_msg,
                     if (ret) {
                         goto out;
                     }
-                    sem_mem_overwrite(tswapal(msgp->msg_name),
+                    sem_mem_overwrite(env, tswapal(msgp->msg_name),
                                       msg.msg_namelen, SEM_OP_SYSCALL);
                 }
 
@@ -2994,8 +2999,8 @@ out2:
     return ret;
 }
 
-static abi_long do_sendrecvmsg(int fd, abi_ulong target_msg,
-                               int flags, int send)
+static abi_long do_sendrecvmsg(CPUArchState *env, int fd,
+                               abi_ulong target_msg, int flags, int send)
 {
     abi_long ret;
     struct target_msghdr *msgp;
@@ -3006,7 +3011,7 @@ static abi_long do_sendrecvmsg(int fd, abi_ulong target_msg,
                           send ? 1 : 0)) {
         return -TARGET_EFAULT;
     }
-    ret = do_sendrecvmsg_locked(fd, target_msg, msgp, flags, send);
+    ret = do_sendrecvmsg_locked(env, fd, target_msg, msgp, flags, send);
     unlock_user_struct(msgp, target_msg, send ? 0 : 1);
     return ret;
 }
@@ -3018,7 +3023,8 @@ static abi_long do_sendrecvmsg(int fd, abi_ulong target_msg,
 #define MSG_WAITFORONE 0x10000
 #endif
 
-static abi_long do_sendrecvmmsg(int fd, abi_ulong target_msgvec,
+static abi_long do_sendrecvmmsg(CPUArchState *env, int fd,
+                                abi_ulong target_msgvec,
                                 unsigned int vlen, unsigned int flags,
                                 int send)
 {
@@ -3037,7 +3043,7 @@ static abi_long do_sendrecvmmsg(int fd, abi_ulong target_msgvec,
 
     for (i = 0; i < vlen; i++) {
         ret = do_sendrecvmsg_locked(
-            fd, target_msgvec + i * sizeof(*mmsgp),
+            env, fd, target_msgvec + i * sizeof(*mmsgp),
             &mmsgp[i].msg_hdr, flags, send);
         if (is_error(ret)) {
             break;
@@ -3061,7 +3067,7 @@ static abi_long do_sendrecvmmsg(int fd, abi_ulong target_msgvec,
 }
 
 /* do_accept4() Must return target values and target errnos. */
-static abi_long do_accept4(int fd, abi_ulong target_addr,
+static abi_long do_accept4(CPUArchState *env, int fd, abi_ulong target_addr,
                            abi_ulong target_addrlen_addr, int flags)
 {
     socklen_t addrlen, ret_addrlen;
@@ -3180,8 +3186,9 @@ static abi_long do_socketpair(int domain, int type, int protocol,
 }
 
 /* do_sendto() Must return target values and target errnos. */
-static abi_long do_sendto(int fd, abi_ulong msg, size_t len, int flags,
-                          abi_ulong target_addr, socklen_t addrlen)
+static abi_long do_sendto(CPUArchState *env, int fd, abi_ulong msg,
+                          size_t len, int flags, abi_ulong target_addr,
+                          socklen_t addrlen)
 {
     void *addr;
     void *host_msg;
@@ -3224,8 +3231,8 @@ fail:
 }
 
 /* do_recvfrom() Must return target values and target errnos. */
-static abi_long do_recvfrom(int fd, abi_ulong msg, size_t len, int flags,
-                            abi_ulong target_addr,
+static abi_long do_recvfrom(CPUArchState *env, int fd, abi_ulong msg,
+                            size_t len, int flags, abi_ulong target_addr,
                             abi_ulong target_addrlen)
 {
     socklen_t addrlen, ret_addrlen;
@@ -3276,12 +3283,12 @@ static abi_long do_recvfrom(int fd, abi_ulong msg, size_t len, int flags,
          * in/out addrlen word.  Invalidate exactly those ranges so stale
          * pointer-shadow entries are not reloaded (Phase 4). */
         if (ret > 0) {
-            sem_mem_overwrite(msg, ret, SEM_OP_SYSCALL);
+            sem_mem_overwrite(env, msg, ret, SEM_OP_SYSCALL);
         }
         if (target_addr) {
-            sem_mem_overwrite(target_addr, MIN(addrlen, ret_addrlen),
+            sem_mem_overwrite(env, target_addr, MIN(addrlen, ret_addrlen),
                               SEM_OP_SYSCALL);
-            sem_mem_overwrite(target_addrlen, sizeof(uint32_t),
+            sem_mem_overwrite(env, target_addrlen, sizeof(uint32_t),
                               SEM_OP_SYSCALL);
         }
         unlock_user(host_msg, msg, len);
@@ -3294,7 +3301,7 @@ fail:
 
 #ifdef TARGET_NR_socketcall
 /* do_socketcall() must return target values and target errnos. */
-static abi_long do_socketcall(int num, abi_ulong vptr)
+static abi_long do_socketcall(CPUArchState *env, int num, abi_ulong vptr)
 {
     static const unsigned nargs[] = { /* number of arguments per operation */
         [TARGET_SYS_SOCKET] = 3,      /* domain, type, protocol */
@@ -3347,7 +3354,7 @@ static abi_long do_socketcall(int num, abi_ulong vptr)
     case TARGET_SYS_LISTEN: /* sockfd, backlog */
         return get_errno(listen(a[0], a[1]));
     case TARGET_SYS_ACCEPT: /* sockfd, addr, addrlen */
-        return do_accept4(a[0], a[1], a[2], 0);
+        return do_accept4(env, a[0], a[1], a[2], 0);
     case TARGET_SYS_GETSOCKNAME: /* sockfd, addr, addrlen */
         return do_getsockname(a[0], a[1], a[2]);
     case TARGET_SYS_GETPEERNAME: /* sockfd, addr, addrlen */
@@ -3355,29 +3362,29 @@ static abi_long do_socketcall(int num, abi_ulong vptr)
     case TARGET_SYS_SOCKETPAIR: /* domain, type, protocol, tab */
         return do_socketpair(a[0], a[1], a[2], a[3]);
     case TARGET_SYS_SEND: /* sockfd, msg, len, flags */
-        return do_sendto(a[0], a[1], a[2], a[3], 0, 0);
+        return do_sendto(env, a[0], a[1], a[2], a[3], 0, 0);
     case TARGET_SYS_RECV: /* sockfd, msg, len, flags */
-        return do_recvfrom(a[0], a[1], a[2], a[3], 0, 0);
+        return do_recvfrom(env, a[0], a[1], a[2], a[3], 0, 0);
     case TARGET_SYS_SENDTO: /* sockfd, msg, len, flags, addr, addrlen */
-        return do_sendto(a[0], a[1], a[2], a[3], a[4], a[5]);
+        return do_sendto(env, a[0], a[1], a[2], a[3], a[4], a[5]);
     case TARGET_SYS_RECVFROM: /* sockfd, msg, len, flags, addr, addrlen */
-        return do_recvfrom(a[0], a[1], a[2], a[3], a[4], a[5]);
+        return do_recvfrom(env, a[0], a[1], a[2], a[3], a[4], a[5]);
     case TARGET_SYS_SHUTDOWN: /* sockfd, how */
         return get_errno(shutdown(a[0], a[1]));
     case TARGET_SYS_SETSOCKOPT: /* sockfd, level, optname, optval, optlen */
         return do_setsockopt(a[0], a[1], a[2], a[3], a[4]);
     case TARGET_SYS_GETSOCKOPT: /* sockfd, level, optname, optval, optlen */
-        return do_getsockopt(a[0], a[1], a[2], a[3], a[4]);
+        return do_getsockopt(env, a[0], a[1], a[2], a[3], a[4]);
     case TARGET_SYS_SENDMSG: /* sockfd, msg, flags */
-        return do_sendrecvmsg(a[0], a[1], a[2], 1);
+        return do_sendrecvmsg(env, a[0], a[1], a[2], 1);
     case TARGET_SYS_RECVMSG: /* sockfd, msg, flags */
-        return do_sendrecvmsg(a[0], a[1], a[2], 0);
+        return do_sendrecvmsg(env, a[0], a[1], a[2], 0);
     case TARGET_SYS_ACCEPT4: /* sockfd, addr, addrlen, flags */
-        return do_accept4(a[0], a[1], a[2], a[3]);
+        return do_accept4(env, a[0], a[1], a[2], a[3]);
     case TARGET_SYS_RECVMMSG: /* sockfd, msgvec, vlen, flags */
-        return do_sendrecvmmsg(a[0], a[1], a[2], a[3], 0);
+        return do_sendrecvmmsg(env, a[0], a[1], a[2], a[3], 0);
     case TARGET_SYS_SENDMMSG: /* sockfd, msgvec, vlen, flags */
-        return do_sendrecvmmsg(a[0], a[1], a[2], a[3], 1);
+        return do_sendrecvmmsg(env, a[0], a[1], a[2], a[3], 1);
     default:
         gemu_log("Unsupported socketcall: %d\n", num);
         return -TARGET_EINVAL;
@@ -5866,7 +5873,7 @@ static int do_fork(CPUArchState *env, unsigned int flags, abi_ulong newsp,
              * Mark only a successfully created shared-VM thread: an
              * invalid or failed clone did not create concurrent state
              * and must not reject an otherwise supported sample. */
-            osprey_mark_unsupported_execution();
+            sem_mark_unsupported_execution();
         } else {
             ret = -1;
         }
@@ -7327,6 +7334,7 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
                             abi_long arg8)
 {
     CPUState *cpu = env_cpu(cpu_env);
+    CPUArchState *env = cpu_env;
     abi_long ret;
 #if defined(TARGET_NR_stat) || defined(TARGET_NR_stat64) \
     || defined(TARGET_NR_lstat) || defined(TARGET_NR_lstat64) \
@@ -8994,15 +9002,15 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
 #endif
 #ifdef TARGET_NR_socketcall
     case TARGET_NR_socketcall:
-        return do_socketcall(arg1, arg2);
+        return do_socketcall(env, arg1, arg2);
 #endif
 #ifdef TARGET_NR_accept
     case TARGET_NR_accept:
-        return do_accept4(arg1, arg2, arg3, 0);
+        return do_accept4(env, arg1, arg2, arg3, 0);
 #endif
 #ifdef TARGET_NR_accept4
     case TARGET_NR_accept4:
-        return do_accept4(arg1, arg2, arg3, arg4);
+        return do_accept4(env, arg1, arg2, arg3, arg4);
 #endif
 #ifdef TARGET_NR_bind
     case TARGET_NR_bind:
@@ -9022,7 +9030,7 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
 #endif
 #ifdef TARGET_NR_getsockopt
     case TARGET_NR_getsockopt:
-        return do_getsockopt(arg1, arg2, arg3, arg4, arg5);
+        return do_getsockopt(env, arg1, arg2, arg3, arg4, arg5);
 #endif
 #ifdef TARGET_NR_listen
     case TARGET_NR_listen:
@@ -9030,33 +9038,33 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
 #endif
 #ifdef TARGET_NR_recv
     case TARGET_NR_recv:
-        return do_recvfrom(arg1, arg2, arg3, arg4, 0, 0);
+        return do_recvfrom(env, arg1, arg2, arg3, arg4, 0, 0);
 #endif
 #ifdef TARGET_NR_recvfrom
     case TARGET_NR_recvfrom:
-        return do_recvfrom(arg1, arg2, arg3, arg4, arg5, arg6);
+        return do_recvfrom(env, arg1, arg2, arg3, arg4, arg5, arg6);
 #endif
 #ifdef TARGET_NR_recvmsg
     case TARGET_NR_recvmsg:
-        return do_sendrecvmsg(arg1, arg2, arg3, 0);
+        return do_sendrecvmsg(env, arg1, arg2, arg3, 0);
 #endif
 #ifdef TARGET_NR_send
     case TARGET_NR_send:
-        return do_sendto(arg1, arg2, arg3, arg4, 0, 0);
+        return do_sendto(env, arg1, arg2, arg3, arg4, 0, 0);
 #endif
 #ifdef TARGET_NR_sendmsg
     case TARGET_NR_sendmsg:
-        return do_sendrecvmsg(arg1, arg2, arg3, 1);
+        return do_sendrecvmsg(env, arg1, arg2, arg3, 1);
 #endif
 #ifdef TARGET_NR_sendmmsg
     case TARGET_NR_sendmmsg:
-        return do_sendrecvmmsg(arg1, arg2, arg3, arg4, 1);
+        return do_sendrecvmmsg(env, arg1, arg2, arg3, arg4, 1);
     case TARGET_NR_recvmmsg:
-        return do_sendrecvmmsg(arg1, arg2, arg3, arg4, 0);
+        return do_sendrecvmmsg(env, arg1, arg2, arg3, arg4, 0);
 #endif
 #ifdef TARGET_NR_sendto
     case TARGET_NR_sendto:
-        return do_sendto(arg1, arg2, arg3, arg4, arg5, arg6);
+        return do_sendto(env, arg1, arg2, arg3, arg4, arg5, arg6);
 #endif
 #ifdef TARGET_NR_shutdown
     case TARGET_NR_shutdown:
@@ -9736,7 +9744,7 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
             struct iovec *vec = lock_iovec(VERIFY_WRITE, arg2, arg3, 0);
             if (vec != NULL) {
                 ret = get_errno(safe_readv(arg1, vec, arg3));
-                sem_overwrite_iovec(vec, arg3, ret);
+                sem_overwrite_iovec(env, vec, arg3, ret);
                 unlock_iovec(vec, arg3, 1);
             } else {
                 ret = -host_to_target_errno(errno);
@@ -9763,7 +9771,7 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
 
                 target_to_host_low_high(arg4, arg5, &low, &high);
                 ret = get_errno(safe_preadv(arg1, vec, arg3, low, high));
-                sem_overwrite_iovec(vec, arg3, ret);
+                sem_overwrite_iovec(env, vec, arg3, ret);
                 unlock_iovec(vec, arg3, 1);
             } else {
                 ret = -host_to_target_errno(errno);
@@ -12069,6 +12077,7 @@ abi_long do_syscall(void *cpu_env, int num, abi_long arg1,
                     abi_long arg8)
 {
     CPUState *cpu = env_cpu(cpu_env);
+    CPUArchState *env = cpu_env;
     abi_long ret;
 #if 0
     if (num == TARGET_NR_open) {
@@ -12193,7 +12202,7 @@ abi_long do_syscall(void *cpu_env, int num, abi_long arg1,
     }
 
 #ifdef SYMBOLIC_INSTRUMENTATION
-    snapshot_syscall(num, arg1, arg2, arg3, arg4, arg5, arg6, arg7, ret);
+    snapshot_syscall(env, num, arg1, arg2, arg3, arg4, arg5, arg6, arg7, ret);
     if (syscall_no != SYS_NOT_INTERESTING) {
         qemu_syscall_helper(syscall_no, arg1, arg2, arg3, arg4, arg5, arg6, arg7, ret);
     }

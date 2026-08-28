@@ -133,11 +133,11 @@ void helper_bndstx64(CPUX86State *env, target_ulong base, target_ulong ptr,
     uint64_t bde, bte;
 
     bte = lookup_bte64(env, base, ra, &bde);
-    sem_mem_overwrite(bte, 8, SEM_OP_MPX);
+    sem_mem_helper_write_attempt(env, bte, 8, SEM_OP_MPX);
     cpu_stq_data_ra(env, bte, lb, ra);
-    sem_mem_overwrite(bte + 8, 8, SEM_OP_MPX);
+    sem_mem_helper_write_attempt(env, bte + 8, 8, SEM_OP_MPX);
     cpu_stq_data_ra(env, bte + 8, ub, ra);
-    sem_mem_overwrite(bte + 16, 8, SEM_OP_MPX);
+    sem_mem_helper_write_attempt(env, bte + 16, 8, SEM_OP_MPX);
     cpu_stq_data_ra(env, bte + 16, ptr, ra);
     sem_mem_helper_access_part(env, bde, 8, pc, false, SEM_OP_MPX,
                                 SEM_INTERVAL_MULTIPART,
@@ -154,11 +154,11 @@ void helper_bndstx32(CPUX86State *env, target_ulong base, target_ulong ptr,
     uint32_t bde, bte;
 
     bte = lookup_bte32(env, base, ra, &bde);
-    sem_mem_overwrite(bte, 4, SEM_OP_MPX);
+    sem_mem_helper_write_attempt(env, bte, 4, SEM_OP_MPX);
     cpu_stl_data_ra(env, bte, lb, ra);
-    sem_mem_overwrite(bte + 4, 4, SEM_OP_MPX);
+    sem_mem_helper_write_attempt(env, bte + 4, 4, SEM_OP_MPX);
     cpu_stl_data_ra(env, bte + 4, ub, ra);
-    sem_mem_overwrite(bte + 8, 4, SEM_OP_MPX);
+    sem_mem_helper_write_attempt(env, bte + 8, 4, SEM_OP_MPX);
     cpu_stl_data_ra(env, bte + 8, ptr, ra);
     sem_mem_helper_access_part(env, bde, 4, pc, false, SEM_OP_MPX,
                                 SEM_INTERVAL_MULTIPART,

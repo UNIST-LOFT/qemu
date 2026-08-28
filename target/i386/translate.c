@@ -200,10 +200,22 @@ static void gen_sem_on_load(int dst_idx, TCGv t_addr, TCGMemOp ot,
 
 /* Store spill/invalidate event.  src_idx == OR_TMP0 means an
  * immediate/unknown source: both consumers invalidate the shadow slot
- * (uniform rule; see helper_sem_on_store in sem-events.c). */
+ * (uniform rule; see helper_sem_on_store in sem-events.c).  `pc` rides
+ * the pending raw transfer-PC scratch (same protocol as the two-helper
+ * LEA sequence) so OSPREY can gate F03/F04 publication on the
+ * main-image producer gate. */
 static void gen_sem_on_store_class(int src_idx, TCGv t_addr, TCGMemOp ot,
-                                   SemOpClass cls) {
+                                   SemOpClass cls, target_ulong pc) {
     if (!sem_events_active()) return;
+    /* Ride the pending raw transfer-PC scratch (same protocol as the
+     * two-helper LEA sequence): the store helper consumes the
+     * instruction PC so OSPREY can gate F03/F04 publication on the
+     * main-image producer gate. */
+    {
+        TCGv t_pc = tcg_const_tl(pc);
+        gen_helper_sem_set_pc(cpu_env, t_pc);
+        tcg_temp_free(t_pc);
+    }
     TCGv_i32 t_src = tcg_const_i32(src_idx);
     TCGv t_size = tcg_const_tl(1 << (ot & MO_SIZE));
     TCGv_i32 t_cls = tcg_const_i32(cls);
@@ -222,12 +234,14 @@ static void gen_sem_on_store_class(int src_idx, TCGv t_addr, TCGMemOp ot,
     tcg_temp_free_i32(t_cls);
 }
 
-static void gen_sem_on_store(int src_idx, TCGv t_addr, TCGMemOp ot) {
-    gen_sem_on_store_class(src_idx, t_addr, ot, SEM_OP_INTEGER);
+static void gen_sem_on_store(int src_idx, TCGv t_addr, TCGMemOp ot,
+                              target_ulong pc) {
+    gen_sem_on_store_class(src_idx, t_addr, ot, SEM_OP_INTEGER, pc);
 }
 
-static void gen_sem_on_store_x87(int src_idx, TCGv t_addr, TCGMemOp ot) {
-    gen_sem_on_store_class(src_idx, t_addr, ot, SEM_OP_X87_HELPER);
+static void gen_sem_on_store_x87(int src_idx, TCGv t_addr, TCGMemOp ot,
+                                   target_ulong pc) {
+    gen_sem_on_store_class(src_idx, t_addr, ot, SEM_OP_X87_HELPER, pc);
 }
 
 /* Full-width register xchg: swap the two registers' provenance tags.
@@ -653,7 +667,7 @@ static void gen_sem_qemu_st_tl(DisasContext *s, TCGv src, TCGv addr,
                                TCGMemOp ot, SemOpClass cls) {
     gen_sem_set_ea_mode(s);
     tcg_gen_qemu_st_tl(src, addr, s->mem_index, ot);
-    gen_sem_on_store_class(-1, addr, ot, cls);
+    gen_sem_on_store_class(-1, addr, ot, cls, s->pc_start);
     gen_sem_mem_access_f01_raw_class_policy(
         addr, 1 << (ot & MO_SIZE), s->pc_start, true, cls,
         SEM_INTERVAL_EXACT_WIDTH, sem_qemu_producer(cls));
@@ -663,7 +677,7 @@ static void gen_sem_qemu_st_i32(DisasContext *s, TCGv_i32 src, TCGv addr,
                                 TCGMemOp ot, SemOpClass cls) {
     gen_sem_set_ea_mode(s);
     tcg_gen_qemu_st_i32(src, addr, s->mem_index, ot);
-    gen_sem_on_store_class(-1, addr, ot, cls);
+    gen_sem_on_store_class(-1, addr, ot, cls, s->pc_start);
     gen_sem_mem_access_f01_raw_class_policy(
         addr, 1 << (ot & MO_SIZE), s->pc_start, true, cls,
         SEM_INTERVAL_EXACT_WIDTH, sem_qemu_producer(cls));
@@ -673,7 +687,7 @@ static void gen_sem_qemu_st_i64(DisasContext *s, TCGv_i64 src, TCGv addr,
                                 TCGMemOp ot, SemOpClass cls) {
     gen_sem_set_ea_mode(s);
     tcg_gen_qemu_st_i64(src, addr, s->mem_index, ot);
-    gen_sem_on_store_class(-1, addr, ot, cls);
+    gen_sem_on_store_class(-1, addr, ot, cls, s->pc_start);
     gen_sem_mem_access_f01_raw_class_policy(
         addr, 1 << (ot & MO_SIZE), s->pc_start, true, cls,
         SEM_INTERVAL_EXACT_WIDTH, sem_qemu_producer(cls));
@@ -1013,7 +1027,7 @@ static inline void gen_op_st_v_raw_class(DisasContext *s, int idx, TCGv t0,
      * results, immediate stores, SIMD/atomic paths routed through here)
      * cannot leave stale shadow metadata.  OR_TMP0 source → both
      * consumers invalidate the slot (uniform rule). */
-    gen_sem_on_store_class(OR_TMP0, a0, idx, cls);
+    gen_sem_on_store_class(OR_TMP0, a0, idx, cls, s->pc_start);
 }
 
 static inline void gen_op_st_v_raw(DisasContext *s, int idx, TCGv t0,
@@ -1963,7 +1977,7 @@ static void gen_op(DisasContext *s1, int op, TCGMemOp ot, int d)
                                         s1->mem_index, ot | MO_LE);
             /* LOCKed RMW: atomic store bypasses gen_op_st_v; invalidate. */
             gen_sem_on_store_class(OR_TMP0, s1->A0, ot,
-                                   SEM_OP_ATOMIC_RMW);
+                                   SEM_OP_ATOMIC_RMW, s1->pc_start);
         } else {
             tcg_gen_add_tl(s1->T0, s1->T0, s1->T1);
             tcg_gen_add_tl(s1->T0, s1->T0, s1->tmp4);
@@ -1981,7 +1995,7 @@ static void gen_op(DisasContext *s1, int op, TCGMemOp ot, int d)
                                         s1->mem_index, ot | MO_LE);
             /* LOCKed RMW: atomic store bypasses gen_op_st_v; invalidate. */
             gen_sem_on_store_class(OR_TMP0, s1->A0, ot,
-                                   SEM_OP_ATOMIC_RMW);
+                                   SEM_OP_ATOMIC_RMW, s1->pc_start);
         } else {
             tcg_gen_sub_tl(s1->T0, s1->T0, s1->T1);
             tcg_gen_sub_tl(s1->T0, s1->T0, s1->tmp4);
@@ -1996,7 +2010,7 @@ static void gen_op(DisasContext *s1, int op, TCGMemOp ot, int d)
                                         s1->mem_index, ot | MO_LE);
             /* LOCKed RMW: atomic store bypasses gen_op_st_v; invalidate. */
             gen_sem_on_store_class(OR_TMP0, s1->A0, ot,
-                                   SEM_OP_ATOMIC_RMW);
+                                   SEM_OP_ATOMIC_RMW, s1->pc_start);
         } else {
             tcg_gen_add_tl(s1->T0, s1->T0, s1->T1);
             gen_op_st_rm_T0_A0(s1, ot, d);
@@ -2012,7 +2026,7 @@ static void gen_op(DisasContext *s1, int op, TCGMemOp ot, int d)
             tcg_gen_sub_tl(s1->T0, s1->cc_srcT, s1->T1);
             /* LOCKed RMW: atomic store bypasses gen_op_st_v; invalidate. */
             gen_sem_on_store_class(OR_TMP0, s1->A0, ot,
-                                   SEM_OP_ATOMIC_RMW);
+                                   SEM_OP_ATOMIC_RMW, s1->pc_start);
         } else {
             tcg_gen_mov_tl(s1->cc_srcT, s1->T0);
             tcg_gen_sub_tl(s1->T0, s1->T0, s1->T1);
@@ -2028,7 +2042,7 @@ static void gen_op(DisasContext *s1, int op, TCGMemOp ot, int d)
                                         s1->mem_index, ot | MO_LE);
             /* LOCKed RMW: atomic store bypasses gen_op_st_v; invalidate. */
             gen_sem_on_store_class(OR_TMP0, s1->A0, ot,
-                                   SEM_OP_ATOMIC_RMW);
+                                   SEM_OP_ATOMIC_RMW, s1->pc_start);
         } else {
             tcg_gen_and_tl(s1->T0, s1->T0, s1->T1);
             gen_op_st_rm_T0_A0(s1, ot, d);
@@ -2042,7 +2056,7 @@ static void gen_op(DisasContext *s1, int op, TCGMemOp ot, int d)
                                        s1->mem_index, ot | MO_LE);
             /* LOCKed RMW: atomic store bypasses gen_op_st_v; invalidate. */
             gen_sem_on_store_class(OR_TMP0, s1->A0, ot,
-                                   SEM_OP_ATOMIC_RMW);
+                                   SEM_OP_ATOMIC_RMW, s1->pc_start);
         } else {
             tcg_gen_or_tl(s1->T0, s1->T0, s1->T1);
             gen_op_st_rm_T0_A0(s1, ot, d);
@@ -2056,7 +2070,7 @@ static void gen_op(DisasContext *s1, int op, TCGMemOp ot, int d)
                                         s1->mem_index, ot | MO_LE);
             /* LOCKed RMW: atomic store bypasses gen_op_st_v; invalidate. */
             gen_sem_on_store_class(OR_TMP0, s1->A0, ot,
-                                   SEM_OP_ATOMIC_RMW);
+                                   SEM_OP_ATOMIC_RMW, s1->pc_start);
         } else {
             tcg_gen_xor_tl(s1->T0, s1->T0, s1->T1);
             gen_op_st_rm_T0_A0(s1, ot, d);
@@ -2091,7 +2105,7 @@ static void gen_inc(DisasContext *s1, TCGMemOp ot, int d, int c)
                                     s1->mem_index, ot | MO_LE);
         /* LOCKed RMW: atomic store bypasses gen_op_st_v; invalidate. */
         gen_sem_on_store_class(OR_TMP0, s1->A0, ot,
-                               SEM_OP_ATOMIC_RMW);
+                               SEM_OP_ATOMIC_RMW, s1->pc_start);
         gen_sem_set_ea_mode(s1);
         gen_sem_mem_access_f01_class(s1->A0, ot, s1->pc_start, true,
                                      SEM_OP_ATOMIC_RMW);
@@ -2892,7 +2906,7 @@ static void gen_ldst_modrm_class(CPUX86State *env, DisasContext *s, int modrm,
             gen_op_st_v_class(s, ot, s->T0, s->A0, cls);
             /* Store source register's tag to memory shadow; OR_TMP0
              * (immediate) → invalidate (both consumers; uniform rule). */
-            gen_sem_on_store_class(reg, s->A0, ot, cls);
+            gen_sem_on_store_class(reg, s->A0, ot, cls, s->pc_start);
             gen_sem_mem_access_class(s->A0, ot, s->pc_start, true, cls);
         } else {
             gen_op_ld_v_class(s, ot, s->T0, s->A0, cls);
@@ -3475,7 +3489,7 @@ static inline void gen_stq_env_A0(DisasContext *s, int offset)
      * shadow slot, then record the F01 access fact (after the store so
      * a fault records nothing). */
     gen_sem_set_ea_mode(s);
-    gen_sem_on_store_class(OR_TMP0, s->A0, MO_64, SEM_OP_SIMD);
+    gen_sem_on_store_class(OR_TMP0, s->A0, MO_64, SEM_OP_SIMD, s->pc_start);
     gen_sem_mem_access_f01_class(s->A0, MO_64, s->pc_start, true,
                                  SEM_OP_SIMD);
 }
@@ -3504,11 +3518,11 @@ static inline void gen_sto_env_A0(DisasContext *s, int offset)
      * store is ONE F01 event (16 bytes) emitted after BOTH qemu halves
      * complete: a fault on the second half records nothing. */
     gen_sem_set_ea_mode(s);
-    gen_sem_on_store_class(OR_TMP0, s->A0, MO_64, SEM_OP_SIMD);
+    gen_sem_on_store_class(OR_TMP0, s->A0, MO_64, SEM_OP_SIMD, s->pc_start);
     tcg_gen_addi_tl(s->tmp0, s->A0, 8);
     tcg_gen_ld_i64(s->tmp1_i64, cpu_env, offset + offsetof(ZMMReg, ZMM_Q(1)));
     tcg_gen_qemu_st_i64(s->tmp1_i64, s->tmp0, mem_index, MO_LEQ);
-    gen_sem_on_store_class(OR_TMP0, s->tmp0, MO_64, SEM_OP_SIMD);
+    gen_sem_on_store_class(OR_TMP0, s->tmp0, MO_64, SEM_OP_SIMD, s->pc_start);
     gen_sem_mem_access_f01_raw_class_policy(
         s->A0, 16, s->pc_start, true, SEM_OP_SIMD,
         SEM_INTERVAL_PAIRED, SEM_PRODUCER_SIMD_VECTOR);
@@ -5764,7 +5778,7 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                  * invalidate, then record the F01 access fact. */
                 gen_sem_set_ea_mode(s);
                 gen_sem_on_store_class(OR_TMP0, s->A0, ot,
-                                       SEM_OP_ATOMIC_RMW);
+                                       SEM_OP_ATOMIC_RMW, s->pc_start);
                 gen_sem_mem_access_f01_class(s->A0, ot, s->pc_start, true,
                                              SEM_OP_ATOMIC_RMW);
             } else {
@@ -5804,7 +5818,7 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                  * invalidate, then record the F01 access fact. */
                 gen_sem_set_ea_mode(s);
                 gen_sem_on_store_class(OR_TMP0, a0, ot,
-                                       SEM_OP_ATOMIC_RMW);
+                                       SEM_OP_ATOMIC_RMW, s->pc_start);
                 gen_sem_mem_access_f01_class(a0, ot, s->pc_start, true,
                                              SEM_OP_ATOMIC_RMW);
 
@@ -6297,7 +6311,7 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                  * invalidate, then record the F01 access fact. */
                 gen_sem_set_ea_mode(s);
                 gen_sem_on_store_class(OR_TMP0, s->A0, ot,
-                                       SEM_OP_ATOMIC_RMW);
+                                       SEM_OP_ATOMIC_RMW, s->pc_start);
                 gen_sem_mem_access_f01_class(s->A0, ot, s->pc_start, true,
                                              SEM_OP_ATOMIC_RMW);
             } else {
@@ -6338,7 +6352,7 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                  * invalidate, then record the F01 access fact. */
                 gen_sem_set_ea_mode(s);
                 gen_sem_on_store_class(OR_TMP0, s->A0, ot,
-                                       SEM_OP_ATOMIC_RMW);
+                                       SEM_OP_ATOMIC_RMW, s->pc_start);
                 gen_sem_mem_access_f01_class(s->A0, ot, s->pc_start, true,
                                              SEM_OP_ATOMIC_RMW);
             } else {
@@ -6402,10 +6416,10 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                  * (16 bytes) after the helper (fault-safe). */
                 gen_sem_set_ea_mode(s);
                 gen_sem_on_store_class(OR_TMP0, s->A0, MO_64,
-                                       SEM_OP_PAIRED);
+                                       SEM_OP_PAIRED, s->pc_start);
                 tcg_gen_addi_tl(s->tmp0, s->A0, 8);
                 gen_sem_on_store_class(OR_TMP0, s->tmp0, MO_64,
-                                       SEM_OP_PAIRED);
+                                       SEM_OP_PAIRED, s->pc_start);
                 gen_sem_mem_access_f01_raw_class_policy(
                     s->A0, 16, s->pc_start, true, SEM_OP_PAIRED,
                     SEM_INTERVAL_PAIRED, SEM_PRODUCER_PAIRED_CMPXCHG16B);
@@ -6431,7 +6445,7 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
              * the helper (fault-safe). */
             gen_sem_set_ea_mode(s);
             gen_sem_on_store_class(OR_TMP0, s->A0, MO_64,
-                                   SEM_OP_PAIRED);
+                                   SEM_OP_PAIRED, s->pc_start);
             gen_sem_mem_access_f01_raw_class_policy(
                 s->A0, 8, s->pc_start, true, SEM_OP_PAIRED,
                 SEM_INTERVAL_PAIRED, SEM_PRODUCER_PAIRED_CMPXCHG8B);
@@ -6475,7 +6489,7 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
          * mode); passing s->dflag (MO_32) would make the helper see a
          * non-full-width store and invalidate the slot instead. */
         gen_sem_on_store((b & 7) | REX_B(s), s->A0,
-                         mo_pushpop(s, s->dflag));
+                         mo_pushpop(s, s->dflag), s->pc_start);
         break;
     case 0x58 ... 0x5f: /* pop */
         ot = gen_pop_T0(s);
@@ -6898,7 +6912,7 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
             gen_sem_set_ea_mode(s);
             gen_sem_reg_invalidate(reg, s->pc_start);
             gen_sem_on_store_class(OR_TMP0, s->A0, ot,
-                                   SEM_OP_ATOMIC_RMW);
+                                   SEM_OP_ATOMIC_RMW, s->pc_start);
             gen_sem_mem_xchg_f01(s->A0, ot, s->pc_start);
         }
         break;
@@ -7144,7 +7158,7 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                                             s->mem_index, MO_LEUL);
                         /* FPU store: invalidate + F01 after the store. */
                         gen_sem_set_ea_mode(s);
-                        gen_sem_on_store_x87(OR_TMP0, s->A0, MO_32);
+                        gen_sem_on_store_x87(OR_TMP0, s->A0, MO_32, s->pc_start);
                         gen_sem_mem_access_f01_class(s->A0, MO_32, s->pc_start,
                                                      true, SEM_OP_X87_HELPER);
                         break;
@@ -7154,7 +7168,7 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                                             s->mem_index, MO_LEQ);
                         /* FPU store: invalidate + F01 after the store. */
                         gen_sem_set_ea_mode(s);
-                        gen_sem_on_store_x87(OR_TMP0, s->A0, MO_64);
+                        gen_sem_on_store_x87(OR_TMP0, s->A0, MO_64, s->pc_start);
                         gen_sem_mem_access_f01_class(s->A0, MO_64, s->pc_start,
                                                      true, SEM_OP_X87_HELPER);
                         break;
@@ -7165,7 +7179,7 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                                             s->mem_index, MO_LEUW);
                         /* FPU store: invalidate + F01 after the store. */
                         gen_sem_set_ea_mode(s);
-                        gen_sem_on_store_x87(OR_TMP0, s->A0, MO_16);
+                        gen_sem_on_store_x87(OR_TMP0, s->A0, MO_16, s->pc_start);
                         gen_sem_mem_access_f01_class(s->A0, MO_16, s->pc_start,
                                                      true, SEM_OP_X87_HELPER);
                         break;
@@ -7180,7 +7194,7 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                                             s->mem_index, MO_LEUL);
                         /* FPU store: invalidate + F01 after the store. */
                         gen_sem_set_ea_mode(s);
-                        gen_sem_on_store_x87(OR_TMP0, s->A0, MO_32);
+                        gen_sem_on_store_x87(OR_TMP0, s->A0, MO_32, s->pc_start);
                         gen_sem_mem_access_f01_class(s->A0, MO_32, s->pc_start,
                                                      true, SEM_OP_X87_HELPER);
                         break;
@@ -7190,7 +7204,7 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                                             s->mem_index, MO_LEUL);
                         /* FPU store: invalidate + F01 after the store. */
                         gen_sem_set_ea_mode(s);
-                        gen_sem_on_store_x87(OR_TMP0, s->A0, MO_32);
+                        gen_sem_on_store_x87(OR_TMP0, s->A0, MO_32, s->pc_start);
                         gen_sem_mem_access_f01_class(s->A0, MO_32, s->pc_start,
                                                      true, SEM_OP_X87_HELPER);
                         break;
@@ -7200,7 +7214,7 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                                             s->mem_index, MO_LEQ);
                         /* FPU store: invalidate + F01 after the store. */
                         gen_sem_set_ea_mode(s);
-                        gen_sem_on_store_x87(OR_TMP0, s->A0, MO_64);
+                        gen_sem_on_store_x87(OR_TMP0, s->A0, MO_64, s->pc_start);
                         gen_sem_mem_access_f01_class(s->A0, MO_64, s->pc_start,
                                                      true, SEM_OP_X87_HELPER);
                         break;
@@ -7211,7 +7225,7 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                                             s->mem_index, MO_LEUW);
                         /* FPU store: invalidate + F01 after the store. */
                         gen_sem_set_ea_mode(s);
-                        gen_sem_on_store_x87(OR_TMP0, s->A0, MO_16);
+                        gen_sem_on_store_x87(OR_TMP0, s->A0, MO_16, s->pc_start);
                         gen_sem_mem_access_f01_class(s->A0, MO_16, s->pc_start,
                                                      true, SEM_OP_X87_HELPER);
                         break;
@@ -7255,14 +7269,14 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                  * shadow slots, then record ONE F01 event (28 bytes) only
                  * for the supported x86-64 form. */
                 gen_sem_set_ea_mode(s);
-                gen_sem_on_store_x87(OR_TMP0, s->A0, MO_64);
+                gen_sem_on_store_x87(OR_TMP0, s->A0, MO_64, s->pc_start);
                 tcg_gen_addi_tl(s->tmp0, s->A0, 8);
-                gen_sem_on_store_x87(OR_TMP0, s->tmp0, MO_64);
+                gen_sem_on_store_x87(OR_TMP0, s->tmp0, MO_64, s->pc_start);
                 if (dflag != MO_16) {
                     tcg_gen_addi_tl(s->tmp0, s->A0, 16);
-                    gen_sem_on_store_x87(OR_TMP0, s->tmp0, MO_64);
+                    gen_sem_on_store_x87(OR_TMP0, s->tmp0, MO_64, s->pc_start);
                     tcg_gen_addi_tl(s->tmp0, s->A0, 24);
-                    gen_sem_on_store_x87(OR_TMP0, s->tmp0, MO_32);
+                    gen_sem_on_store_x87(OR_TMP0, s->tmp0, MO_32, s->pc_start);
                     gen_sem_mem_access_f01_raw_class_policy(
                         s->A0, 28, s->pc_start, true, SEM_OP_X87_HELPER,
                         SEM_INTERVAL_RAW, SEM_PRODUCER_X87_ENVIRONMENT);
@@ -7274,7 +7288,7 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                                     s->mem_index, MO_LEUW);
                 /* FPU control-word store: invalidate + F01. */
                 gen_sem_set_ea_mode(s);
-                gen_sem_on_store_x87(OR_TMP0, s->A0, MO_16);
+                gen_sem_on_store_x87(OR_TMP0, s->A0, MO_16, s->pc_start);
                 gen_sem_mem_access_f01_class(s->A0, MO_16, s->pc_start, true,
                                              SEM_OP_X87_HELPER);
                 break;
@@ -7289,9 +7303,9 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                 /* Helper writes 10 bytes: invalidate, then ONE F01 event
                  * (10 bytes) after the helper. */
                 gen_sem_set_ea_mode(s);
-                gen_sem_on_store_x87(OR_TMP0, s->A0, MO_64);
+                gen_sem_on_store_x87(OR_TMP0, s->A0, MO_64, s->pc_start);
                 tcg_gen_addi_tl(s->tmp0, s->A0, 8);
-                gen_sem_on_store_x87(OR_TMP0, s->tmp0, MO_16);
+                gen_sem_on_store_x87(OR_TMP0, s->tmp0, MO_16, s->pc_start);
                 gen_sem_mem_access_f01_raw_class_policy(
                     s->A0, 10, s->pc_start, true, SEM_OP_X87_HELPER,
                     SEM_INTERVAL_RAW, SEM_PRODUCER_X87_RAW);
@@ -7323,34 +7337,34 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                  * record ONE F01 event (94/108 bytes) after the helper. */
                 gen_sem_set_ea_mode(s);
                 tcg_gen_mov_tl(s->tmp4, s->A0); /* env-image start */
-                gen_sem_on_store_x87(OR_TMP0, s->A0, MO_64);
+                gen_sem_on_store_x87(OR_TMP0, s->A0, MO_64, s->pc_start);
                 tcg_gen_addi_tl(s->tmp0, s->A0, 8);
-                gen_sem_on_store_x87(OR_TMP0, s->tmp0, MO_64);
+                gen_sem_on_store_x87(OR_TMP0, s->tmp0, MO_64, s->pc_start);
                 tcg_gen_addi_tl(s->tmp0, s->A0, 16);
-                gen_sem_on_store_x87(OR_TMP0, s->tmp0, MO_64);
+                gen_sem_on_store_x87(OR_TMP0, s->tmp0, MO_64, s->pc_start);
                 tcg_gen_addi_tl(s->tmp0, s->A0, 24);
-                gen_sem_on_store_x87(OR_TMP0, s->tmp0, MO_64);
+                gen_sem_on_store_x87(OR_TMP0, s->tmp0, MO_64, s->pc_start);
                 tcg_gen_addi_tl(s->tmp0, s->A0, 32);
-                gen_sem_on_store_x87(OR_TMP0, s->tmp0, MO_64);
+                gen_sem_on_store_x87(OR_TMP0, s->tmp0, MO_64, s->pc_start);
                 tcg_gen_addi_tl(s->tmp0, s->A0, 40);
-                gen_sem_on_store_x87(OR_TMP0, s->tmp0, MO_64);
+                gen_sem_on_store_x87(OR_TMP0, s->tmp0, MO_64, s->pc_start);
                 tcg_gen_addi_tl(s->tmp0, s->A0, 48);
-                gen_sem_on_store_x87(OR_TMP0, s->tmp0, MO_64);
+                gen_sem_on_store_x87(OR_TMP0, s->tmp0, MO_64, s->pc_start);
                 tcg_gen_addi_tl(s->tmp0, s->A0, 56);
-                gen_sem_on_store_x87(OR_TMP0, s->tmp0, MO_64);
+                gen_sem_on_store_x87(OR_TMP0, s->tmp0, MO_64, s->pc_start);
                 tcg_gen_addi_tl(s->tmp0, s->A0, 64);
-                gen_sem_on_store_x87(OR_TMP0, s->tmp0, MO_64);
+                gen_sem_on_store_x87(OR_TMP0, s->tmp0, MO_64, s->pc_start);
                 tcg_gen_addi_tl(s->tmp0, s->A0, 72);
-                gen_sem_on_store_x87(OR_TMP0, s->tmp0, MO_64);
+                gen_sem_on_store_x87(OR_TMP0, s->tmp0, MO_64, s->pc_start);
                 tcg_gen_addi_tl(s->tmp0, s->A0, 80);
-                gen_sem_on_store_x87(OR_TMP0, s->tmp0, MO_64);
+                gen_sem_on_store_x87(OR_TMP0, s->tmp0, MO_64, s->pc_start);
                 tcg_gen_addi_tl(s->tmp0, s->A0, 88);
-                gen_sem_on_store_x87(OR_TMP0, s->tmp0, MO_64);
+                gen_sem_on_store_x87(OR_TMP0, s->tmp0, MO_64, s->pc_start);
                 if (dflag != MO_16) {
                     tcg_gen_addi_tl(s->tmp0, s->A0, 96);
-                    gen_sem_on_store_x87(OR_TMP0, s->tmp0, MO_64);
+                    gen_sem_on_store_x87(OR_TMP0, s->tmp0, MO_64, s->pc_start);
                     tcg_gen_addi_tl(s->tmp0, s->A0, 104);
-                    gen_sem_on_store_x87(OR_TMP0, s->tmp0, MO_32);
+                    gen_sem_on_store_x87(OR_TMP0, s->tmp0, MO_32, s->pc_start);
                     gen_sem_mem_access_f01_raw_class_policy(
                         s->tmp4, 108, s->pc_start, true, SEM_OP_X87_HELPER,
                         SEM_INTERVAL_RAW, SEM_PRODUCER_X87_SAVED_STATE);
@@ -7366,7 +7380,7 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                                     s->mem_index, MO_LEUW);
                 /* FPU status-word store: invalidate + F01. */
                 gen_sem_set_ea_mode(s);
-                gen_sem_on_store_x87(OR_TMP0, s->A0, MO_16);
+                gen_sem_on_store_x87(OR_TMP0, s->A0, MO_16, s->pc_start);
                 gen_sem_mem_access_f01_class(s->A0, MO_16, s->pc_start, true,
                                              SEM_OP_X87_HELPER);
                 break;
@@ -7381,9 +7395,9 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                 /* Helper writes 10 bytes: invalidate, then ONE F01 event
                  * (10 bytes) after the helper. */
                 gen_sem_set_ea_mode(s);
-                gen_sem_on_store_x87(OR_TMP0, s->A0, MO_64);
+                gen_sem_on_store_x87(OR_TMP0, s->A0, MO_64, s->pc_start);
                 tcg_gen_addi_tl(s->tmp0, s->A0, 8);
-                gen_sem_on_store_x87(OR_TMP0, s->tmp0, MO_16);
+                gen_sem_on_store_x87(OR_TMP0, s->tmp0, MO_16, s->pc_start);
                 gen_sem_mem_access_f01_raw_class_policy(
                     s->A0, 10, s->pc_start, true, SEM_OP_X87_HELPER,
                     SEM_INTERVAL_RAW, SEM_PRODUCER_X87_RAW);
@@ -7400,7 +7414,7 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                 tcg_gen_qemu_st_i64(s->tmp1_i64, s->A0, s->mem_index, MO_LEQ);
                 /* FPU store: invalidate + F01 after the store. */
                 gen_sem_set_ea_mode(s);
-                gen_sem_on_store_x87(OR_TMP0, s->A0, MO_64);
+                gen_sem_on_store_x87(OR_TMP0, s->A0, MO_64, s->pc_start);
                 gen_sem_mem_access_f01_class(s->A0, MO_64, s->pc_start, true,
                                              SEM_OP_X87_HELPER);
                 gen_helper_fpop(cpu_env);
@@ -8322,7 +8336,7 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                  * invalidate, then record the F01 access fact. */
                 gen_sem_set_ea_mode(s);
                 gen_sem_on_store_class(OR_TMP0, s->A0, ot,
-                                       SEM_OP_ATOMIC_RMW);
+                                       SEM_OP_ATOMIC_RMW, s->pc_start);
                 gen_sem_mem_access_f01_class(s->A0, ot, s->pc_start, true,
                                              SEM_OP_ATOMIC_RMW);
                 break;
@@ -8334,7 +8348,7 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                  * invalidate, then record the F01 access fact. */
                 gen_sem_set_ea_mode(s);
                 gen_sem_on_store_class(OR_TMP0, s->A0, ot,
-                                       SEM_OP_ATOMIC_RMW);
+                                       SEM_OP_ATOMIC_RMW, s->pc_start);
                 gen_sem_mem_access_f01_class(s->A0, ot, s->pc_start, true,
                                              SEM_OP_ATOMIC_RMW);
                 break;
@@ -8346,7 +8360,7 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                  * invalidate, then record the F01 access fact. */
                 gen_sem_set_ea_mode(s);
                 gen_sem_on_store_class(OR_TMP0, s->A0, ot,
-                                       SEM_OP_ATOMIC_RMW);
+                                       SEM_OP_ATOMIC_RMW, s->pc_start);
                 gen_sem_mem_access_f01_class(s->A0, ot, s->pc_start, true,
                                              SEM_OP_ATOMIC_RMW);
                 break;
@@ -9511,12 +9525,12 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                         /* MPX 64-bit bound store — invalidate. */
                         gen_sem_set_ea_mode(s);
                         gen_sem_on_store_class(OR_TMP0, s->A0, MO_64,
-                                               SEM_OP_MPX);
+                                               SEM_OP_MPX, s->pc_start);
                         tcg_gen_addi_tl(s->A0, s->A0, 8);
                         tcg_gen_qemu_st_i64(cpu_bndu[reg], s->A0,
                                             s->mem_index, MO_LEQ);
                         gen_sem_on_store_class(OR_TMP0, s->A0, MO_64,
-                                               SEM_OP_MPX);
+                                               SEM_OP_MPX, s->pc_start);
                         /* 16-byte bound pair: ONE F01 event after both
                          * qemu stores (fault on the second → nothing). */
                         gen_sem_mpx_bndmov_access(s->tmp4, 16, s->pc_start,
@@ -9527,12 +9541,12 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                         /* MPX bound store — invalidate. */
                         gen_sem_set_ea_mode(s);
                         gen_sem_on_store_class(OR_TMP0, s->A0, MO_32,
-                                               SEM_OP_MPX);
+                                               SEM_OP_MPX, s->pc_start);
                         tcg_gen_addi_tl(s->A0, s->A0, 4);
                         tcg_gen_qemu_st_i64(cpu_bndu[reg], s->A0,
                                             s->mem_index, MO_LEUL);
                         gen_sem_on_store_class(OR_TMP0, s->A0, MO_32,
-                                               SEM_OP_MPX);
+                                               SEM_OP_MPX, s->pc_start);
                         /* 8-byte bound pair: ONE F01 event. */
                         gen_sem_mpx_bndmov_access(s->tmp4, 8, s->pc_start,
                                                    true);

@@ -174,11 +174,11 @@ typedef enum {
 MemcheckResult snapshot_memcheck_access(target_ulong addr, target_ulong size);
 void snapshot_memcheck_helper(target_ulong addr, target_ulong size, target_ulong pc);
 
-void snapshot_syscall(uintptr_t syscall_no, uintptr_t syscall_arg0,
-                      uintptr_t syscall_arg1, uintptr_t syscall_arg2,
-                      uintptr_t syscall_arg3, uintptr_t syscall_arg4,
-                      uintptr_t syscall_arg5, uintptr_t syscall_arg6,
-                      uintptr_t ret_val);
+void snapshot_syscall(CPUArchState *env, uintptr_t syscall_no,
+                      uintptr_t syscall_arg0, uintptr_t syscall_arg1,
+                      uintptr_t syscall_arg2, uintptr_t syscall_arg3,
+                      uintptr_t syscall_arg4, uintptr_t syscall_arg5,
+                      uintptr_t syscall_arg6, uintptr_t ret_val);
 void snapshot_syscall_munmap(target_ulong addr, target_ulong len);
 int snapshot_is_unmap_allowed(target_ulong addr, target_ulong len);
 

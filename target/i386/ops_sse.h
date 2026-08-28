@@ -483,11 +483,11 @@ void glue(helper_maskmov, SUFFIX)(CPUX86State *env, Reg *d, Reg *s,
 
     for (i = 0; i < (8 << SHIFT); i++) {
         if (s->B(i) & 0x80) {
-            /* Invalidate before each helper-owned byte store so a fault
-             * midway through the sparse operation cannot leave stale
-             * provenance for bytes already attempted.  OSPREY F01 rows
-             * remain buffered until the helper returns successfully. */
-            sem_mem_overwrite(a0 + i, 1, SEM_OP_SIMD);
+            /* Preserve provenance's per-attempt invalidation before the
+             * helper-owned byte store.  OSPREY shadow invalidation and
+             * F01 rows wait for sem_mem_maskmov() after the complete
+             * sparse operation succeeds. */
+            sem_mem_helper_write_attempt(env, a0 + i, 1, SEM_OP_SIMD);
             cpu_stb_data_ra(env, a0 + i, d->B(i), GETPC());
         }
     }

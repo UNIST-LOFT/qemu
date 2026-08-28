@@ -871,22 +871,116 @@ def materialize_membership(errors):
 
 
 def no_direct_osprey(translate_text, errors):
-    """translate.c and helper.h must contain no direct osprey_* calls:
-    every OSPREY consumer is reached through the neutral sem helper
-    layer.  (DisasContext fields such as osprey_skip_rsp_update are
-    assignments, not calls, and do not match.)"""
+    """translate.c, helper.h, symbolic.c, and the signal code must
+    contain no direct osprey_* calls: every OSPREY memory/register
+    producer consumer is reached through the neutral sem helper layer.
+    Accepted integration exceptions: snapshot.c owns the analysis
+    transaction (osprey_analyze/model/lookup_raw/shared-run lifecycle),
+    and symbolic.c's allocator lifecycle hooks
+    (osprey_on_alloc_success/failure/on_free_identity) are the
+    provenance-authoritative allocator boundary accepted in Stage 1,
+    not memory-event producers.  DisasContext fields such as
+    osprey_skip_rsp_update are assignments, not calls, and do not
+    match."""
     try:
         helper_h = HELPER_H.read_text()
     except OSError as exc:
         errors.append(f"semantic inventory: cannot read {HELPER_H}: {exc}")
         return
+    allowed = {
+        "osprey_on_alloc_success", "osprey_on_alloc_failure",
+        "osprey_on_free_identity", "osprey_on_entrypoint",
+    }
     for label, text in (("translate.c", translate_text),
-                        ("helper.h", helper_h)):
+                        ("helper.h", helper_h),
+                        ("symbolic.c", SYMBOLIC.read_text()),
+                        ("signal.c", SIGNAL.read_text())):
         masked = mask_c_source(text)
         for match in re.finditer(r"\bosprey_[A-Za-z0-9_]+\s*\(", masked):
+            name = match.group(0).rstrip("(")
+            if label == "symbolic.c" and name in allowed:
+                continue
             fail(errors, 0,
-                 f"{label} calls {match.group(0).rstrip('(')} directly; "
+                 f"{label} calls {name} directly; "
                  "route through the shared gen_helper_sem_* layer")
+
+
+def stage24_source_gates(translate_text, source_by_name, errors):
+    """Bounded Stage-2.4 source gate:
+    - the obsolete osprey_on_mem_{load,store}_address names are absent
+      everywhere (no compatibility aliases);
+    - memcpy/memmove/strcpy/strncpy model success paths use
+      sem_mem_copy while memset and strncpy padding use
+      sem_mem_overwrite;
+    - helper-owned store attempts are provenance-only until their
+      post-success MASKMOV/multipart event commits OSPREY invalidation;
+    - the placeholder one-byte OspreyValueOrigin layout is absent;
+    - every dynamic overwrite/copy caller passes an authoritative env
+      (checked per event in the dynamic scan).
+    """
+    combined = "\n".join(text for text in source_by_name.values())
+    masked = mask_c_source(combined)
+    for name in ("osprey_on_mem_load_address", "osprey_on_mem_store_address"):
+        if re.search(r"\b" + name + r"\s*\(", masked):
+            fail(errors, 0,
+                 f"obsolete {name} is still referenced; delete without "
+                 "aliases")
+
+    symbolic = source_by_name.get("symbolic.c", "")
+    masked_sym = mask_c_source(symbolic)
+    for model in ("MEMCPY", "MEMMOVE", "STRCPY", "STRNCPY"):
+        if not re.search(rf"\bmodel\s*==\s*{model}\b", masked_sym):
+            fail(errors, 0, f"model {model} block is absent from symbolic.c")
+    if not re.search(r"\bsem_mem_copy\s*\(", masked_sym):
+        fail(errors, 0, "symbolic.c has no sem_mem_copy model event")
+    # memset keeps overwrite-only semantics; strncpy padding routes the
+    # zero tail through sem_mem_overwrite while the copied prefix rides
+    # sem_mem_copy.
+    if not re.search(r"\bmodel\s*==\s*MEMSET\b", masked_sym):
+        fail(errors, 0, "model MEMSET block is absent from symbolic.c")
+    strncpy_block = re.search(
+        r"\bmodel\s*==\s*STRNCPY\b.*?\n(?=\s*\}?\s*else\s+if)",
+        masked_sym, re.DOTALL)
+    if strncpy_block is not None:
+        if not re.search(r"\bsem_mem_copy\s*\(", strncpy_block.group(0)) or \
+                not re.search(r"\bsem_mem_overwrite\s*\(",
+                              strncpy_block.group(0)):
+            fail(errors, 0,
+                 "strncpy model block must use both sem_mem_copy "
+                 "(copied prefix) and sem_mem_overwrite (padding tail)")
+    else:
+        fail(errors, 0, "STRNCPY model block is absent from symbolic.c")
+
+    for filename in ("fpu_helper.c", "mpx_helper.c", "ops_sse.h"):
+        helper_text = source_by_name.get(filename, "")
+        masked_helper = mask_c_source(helper_text)
+        if re.search(r"\bsem_mem_overwrite\s*\(", masked_helper):
+            fail(errors, 0,
+                 f"{filename} mutates OSPREY shadow before a helper "
+                 "store succeeds; use sem_mem_helper_write_attempt")
+        if not re.search(r"\bsem_mem_helper_write_attempt\s*\(",
+                         masked_helper):
+            fail(errors, 0,
+                 f"{filename} has no provenance-only helper write attempt")
+
+    sem_events_text = SEM_EVENTS.read_text()
+    for event_name in ("sem_mem_helper_access_part", "sem_mem_maskmov"):
+        body = function_body(sem_events_text, event_name)
+        if body is None or not re.search(r"\bosprey_on_mem_overwrite\s*\(",
+                                         mask_c_source(body)):
+            fail(errors, 0,
+                 f"{event_name} lacks post-success OSPREY invalidation")
+
+    internal_h = Path(__file__).resolve().parents[2] / \
+        "linux-user/osprey-internal.h"
+    if internal_h.exists():
+        text = internal_h.read_text()
+        if re.search(r"typedef\s+struct\s+OspreyValueOrigin\s*\{"
+                     r"\s*uint8_t\s+valid;\s*uint8_t\s+reserved\[7\];\s*\}",
+                     text, re.DOTALL):
+            fail(errors, 0,
+                 "placeholder one-byte OspreyValueOrigin layout is still "
+                 "present")
 
 
 def main():
@@ -1001,15 +1095,18 @@ def main():
             }
             coverage_events = {
                 symbol for symbol in symbols
-                if symbol in {"sem_mem_overwrite", "sem_context_replace"}
+                if symbol in {"sem_mem_overwrite", "sem_context_replace",
+                              "sem_mem_copy"}
             }
             if not coverage_files:
                 errors.append(
                     f"{producer}: dynamic producer lacks a coverage file")
-            if "sem_mem_overwrite" not in coverage_events:
+            if row_kind == "DYNAMIC_PRODUCER" and \
+                    "sem_mem_overwrite" not in coverage_events and \
+                    "sem_mem_copy" not in coverage_events:
                 errors.append(
                     f"{producer}: dynamic producer lacks a class-carrying "
-                    "overwrite event")
+                    "overwrite or copy event")
             dynamic_specs.append((producer, class_token, coverage_files,
                                   coverage_events))
         if row_kind == "UNSUPPORTED":
@@ -1037,11 +1134,16 @@ def main():
             file_has_class = False
             for event_name, event_start, event_end in call_sites(
                     file_text,
-                    r"\b(sem_mem_overwrite|sem_context_replace)\s*\("):
+                    r"\b(sem_mem_overwrite|sem_context_replace|sem_mem_copy)"
+                    r"\s*\("):
                 if event_name not in coverage_events:
                     continue
                 seen_events.add(event_name)
                 if event_name == "sem_mem_overwrite":
+                    event_text = file_text[event_start:event_end]
+                    if event_class_token(event_name, event_text) == class_token:
+                        file_has_class = True
+                elif event_name == "sem_mem_copy":
                     event_text = file_text[event_start:event_end]
                     if event_class_token(event_name, event_text) == class_token:
                         file_has_class = True
@@ -1065,17 +1167,30 @@ def main():
             continue
         for event_name, event_start, event_end in call_sites(
                 file_text,
-                r"\b(sem_mem_overwrite|sem_context_replace)\s*\("):
+                r"\b(sem_mem_overwrite|sem_context_replace|sem_mem_copy)"
+                r"\s*\("):
             dynamic_event_count += 1
             class_token = None
-            if event_name == "sem_mem_overwrite":
+            if event_name in {"sem_mem_overwrite", "sem_mem_copy"}:
                 event_text = file_text[event_start:event_end]
                 class_token = event_class_token(event_name, event_text)
                 if class_token is None:
                     errors.append(
                         f"{filename}:{source_line(file_text, event_start)}: "
-                        "dynamic overwrite lacks a literal SemOpClass")
+                        f"dynamic {event_name} lacks a literal SemOpClass")
                     continue
+                # Stage 2.4: overwrite/copy events are environment-aware
+                # boundaries; the first argument must be an authoritative
+                # CPUArchState expression (env / cpu_env), never a NULL
+                # literal or a bare address.
+                args = event_arguments(event_text)
+                if not args or not re.match(
+                        r"^(?:env|cpu_env|&env|\(\s*CPUArchState\s*\*"
+                        r"\s*\)\s*(?:env|cpu_env))\b", args[0]):
+                    errors.append(
+                        f"{filename}:{source_line(file_text, event_start)}: "
+                        f"dynamic {event_name} lacks an authoritative "
+                        "CPUArchState first argument")
             matches = [
                 producer for producer, expected_class, coverage_files,
                 coverage_events in dynamic_specs
@@ -1100,6 +1215,10 @@ def main():
                                                         errors)
     materialize_ok = materialize_membership(errors)
     no_direct_osprey(translate_text, errors)
+    # Stage 2.4 bounded source gate: obsolete hook names are deleted,
+    # libc models route copies through the combined event, and the
+    # placeholder VALUE layout is gone.
+    stage24_source_gates(translate_text, source_by_name, errors)
 
     # Every fixed manifest token must resolve not only to a spelling in the
     # source tree, but to an event carrying that row's class and interval

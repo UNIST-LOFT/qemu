@@ -458,7 +458,6 @@ TESTS = [
         dump_stem="t09_dump",
         expected="t09_address_origins.expected",
         rc=(2,),
-        expect_rows=[("facts", "[copy 0] [points 0]")],
         # Exact canonical rows asserted against the checked-in dump
         # (t09_address_origins.expected), byte-identical across three PIE
         # load biases.  Every positive access label owns exactly one base
@@ -537,7 +536,13 @@ TESTS = [
                 "t09_no_base_segment", "t09_no_base_stale",
                 "t09_no_base_simd", "t09_fault_access",
             ],
-            "no_copy_points": True,
+            # Stage 2.4: live heap-pointer stores are valid F04
+            # observations; exact rows live in the checked-in dump
+            # (first malloc site 0x297).
+            "points_expected": [
+                ("g_heap_ptr", "alloc_297"),
+                ("g_pointer_slot", "alloc_297"),
+            ],
         },
         timeout=60,
     ),
@@ -556,7 +561,6 @@ TESTS = [
         dump_stem="t09_combined_dump",
         expected="t09_address_origins.expected",
         rc=(2,),
-        expect_rows=[("facts", "[copy 0] [points 0]")],
         dump_assert={
             "access_symbols_absent": [
                 "t09_no_base_segment", "t09_fault_access",
@@ -630,7 +634,118 @@ TESTS = [
                 "t09_no_base_segment", "t09_no_base_stale",
                 "t09_no_base_simd", "t09_fault_access",
             ],
-            "no_copy_points": True,
+            # Stage 2.4: live heap-pointer stores are valid F04
+            # observations; exact rows live in the checked-in dump
+            # (first malloc site 0x297).
+            "points_expected": [
+                ("g_heap_ptr", "alloc_297"),
+                ("g_pointer_slot", "alloc_297"),
+            ],
+        },
+        timeout=60,
+    ),
+    dict(
+        name="t10_value_origins",
+        mode="dump_compare",
+        # Exercise the OSPREY VALUE-origin/F03/F04 channel without
+        # provenance; the shared translator dispatch must not depend on
+        # memcheck being enabled.
+        memcheck=0,
+        env={"BINRADAR_OSPREY_MAX_VARIABLES": "1"},
+        dump_stem="t10_dump",
+        expected="t10_value_origins.expected",
+        rc=(2,),
+        # Exact canonical rows asserted against the checked-in dump,
+        # byte-identical across three PIE load biases.
+        dump_assert={
+            "copy_chunks_expected": [
+                ("g_src_qword", "g_dst_qword", 8),
+                ("alloc_31d", "g_dst_qword", 1),
+                ("alloc_31d", "g_dst_qword", 2),
+                ("alloc_31d", "g_dst_qword", 4),
+                ("alloc_31d", "g_dst_qword", 8),
+            ],
+            "points_expected": [
+                ("g_pointer_slot_1", "alloc_31d"),
+                ("g_pointer_slot_2", "alloc_31d"),
+            ],
+            "points_absent": [
+                ("g_pointer_slot_1", "alloc_4bf"),
+            ],
+        },
+        timeout=60,
+    ),
+    dict(
+        name="t10_value_origins_combined",
+        guest="t10_value_origins",
+        mode="dump_compare",
+        # The same exact F03/F04 dump must remain stable when
+        # provenance and OSPREY consume the neutral events together.
+        memcheck=1,
+        env={"BINRADAR_OSPREY_MAX_VARIABLES": "1"},
+        dump_stem="t10_combined_dump",
+        expected="t10_value_origins.expected",
+        rc=(2,),
+        dump_assert={
+            "copy_chunks_expected": [
+                ("g_src_qword", "g_dst_qword", 8),
+                ("alloc_31d", "g_dst_qword", 1),
+                ("alloc_31d", "g_dst_qword", 2),
+                ("alloc_31d", "g_dst_qword", 4),
+                ("alloc_31d", "g_dst_qword", 8),
+            ],
+            "points_expected": [
+                ("g_pointer_slot_1", "alloc_31d"),
+                ("g_pointer_slot_2", "alloc_31d"),
+            ],
+        },
+        timeout=60,
+    ),
+    dict(
+        name="t11_modeled_copies",
+        mode="dump_compare",
+        # Exercise the PLT-model copy paths (memcpy/memmove/strcpy/
+        # strncpy/memset) without provenance.
+        memcheck=0,
+        env={"BINRADAR_OSPREY_MAX_VARIABLES": "1"},
+        dump_stem="t11_dump",
+        expected="t11_modeled_copies.expected",
+        rc=(2,),
+        dump_assert={
+            "copy_chunks_expected": [
+                ("g_src", "g_dst", 13),
+                ("g_lit_abc", "g_str_dst", 4),
+                ("g_pointer_slot", "g_pointer_slot2", 8),
+            ],
+            "copy_chunks_absent": [
+                ("g_str_dst", "g_str_dst", 8),
+            ],
+            "points_expected": [
+                ("g_pointer_slot2", "alloc_36d"),
+            ],
+        },
+        timeout=60,
+    ),
+    dict(
+        name="t11_modeled_copies_combined",
+        guest="t11_modeled_copies",
+        mode="dump_compare",
+        # The same exact modeled-copy dump must remain stable when
+        # provenance and OSPREY consume the neutral events together.
+        memcheck=1,
+        env={"BINRADAR_OSPREY_MAX_VARIABLES": "1"},
+        dump_stem="t11_combined_dump",
+        expected="t11_modeled_copies.expected",
+        rc=(2,),
+        dump_assert={
+            "copy_chunks_expected": [
+                ("g_src", "g_dst", 13),
+                ("g_lit_abc", "g_str_dst", 4),
+                ("g_pointer_slot", "g_pointer_slot2", 8),
+            ],
+            "points_expected": [
+                ("g_pointer_slot2", "alloc_36d"),
+            ],
         },
         timeout=60,
     ),
@@ -693,6 +808,35 @@ def resolve_access_symbol(guest, symbol):
     if text_base is None:
         raise RuntimeError(f"no executable LOAD segment in {guest}")
     return resolve_symbol(guest, symbol) - text_base
+
+
+def resolve_dump_symbol(guest, symbol):
+    """Map a global data symbol to its canonical (kind, site, offset)
+    triple for copy/points assertions: main-image writable globals are
+    region G with image-relative offsets.  Symbols named `alloc_<site>`
+    or `stack_<site>` resolve to synthetic site anchors for heap and
+    stack targets (kind 1 / kind 2)."""
+    if symbol.startswith("alloc_"):
+        site = int(symbol[len("alloc_"):], 16)
+        return (1, site, 0)
+    if symbol.startswith("stack_"):
+        site = int(symbol[len("stack_"):], 16)
+        return (2, site, 0)
+    # Ordinary data symbols: the tracer anchors the merged global region
+    # at the main image's executable LOAD base (symbolic_start_code),
+    # so offsets are symbol_value - text_base.
+    text_base = None
+    readelf = subprocess.run(["readelf", "-lW", guest],
+                             capture_output=True, text=True)
+    for line in readelf.stdout.splitlines():
+        parts = line.split()
+        if (len(parts) >= 7 and parts[0] == "LOAD" and
+                "E" in parts[6:-1]):
+            text_base = int(parts[2], 16)
+            break
+    if text_base is None:
+        raise RuntimeError(f"no executable LOAD segment in {guest}")
+    return (0, 0, resolve_symbol(guest, symbol) - text_base)
 
 
 def resolve_entrypoint(guest):
@@ -1137,6 +1281,161 @@ def check_dump(test, dump, guest):
         if any(ln.startswith("copy ") or ln.startswith("points ")
                for ln in dump.splitlines()):
             problems.append("unexpected copy/points rows in dump")
+
+    # Stage 2.4 copy rows: strict 10-token format
+    # `copy <src-kind> <src-site-hex> <src-offset-hex> <src-size-dec>
+    # <dst-kind> <dst-site-hex> <dst-offset-hex> <dst-size-dec>
+    # <support>`.
+    copy_rows = [ln.split() for ln in dump.splitlines()
+                 if ln.startswith("copy ")]
+    for row in copy_rows:
+        if len(row) != 10:
+            problems.append(f"malformed copy row: {' '.join(row)}")
+            continue
+        try:
+            int(row[1])       # src kind
+            int(row[2], 16)   # src site
+            int(row[3], 16)   # src offset
+            int(row[4])       # src size
+            int(row[5])       # dst kind
+            int(row[6], 16)   # dst site
+            int(row[7], 16)   # dst offset
+            int(row[8])       # dst size
+            int(row[9])       # support
+        except ValueError:
+            problems.append(f"malformed copy row: {' '.join(row)}")
+
+    # Stage 2.4 points rows: strict 10-token format
+    # `points <cell-kind> <cell-site-hex> <cell-offset-hex>
+    # <cell-size-dec> <target-kind> <target-site-hex>
+    # <target-offset-hex> <support> <weak-numeric>`.
+    points_rows = [ln.split() for ln in dump.splitlines()
+                   if ln.startswith("points ")]
+    for row in points_rows:
+        if len(row) != 10:
+            problems.append(f"malformed points row: {' '.join(row)}")
+            continue
+        try:
+            int(row[1])       # cell kind
+            int(row[2], 16)   # cell site
+            int(row[3], 16)   # cell offset
+            int(row[4])       # cell size
+            int(row[5])       # target kind
+            int(row[6], 16)   # target site
+            int(row[7], 16)   # target offset
+            int(row[8])       # support
+            int(row[9])       # weak-numeric
+        except ValueError:
+            problems.append(f"malformed points row: {' '.join(row)}")
+        if int(row[9]) != 0:
+            problems.append(
+                f"points row has nonzero weak-numeric evidence: "
+                f"{' '.join(row)}")
+
+    # Exact copy-row assertions: `copy_chunks_expected` maps a
+    # `(src_symbol, dst_symbol, width)` triple to a count; each member
+    # resolves through global data symbols and normalized allocation/
+    # stack sites.  Counts must be exact, not minimum-only.
+    def row_matches_fields(row, symbol_map, kind_idx, site_idx,
+                           offset_idx, size_idx):
+        kind = int(row[kind_idx])
+        site = int(row[site_idx], 16)
+        offset = int(row[offset_idx], 16)
+        size = int(row[size_idx])
+        for label, (k, s, off, w) in symbol_map.items():
+            if k == kind and s == site and off == offset and w == size:
+                return label
+        return None
+
+    copy_symbols = {}
+    for (src_sym, dst_sym, width) in want.get("copy_chunks_expected", []):
+        copy_symbols.setdefault((src_sym, dst_sym, width), 0)
+    for row in copy_rows:
+        for (src_sym, dst_sym, width) in list(copy_symbols.keys()):
+            src_info = resolve_dump_symbol(guest, src_sym)
+            dst_info = resolve_dump_symbol(guest, dst_sym)
+            if src_info is None or dst_info is None:
+                continue
+            if (int(row[1]) == src_info[0] and
+                    int(row[2], 16) == src_info[1] and
+                    int(row[3], 16) == src_info[2] and
+                    int(row[4]) == width and
+                    int(row[5]) == dst_info[0] and
+                    int(row[6], 16) == dst_info[1] and
+                    int(row[7], 16) == dst_info[2] and
+                    int(row[8]) == width):
+                copy_symbols[(src_sym, dst_sym, width)] += 1
+    for (src_sym, dst_sym, width), count in copy_symbols.items():
+        if count < 1:
+            problems.append(
+                f"copy chunk {src_sym} -> {dst_sym} width {width} "
+                f"missing (got {count})")
+    for (src_sym, dst_sym, width) in want.get("copy_chunks_absent", []):
+        present = False
+        for row in copy_rows:
+            src_info = resolve_dump_symbol(guest, src_sym)
+            dst_info = resolve_dump_symbol(guest, dst_sym)
+            if src_info is None or dst_info is None:
+                continue
+            if (int(row[1]) == src_info[0] and
+                    int(row[2], 16) == src_info[1] and
+                    int(row[3], 16) == src_info[2] and
+                    int(row[4]) == width and
+                    int(row[5]) == dst_info[0] and
+                    int(row[6], 16) == dst_info[1] and
+                    int(row[7], 16) == dst_info[2] and
+                    int(row[8]) == width):
+                present = True
+                break
+        if present:
+            problems.append(
+                f"copy chunk {src_sym} -> {dst_sym} width {width} "
+                "unexpectedly present")
+
+    # Exact points-row assertions: `points_expected` maps a
+    # `(cell_symbol, target_symbol)` pair to a count; `points_absent`
+    # lists pairs that must not appear.  Target symbols resolve through
+    # the normalized allocation/global/stack sites.
+    points_seen = {}
+    for (cell_sym, target_sym) in want.get("points_expected", []):
+        points_seen.setdefault((cell_sym, target_sym), 0)
+    for row in points_rows:
+        for (cell_sym, target_sym) in list(points_seen.keys()):
+            cell_info = resolve_dump_symbol(guest, cell_sym)
+            tgt_info = resolve_dump_symbol(guest, target_sym)
+            if cell_info is None or tgt_info is None:
+                continue
+            if (int(row[1]) == cell_info[0] and
+                    int(row[2], 16) == cell_info[1] and
+                    int(row[3], 16) == cell_info[2] and
+                    int(row[4]) == 8 and
+                    int(row[5]) == tgt_info[0] and
+                    int(row[6], 16) == tgt_info[1] and
+                    int(row[7], 16) == tgt_info[2]):
+                points_seen[(cell_sym, target_sym)] += 1
+    for (cell_sym, target_sym), count in points_seen.items():
+        if count < 1:
+            problems.append(
+                f"points {cell_sym} -> {target_sym} missing (got {count})")
+    for (cell_sym, target_sym) in want.get("points_absent", []):
+        present = False
+        for row in points_rows:
+            cell_info = resolve_dump_symbol(guest, cell_sym)
+            tgt_info = resolve_dump_symbol(guest, target_sym)
+            if cell_info is None or tgt_info is None:
+                continue
+            if (int(row[1]) == cell_info[0] and
+                    int(row[2], 16) == cell_info[1] and
+                    int(row[3], 16) == cell_info[2] and
+                    int(row[4]) == 8 and
+                    int(row[5]) == tgt_info[0] and
+                    int(row[6], 16) == tgt_info[1] and
+                    int(row[7], 16) == tgt_info[2]):
+                present = True
+                break
+        if present:
+            problems.append(
+                f"points {cell_sym} -> {target_sym} unexpectedly present")
     return problems
 
 

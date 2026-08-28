@@ -60,7 +60,7 @@ CC        ?= gcc
 CFLAGS    := -O0 -g -fno-pie -no-pie -fno-stack-protector -U_FORTIFY_SOURCE -fno-builtin
 LDFLAGS   := -no-pie
 
-TESTS := osprey_deref t01_regions t01_clone t02_chunk_widths t04_mpx t05_enter_fault t06_control_reject t07_legacy_width_reject t08_bound_reject t09_address_origins
+TESTS := osprey_deref t01_regions t01_clone t02_chunk_widths t04_mpx t05_enter_fault t06_control_reject t07_legacy_width_reject t08_bound_reject t09_address_origins t10_value_origins t11_modeled_copies
 
 GUEST_BINS := $(addprefix $(WORK)/,$(TESTS))
 PLT_FILES  := $(addprefix $(WORK)/,$(addsuffix .plt,$(TESTS)))
@@ -111,6 +111,17 @@ $(WORK)/t05_enter_fault: $(GUESTS)/t05_enter_fault.c | $(WORK)
 # PIE so the dump_compare harness can verify byte-identity across load
 # biases and resolve labeled producer/access symbols.
 $(WORK)/t09_address_origins: $(GUESTS)/t09_address_origins.c | $(WORK)
+	$(CC) -O0 -g -fPIE -pie -fno-omit-frame-pointer -fno-stack-protector \
+		-U_FORTIFY_SOURCE -fno-builtin -o $@ $<
+
+# t10_value_origins / t11_modeled_copies: Stage-2.4 VALUE/F03/F04 and
+# modeled-copy fixtures — must be PIE so the dump_compare harness can
+# verify byte-identity across load biases and resolve labeled symbols.
+$(WORK)/t10_value_origins: $(GUESTS)/t10_value_origins.c | $(WORK)
+	$(CC) -O0 -g -fPIE -pie -fno-omit-frame-pointer -fno-stack-protector \
+		-U_FORTIFY_SOURCE -fno-builtin -o $@ $<
+
+$(WORK)/t11_modeled_copies: $(GUESTS)/t11_modeled_copies.c | $(WORK)
 	$(CC) -O0 -g -fPIE -pie -fno-omit-frame-pointer -fno-stack-protector \
 		-U_FORTIFY_SOURCE -fno-builtin -o $@ $<
 

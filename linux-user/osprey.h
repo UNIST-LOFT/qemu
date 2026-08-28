@@ -222,12 +222,24 @@ void osprey_on_reg_xchg(CPUArchState *env, uint32_t dst, uint32_t src,
                         target_ulong dst_value, target_ulong src_value,
                         target_ulong pc);
 void osprey_on_reg_invalidate(CPUArchState *env, uint32_t reg);
-void osprey_on_mem_store_address(CPUArchState *env, uint32_t src,
-                                 target_ulong addr, target_ulong size,
-                                 target_ulong src_value);
-void osprey_on_mem_load_address(CPUArchState *env, uint32_t dst,
-                                target_ulong addr, target_ulong value,
-                                target_ulong pc);
+/* Combined Stage 2.4 memory hooks (replaces the Stage 2.3
+ * osprey_on_mem_{load,store}_address split).  Both run only after a
+ * successful guest access.  On load, the helper reads the post-load
+ * architectural GPR value from env->regs[dst] itself; on store the
+ * source register index, address, size, and src_value are explicit.
+ * Each hook clears/updates the destination channels, invalidates
+ * overlap, then evaluates the applicable facts (F02, F03, F04) and
+ * shadow installation. */
+void osprey_on_mem_load(CPUArchState *env, uint32_t dst,
+                        target_ulong addr, target_ulong size,
+                        uint64_t pc);
+void osprey_on_mem_store(CPUArchState *env, uint32_t src,
+                         target_ulong addr, target_ulong size,
+                         target_ulong src_value, target_ulong pc);
+/* External/unknown-source overwrite: exact overlap invalidation only,
+ * no fact or replacement metadata. */
+void osprey_on_mem_overwrite(CPUArchState *env, target_ulong addr,
+                             target_ulong size);
 
 /* Call/return stack events.  The call hook fires AFTER the return-
  * address push, so entry_sp is the precise callee-entry RSP; callee_pc

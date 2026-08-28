@@ -9247,10 +9247,13 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
                  * so per-instruction checks can't see this range. Validate
                  * the full copy interval here (access pc = caller),
                  * carrying the dst/src register tags so tagged
-                 * underruns/overruns are detected. */
+                 * underruns/overruns are detected.  OSPREY (Stage 2.4):
+                 * the combined copy event snapshots source shadow before
+                 * destination invalidation and records exact F03. */
                 if (len != 0) {
-                    sem_mem_overwrite((target_ulong)env->regs[R_EDI], len,
-                                      SEM_OP_LIBC_MODEL);
+                    sem_mem_copy(env, (target_ulong)env->regs[R_ESI],
+                                 (target_ulong)env->regs[R_EDI], len,
+                                 SEM_OP_LIBC_MODEL);
                     if (binradar_memcheck_enabled) {
                         provenance_model_check_access(
                             env, (target_ulong)env->regs[R_EDI], len,
@@ -9278,7 +9281,7 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
                 /* memcheck-only: validate the full fill interval (see
                  * above). */
                 if (len != 0) {
-                    sem_mem_overwrite((target_ulong)env->regs[R_EDI], len,
+                    sem_mem_overwrite(env, (target_ulong)env->regs[R_EDI], len,
                                       SEM_OP_LIBC_MODEL);
                     if (binradar_memcheck_enabled) {
                         provenance_model_check_access(
@@ -9308,9 +9311,12 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
                                  (uintptr_t)env->regs[R_EDI], len);
                     /* The full successful destination write invalidates
                      * stale pointer shadow; the length model checks the
-                     * source with its actual RSI provenance. */
-                    sem_mem_overwrite((target_ulong)env->regs[R_EDI], len,
-                                      SEM_OP_LIBC_MODEL);
+                     * source with its actual RSI provenance.  OSPREY
+                     * (Stage 2.4) records the exact
+                     * scanned-length-plus-NUL F03. */
+                    sem_mem_copy(env, (target_ulong)env->regs[R_ESI],
+                                 (target_ulong)env->regs[R_EDI], len,
+                                 SEM_OP_LIBC_MODEL);
                     if (binradar_memcheck_enabled) {
                         provenance_model_check_access(
                             env, (target_ulong)env->regs[R_EDI], len,
@@ -9344,9 +9350,20 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
                                    n - copied);
                     }
                     /* strncpy always writes exactly n bytes, including
-                     * zero padding after an early source terminator. */
-                    sem_mem_overwrite((target_ulong)env->regs[R_EDI], n,
-                                      SEM_OP_LIBC_MODEL);
+                     * zero padding after an early source terminator.
+                     * OSPREY (Stage 2.4): the copied prefix is one exact
+                     * F03 (source_length+1 including NUL when padded);
+                     * the zero-padding tail is an overwrite, not a copy,
+                     * and invalidates the exact destination bytes. */
+                    sem_mem_copy(env, (target_ulong)env->regs[R_ESI],
+                                 (target_ulong)env->regs[R_EDI], copied,
+                                 SEM_OP_LIBC_MODEL);
+                    if (copied < n) {
+                        sem_mem_overwrite(env,
+                                          (target_ulong)env->regs[R_EDI] +
+                                              copied,
+                                          n - copied, SEM_OP_LIBC_MODEL);
+                    }
                     if (binradar_memcheck_enabled) {
                         provenance_model_check_access(
                             env, (target_ulong)env->regs[R_EDI], n,

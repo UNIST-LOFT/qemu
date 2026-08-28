@@ -212,7 +212,7 @@ const SemProducerSpec sem_producer_table[] = {
              widths_4_6_8_10_16_24_64_128_256, true,
              "gen_helper_xsave@SEM_INTERVAL_SPARSE,gen_helper_xsaveopt@SEM_INTERVAL_SPARSE,gen_helper_xrstor@SEM_INTERVAL_SPARSE"),
     DYNAMIC_PRODUCER("model.output", SEM_OP_LIBC_MODEL,
-                     "file=symbolic.c,sem_mem_overwrite"),
+                     "file=symbolic.c,sem_mem_copy,sem_mem_overwrite"),
     DYNAMIC_PRODUCER("syscall.output", SEM_OP_SYSCALL,
                      "file=syscall.c,file=snapshot.c,sem_mem_overwrite"),
     DYNAMIC_PRODUCER("mapping.output", SEM_OP_MAPPING,
@@ -355,8 +355,8 @@ static void osprey_clear_pending_helper(OspreyCpuOriginState *st) {
 /* Overwrite events (C API)                                           */
 /* ------------------------------------------------------------------ */
 
-void sem_mem_overwrite(target_ulong addr, target_ulong size,
-                       SemOpClass cls) {
+void sem_mem_overwrite(CPUArchState *env, target_ulong addr,
+                       target_ulong size, SemOpClass cls) {
     if (!sem_events_active()) {
         return;
     }
@@ -366,9 +366,58 @@ void sem_mem_overwrite(target_ulong addr, target_ulong size,
     if (binradar_memcheck_enabled) {
         provenance_on_modify_mem(addr, size);
     }
-    /* OSPREY consumer (Stage 2.2): documented no-op — no mem-slot
-     * invalidation exists; shadow invalidation is Stage 2.4. */
+    /* OSPREY consumer (Stage 2.4): exact sparse overlap invalidation
+     * of the address shadow whenever OSPREY collection is enabled,
+     * regardless of class validity.  No fact or replacement is allowed
+     * for an invalid class. */
+    if (osprey_collect_enabled && env != NULL) {
+        osprey_on_mem_overwrite(env, addr, size);
+    }
     (void)valid_class;
+}
+
+void sem_mem_helper_write_attempt(CPUArchState *env, target_ulong addr,
+                                  target_ulong size, SemOpClass cls) {
+    if (!sem_events_active()) {
+        return;
+    }
+    /* Helper bodies call this immediately before a constituent host
+     * store.  Preserve provenance's accepted partial-commit behavior,
+     * but do not touch OSPREY until the helper publishes its complete
+     * post-success interval set. */
+    if (binradar_memcheck_enabled) {
+        provenance_on_modify_mem(addr, size);
+    }
+    (void)env;
+    (void)cls;
+}
+
+/* Combined modeled byte-copy event (memcpy/memmove/strcpy family).
+ * Consumer order is fixed: provenance keeps its conservative
+ * destination invalidation; OSPREY snapshots eligible source tags
+ * before destination invalidation, records exact modeled F03, then
+ * relocates sound ADDRESS tags and publishes F04 for relocated
+ * pointer cells.  Invalid class or invalid/wrapping intervals still
+ * invalidate the destination conservatively but publish nothing. */
+void sem_mem_copy(CPUArchState *env, target_ulong src, target_ulong dst,
+                  target_ulong size, SemOpClass cls) {
+    if (!sem_events_active()) {
+        return;
+    }
+    bool valid_class = sem_op_class_is_valid(cls);
+    if (binradar_memcheck_enabled) {
+        provenance_on_modify_mem(dst, size);
+    }
+    if (osprey_collect_enabled && env != NULL) {
+        if (valid_class) {
+            osprey_on_mem_copy(env, src, dst, size);
+        } else {
+            /* The class cannot authorize F03/F04 or ADDRESS
+             * relocation.  The successful write still invalidates the
+             * exact destination interval conservatively. */
+            osprey_on_mem_overwrite(env, dst, size);
+        }
+    }
 }
 
 void sem_reg_overwrite(CPUArchState *env, int reg_idx, SemOpClass cls) {
@@ -891,7 +940,7 @@ void helper_sem_mem_access(CPUArchState *env, target_ulong addr,
 
 void helper_sem_mem_overwrite(CPUArchState *env, target_ulong addr,
                               target_ulong size, uint32_t cls) {
-    sem_mem_overwrite(addr, size, (SemOpClass)cls);
+    sem_mem_overwrite(env, addr, size, (SemOpClass)cls);
     if (!sem_op_class_is_valid((SemOpClass)cls)) {
         if (binradar_memcheck_enabled) {
             provenance_get_reg_shadow(env)->ea_meta.valid = false;
@@ -954,6 +1003,12 @@ void sem_mem_helper_access_part(CPUArchState *env, target_ulong addr,
     }
     OspreyCpuOriginState *st = osprey_cpu_origin(env);
     uint32_t mode = st->ea_mode;
+    /* Current callers publish constituent intervals only after the
+     * complete helper returned successfully.  Commit OSPREY shadow
+     * invalidation here, never at the pre-store write-attempt boundary. */
+    if (is_store) {
+        osprey_on_mem_overwrite(env, addr, size);
+    }
     /* Helper-backed producers publish only after their complete operation
      * succeeds.  Clear decomposed EA fields after each part, but retain the
      * instruction mode until the final ordered interval. */
@@ -1027,11 +1082,21 @@ void sem_mem_maskmov(CPUArchState *env, target_ulong addr,
     }
     OspreyCpuOriginState *st = osprey_cpu_origin(env);
     uint32_t mode = st->ea_mode;
+    bool valid_width = width == 8 || width == 16;
+    /* The helper reached this boundary only after every selected byte
+     * store succeeded.  Commit sparse OSPREY invalidation now; the
+     * pre-store attempt events were provenance-only. */
+    if (valid_width) {
+        for (uint32_t i = 0; i < width; i++) {
+            if (selected_mask & (1u << i)) {
+                osprey_on_mem_overwrite(env, addr + i, 1);
+            }
+        }
+    }
     /* MASKMOV has no decomposed EA transfer.  Consume all pending state
      * before publishing selected-byte intervals. */
     osprey_clear_pending_helper(st);
     osprey_clear_ea(st, true);
-    bool valid_width = width == 8 || width == 16;
     if (!valid_class || !valid_policy || !valid_width ||
         !osprey_mode_ok(mode)) {
         if (!valid_class || !valid_policy || !valid_width) {
@@ -1068,24 +1133,30 @@ void helper_sem_on_load(CPUArchState *env, uint32_t dst_idx,
     if (!osprey_collect_enabled) {
         return;
     }
-    /* Uninterrupted aligned pointer-width reload: restore the ADDRESS
-     * origin into dst_reg.  The already-successful guest load's
-     * pointer-width bytes are re-read here; the raw instruction PC
-     * becomes the reload's producer.  Partial/unaligned/atomic/output
-     * overlap invalidation remains Stage 2.4. */
-    if (size == OSPREY_SHADOW_ALIGN &&
-        (addr & (OSPREY_SHADOW_ALIGN - 1)) == 0) {
-        target_ulong value = 0;
-        if (is_valid_address(addr, false)) {
-            memcpy(&value, g2h(addr), sizeof(value));
-        }
-        osprey_on_mem_load_address(env, dst_idx, addr, value, pc);
-    }
+    /* Stage 2.4 combined load: the C hook reads the post-load
+     * architectural GPR value from env->regs[dst_idx] itself, builds
+     * the VALUE channel from the exact canonical source chunk, and
+     * restores the ADDRESS channel from the aligned shadow slot. */
+    osprey_on_mem_load(env, dst_idx, addr, size, pc);
 }
 
 void helper_sem_on_store(CPUArchState *env, uint32_t src_idx,
                          target_ulong addr, target_ulong size,
                          target_ulong src_val, uint32_t cls) {
+    /* OSPREY: the translator rode the pending raw transfer-PC scratch
+     * (same protocol as the two-helper LEA sequence) so the store hook
+     * can gate F03/F04/slot publication on the main-image producer
+     * gate.  Consume it here: a stale PC must never leak to a later
+     * instruction, and an out-of-image store (libc internals) must
+     * still invalidate overlap but publish nothing. */
+    target_ulong transfer_pc = 0;
+    OspreyCpuOriginState *st = NULL;
+    if (osprey_collect_enabled) {
+        st = osprey_cpu_origin(env);
+        transfer_pc = st->pending_transfer_pc_valid
+            ? st->pending_transfer_pc : 0;
+        osprey_clear_transfer_pc(st);
+    }
     if (!sem_op_class_is_valid((SemOpClass)cls)) {
         if (binradar_memcheck_enabled) {
             provenance_mem_invalidate(addr, size);
@@ -1093,10 +1164,10 @@ void helper_sem_on_store(CPUArchState *env, uint32_t src_idx,
         if (osprey_collect_enabled) {
             /* Unknown stores cannot transfer an origin.  Route an
              * impossible source index through the normal store path so
-             * the OSPREY memory shadow is overwritten with an invalid
-             * origin instead of retaining stale metadata. */
-            osprey_on_mem_store_address(env, CPU_NB_REGS, addr, size,
-                                        src_val);
+             * the OSPREY memory shadow invalidates overlap instead of
+             * retaining stale metadata. */
+            osprey_on_mem_store(env, CPU_NB_REGS, addr, size, src_val,
+                                transfer_pc);
             osprey_clear_ea(osprey_cpu_origin(env), true);
         }
         return;
@@ -1107,7 +1178,7 @@ void helper_sem_on_store(CPUArchState *env, uint32_t src_idx,
     if (!osprey_collect_enabled) {
         return;
     }
-    osprey_on_mem_store_address(env, src_idx, addr, size, src_val);
+    osprey_on_mem_store(env, src_idx, addr, size, src_val, transfer_pc);
 }
 
 void helper_sem_reg_invalidate(CPUArchState *env, uint32_t reg_idx,

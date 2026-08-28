@@ -1,0 +1,135 @@
+region 0 0 0 1 7130
+region 1 36d 1 2 40
+region 2 0 745 3 8
+region 2 100 785 4 0
+region 2 100 788 4 0
+region 2 100 791 4 0
+region 2 110 810 4 0
+region 2 120 784 4 0
+region 2 130 797 4 0
+region 2 130 809 4 0
+region 2 140 803 11 0
+region 2 150 793 4 0
+region 2 150 795 4 0
+region 2 160 796 4 0
+region 2 170 782 4 0
+region 2 170 790 4 0
+region 2 170 794 4 0
+region 2 170 802 4 460
+region 2 180 757 4 0
+region 2 190 783 4 0
+region 2 1a0 798 4 0
+region 2 1a0 808 4 0
+region 2 1b0 799 4 0
+region 2 2a0 746 3 0
+region 2 2d6 756 25 170
+access 8 0 0 0 2fe8 8 1
+access 104 0 0 0 2f78 8 1
+access 114 0 0 0 2f80 8 1
+access 124 0 0 0 2f88 8 1
+access 134 0 0 0 2f90 8 1
+access 144 0 0 0 2f98 8 1
+access 154 0 0 0 2fa0 8 1
+access 164 0 0 0 2fa8 8 1
+access 174 0 0 0 2fb0 8 1
+access 184 0 0 0 2fb8 8 1
+access 194 0 0 0 2fc0 8 1
+access 1a4 0 0 0 2fc8 8 1
+access 1b4 0 0 0 2fd0 8 1
+access 1df 0 0 0 2fd8 8 1
+access 2b5 1 2 170 fffffffffffffbb4 4 1
+access 2b8 1 0 0 7128 4 1
+access 2d1 1 2 170 fffffffffffffba0 8 1
+access 2da 1 2 2d6 fffffffffffffff8 8 1
+access 2de 1 2 2d6 fffffffffffffff0 8 1
+access 2e0 1 2 2d6 ffffffffffffffe8 8 1
+access 2e9 1 2 2d6 ffffffffffffffe4 4 1
+access 2f2 0 2 2d6 ffffffffffffffe4 4 1
+access 308 0 2 2d6 ffffffffffffffe4 4 1
+access 31d 1 0 0 5000 8 1
+access 31d 1 0 0 5008 8 1
+access 31d 1 0 0 5010 8 1
+access 31d 1 0 0 5018 8 1
+access 31d 1 0 0 5020 8 1
+access 31d 1 0 0 5028 8 1
+access 31d 1 0 0 5030 8 1
+access 31d 1 0 0 5038 8 1
+access 321 0 2 2d6 ffffffffffffffe4 4 1
+access 335 1 0 0 5040 8 1
+access 335 1 0 0 5048 8 1
+access 335 1 0 0 5050 8 1
+access 335 1 0 0 5058 8 1
+access 335 1 0 0 5060 8 1
+access 335 1 0 0 5068 8 1
+access 335 1 0 0 5070 8 1
+access 335 1 0 0 5078 8 1
+access 33d 0 2 2d6 ffffffffffffffe4 4 1
+access 351 1 0 0 5080 8 1
+access 351 1 0 0 5088 8 1
+access 351 1 0 0 5090 8 1
+access 351 1 0 0 5098 8 1
+access 351 1 0 0 50a0 8 1
+access 351 1 0 0 50a8 8 1
+access 351 1 0 0 50b0 8 1
+access 351 1 0 0 50b8 8 1
+access 359 1 2 2d6 ffffffffffffffe4 4 1
+access 35d 0 2 2d6 ffffffffffffffe4 4 1
+access 368 1 2 2d6 fffffffffffffe90 8 1
+access 36d 1 2 2d6 ffffffffffffffd8 8 1
+access 371 0 2 2d6 ffffffffffffffd8 8 1
+access 382 0 2 2d6 ffffffffffffffd8 8 1
+access 386 1 0 0 50d0 8 1
+access 38d 0 0 0 50d0 8 1
+access 394 1 0 0 50c0 8 1
+access 3b4 1 2 2d6 fffffffffffffe90 8 1
+access 3d2 1 2 2d6 fffffffffffffe90 8 1
+access 3eb 1 2 2d6 fffffffffffffe90 8 1
+access 409 1 2 2d6 fffffffffffffe90 8 1
+access 427 1 2 2d6 fffffffffffffe90 8 1
+access 445 1 2 2d6 fffffffffffffe90 8 1
+access 463 1 2 2d6 fffffffffffffe90 8 1
+access 468 0 0 0 50d0 8 1
+access 46f 1 0 0 50c8 8 1
+access 48a 1 2 2d6 fffffffffffffe90 8 1
+access 4a8 1 2 2d6 fffffffffffffe90 8 1
+access 4ad 0 0 0 50c8 8 1
+access 4b4 0 1 36d 0 1 1
+access 4cd 1 2 2d6 fffffffffffffe90 8 1
+access 4d9 1 2 2d6 fffffffffffffe98 8 1
+access 4ee 1 2 2d6 fffffffffffffe90 8 1
+access 509 1 2 2d6 fffffffffffffe90 8 1
+access 522 1 2 2d6 fffffffffffffe90 8 1
+access 535 1 0 0 7128 4 1
+access 54e 1 2 2d6 fffffffffffffe90 8 1
+access 574 1 2 2d6 fffffffffffffe90 8 1
+access 579 0 0 0 7128 4 1
+access 59e 1 2 2d6 fffffffffffffe90 8 1
+access 5b7 1 2 2d6 fffffffffffffe90 8 1
+access 5bc 0 0 0 5040 8 1
+access 5c3 0 2 2d6 ffffffffffffffd8 8 1
+access 5c7 0 1 36d 0 1 1
+access 5d0 0 0 0 7040 8 1
+access 5da 1 0 0 7040 8 1
+access 5e6 1 2 2d6 fffffffffffffe90 8 1
+base 2b5 2 170 fffffffffffffbb4 4 2 170 fffffffffffffbb8 0 0 2ae 1
+base 2e9 2 2d6 ffffffffffffffe4 4 2 2d6 fffffffffffffff8 0 0 2db 1
+base 2f2 2 2d6 ffffffffffffffe4 4 2 2d6 fffffffffffffff8 0 0 2db 1
+base 308 2 2d6 ffffffffffffffe4 4 2 2d6 fffffffffffffff8 0 0 2db 1
+base 321 2 2d6 ffffffffffffffe4 4 2 2d6 fffffffffffffff8 0 0 2db 1
+base 33d 2 2d6 ffffffffffffffe4 4 2 2d6 fffffffffffffff8 0 0 2db 1
+base 35d 2 2d6 ffffffffffffffe4 4 2 2d6 fffffffffffffff8 0 0 2db 1
+base 5c7 1 36d 0 1 1 36d 0 1 1 5c3 1
+copy 0 0 3010 4 0 0 7000 4 1
+copy 0 0 3010 4 0 0 7010 4 1
+copy 0 0 3018 8 0 0 7020 8 1
+copy 0 0 5000 13 0 0 5040 13 1
+copy 0 0 5080 16 0 0 5088 16 1
+copy 0 0 50c0 8 0 0 50c8 8 1
+copy 0 0 50d0 8 0 0 50c0 8 1
+copy 0 0 50d0 8 0 0 50c8 8 1
+copy 2 2d6 ffffffffffffffd8 8 0 0 50d0 8 1
+points 0 0 50c0 8 1 36d 0 1 0
+points 0 0 50c8 8 1 36d 0 1 0
+points 0 0 50d0 8 1 36d 0 1 0
+points 2 2d6 ffffffffffffffd8 8 1 36d 0 1 0
+alloc 36d 64 1

@@ -171,9 +171,32 @@ bool sem_events_active(void);
 /* Route an accepted memory-overwrite interval through the shared
  * overwrite event BEFORE either consumer mutates its shadow.  The
  * class is validated against the manifest: an invalid class performs
- * conservative invalidation and never produces an OSPREY fact. */
-void sem_mem_overwrite(target_ulong addr, target_ulong size,
-                       SemOpClass cls);
+ * conservative invalidation and never produces an OSPREY fact.  The
+ * authoritative CPU environment is required; production callsites must
+ * never rely on a null fallback (a null env stays a defensive no-op). */
+void sem_mem_overwrite(CPUArchState *env, target_ulong addr,
+                       target_ulong size, SemOpClass cls);
+
+/* Helper-owned store attempt.  Provenance invalidates before the host
+ * store so a partially committed helper cannot retain stale tags.
+ * OSPREY deliberately waits for the corresponding post-success
+ * sem_mem_access/sem_mem_helper_access/sem_mem_maskmov event; a faulting
+ * multipart helper must not mutate its analysis shadow. */
+void sem_mem_helper_write_attempt(CPUArchState *env, target_ulong addr,
+                                  target_ulong size, SemOpClass cls);
+
+/* Combined modeled byte-copy event (memcpy/memmove/strcpy family),
+ * dispatched only after the model's full success boundary.  Not
+ * `sem_mem_overwrite(dst,size)` followed by a copy hook: for
+ * overlapping memmove, OSPREY snapshots source shadow before
+ * destination invalidation.  Consumer order: provenance keeps its
+ * conservative destination invalidation; OSPREY snapshots eligible
+ * source tags, invalidates destination overlap, records exact modeled
+ * F03, then installs any sound transferred ADDRESS tags/F04 rows.
+ * Invalid class or invalid/wrapping interval still invalidates the
+ * destination conservatively but publishes no F03/F04. */
+void sem_mem_copy(CPUArchState *env, target_ulong src, target_ulong dst,
+                  target_ulong size, SemOpClass cls);
 
 /* The translator carries the operation class, interval policy, and manifest
  * family on every memory event.  The family is validated independently from

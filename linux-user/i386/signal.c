@@ -337,7 +337,7 @@ void setup_frame(int sig, struct target_sigaction *ka,
     /* Provenance: the whole frame was written via host __put_user /
      * cpu_x86_fsave, bypassing TCG; stale pointer shadow in the frame
      * must not be reloaded by the handler. */
-    sem_mem_overwrite(frame_addr, sizeof(*frame), SEM_OP_SIGNAL);
+    sem_mem_overwrite(env, frame_addr, sizeof(*frame), SEM_OP_SIGNAL);
 
     /* Set up to return from userspace.  If provided, use a stub
        already in userspace.  */
@@ -425,7 +425,7 @@ void setup_rt_frame(int sig, struct target_sigaction *ka,
     /* Provenance: the whole frame was written via host __put_user /
      * cpu_x86_fxsave, bypassing TCG; stale pointer shadow in the frame
      * must not be reloaded by the handler. */
-    sem_mem_overwrite(frame_addr, sizeof(*frame), SEM_OP_SIGNAL);
+    sem_mem_overwrite(env, frame_addr, sizeof(*frame), SEM_OP_SIGNAL);
 
     /* Set up to return from userspace.  If provided, use a stub
        already in userspace.  */

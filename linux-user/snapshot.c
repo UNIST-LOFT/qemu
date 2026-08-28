@@ -2062,11 +2062,11 @@ void snapshot_read_access(SnapshotMemAccess *mem_access) {
 
 // Syscall Hook
 static target_ulong last_brk_end;  /* previous brk end (for shrink detection) */
-void snapshot_syscall(uintptr_t syscall_no, uintptr_t syscall_arg0,
-                      uintptr_t syscall_arg1, uintptr_t syscall_arg2,
-                      uintptr_t syscall_arg3, uintptr_t syscall_arg4,
-                      uintptr_t syscall_arg5, uintptr_t syscall_arg6,
-                      uintptr_t ret_val) {
+void snapshot_syscall(CPUArchState *env, uintptr_t syscall_no,
+                      uintptr_t syscall_arg0, uintptr_t syscall_arg1,
+                      uintptr_t syscall_arg2, uintptr_t syscall_arg3,
+                      uintptr_t syscall_arg4, uintptr_t syscall_arg5,
+                      uintptr_t syscall_arg6, uintptr_t ret_val) {
     switch (syscall_no) {
     case TARGET_NR_read:
     case TARGET_NR_pread64: // read from file (write to buffer)
@@ -2089,7 +2089,7 @@ void snapshot_syscall(uintptr_t syscall_no, uintptr_t syscall_arg0,
             snapshot_write_access(&mem_access);
             /* Provenance: kernel wrote into the buffer — stale shadow
              * entries must not be reloaded (FIX_TRACER.md test 18). */
-            sem_mem_overwrite(syscall_arg1, ret_val, SEM_OP_SYSCALL);
+            sem_mem_overwrite(env, syscall_arg1, ret_val, SEM_OP_SYSCALL);
         }
         break;
     case TARGET_NR_write:
@@ -2121,7 +2121,7 @@ void snapshot_syscall(uintptr_t syscall_no, uintptr_t syscall_arg0,
             uint32_t op = (uint32_t)syscall_arg1 & FUTEX_CMD_MASK;
             if (op == FUTEX_WAKE_OP) {
                 if (syscall_arg4) {
-                    sem_mem_overwrite(syscall_arg4, sizeof(uint32_t), SEM_OP_SYSCALL);
+                    sem_mem_overwrite(env, syscall_arg4, sizeof(uint32_t), SEM_OP_SYSCALL);
                 }
             }
         }
@@ -2131,14 +2131,14 @@ void snapshot_syscall(uintptr_t syscall_no, uintptr_t syscall_arg0,
     case TARGET_NR_newfstatat: // newfstatat(dirfd, pathname, statbuf, flags)
         // Kernel wrote sizeof(struct target_stat) bytes on success only.
         if ((long)ret_val == 0) {
-            sem_mem_overwrite(syscall_arg2, sizeof(struct target_stat), SEM_OP_SYSCALL);
+            sem_mem_overwrite(env, syscall_arg2, sizeof(struct target_stat), SEM_OP_SYSCALL);
         }
         break;
 #endif
 #if defined(TARGET_NR_fstatat64)
     case TARGET_NR_fstatat64:
         if ((long)ret_val == 0) {
-            sem_mem_overwrite(syscall_arg2, sizeof(struct target_stat64), SEM_OP_SYSCALL);
+            sem_mem_overwrite(env, syscall_arg2, sizeof(struct target_stat64), SEM_OP_SYSCALL);
         }
         break;
 #endif
@@ -2148,14 +2148,14 @@ void snapshot_syscall(uintptr_t syscall_no, uintptr_t syscall_arg0,
     case TARGET_NR_fstat:
         // stat(pathname, statbuf) / lstat / fstat(fd, statbuf)
         if ((long)ret_val == 0) {
-            sem_mem_overwrite(syscall_arg1, sizeof(struct target_stat), SEM_OP_SYSCALL);
+            sem_mem_overwrite(env, syscall_arg1, sizeof(struct target_stat), SEM_OP_SYSCALL);
         }
         break;
 #endif
 #if defined(TARGET_NR_statx)
     case TARGET_NR_statx: // statx(dirfd, pathname, flags, mask, statxbuf)
         if ((long)ret_val == 0) {
-            sem_mem_overwrite(syscall_arg4, sizeof(struct target_statx), SEM_OP_SYSCALL);
+            sem_mem_overwrite(env, syscall_arg4, sizeof(struct target_statx), SEM_OP_SYSCALL);
         }
         break;
 #endif
@@ -2164,7 +2164,7 @@ void snapshot_syscall(uintptr_t syscall_no, uintptr_t syscall_arg0,
     case TARGET_NR_fstatfs:
         // statfs(path, buf) / fstatfs(fd, buf)
         if ((long)ret_val == 0) {
-            sem_mem_overwrite(syscall_arg1, sizeof(struct target_statfs), SEM_OP_SYSCALL);
+            sem_mem_overwrite(env, syscall_arg1, sizeof(struct target_statfs), SEM_OP_SYSCALL);
         }
         break;
 #endif
@@ -2172,21 +2172,21 @@ void snapshot_syscall(uintptr_t syscall_no, uintptr_t syscall_arg0,
     case TARGET_NR_readlink: // readlink(pathname, buf, bufsiz)
         // Kernel wrote ret bytes (the link length, no NUL).
         if ((long)ret_val > 0) {
-            sem_mem_overwrite(syscall_arg1, ret_val, SEM_OP_SYSCALL);
+            sem_mem_overwrite(env, syscall_arg1, ret_val, SEM_OP_SYSCALL);
         }
         break;
 #endif
 #if defined(TARGET_NR_readlinkat)
     case TARGET_NR_readlinkat: // readlinkat(dirfd, pathname, buf, bufsiz)
         if ((long)ret_val > 0) {
-            sem_mem_overwrite(syscall_arg2, ret_val, SEM_OP_SYSCALL);
+            sem_mem_overwrite(env, syscall_arg2, ret_val, SEM_OP_SYSCALL);
         }
         break;
 #endif
 #if defined(TARGET_NR_getrandom)
     case TARGET_NR_getrandom: // getrandom(buf, buflen, flags)
         if ((long)ret_val > 0) {
-            sem_mem_overwrite(syscall_arg0, ret_val, SEM_OP_SYSCALL);
+            sem_mem_overwrite(env, syscall_arg0, ret_val, SEM_OP_SYSCALL);
         }
         break;
 #endif
@@ -2196,7 +2196,7 @@ void snapshot_syscall(uintptr_t syscall_no, uintptr_t syscall_arg0,
         // deliberately passes NULL for the obsolete timezone argument.
         if ((long)ret_val == 0) {
             if (syscall_arg0) {
-                sem_mem_overwrite(syscall_arg0,
+                sem_mem_overwrite(env, syscall_arg0,
                                          sizeof(struct target_timeval), SEM_OP_SYSCALL);
             }
         }
@@ -2206,7 +2206,7 @@ void snapshot_syscall(uintptr_t syscall_no, uintptr_t syscall_arg0,
     case TARGET_NR_clock_gettime: // clock_gettime(clockid, tp)
         // Kernel wrote struct timespec on success only.
         if ((long)ret_val == 0 && syscall_arg1) {
-            sem_mem_overwrite(syscall_arg1,
+            sem_mem_overwrite(env, syscall_arg1,
                                      sizeof(struct target_timespec), SEM_OP_SYSCALL);
         }
         break;
@@ -2214,7 +2214,7 @@ void snapshot_syscall(uintptr_t syscall_no, uintptr_t syscall_arg0,
 #if defined(TARGET_NR_clock_getres)
     case TARGET_NR_clock_getres: // clock_getres(clockid, res)
         if ((long)ret_val == 0 && syscall_arg1) {
-            sem_mem_overwrite(syscall_arg1,
+            sem_mem_overwrite(env, syscall_arg1,
                                      sizeof(struct target_timespec), SEM_OP_SYSCALL);
         }
         break;
@@ -2223,7 +2223,7 @@ void snapshot_syscall(uintptr_t syscall_no, uintptr_t syscall_arg0,
     case TARGET_NR_getdents: // getdents(fd, dirp, count)
         // Kernel wrote ret bytes of dirent records into dirp.
         if ((long)ret_val > 0) {
-            sem_mem_overwrite(syscall_arg1, ret_val, SEM_OP_SYSCALL);
+            sem_mem_overwrite(env, syscall_arg1, ret_val, SEM_OP_SYSCALL);
         }
         break;
 #endif
@@ -2231,7 +2231,7 @@ void snapshot_syscall(uintptr_t syscall_no, uintptr_t syscall_arg0,
     case TARGET_NR_getdents64: // getdents64(fd, dirp, count)
         // Kernel wrote ret bytes of dirent records into dirp.
         if ((long)ret_val > 0) {
-            sem_mem_overwrite(syscall_arg1, ret_val, SEM_OP_SYSCALL);
+            sem_mem_overwrite(env, syscall_arg1, ret_val, SEM_OP_SYSCALL);
         }
         break;
 #endif
@@ -2256,7 +2256,7 @@ void snapshot_syscall(uintptr_t syscall_no, uintptr_t syscall_arg0,
         // On shrink (new brk below the previous end), stale shadow tags
         // in the unmapped tail must not be reloaded after regrowth.
         if ((long)ret_val < (long)last_brk_end) {
-            sem_mem_overwrite(ret_val, last_brk_end - ret_val, SEM_OP_MAPPING);
+            sem_mem_overwrite(env, ret_val, last_brk_end - ret_val, SEM_OP_MAPPING);
         }
         last_brk_end = ret_val;
         break;
@@ -2267,7 +2267,7 @@ void snapshot_syscall(uintptr_t syscall_no, uintptr_t syscall_arg0,
         // A fresh mapping must never inherit stale shadow entries (an
         // address previously used by another object).
         if ((long)ret_val > 0) {
-            sem_mem_overwrite(ret_val, syscall_arg1, SEM_OP_MAPPING);
+            sem_mem_overwrite(env, ret_val, syscall_arg1, SEM_OP_MAPPING);
         }
         break;
     case TARGET_NR_mremap: // memory remap
@@ -2276,9 +2276,9 @@ void snapshot_syscall(uintptr_t syscall_no, uintptr_t syscall_arg0,
         snapshot_add_mapping(ret_val, syscall_arg2);
         // Old range's shadow entries are stale (pages may be moved/freed).
         if ((long)ret_val >= 0) {
-            sem_mem_overwrite(syscall_arg0, syscall_arg1, SEM_OP_MAPPING);
+            sem_mem_overwrite(env, syscall_arg0, syscall_arg1, SEM_OP_MAPPING);
             if ((uintptr_t)ret_val != (uintptr_t)syscall_arg0) {
-                sem_mem_overwrite(ret_val, syscall_arg2, SEM_OP_MAPPING);
+                sem_mem_overwrite(env, ret_val, syscall_arg2, SEM_OP_MAPPING);
             }
         }
         break;
@@ -2288,7 +2288,7 @@ void snapshot_syscall(uintptr_t syscall_no, uintptr_t syscall_arg0,
         // Invalidate shadow for the unmapped range (stale tags must not
         // survive an address-space reuse).
         if ((long)ret_val == 0) {
-            sem_mem_overwrite(syscall_arg0, syscall_arg1, SEM_OP_MAPPING);
+            sem_mem_overwrite(env, syscall_arg0, syscall_arg1, SEM_OP_MAPPING);
         }
         break;
     case TARGET_NR_mprotect: // permission
@@ -2336,7 +2336,7 @@ void snapshot_fork_setup(void) {
     log_msg("[forkserver] [setup]\n");
 }
 
-static abi_ulong snapshot_alloc_pointer_page(void)
+static abi_ulong snapshot_alloc_pointer_page(CPUArchState *env)
 {
     abi_long mapped = target_mmap(0, SNAPSHOT_PAGE_SIZE,
                                   PROT_READ | PROT_WRITE,
@@ -2348,7 +2348,7 @@ static abi_ulong snapshot_alloc_pointer_page(void)
     }
 
     memset(g2h((target_ulong)mapped), 0, SNAPSHOT_PAGE_SIZE);
-    sem_mem_overwrite((target_ulong)mapped, SNAPSHOT_PAGE_SIZE,
+    sem_mem_overwrite(env, (target_ulong)mapped, SNAPSHOT_PAGE_SIZE,
                       SEM_OP_SNAPSHOT);
     log_msg("[mod-pointer] [alloc] [addr %lx] [size %x]\n",
               (target_ulong)mapped, SNAPSHOT_PAGE_SIZE);
@@ -2390,7 +2390,7 @@ static void snapshot_modify_memory(CPUArchState *cpu_env) {
     abi_ulong pointer_page = (abi_ulong)-1;
     if (pointer_mod) {
         log_msg("[mod-pointer] [start]\n");
-        pointer_page = snapshot_alloc_pointer_page();
+        pointer_page = snapshot_alloc_pointer_page(cpu_env);
         if (pointer_page == (abi_ulong)-1) {
             log_msg("[mod-pointer] [error] failed to allocate pointer page\n");
             exit_with_status(1);
@@ -2408,8 +2408,8 @@ static void snapshot_modify_memory(CPUArchState *cpu_env) {
                 }
                 memcpy(g2h((target_ulong)pointer_page),
                        single_mod.value_obj, obj_size);
-                sem_mem_overwrite((target_ulong)pointer_page, obj_size,
-                                  SEM_OP_SNAPSHOT);
+                sem_mem_overwrite(cpu_env, (target_ulong)pointer_page,
+                                  obj_size, SEM_OP_SNAPSHOT);
             }
         }
         if (single_mod.addr < SNAPSHOT_PAGE_SIZE) {
@@ -2430,7 +2430,8 @@ static void snapshot_modify_memory(CPUArchState *cpu_env) {
         memcpy(target_addr_h, single_mod.value, single_mod.size);
         /* Provenance: memory overwritten by modification → stale shadow
          * entries must not be reloaded (FIX_TRACER.md test 17). */
-        sem_mem_overwrite(single_mod.addr, single_mod.size, SEM_OP_SNAPSHOT);
+        sem_mem_overwrite(cpu_env, single_mod.addr, single_mod.size,
+                          SEM_OP_SNAPSHOT);
         log_msg("[mod] [addr %lx] [size %ld] [total %d]\n", single_mod.addr, single_mod.size, g_queue_get_length(mod_manager->modifications));
     }
 }

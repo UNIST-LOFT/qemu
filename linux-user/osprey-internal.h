@@ -206,12 +206,19 @@ typedef struct OspreyAddressOrigin {
     uint64_t producer_pc;        /* normalized producer instruction */
 } OspreyAddressOrigin;
 
-/* Stage 2.4 value channel.  Stays invalid throughout Stage 2.3; the
- * type exists so every register write updates or kills BOTH channels
- * explicitly. */
+/* Stage 2.4 value channel: a register holds a concrete value loaded
+ * from a canonical memory chunk.  Every valid Stage 2.4 VALUE origin
+ * carries the source memory width (1/2/4/8), the complete post-load
+ * architectural GPR value, and the exact canonical source chunk.
+ * Deliberately no producer PC or heap generation: F03 describes a
+ * historical successful load-to-store flow; the source chunk was
+ * validated while its region instance was live. */
 typedef struct OspreyValueOrigin {
     uint8_t valid;
-    uint8_t reserved[7];
+    uint8_t width;                 /* source memory width: 1, 2, 4, or 8 */
+    uint8_t reserved[6];
+    target_ulong concrete_value;   /* architectural GPR value after load */
+    OspreyChunk source;            /* exact canonical source chunk */
 } OspreyValueOrigin;
 
 typedef struct OspreyRegisterOrigins {
@@ -219,7 +226,8 @@ typedef struct OspreyRegisterOrigins {
     OspreyValueOrigin value;
 } OspreyRegisterOrigins;
 
-/* Sparse aligned memory shadow: ADDRESS state only in Stage 2.3. */
+/* Sparse aligned memory shadow: ADDRESS slots retained through Stage 2.4;
+ * VALUE origins are register-local load history and need no memory shadow. */
 typedef struct OspreyMemAddressOrigin {
     uint8_t valid;
     uint8_t width;             /* sizeof(target_ulong) when valid */
@@ -412,6 +420,16 @@ uint64_t osprey_base_hash(const OspreyBaseFact *f);
 bool osprey_base_eq(const OspreyBaseFact *a, const OspreyBaseFact *b);
 /* Provenance-authoritative heap origin check (osprey-facts.c). */
 bool osprey_address_origin_live(const OspreyAddressOrigin *o);
+
+/* Exact canonical chunk resolution for an interval (osprey-facts.c).
+ * Rejects zero size, addr+size-1 wrap, start/end points outside
+ * modeled regions, endpoints in different region identities,
+ * nonconsecutive canonical offsets, and offsets/sizes not exactly
+ * representable in the fixed record.  Both endpoints are resolved, not
+ * just the start.  Used for VALUE creation, ordinary F03/F04
+ * destinations, modeled F03, and canonical pointer-cell chunks. */
+bool osprey_chunk_of_interval(CPUArchState *env, target_ulong addr,
+                              target_ulong size, OspreyChunk *out);
 uint64_t osprey_copy_hash(const OspreyCopyFact *f);
 bool osprey_copy_eq(const OspreyCopyFact *a, const OspreyCopyFact *b);
 uint64_t osprey_points_hash(const OspreyPointsToFact *f);

@@ -946,3 +946,35 @@ base 1bf0 2 1b9b ffffffffffffffc8 8 2 1b9b fffffffffffffff8 0 0 1ba0 1
 base 1bf4 2 1b9b ffffffffffffffd0 8 2 1b9b fffffffffffffff8 0 0 1ba0 1
 base 1c0f 2 1b9b fffffffffffffff0 8 2 1b9b fffffffffffffff8 0 0 1ba0 1
 base 1ca2 0 0 6110 2 0 0 6110 0 0 1c9b 1
+copy 0 0 6130 8 0 0 6000 8 1
+copy 0 0 6150 8 0 0 6000 8 1
+copy 0 0 6160 8 0 0 6000 8 1
+copy 0 0 6180 8 0 0 6000 8 1
+copy 0 0 6190 8 0 0 6000 8 1
+copy 0 0 61a0 8 0 0 6000 8 1
+copy 2 14be fffffffffffffff8 8 2 151d fffffffffffffff8 8 1
+copy 2 151d fffffffffffffff8 8 2 1577 fffffffffffffff8 8 1
+copy 2 1577 fffffffffffffff8 8 2 15d6 fffffffffffffff8 8 1
+copy 2 15d6 fffffffffffffff0 8 2 1811 fffffffffffffff0 8 1
+copy 2 1646 fffffffffffffff8 8 2 1688 fffffffffffffff8 8 1
+copy 2 1688 ffffffffffffffc9 1 2 1688 ffffffffffffffe7 1 1
+copy 2 1688 ffffffffffffffcd 1 2 1688 ffffffffffffffe7 1 1
+copy 2 1688 ffffffffffffffd1 1 2 1688 ffffffffffffffe7 1 1
+copy 2 1688 ffffffffffffffd7 1 2 1688 ffffffffffffffe7 1 1
+copy 2 1688 fffffffffffffff8 8 2 17c8 fffffffffffffff8 8 1
+copy 2 17c8 fffffffffffffff8 8 2 1811 fffffffffffffff8 8 1
+copy 2 1811 fffffffffffffff0 8 2 199a fffffffffffffff0 8 1
+copy 2 1908 fffffffffffffff8 8 2 199a fffffffffffffff8 8 1
+copy 2 199a fffffffffffffff0 8 2 1ad7 fffffffffffffff0 8 1
+copy 2 1a71 fffffffffffffff8 8 2 1ad7 fffffffffffffff8 8 1
+copy 2 1ad7 fffffffffffffff0 8 2 1b9b fffffffffffffff0 8 1
+points 2 1206 fffffffffffffff8 8 2 1c15 fffffffffffffff8 1 0
+points 2 1331 ffffffffffffffe0 8 0 0 9000 1 0
+points 2 1331 ffffffffffffffe8 8 0 0 8ff8 1 0
+points 2 14be fffffffffffffff0 8 0 0 6100 1 0
+points 2 151d fffffffffffffff0 8 0 0 6140 1 0
+points 2 1577 fffffffffffffff0 8 0 0 6150 1 0
+points 2 15d6 ffffffffffffffe8 8 0 0 6160 1 0
+points 2 1688 ffffffffffffffe8 8 0 0 62c0 1 0
+points 2 1811 ffffffffffffffd8 8 0 0 6220 1 0
+points 2 1811 ffffffffffffffe8 8 0 0 6210 1 0

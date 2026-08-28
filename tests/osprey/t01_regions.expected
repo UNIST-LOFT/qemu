@@ -170,6 +170,19 @@ base 390 1 348 0 1 1 348 0 6 1 38c 1
 base 397 1 348 0 1 1 348 0 6 1 393 1
 base 3c6 1 3ad 0 1 1 3ad 0 7 1 3c2 1
 base 450 2 1fa ffffffffffffffa8 8 2 1fa ffffffffffffffa8 0 0 1fa 1
+copy 0 0 3010 4 0 0 3030 4 1
+copy 2 1a9 ffffffffffffffe4 4 2 1a9 fffffffffffffff0 4 1
+copy 2 1e6 fffffffffffffff8 8 2 1e6 fffffffffffffff8 8 1
+points 2 1a9 fffffffffffffff8 8 2 1a9 fffffffffffffff8 1 0
+points 2 1a9 fffffffffffffff8 8 2 1fa fffffffffffffff8 1 0
+points 2 1fa ffffffffffffffa8 8 1 3e8 0 1 0
+points 2 1fa ffffffffffffffb8 8 1 3ad 0 1 0
+points 2 1fa ffffffffffffffc8 8 1 348 0 1 0
+points 2 1fa ffffffffffffffd0 8 1 312 0 1 0
+points 2 1fa ffffffffffffffd8 8 1 2e5 0 1 0
+points 2 1fa ffffffffffffffe0 8 1 2af 0 1 0
+points 2 1fa ffffffffffffffe8 8 1 1f8 0 1 0
+points 2 1fa fffffffffffffff0 8 1 1f8 0 1 0
 alloc 1f8 32 1
 alloc 2af 32 1
 alloc 2e5 16 1

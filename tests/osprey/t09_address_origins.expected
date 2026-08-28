@@ -136,6 +136,20 @@ base 3e8 1 297 0 8 1 297 0 1 1 3e1 1
 base 3f3 1 297 0 8 1 297 0 1 1 3ec 1
 base 598 1 297 0 1 1 297 0 1 1 594 1
 base 59f 1 3ba 0 1 1 3ba 0 2 1 59b 1
+copy 0 0 5008 8 0 0 5000 8 1
+copy 0 0 5010 8 1 297 0 8 1
+copy 2 276 ffffffffffffffc0 8 2 276 ffffffffffffffb0 8 1
+copy 2 276 ffffffffffffffc8 8 0 0 5008 8 1
+copy 2 276 ffffffffffffffd0 8 0 0 5010 8 1
+points 0 0 5000 8 1 297 0 1 0
+points 0 0 5008 8 1 297 0 1 0
+points 0 0 5010 8 1 3ba 0 1 0
+points 1 297 0 8 1 3ba 0 1 0
+points 2 276 ffffffffffffffb0 8 1 44e 0 1 0
+points 2 276 ffffffffffffffb8 8 1 481 0 1 0
+points 2 276 ffffffffffffffc0 8 1 44e 0 1 0
+points 2 276 ffffffffffffffc8 8 1 297 0 1 0
+points 2 276 ffffffffffffffd0 8 1 3ba 0 1 0
 alloc 297 64 1
 alloc 3ba 64 1
 alloc 44e 64 1

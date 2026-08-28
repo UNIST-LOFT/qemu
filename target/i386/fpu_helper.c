@@ -87,9 +87,9 @@ static inline void helper_fstt(CPUX86State *env, floatx80 f, target_ulong ptr,
     CPU_LDoubleU temp;
 
     temp.d = f;
-    sem_mem_overwrite(ptr, 8, cls);
+    sem_mem_helper_write_attempt(env, ptr, 8, cls);
     cpu_stq_data_ra(env, ptr, temp.l.lower, retaddr);
-    sem_mem_overwrite(ptr + 8, 2, cls);
+    sem_mem_helper_write_attempt(env, ptr + 8, 2, cls);
     cpu_stw_data_ra(env, ptr + 8, temp.l.upper, retaddr);
 }
 
@@ -656,11 +656,11 @@ void helper_fbst_ST0(CPUX86State *env, target_ulong ptr)
     mem_ref = ptr;
     mem_end = mem_ref + 9;
     if (val < 0) {
-        sem_mem_overwrite(mem_end, 1, SEM_OP_X87_HELPER);
+        sem_mem_helper_write_attempt(env, mem_end, 1, SEM_OP_X87_HELPER);
         cpu_stb_data_ra(env, mem_end, 0x80, GETPC());
         val = -val;
     } else {
-        sem_mem_overwrite(mem_end, 1, SEM_OP_X87_HELPER);
+        sem_mem_helper_write_attempt(env, mem_end, 1, SEM_OP_X87_HELPER);
         cpu_stb_data_ra(env, mem_end, 0x00, GETPC());
     }
     while (mem_ref < mem_end) {
@@ -670,11 +670,11 @@ void helper_fbst_ST0(CPUX86State *env, target_ulong ptr)
         v = val % 100;
         val = val / 100;
         v = ((v / 10) << 4) | (v % 10);
-        sem_mem_overwrite(mem_ref, 1, SEM_OP_X87_HELPER);
+        sem_mem_helper_write_attempt(env, mem_ref, 1, SEM_OP_X87_HELPER);
         cpu_stb_data_ra(env, mem_ref++, v, GETPC());
     }
     while (mem_ref < mem_end) {
-        sem_mem_overwrite(mem_ref, 1, SEM_OP_X87_HELPER);
+        sem_mem_helper_write_attempt(env, mem_ref, 1, SEM_OP_X87_HELPER);
         cpu_stb_data_ra(env, mem_ref++, 0, GETPC());
     }
 }
@@ -1012,35 +1012,35 @@ static void do_fstenv(CPUX86State *env, target_ulong ptr, int data32,
     }
     if (data32) {
         /* 32 bit */
-        sem_mem_overwrite(ptr, 4, SEM_OP_X87_HELPER);
+        sem_mem_helper_write_attempt(env, ptr, 4, SEM_OP_X87_HELPER);
         cpu_stl_data_ra(env, ptr, env->fpuc, retaddr);
-        sem_mem_overwrite(ptr + 4, 4, SEM_OP_X87_HELPER);
+        sem_mem_helper_write_attempt(env, ptr + 4, 4, SEM_OP_X87_HELPER);
         cpu_stl_data_ra(env, ptr + 4, fpus, retaddr);
-        sem_mem_overwrite(ptr + 8, 4, SEM_OP_X87_HELPER);
+        sem_mem_helper_write_attempt(env, ptr + 8, 4, SEM_OP_X87_HELPER);
         cpu_stl_data_ra(env, ptr + 8, fptag, retaddr);
-        sem_mem_overwrite(ptr + 12, 4, SEM_OP_X87_HELPER);
+        sem_mem_helper_write_attempt(env, ptr + 12, 4, SEM_OP_X87_HELPER);
         cpu_stl_data_ra(env, ptr + 12, 0, retaddr); /* fpip */
-        sem_mem_overwrite(ptr + 16, 4, SEM_OP_X87_HELPER);
+        sem_mem_helper_write_attempt(env, ptr + 16, 4, SEM_OP_X87_HELPER);
         cpu_stl_data_ra(env, ptr + 16, 0, retaddr); /* fpcs */
-        sem_mem_overwrite(ptr + 20, 4, SEM_OP_X87_HELPER);
+        sem_mem_helper_write_attempt(env, ptr + 20, 4, SEM_OP_X87_HELPER);
         cpu_stl_data_ra(env, ptr + 20, 0, retaddr); /* fpoo */
-        sem_mem_overwrite(ptr + 24, 4, SEM_OP_X87_HELPER);
+        sem_mem_helper_write_attempt(env, ptr + 24, 4, SEM_OP_X87_HELPER);
         cpu_stl_data_ra(env, ptr + 24, 0, retaddr); /* fpos */
     } else {
         /* 16 bit */
-        sem_mem_overwrite(ptr, 2, SEM_OP_X87_HELPER);
+        sem_mem_helper_write_attempt(env, ptr, 2, SEM_OP_X87_HELPER);
         cpu_stw_data_ra(env, ptr, env->fpuc, retaddr);
-        sem_mem_overwrite(ptr + 2, 2, SEM_OP_X87_HELPER);
+        sem_mem_helper_write_attempt(env, ptr + 2, 2, SEM_OP_X87_HELPER);
         cpu_stw_data_ra(env, ptr + 2, fpus, retaddr);
-        sem_mem_overwrite(ptr + 4, 2, SEM_OP_X87_HELPER);
+        sem_mem_helper_write_attempt(env, ptr + 4, 2, SEM_OP_X87_HELPER);
         cpu_stw_data_ra(env, ptr + 4, fptag, retaddr);
-        sem_mem_overwrite(ptr + 6, 2, SEM_OP_X87_HELPER);
+        sem_mem_helper_write_attempt(env, ptr + 6, 2, SEM_OP_X87_HELPER);
         cpu_stw_data_ra(env, ptr + 6, 0, retaddr);
-        sem_mem_overwrite(ptr + 8, 2, SEM_OP_X87_HELPER);
+        sem_mem_helper_write_attempt(env, ptr + 8, 2, SEM_OP_X87_HELPER);
         cpu_stw_data_ra(env, ptr + 8, 0, retaddr);
-        sem_mem_overwrite(ptr + 10, 2, SEM_OP_X87_HELPER);
+        sem_mem_helper_write_attempt(env, ptr + 10, 2, SEM_OP_X87_HELPER);
         cpu_stw_data_ra(env, ptr + 10, 0, retaddr);
-        sem_mem_overwrite(ptr + 12, 2, SEM_OP_X87_HELPER);
+        sem_mem_helper_write_attempt(env, ptr + 12, 2, SEM_OP_X87_HELPER);
         cpu_stw_data_ra(env, ptr + 12, 0, retaddr);
     }
 }
@@ -1257,19 +1257,19 @@ static void do_xsave_fpu(CPUX86State *env, target_ulong ptr, uintptr_t ra)
         fptag |= (env->fptags[i] << i);
     }
 
-    sem_mem_overwrite(ptr + XO(legacy.fcw), 2, SEM_OP_PAIRED);
+    sem_mem_helper_write_attempt(env, ptr + XO(legacy.fcw), 2, SEM_OP_PAIRED);
     cpu_stw_data_ra(env, ptr + XO(legacy.fcw), env->fpuc, ra);
-    sem_mem_overwrite(ptr + XO(legacy.fsw), 2, SEM_OP_PAIRED);
+    sem_mem_helper_write_attempt(env, ptr + XO(legacy.fsw), 2, SEM_OP_PAIRED);
     cpu_stw_data_ra(env, ptr + XO(legacy.fsw), fpus, ra);
-    sem_mem_overwrite(ptr + XO(legacy.ftw), 2, SEM_OP_PAIRED);
+    sem_mem_helper_write_attempt(env, ptr + XO(legacy.ftw), 2, SEM_OP_PAIRED);
     cpu_stw_data_ra(env, ptr + XO(legacy.ftw), fptag ^ 0xff, ra);
 
     /* In 32-bit mode this is eip, sel, dp, sel.
        In 64-bit mode this is rip, rdp.
        But in either case we don't write actual data, just zeros.  */
-    sem_mem_overwrite(ptr + XO(legacy.fpip), 8, SEM_OP_PAIRED);
+    sem_mem_helper_write_attempt(env, ptr + XO(legacy.fpip), 8, SEM_OP_PAIRED);
     cpu_stq_data_ra(env, ptr + XO(legacy.fpip), 0, ra); /* eip+sel; rip */
-    sem_mem_overwrite(ptr + XO(legacy.fpdp), 8, SEM_OP_PAIRED);
+    sem_mem_helper_write_attempt(env, ptr + XO(legacy.fpdp), 8, SEM_OP_PAIRED);
     cpu_stq_data_ra(env, ptr + XO(legacy.fpdp), 0, ra); /* edp+sel; rdp */
 
     addr = ptr + XO(legacy.fpregs);
@@ -1282,9 +1282,9 @@ static void do_xsave_fpu(CPUX86State *env, target_ulong ptr, uintptr_t ra)
 
 static void do_xsave_mxcsr(CPUX86State *env, target_ulong ptr, uintptr_t ra)
 {
-    sem_mem_overwrite(ptr + XO(legacy.mxcsr), 4, SEM_OP_PAIRED);
+    sem_mem_helper_write_attempt(env, ptr + XO(legacy.mxcsr), 4, SEM_OP_PAIRED);
     cpu_stl_data_ra(env, ptr + XO(legacy.mxcsr), env->mxcsr, ra);
-    sem_mem_overwrite(ptr + XO(legacy.mxcsr_mask), 4, SEM_OP_PAIRED);
+    sem_mem_helper_write_attempt(env, ptr + XO(legacy.mxcsr_mask), 4, SEM_OP_PAIRED);
     cpu_stl_data_ra(env, ptr + XO(legacy.mxcsr_mask), 0x0000ffff, ra);
 }
 
@@ -1301,9 +1301,9 @@ static void do_xsave_sse(CPUX86State *env, target_ulong ptr, uintptr_t ra)
 
     addr = ptr + XO(legacy.xmm_regs);
     for (i = 0; i < nb_xmm_regs; i++) {
-        sem_mem_overwrite(addr, 8, SEM_OP_PAIRED);
+        sem_mem_helper_write_attempt(env, addr, 8, SEM_OP_PAIRED);
         cpu_stq_data_ra(env, addr, env->xmm_regs[i].ZMM_Q(0), ra);
-        sem_mem_overwrite(addr + 8, 8, SEM_OP_PAIRED);
+        sem_mem_helper_write_attempt(env, addr + 8, 8, SEM_OP_PAIRED);
         cpu_stq_data_ra(env, addr + 8, env->xmm_regs[i].ZMM_Q(1), ra);
         addr += 16;
     }
@@ -1315,20 +1315,20 @@ static void do_xsave_bndregs(CPUX86State *env, target_ulong ptr, uintptr_t ra)
     int i;
 
     for (i = 0; i < 4; i++, addr += 16) {
-        sem_mem_overwrite(addr, 8, SEM_OP_PAIRED);
+        sem_mem_helper_write_attempt(env, addr, 8, SEM_OP_PAIRED);
         cpu_stq_data_ra(env, addr, env->bnd_regs[i].lb, ra);
-        sem_mem_overwrite(addr + 8, 8, SEM_OP_PAIRED);
+        sem_mem_helper_write_attempt(env, addr + 8, 8, SEM_OP_PAIRED);
         cpu_stq_data_ra(env, addr + 8, env->bnd_regs[i].ub, ra);
     }
 }
 
 static void do_xsave_bndcsr(CPUX86State *env, target_ulong ptr, uintptr_t ra)
 {
-    sem_mem_overwrite(ptr + offsetof(XSaveBNDCSR, bndcsr.cfgu), 8,
+    sem_mem_helper_write_attempt(env, ptr + offsetof(XSaveBNDCSR, bndcsr.cfgu), 8,
                       SEM_OP_PAIRED);
     cpu_stq_data_ra(env, ptr + offsetof(XSaveBNDCSR, bndcsr.cfgu),
                     env->bndcs_regs.cfgu, ra);
-    sem_mem_overwrite(ptr + offsetof(XSaveBNDCSR, bndcsr.sts), 8,
+    sem_mem_helper_write_attempt(env, ptr + offsetof(XSaveBNDCSR, bndcsr.sts), 8,
                       SEM_OP_PAIRED);
     cpu_stq_data_ra(env, ptr + offsetof(XSaveBNDCSR, bndcsr.sts),
                     env->bndcs_regs.sts, ra);
@@ -1336,7 +1336,7 @@ static void do_xsave_bndcsr(CPUX86State *env, target_ulong ptr, uintptr_t ra)
 
 static void do_xsave_pkru(CPUX86State *env, target_ulong ptr, uintptr_t ra)
 {
-    sem_mem_overwrite(ptr, 8, SEM_OP_PAIRED);
+    sem_mem_helper_write_attempt(env, ptr, 8, SEM_OP_PAIRED);
     cpu_stq_data_ra(env, ptr, env->pkru, ra);
 }
 
@@ -1421,7 +1421,7 @@ static void do_xsave(CPUX86State *env, target_ulong ptr, uint64_t rfbm,
     /* Update the XSTATE_BV field.  */
     old_bv = cpu_ldq_data_ra(env, ptr + XO(header.xstate_bv), ra);
     new_bv = (old_bv & ~rfbm) | (inuse & rfbm);
-    sem_mem_overwrite(ptr + XO(header.xstate_bv), 8, SEM_OP_PAIRED);
+    sem_mem_helper_write_attempt(env, ptr + XO(header.xstate_bv), 8, SEM_OP_PAIRED);
     cpu_stq_data_ra(env, ptr + XO(header.xstate_bv), new_bv, ra);
 }
 
