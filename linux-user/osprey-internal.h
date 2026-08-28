@@ -948,6 +948,9 @@ struct OspreyGraph {
     uint64_t hint_instances;       /* total R10-R12 hint instances */
     uint64_t limit_rows;           /* [osprey] [limit] rows emitted */
     uint64_t cd04_extensions;      /* CD04 closure extensions */
+    /* Raw candidate-proposal rows submitted by each Stage-3 source rule;
+     * used for deterministic acceptance diagnostics. */
+    uint64_t candidate_proposals[OSPREY_RULE_COUNT];
 };
 
 /* Stage 3 base graph entry: current candidate/factor construction over

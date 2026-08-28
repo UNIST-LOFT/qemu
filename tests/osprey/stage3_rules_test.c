@@ -143,6 +143,346 @@ static const OspreyFactor *first_rule(const OspreyContext *ctx, uint16_t rule)
     return NULL;
 }
 
+static uint32_t variable_id(const OspreyContext *ctx, uint8_t kind,
+                            const OspreyVarPayload *payload)
+{
+    if (ctx == NULL || ctx->graph == NULL || payload == NULL) return UINT32_MAX;
+    OspreyKey key = osprey_var_key(kind, payload);
+    gpointer value = g_hash_table_lookup(ctx->graph->var_index, &key);
+    return value == NULL ? UINT32_MAX : (uint32_t)(uintptr_t)value - 1;
+}
+
+static uint32_t chunk_variable_id(const OspreyContext *ctx, uint8_t kind,
+                                  const OspreyChunk *value)
+{
+    OspreyVarPayload payload;
+    memset(&payload, 0, sizeof(payload));
+    payload.chunk = *value;
+    return variable_id(ctx, kind, &payload);
+}
+
+static uint32_t access_variable_id(const OspreyContext *ctx, uint64_t pc,
+                                   const OspreyChunk *value)
+{
+    OspreyVarPayload payload;
+    memset(&payload, 0, sizeof(payload));
+    payload.prim_access.chunk = *value;
+    payload.prim_access.insn_pc = pc;
+    return variable_id(ctx, OSPREY_PRED_PRIMITIVE_ACCESS, &payload);
+}
+
+static uint32_t array_variable_id(const OspreyContext *ctx,
+                                  OspreyRegionId region_id, int64_t lo,
+                                  int64_t hi, int64_t stride)
+{
+    OspreyVarPayload payload;
+    memset(&payload, 0, sizeof(payload));
+    payload.segment.a1 = address(region_id, lo);
+    payload.segment.a2 = address(region_id, hi);
+    payload.segment.size = stride;
+    return variable_id(ctx, OSPREY_PRED_ARRAY, &payload);
+}
+
+static uint32_t start_variable_id(const OspreyContext *ctx,
+                                  const OspreyAddress *value)
+{
+    OspreyVarPayload payload;
+    memset(&payload, 0, sizeof(payload));
+    payload.addr = *value;
+    return variable_id(ctx, OSPREY_PRED_ARRAY_START, &payload);
+}
+
+static uint32_t field_variable_id(const OspreyContext *ctx,
+                                  const OspreyChunk *value,
+                                  const OspreyAddress *base)
+{
+    OspreyVarPayload payload;
+    memset(&payload, 0, sizeof(payload));
+    payload.attached.chunk = *value;
+    payload.attached.base = *base;
+    return variable_id(ctx, OSPREY_PRED_FIELD_OF, &payload);
+}
+
+static bool probability_bits_equal(double actual, double expected)
+{
+    uint64_t actual_bits;
+    uint64_t expected_bits;
+    memcpy(&actual_bits, &actual, sizeof(actual_bits));
+    memcpy(&expected_bits, &expected, sizeof(expected_bits));
+    return actual_bits == expected_bits;
+}
+
+static bool factor_exact(const OspreyContext *ctx, uint16_t rule,
+                         uint8_t stage, uint8_t potential_kind,
+                         bool negative, double probability,
+                         uint16_t head_idx, const uint32_t *var_ids,
+                         uint32_t num_vars)
+{
+    for (guint i = 0; i < ctx->graph->factors->len; i++) {
+        const OspreyFactor *factor = g_array_index(ctx->graph->factors,
+                                                    OspreyFactor *, i);
+        if (factor->rule != rule || factor->stage != stage ||
+            factor->potential_kind != potential_kind ||
+            factor->negative != (uint8_t)negative ||
+            !probability_bits_equal(factor->p, probability) ||
+            factor->head_idx != head_idx || factor->num_vars != num_vars) {
+            continue;
+        }
+        bool matches = true;
+        for (uint32_t j = 0; j < num_vars; j++) {
+            if (factor->var_ids[j] != var_ids[j]) {
+                matches = false;
+                break;
+            }
+        }
+        if (matches) return true;
+    }
+    return false;
+}
+
+static void expect_factor(const OspreyContext *ctx, uint16_t rule,
+                          uint8_t stage, uint8_t potential_kind,
+                          bool negative, double probability,
+                          uint16_t head_idx, const uint32_t *var_ids,
+                          uint32_t num_vars, const char *message)
+{
+    CHECK(factor_exact(ctx, rule, stage, potential_kind, negative,
+                       probability, head_idx, var_ids, num_vars), message);
+}
+
+typedef struct FactorExpectation {
+    uint8_t stage;
+    uint8_t potential_kind;
+    bool negative;
+    double probability;
+    uint16_t head_idx;
+    const uint32_t *var_ids;
+    uint32_t num_vars;
+} FactorExpectation;
+
+static bool factor_matches_expectation(const OspreyFactor *factor,
+                                       const FactorExpectation *expected)
+{
+    if (factor->stage != expected->stage ||
+        factor->potential_kind != expected->potential_kind ||
+        factor->negative != (uint8_t)expected->negative ||
+        !probability_bits_equal(factor->p, expected->probability) ||
+        factor->head_idx != expected->head_idx ||
+        factor->num_vars != expected->num_vars) {
+        return false;
+    }
+    for (uint32_t i = 0; i < expected->num_vars; i++) {
+        if (factor->var_ids[i] != expected->var_ids[i]) return false;
+    }
+    return true;
+}
+
+static bool factor_block_exact(const OspreyContext *ctx, uint16_t rule,
+                               const FactorExpectation *expected,
+                               guint expected_count)
+{
+    guint actual_count = 0;
+    for (guint i = 0; i < ctx->graph->factors->len; i++) {
+        const OspreyFactor *factor = g_array_index(ctx->graph->factors,
+                                                    OspreyFactor *, i);
+        if (factor->rule == rule) actual_count++;
+    }
+    if (actual_count != expected_count) return false;
+
+    bool *matched = g_new0(bool, expected_count);
+    bool equal = true;
+    for (guint i = 0; i < ctx->graph->factors->len && equal; i++) {
+        const OspreyFactor *factor = g_array_index(ctx->graph->factors,
+                                                    OspreyFactor *, i);
+        if (factor->rule != rule) continue;
+        bool found = false;
+        for (guint j = 0; j < expected_count; j++) {
+            if (!matched[j] && factor_matches_expectation(factor,
+                                                           &expected[j])) {
+                matched[j] = true;
+                found = true;
+                break;
+            }
+        }
+        equal = found;
+    }
+    g_free(matched);
+    return equal;
+}
+
+static void expect_factor_block(const OspreyContext *ctx, uint16_t rule,
+                                const FactorExpectation *expected,
+                                guint expected_count, const char *message)
+{
+    CHECK(factor_block_exact(ctx, rule, expected, expected_count), message);
+}
+
+static void expect_candidate_proposals(const OspreyContext *ctx,
+                                       uint16_t rule, uint64_t expected,
+                                       const char *message)
+{
+    CHECK(ctx->graph->candidate_proposals[rule] == expected, message);
+}
+
+static void expect_candidate_accounting(const OspreyContext *ctx,
+                                        uint16_t rule,
+                                        uint64_t expected_proposals,
+                                        uint64_t expected_kept,
+                                        uint64_t expected_dropped,
+                                        const char *message)
+{
+    uint64_t kept = 0;
+    uint64_t dropped = 0;
+    GHashTableIter iterator;
+    gpointer key_pointer;
+    gpointer value_pointer;
+    g_hash_table_iter_init(&iterator, ctx->graph->kind_region);
+    while (g_hash_table_iter_next(&iterator, &key_pointer, &value_pointer)) {
+        const OspreyKindRegionCount *count = value_pointer;
+        kept += count->kept;
+        dropped += count->dropped;
+    }
+    CHECK(ctx->graph->candidate_proposals[rule] == expected_proposals &&
+          kept == expected_kept && dropped == expected_dropped, message);
+}
+
+static bool candidate_accounting_equal(const OspreyGraph *left,
+                                       const OspreyGraph *right)
+{
+    for (uint16_t rule = 0; rule < OSPREY_RULE_COUNT; rule++) {
+        if (left->candidate_proposals[rule] !=
+            right->candidate_proposals[rule]) {
+            return false;
+        }
+    }
+    if (g_hash_table_size(left->kind_region) !=
+        g_hash_table_size(right->kind_region) ||
+        left->limit_rows != right->limit_rows) {
+        return false;
+    }
+    GHashTableIter iterator;
+    gpointer key_pointer;
+    gpointer value_pointer;
+    g_hash_table_iter_init(&iterator, left->kind_region);
+    while (g_hash_table_iter_next(&iterator, &key_pointer, &value_pointer)) {
+        const OspreyKindRegionCount *left_count = value_pointer;
+        const OspreyKindRegionCount *right_count = g_hash_table_lookup(
+            right->kind_region, key_pointer);
+        if (right_count == NULL || left_count->kept != right_count->kept ||
+            left_count->dropped != right_count->dropped) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool variable_semantic_equal(const OspreyVar *left,
+                                    const OspreyVar *right)
+{
+    if (left == NULL || right == NULL || left->kind != right->kind ||
+        left->hard_false != right->hard_false ||
+        left->region_limit_hit != right->region_limit_hit ||
+        left->direct_support != right->direct_support ||
+        left->source_rule_bits != right->source_rule_bits ||
+        !probability_bits_equal(left->prior, right->prior)) {
+        return false;
+    }
+    OspreyKey left_key = osprey_var_key(left->kind, &left->payload);
+    OspreyKey right_key = osprey_var_key(right->kind, &right->payload);
+    return osprey_key_equal(&left_key, &right_key);
+}
+
+static bool variable_sets_equal(const OspreyContext *left,
+                                const OspreyContext *right)
+{
+    if (left->graph->vars->len != right->graph->vars->len) return false;
+    bool *matched = g_new0(bool, right->graph->vars->len);
+    bool equal = true;
+    for (guint i = 0; i < left->graph->vars->len && equal; i++) {
+        const OspreyVar *left_var = &g_array_index(left->graph->vars,
+                                                    OspreyVar, i);
+        bool found = false;
+        for (guint j = 0; j < right->graph->vars->len; j++) {
+            const OspreyVar *right_var = &g_array_index(right->graph->vars,
+                                                         OspreyVar, j);
+            if (!matched[j] && variable_semantic_equal(left_var, right_var)) {
+                matched[j] = true;
+                found = true;
+                break;
+            }
+        }
+        equal = found;
+    }
+    g_free(matched);
+    return equal;
+}
+
+static const OspreyVar *find_semantic_variable(const OspreyContext *ctx,
+                                                 const OspreyVar *needle)
+{
+    for (guint i = 0; i < ctx->graph->vars->len; i++) {
+        const OspreyVar *candidate = &g_array_index(ctx->graph->vars,
+                                                     OspreyVar, i);
+        if (variable_semantic_equal(needle, candidate)) return candidate;
+    }
+    return NULL;
+}
+
+static bool factor_semantic_equal(const OspreyContext *left_ctx,
+                                  const OspreyFactor *left,
+                                  const OspreyContext *right_ctx,
+                                  const OspreyFactor *right)
+{
+    if (left->rule != right->rule || left->stage != right->stage ||
+        left->potential_kind != right->potential_kind ||
+        left->negative != right->negative || left->head_idx != right->head_idx ||
+        !probability_bits_equal(left->p, right->p) ||
+        left->num_vars != right->num_vars) {
+        return false;
+    }
+    for (uint32_t i = 0; i < left->num_vars; i++) {
+        const OspreyVar *left_var = &g_array_index(left_ctx->graph->vars,
+                                                    OspreyVar,
+                                                    left->var_ids[i]);
+        const OspreyVar *right_var = find_semantic_variable(right_ctx,
+                                                              left_var);
+        if (right_var == NULL || right_var->id != right->var_ids[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool rule_factor_sets_equal(const OspreyContext *left,
+                                   const OspreyContext *right,
+                                   uint16_t rule)
+{
+    guint left_count = rule_count(left, rule);
+    guint right_count = rule_count(right, rule);
+    if (left_count != right_count) return false;
+    bool *matched = g_new0(bool, right->graph->factors->len);
+    bool equal = true;
+    for (guint i = 0; i < left->graph->factors->len && equal; i++) {
+        const OspreyFactor *left_factor = g_array_index(left->graph->factors,
+                                                         OspreyFactor *, i);
+        if (left_factor->rule != rule) continue;
+        bool found = false;
+        for (guint j = 0; j < right->graph->factors->len; j++) {
+            const OspreyFactor *right_factor = g_array_index(
+                right->graph->factors, OspreyFactor *, j);
+            if (!matched[j] && right_factor->rule == rule &&
+                factor_semantic_equal(left, left_factor, right, right_factor)) {
+                matched[j] = true;
+                found = true;
+                break;
+            }
+        }
+        equal = found;
+    }
+    g_free(matched);
+    return equal;
+}
+
 static void add_extent(OspreyContext *ctx, const OspreyChunk *value)
 {
     OspreyAccessFact access;
@@ -174,6 +514,15 @@ static OspreyInternResult seed_scalar(OspreyContext *ctx,
     return osprey_intern_var(ctx, OSPREY_PRED_SCALAR, &payload);
 }
 
+static OspreyInternResult seed_array_start(OspreyContext *ctx,
+                                           const OspreyAddress *value)
+{
+    OspreyVarPayload payload;
+    memset(&payload, 0, sizeof(payload));
+    payload.addr = *value;
+    return osprey_intern_var(ctx, OSPREY_PRED_ARRAY_START, &payload);
+}
+
 static const OspreyVar *find_array(const OspreyContext *ctx,
                                    OspreyRegionId region_id, int64_t lo,
                                    int64_t hi, int64_t stride)
@@ -196,6 +545,26 @@ static const OspreyVar *find_array(const OspreyContext *ctx,
     return NULL;
 }
 
+static char *graph_dump(const OspreyContext *ctx)
+{
+    FILE *stream = tmpfile();
+    CHECK(stream != NULL, "temporary canonical graph dump file");
+    if (stream == NULL) return g_strdup("");
+    CHECK(osprey_graph_dump_file(ctx, stream),
+          "canonical graph dump succeeds");
+    fflush(stream);
+    fseek(stream, 0, SEEK_END);
+    long length = ftell(stream);
+    CHECK(length >= 0, "canonical graph dump length");
+    rewind(stream);
+    size_t size = length < 0 ? 0 : (size_t)length;
+    char *text = g_malloc(size + 1);
+    size_t actual = fread(text, 1, size, stream);
+    text[actual] = '\0';
+    fclose(stream);
+    return text;
+}
+
 static char *cb03_dump(bool reverse)
 {
     OspreyContext *ctx = new_context();
@@ -210,22 +579,7 @@ static char *cb03_dump(bool reverse)
         seed_array(ctx, global, 8, 24, 8);
     }
     CHECK(build_secondary(ctx), "CB03 permutation build");
-    FILE *stream = tmpfile();
-    CHECK(stream != NULL, "CB03 permutation dump file");
-    if (stream == NULL) {
-        osprey_free(ctx);
-        return g_strdup("");
-    }
-    CHECK(osprey_graph_dump_file(ctx, stream), "CB03 permutation dump");
-    fflush(stream);
-    fseek(stream, 0, SEEK_END);
-    long length = ftell(stream);
-    CHECK(length >= 0, "CB03 permutation dump length");
-    rewind(stream);
-    char *text = g_malloc((size_t)(length < 0 ? 0 : length) + 1);
-    size_t actual = length < 0 ? 0 : fread(text, 1, (size_t)length, stream);
-    text[actual] = '\0';
-    fclose(stream);
+    char *text = graph_dump(ctx);
     osprey_free(ctx);
     return text;
 }
@@ -242,12 +596,43 @@ static void test_ca01(void)
     const OspreyFactor *factor = first_rule(ctx, OSPREY_RULE_CA01);
     CHECK(factor != NULL && fabs(factor->p - 0.25) < 1e-12,
           "CA01 uses logical sample support");
+    uint32_t primitive = chunk_variable_id(ctx, OSPREY_PRED_PRIMITIVE_VAR,
+                                           &value);
+    uint32_t ids[1] = { primitive };
+    expect_factor(ctx, OSPREY_RULE_CA01, OSPREY_GRAPH_BASE_CA,
+                  OSPREY_POTENTIAL_PRIOR, false, 0.25, 0, ids, 1,
+                  "CA01 exact primitive prior");
+    const FactorExpectation ca01_block[] = {
+        { OSPREY_GRAPH_BASE_CA, OSPREY_POTENTIAL_PRIOR, false, 0.25,
+          0, ids, 1 },
+    };
+    expect_factor_block(ctx, OSPREY_RULE_CA01, ca01_block,
+                        G_N_ELEMENTS(ca01_block),
+                        "CA01 complete canonical factor block");
+    expect_candidate_proposals(ctx, OSPREY_RULE_CA01, 1,
+                               "CA01 exact proposal count");
+    expect_candidate_accounting(ctx, OSPREY_RULE_CA01, 1, 3, 0,
+                                "CA01 exact proposal/kept/dropped totals");
     osprey_free(ctx);
 
     ctx = new_context();
     CHECK(build_base(ctx), "CA01 one-condition-off");
     CHECK(rule_count(ctx, OSPREY_RULE_CA01) == 0,
           "CA01 has no witness without Access");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    add_logical(ctx, 0x10, &value, 2, 1);
+    add_logical(ctx, 0x10, &value, 1, 1);
+    CHECK(build_base(ctx), "CA01 duplicate RMW projection");
+    CHECK(rule_count(ctx, OSPREY_RULE_CA01) == 1,
+          "CA01 merges duplicate logical load/store rows");
+    CHECK(chunk_variable_id(ctx, OSPREY_PRED_PRIMITIVE_VAR, &value) !=
+              UINT32_MAX,
+          "CA01 retains one primitive for duplicate rows");
+    factor = first_rule(ctx, OSPREY_RULE_CA01);
+    CHECK(factor != NULL && probability_bits_equal(factor->p, 0.5),
+          "CA01 duplicate rows merge logical support");
     osprey_free(ctx);
 
     ctx = new_context();
@@ -269,6 +654,29 @@ static void test_ca02(void)
     CHECK(build_base(ctx), "CA02 positive");
     CHECK(rule_count(ctx, OSPREY_RULE_CA02) == 2,
           "CA02 preserves both directions");
+    uint32_t first = chunk_variable_id(ctx, OSPREY_PRED_PRIMITIVE_VAR, &a);
+    uint32_t second = chunk_variable_id(ctx, OSPREY_PRED_PRIMITIVE_VAR, &b);
+    uint32_t forward[2] = { first, second };
+    uint32_t reverse[2] = { second, first };
+    expect_factor(ctx, OSPREY_RULE_CA02, OSPREY_GRAPH_BASE_CA,
+                  OSPREY_POTENTIAL_IMPLICATION, false, 0.8, 1,
+                  forward, 2, "CA02 exact forward factor");
+    expect_factor(ctx, OSPREY_RULE_CA02, OSPREY_GRAPH_BASE_CA,
+                  OSPREY_POTENTIAL_IMPLICATION, false, 0.8, 1,
+                  reverse, 2, "CA02 exact reverse factor");
+    const FactorExpectation ca02_block[] = {
+        { OSPREY_GRAPH_BASE_CA, OSPREY_POTENTIAL_IMPLICATION, false, 0.8,
+          1, forward, 2 },
+        { OSPREY_GRAPH_BASE_CA, OSPREY_POTENTIAL_IMPLICATION, false, 0.8,
+          1, reverse, 2 },
+    };
+    expect_factor_block(ctx, OSPREY_RULE_CA02, ca02_block,
+                        G_N_ELEMENTS(ca02_block),
+                        "CA02 complete canonical factor block");
+    expect_candidate_proposals(ctx, OSPREY_RULE_CA02, 0,
+                               "CA02 exact proposal count");
+    expect_candidate_accounting(ctx, OSPREY_RULE_CA02, 0, 6, 0,
+                                "CA02 exact proposal/kept/dropped totals");
     osprey_free(ctx);
 
     ctx = new_context();
@@ -277,6 +685,47 @@ static void test_ca02(void)
     CHECK(build_base(ctx), "CA02 one-condition-off");
     CHECK(rule_count(ctx, OSPREY_RULE_CA02) == 0,
           "CA02 rejects a one-byte gap");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    OspreyChunk narrow = chunk(global, 0, 4);
+    OspreyChunk wide = chunk(global, 0, 8);
+    add_logical(ctx, 0x10, &narrow, 1, 1);
+    add_logical(ctx, 0x20, &wide, 1, 1);
+    CHECK(build_base(ctx), "CA02 same-address widths");
+    CHECK(rule_count(ctx, OSPREY_RULE_CA02) == 0 &&
+          rule_count(ctx, OSPREY_RULE_CA03) == 2,
+          "CA02/CA03 classify same-address widths as overlap");
+    uint32_t narrow_id = chunk_variable_id(ctx, OSPREY_PRED_PRIMITIVE_VAR,
+                                            &narrow);
+    uint32_t wide_id = chunk_variable_id(ctx, OSPREY_PRED_PRIMITIVE_VAR,
+                                         &wide);
+    uint32_t overlap[2] = { narrow_id, wide_id };
+    uint32_t reverse_overlap[2] = { wide_id, narrow_id };
+    expect_factor(ctx, OSPREY_RULE_CA03, OSPREY_GRAPH_BASE_CA,
+                  OSPREY_POTENTIAL_IMPLICATION, true, 0.2, 1,
+                  overlap, 2, "CA03 same-address forward overlap");
+    expect_factor(ctx, OSPREY_RULE_CA03, OSPREY_GRAPH_BASE_CA,
+                  OSPREY_POTENTIAL_IMPLICATION, true, 0.2, 1,
+                  reverse_overlap, 2, "CA03 same-address reverse overlap");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    OspreyRegionId stack = region(OSPREY_REGION_STACK_FUNCTION, 0);
+    OspreyChunk other_region = chunk(stack, 8, 8);
+    add_logical(ctx, 0x10, &a, 1, 1);
+    add_logical(ctx, 0x20, &other_region, 1, 1);
+    CHECK(build_base(ctx), "CA02 region mismatch");
+    CHECK(rule_count(ctx, OSPREY_RULE_CA02) == 0 &&
+          rule_count(ctx, OSPREY_RULE_CA03) == 0,
+          "CA02/CA03 reject region mismatch");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    OspreyChunk overflowing = chunk(global, INT64_MAX, 1);
+    add_logical(ctx, 0x10, &overflowing, 1, 1);
+    CHECK(osprey_stage3_base(ctx) == OSPREY_GRAPH_ARITHMETIC,
+          "CA02 rejects an overflowing observed chunk endpoint");
     osprey_free(ctx);
 }
 
@@ -291,6 +740,56 @@ static void test_ca03(void)
     CHECK(build_base(ctx), "CA03 positive");
     CHECK(rule_count(ctx, OSPREY_RULE_CA03) == 2,
           "CA03 emits both negative directions");
+    uint32_t first = chunk_variable_id(ctx, OSPREY_PRED_PRIMITIVE_VAR, &a);
+    uint32_t second = chunk_variable_id(ctx, OSPREY_PRED_PRIMITIVE_VAR, &b);
+    uint32_t forward[2] = { first, second };
+    uint32_t reverse[2] = { second, first };
+    expect_factor(ctx, OSPREY_RULE_CA03, OSPREY_GRAPH_BASE_CA,
+                  OSPREY_POTENTIAL_IMPLICATION, true, 0.2, 1,
+                  forward, 2, "CA03 exact forward factor");
+    expect_factor(ctx, OSPREY_RULE_CA03, OSPREY_GRAPH_BASE_CA,
+                  OSPREY_POTENTIAL_IMPLICATION, true, 0.2, 1,
+                  reverse, 2, "CA03 exact reverse factor");
+    const FactorExpectation ca03_block[] = {
+        { OSPREY_GRAPH_BASE_CA, OSPREY_POTENTIAL_IMPLICATION, true, 0.2,
+          1, forward, 2 },
+        { OSPREY_GRAPH_BASE_CA, OSPREY_POTENTIAL_IMPLICATION, true, 0.2,
+          1, reverse, 2 },
+    };
+    expect_factor_block(ctx, OSPREY_RULE_CA03, ca03_block,
+                        G_N_ELEMENTS(ca03_block),
+                        "CA03 complete canonical factor block");
+    expect_candidate_proposals(ctx, OSPREY_RULE_CA03, 0,
+                               "CA03 exact proposal count");
+    expect_candidate_accounting(ctx, OSPREY_RULE_CA03, 0, 6, 0,
+                                "CA03 exact proposal/kept/dropped totals");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    OspreyChunk overlap_low = chunk(global, 0, 8);
+    OspreyChunk overlap_high = chunk(global, 4, 16);
+    add_logical(ctx, 0x20, &overlap_high, 1, 1);
+    add_logical(ctx, 0x10, &overlap_low, 1, 1);
+    CHECK(build_base(ctx), "CA03 reverse-direction overlap");
+    CHECK(rule_count(ctx, OSPREY_RULE_CA03) == 2,
+          "CA03 emits both directions for reverse overlap geometry");
+    uint32_t overlap_low_id = chunk_variable_id(ctx,
+                                                 OSPREY_PRED_PRIMITIVE_VAR,
+                                                 &overlap_low);
+    uint32_t overlap_high_id = chunk_variable_id(ctx,
+                                                  OSPREY_PRED_PRIMITIVE_VAR,
+                                                  &overlap_high);
+    uint32_t overlap_forward[2] = { overlap_high_id, overlap_low_id };
+    uint32_t overlap_reverse[2] = { overlap_low_id, overlap_high_id };
+    const FactorExpectation ca03_reverse_block[] = {
+        { OSPREY_GRAPH_BASE_CA, OSPREY_POTENTIAL_IMPLICATION, true, 0.2,
+          1, overlap_forward, 2 },
+        { OSPREY_GRAPH_BASE_CA, OSPREY_POTENTIAL_IMPLICATION, true, 0.2,
+          1, overlap_reverse, 2 },
+    };
+    expect_factor_block(ctx, OSPREY_RULE_CA03, ca03_reverse_block,
+                        G_N_ELEMENTS(ca03_reverse_block),
+                        "CA03 reverse overlap factor block");
     osprey_free(ctx);
 
     ctx = new_context();
@@ -314,6 +813,24 @@ static void test_ca04(void)
           "CA04 keeps antecedent then head order");
     CHECK(rule_count(ctx, OSPREY_RULE_CA04) == 1,
           "CA04 emits one primitive-access edge");
+    uint32_t primitive = chunk_variable_id(ctx, OSPREY_PRED_PRIMITIVE_VAR,
+                                           &value);
+    uint32_t access = access_variable_id(ctx, 0x10, &value);
+    uint32_t ids[2] = { primitive, access };
+    expect_factor(ctx, OSPREY_RULE_CA04, OSPREY_GRAPH_BASE_CA,
+                  OSPREY_POTENTIAL_IMPLICATION, false, 0.8, 1,
+                  ids, 2, "CA04 exact antecedent and head");
+    const FactorExpectation ca04_block[] = {
+        { OSPREY_GRAPH_BASE_CA, OSPREY_POTENTIAL_IMPLICATION, false, 0.8,
+          1, ids, 2 },
+    };
+    expect_factor_block(ctx, OSPREY_RULE_CA04, ca04_block,
+                        G_N_ELEMENTS(ca04_block),
+                        "CA04 complete canonical factor block");
+    expect_candidate_proposals(ctx, OSPREY_RULE_CA04, 1,
+                               "CA04 exact proposal count");
+    expect_candidate_accounting(ctx, OSPREY_RULE_CA04, 1, 3, 0,
+                                "CA04 exact proposal/kept/dropped totals");
     osprey_free(ctx);
 
     ctx = new_context();
@@ -334,6 +851,74 @@ static void test_ca05(void)
     CHECK(build_base(ctx), "CA05 positive");
     CHECK(rule_count(ctx, OSPREY_RULE_CA05) == 4,
           "CA05 performs complete P02 by R01 join");
+    uint32_t primitive_a = chunk_variable_id(ctx, OSPREY_PRED_PRIMITIVE_VAR,
+                                             &a);
+    uint32_t primitive_b = chunk_variable_id(ctx, OSPREY_PRED_PRIMITIVE_VAR,
+                                             &b);
+    uint32_t access_a = access_variable_id(ctx, 0x10, &a);
+    uint32_t access_b = access_variable_id(ctx, 0x10, &b);
+    uint32_t ids[2] = { access_a, primitive_a };
+    expect_factor(ctx, OSPREY_RULE_CA05, OSPREY_GRAPH_BASE_CA,
+                  OSPREY_POTENTIAL_IMPLICATION, false, 0.8, 1,
+                  ids, 2, "CA05 exact first self join");
+    ids[0] = access_b;
+    expect_factor(ctx, OSPREY_RULE_CA05, OSPREY_GRAPH_BASE_CA,
+                  OSPREY_POTENTIAL_IMPLICATION, false, 0.8, 1,
+                  ids, 2, "CA05 exact second-to-first join");
+    ids[1] = primitive_b;
+    expect_factor(ctx, OSPREY_RULE_CA05, OSPREY_GRAPH_BASE_CA,
+                  OSPREY_POTENTIAL_IMPLICATION, false, 0.8, 1,
+                  ids, 2, "CA05 exact second self join");
+    ids[0] = access_a;
+    expect_factor(ctx, OSPREY_RULE_CA05, OSPREY_GRAPH_BASE_CA,
+                  OSPREY_POTENTIAL_IMPLICATION, false, 0.8, 1,
+                  ids, 2, "CA05 exact first-to-second join");
+    uint32_t ca05_first_self[2] = { access_a, primitive_a };
+    uint32_t ca05_second_first[2] = { access_b, primitive_a };
+    uint32_t ca05_second_self[2] = { access_b, primitive_b };
+    uint32_t ca05_first_second[2] = { access_a, primitive_b };
+    const FactorExpectation ca05_block[] = {
+        { OSPREY_GRAPH_BASE_CA, OSPREY_POTENTIAL_IMPLICATION, false, 0.8,
+          1, ca05_first_self, 2 },
+        { OSPREY_GRAPH_BASE_CA, OSPREY_POTENTIAL_IMPLICATION, false, 0.8,
+          1, ca05_second_first, 2 },
+        { OSPREY_GRAPH_BASE_CA, OSPREY_POTENTIAL_IMPLICATION, false, 0.8,
+          1, ca05_second_self, 2 },
+        { OSPREY_GRAPH_BASE_CA, OSPREY_POTENTIAL_IMPLICATION, false, 0.8,
+          1, ca05_first_second, 2 },
+    };
+    expect_factor_block(ctx, OSPREY_RULE_CA05, ca05_block,
+                        G_N_ELEMENTS(ca05_block),
+                        "CA05 complete canonical factor block");
+    expect_candidate_proposals(ctx, OSPREY_RULE_CA05, 0,
+                               "CA05 exact proposal count");
+    expect_candidate_accounting(ctx, OSPREY_RULE_CA05, 0, 7, 0,
+                                "CA05 exact proposal/kept/dropped totals");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    OspreyRegionId stack = region(OSPREY_REGION_STACK_FUNCTION, 1);
+    OspreyChunk c = chunk(stack, 0, 8);
+    add_logical(ctx, 0x10, &a, 1, 1);
+    add_logical(ctx, 0x10, &b, 1, 1);
+    add_logical(ctx, 0x10, &c, 1, 1);
+    CHECK(build_base(ctx), "CA05 three-chunk cross-region join");
+    CHECK(rule_count(ctx, OSPREY_RULE_CA04) == 3 &&
+          rule_count(ctx, OSPREY_RULE_CA05) == 9,
+          "CA05 joins every P02 with every same-PC chunk");
+    OspreyChunk chunks[3] = { a, b, c };
+    for (guint source = 0; source < G_N_ELEMENTS(chunks); source++) {
+        uint32_t source_access = access_variable_id(ctx, 0x10,
+                                                    &chunks[source]);
+        for (guint target = 0; target < G_N_ELEMENTS(chunks); target++) {
+            uint32_t target_primitive = chunk_variable_id(
+                ctx, OSPREY_PRED_PRIMITIVE_VAR, &chunks[target]);
+            uint32_t ids[2] = { source_access, target_primitive };
+            expect_factor(ctx, OSPREY_RULE_CA05, OSPREY_GRAPH_BASE_CA,
+                          OSPREY_POTENTIAL_IMPLICATION, false, 0.8, 1,
+                          ids, 2, "CA05 exact cross-region join");
+        }
+    }
     osprey_free(ctx);
 
     ctx = new_context();
@@ -357,6 +942,35 @@ static void test_ca06(void)
     const OspreyFactor *factor = first_rule(ctx, OSPREY_RULE_CA06);
     CHECK(factor != NULL && fabs(factor->p - 0.5) < 1e-12,
           "CA06 uses logical support");
+    uint32_t access = access_variable_id(ctx, 0x10, &value);
+    uint32_t scalar = chunk_variable_id(ctx, OSPREY_PRED_SCALAR, &value);
+    uint32_t ids[2] = { access, scalar };
+    expect_factor(ctx, OSPREY_RULE_CA06, OSPREY_GRAPH_BASE_CA,
+                  OSPREY_POTENTIAL_IMPLICATION, false, 0.5, 1,
+                  ids, 2, "CA06 exact access-to-scalar factor");
+    const FactorExpectation ca06_block[] = {
+        { OSPREY_GRAPH_BASE_CA, OSPREY_POTENTIAL_IMPLICATION, false, 0.5,
+          1, ids, 2 },
+    };
+    expect_factor_block(ctx, OSPREY_RULE_CA06, ca06_block,
+                        G_N_ELEMENTS(ca06_block),
+                        "CA06 complete canonical factor block");
+    expect_candidate_proposals(ctx, OSPREY_RULE_CA06, 1,
+                               "CA06 exact proposal count");
+    expect_candidate_accounting(ctx, OSPREY_RULE_CA06, 1, 3, 0,
+                                "CA06 exact proposal/kept/dropped totals");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    add_logical(ctx, 0x10, &value, 1, 1);
+    add_logical(ctx, 0x10, &value, 1, 1);
+    CHECK(build_base(ctx), "CA06 duplicate fact rows");
+    CHECK(rule_count(ctx, OSPREY_RULE_CA06) == 1 &&
+          chunk_variable_id(ctx, OSPREY_PRED_SCALAR, &value) != UINT32_MAX,
+          "CA06 counts one distinct logical chunk");
+    factor = first_rule(ctx, OSPREY_RULE_CA06);
+    CHECK(factor != NULL && probability_bits_equal(factor->p, 0.5),
+          "CA06 duplicate rows retain merged support");
     osprey_free(ctx);
 
     ctx = new_context();
@@ -382,6 +996,99 @@ static void test_ca07(void)
     const OspreyFactor *factor = first_rule(ctx, OSPREY_RULE_CA07);
     CHECK(factor != NULL && fabs(factor->p - 0.2) < 1e-12,
           "CA07 applies the lower clamp");
+    uint32_t first = chunk_variable_id(ctx, OSPREY_PRED_SCALAR, &a);
+    uint32_t second = chunk_variable_id(ctx, OSPREY_PRED_SCALAR, &b);
+    uint32_t forward[2] = { first, second };
+    uint32_t reverse[2] = { second, first };
+    expect_factor(ctx, OSPREY_RULE_CA07, OSPREY_GRAPH_BASE_CA,
+                  OSPREY_POTENTIAL_IMPLICATION, false, 0.2, 1,
+                  forward, 2, "CA07 exact lower-clamp forward factor");
+    expect_factor(ctx, OSPREY_RULE_CA07, OSPREY_GRAPH_BASE_CA,
+                  OSPREY_POTENTIAL_IMPLICATION, false, 0.2, 1,
+                  reverse, 2, "CA07 exact lower-clamp reverse factor");
+    const FactorExpectation ca07_lower_block[] = {
+        { OSPREY_GRAPH_BASE_CA, OSPREY_POTENTIAL_IMPLICATION, false, 0.2,
+          1, forward, 2 },
+        { OSPREY_GRAPH_BASE_CA, OSPREY_POTENTIAL_IMPLICATION, false, 0.2,
+          1, reverse, 2 },
+    };
+    expect_factor_block(ctx, OSPREY_RULE_CA07, ca07_lower_block,
+                        G_N_ELEMENTS(ca07_lower_block),
+                        "CA07 complete lower-clamp factor block");
+    expect_candidate_proposals(ctx, OSPREY_RULE_CA07, 0,
+                               "CA07 exact proposal count");
+    expect_candidate_accounting(ctx, OSPREY_RULE_CA07, 0, 6, 0,
+                                "CA07 exact proposal/kept/dropped totals");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    add_logical(ctx, 0x10, &a, 1, 4);
+    add_logical(ctx, 0x20, &b, 1, 4);
+    CHECK(build_base(ctx), "CA07 upper clamp");
+    CHECK(rule_count(ctx, OSPREY_RULE_CA07) == 2,
+          "CA07 emits both upper-clamp directions");
+    first = chunk_variable_id(ctx, OSPREY_PRED_SCALAR, &a);
+    second = chunk_variable_id(ctx, OSPREY_PRED_SCALAR, &b);
+    forward[0] = first;
+    forward[1] = second;
+    reverse[0] = second;
+    reverse[1] = first;
+    expect_factor(ctx, OSPREY_RULE_CA07, OSPREY_GRAPH_BASE_CA,
+                  OSPREY_POTENTIAL_IMPLICATION, false, 0.8, 1,
+                  forward, 2, "CA07 exact upper-clamp forward factor");
+    expect_factor(ctx, OSPREY_RULE_CA07, OSPREY_GRAPH_BASE_CA,
+                  OSPREY_POTENTIAL_IMPLICATION, false, 0.8, 1,
+                  reverse, 2, "CA07 exact upper-clamp reverse factor");
+    const FactorExpectation ca07_upper_block[] = {
+        { OSPREY_GRAPH_BASE_CA, OSPREY_POTENTIAL_IMPLICATION, false, 0.8,
+          1, forward, 2 },
+        { OSPREY_GRAPH_BASE_CA, OSPREY_POTENTIAL_IMPLICATION, false, 0.8,
+          1, reverse, 2 },
+    };
+    expect_factor_block(ctx, OSPREY_RULE_CA07, ca07_upper_block,
+                        G_N_ELEMENTS(ca07_upper_block),
+                        "CA07 complete upper-clamp factor block");
+    expect_candidate_proposals(ctx, OSPREY_RULE_CA07, 0,
+                               "CA07 exact proposal count");
+    expect_candidate_accounting(ctx, OSPREY_RULE_CA07, 0, 6, 0,
+                                "CA07 exact proposal/kept/dropped totals");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    add_logical(ctx, 0x10, &a, 1, 5);
+    add_logical(ctx, 0x20, &b, 1, 4);
+    CHECK(build_base(ctx), "CA07 unequal upper-clamp supports");
+    CHECK(rule_count(ctx, OSPREY_RULE_CA07) == 2,
+          "CA07 clamps unequal saturated supports at the upper bound");
+    factor = first_rule(ctx, OSPREY_RULE_CA07);
+    CHECK(factor != NULL && probability_bits_equal(factor->p, 0.8),
+          "CA07 uses the upper clamp after support saturation");
+    first = chunk_variable_id(ctx, OSPREY_PRED_SCALAR, &a);
+    second = chunk_variable_id(ctx, OSPREY_PRED_SCALAR, &b);
+    uint32_t ca07_saturated_forward[2] = { first, second };
+    uint32_t ca07_saturated_reverse[2] = { second, first };
+    const FactorExpectation ca07_saturated_block[] = {
+        { OSPREY_GRAPH_BASE_CA, OSPREY_POTENTIAL_IMPLICATION, false, 0.8,
+          1, ca07_saturated_forward, 2 },
+        { OSPREY_GRAPH_BASE_CA, OSPREY_POTENTIAL_IMPLICATION, false, 0.8,
+          1, ca07_saturated_reverse, 2 },
+    };
+    expect_factor_block(ctx, OSPREY_RULE_CA07, ca07_saturated_block,
+                        G_N_ELEMENTS(ca07_saturated_block),
+                        "CA07 complete unequal-saturated factor block");
+    expect_candidate_accounting(ctx, OSPREY_RULE_CA07, 0, 6, 0,
+                                "CA07 unequal proposal/kept/dropped totals");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    add_logical(ctx, 0x10, &a, 1, 2);
+    add_logical(ctx, 0x20, &b, 1, 3);
+    CHECK(build_base(ctx), "CA07 unequal interior supports");
+    CHECK(rule_count(ctx, OSPREY_RULE_CA07) == 2,
+          "CA07 retains unequal non-clamped support");
+    factor = first_rule(ctx, OSPREY_RULE_CA07);
+    CHECK(factor != NULL && fabs(factor->p - 0.3) < 1e-12,
+          "CA07 applies the exact unequal-support formula");
     osprey_free(ctx);
 
     ctx = new_context();
@@ -408,6 +1115,94 @@ static void test_ca08(void)
     CHECK(build_base(ctx), "CA08 positive");
     CHECK(rule_count(ctx, OSPREY_RULE_CA08) == 2,
           "CA08 preserves both negative directions");
+    uint32_t scalar = chunk_variable_id(ctx, OSPREY_PRED_SCALAR, &value);
+    uint32_t field_id = field_variable_id(ctx, &value, &value.address);
+    uint32_t forward[2] = { scalar, field_id };
+    uint32_t reverse[2] = { field_id, scalar };
+    expect_factor(ctx, OSPREY_RULE_CA08, OSPREY_GRAPH_BASE_CA,
+                  OSPREY_POTENTIAL_IMPLICATION, true, 0.2, 1,
+                  forward, 2, "CA08 exact scalar-to-field factor");
+    expect_factor(ctx, OSPREY_RULE_CA08, OSPREY_GRAPH_BASE_CA,
+                  OSPREY_POTENTIAL_IMPLICATION, true, 0.2, 1,
+                  reverse, 2, "CA08 exact field-to-scalar factor");
+    const FactorExpectation ca08_single_block[] = {
+        { OSPREY_GRAPH_BASE_CA, OSPREY_POTENTIAL_IMPLICATION, true, 0.2,
+          1, forward, 2 },
+        { OSPREY_GRAPH_BASE_CA, OSPREY_POTENTIAL_IMPLICATION, true, 0.2,
+          1, reverse, 2 },
+    };
+    expect_factor_block(ctx, OSPREY_RULE_CA08, ca08_single_block,
+                        G_N_ELEMENTS(ca08_single_block),
+                        "CA08 complete single-base factor block");
+    expect_candidate_proposals(ctx, OSPREY_RULE_CA08, 0,
+                               "CA08 exact proposal count");
+    expect_candidate_accounting(ctx, OSPREY_RULE_CA08, 0, 3, 0,
+                                "CA08 exact proposal/kept/dropped totals");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    add_logical(ctx, 0x10, &value, 1, 1);
+    OspreyChunk full_extent = chunk(global, 0, 16);
+    add_extent(ctx, &full_extent);
+    OspreyAddress base_zero = address(global, 0);
+    OspreyAddress base_eight = address(global, 8);
+    OspreyVarPayload first_field;
+    OspreyVarPayload second_field;
+    memset(&first_field, 0, sizeof(first_field));
+    memset(&second_field, 0, sizeof(second_field));
+    first_field.attached.chunk = value;
+    first_field.attached.base = base_zero;
+    second_field.attached.chunk = value;
+    second_field.attached.base = base_eight;
+    CHECK(osprey_intern_var(ctx, OSPREY_PRED_FIELD_OF,
+                            &first_field).inserted,
+          "CA08 first field base");
+    CHECK(osprey_intern_var(ctx, OSPREY_PRED_FIELD_OF,
+                            &second_field).inserted,
+          "CA08 second field base");
+    CHECK(build_base(ctx), "CA08 multiple bases");
+    CHECK(rule_count(ctx, OSPREY_RULE_CA08) == 4,
+          "CA08 retains both field-base candidates");
+    uint32_t scalar_id = chunk_variable_id(ctx, OSPREY_PRED_SCALAR, &value);
+    uint32_t first_field_id = field_variable_id(ctx, &value, &base_zero);
+    uint32_t second_field_id = field_variable_id(ctx, &value, &base_eight);
+    uint32_t pair[2] = { scalar_id, first_field_id };
+    uint32_t reverse_pair[2] = { first_field_id, scalar_id };
+    expect_factor(ctx, OSPREY_RULE_CA08, OSPREY_GRAPH_BASE_CA,
+                  OSPREY_POTENTIAL_IMPLICATION, true, 0.2, 1,
+                  pair, 2, "CA08 first-base scalar direction");
+    expect_factor(ctx, OSPREY_RULE_CA08, OSPREY_GRAPH_BASE_CA,
+                  OSPREY_POTENTIAL_IMPLICATION, true, 0.2, 1,
+                  reverse_pair, 2, "CA08 first-base reverse direction");
+    pair[1] = second_field_id;
+    reverse_pair[0] = second_field_id;
+    expect_factor(ctx, OSPREY_RULE_CA08, OSPREY_GRAPH_BASE_CA,
+                  OSPREY_POTENTIAL_IMPLICATION, true, 0.2, 1,
+                  pair, 2, "CA08 second-base scalar direction");
+    expect_factor(ctx, OSPREY_RULE_CA08, OSPREY_GRAPH_BASE_CA,
+                  OSPREY_POTENTIAL_IMPLICATION, true, 0.2, 1,
+                  reverse_pair, 2, "CA08 second-base reverse direction");
+    uint32_t ca08_first_forward[2] = { scalar_id, first_field_id };
+    uint32_t ca08_first_reverse[2] = { first_field_id, scalar_id };
+    uint32_t ca08_second_forward[2] = { scalar_id, second_field_id };
+    uint32_t ca08_second_reverse[2] = { second_field_id, scalar_id };
+    const FactorExpectation ca08_multi_block[] = {
+        { OSPREY_GRAPH_BASE_CA, OSPREY_POTENTIAL_IMPLICATION, true, 0.2,
+          1, ca08_first_forward, 2 },
+        { OSPREY_GRAPH_BASE_CA, OSPREY_POTENTIAL_IMPLICATION, true, 0.2,
+          1, ca08_first_reverse, 2 },
+        { OSPREY_GRAPH_BASE_CA, OSPREY_POTENTIAL_IMPLICATION, true, 0.2,
+          1, ca08_second_forward, 2 },
+        { OSPREY_GRAPH_BASE_CA, OSPREY_POTENTIAL_IMPLICATION, true, 0.2,
+          1, ca08_second_reverse, 2 },
+    };
+    expect_factor_block(ctx, OSPREY_RULE_CA08, ca08_multi_block,
+                        G_N_ELEMENTS(ca08_multi_block),
+                        "CA08 complete multi-base factor block");
+    expect_candidate_proposals(ctx, OSPREY_RULE_CA08, 0,
+                               "CA08 exact proposal count");
+    expect_candidate_accounting(ctx, OSPREY_RULE_CA08, 0, 3, 0,
+                                "CA08 exact proposal/kept/dropped totals");
     osprey_free(ctx);
 
     ctx = new_context();
@@ -437,14 +1232,47 @@ static void test_cb01(void)
     CHECK(build_secondary(ctx), "CB01 positive");
     CHECK(rule_count(ctx, OSPREY_RULE_CB01) == 2,
           "CB01 emits independent head priors");
+    OspreyAddress start_address = a.address;
+    uint32_t array = array_variable_id(ctx, global, 0, 16, 8);
+    uint32_t start = start_variable_id(ctx, &start_address);
+    uint32_t array_ids[1] = { array };
+    uint32_t start_ids[1] = { start };
+    expect_factor(ctx, OSPREY_RULE_CB01, OSPREY_GRAPH_SECONDARY,
+                  OSPREY_POTENTIAL_PRIOR, false, 0.8, 0,
+                  array_ids, 1, "CB01 exact array prior");
+    expect_factor(ctx, OSPREY_RULE_CB01, OSPREY_GRAPH_SECONDARY,
+                  OSPREY_POTENTIAL_PRIOR, false, 0.8, 0,
+                  start_ids, 1, "CB01 exact array-start prior");
+    const FactorExpectation cb01_block[] = {
+        { OSPREY_GRAPH_SECONDARY, OSPREY_POTENTIAL_PRIOR, false, 0.8,
+          0, array_ids, 1 },
+        { OSPREY_GRAPH_SECONDARY, OSPREY_POTENTIAL_PRIOR, false, 0.8,
+          0, start_ids, 1 },
+    };
+    expect_factor_block(ctx, OSPREY_RULE_CB01, cb01_block,
+                        G_N_ELEMENTS(cb01_block),
+                        "CB01 complete canonical factor block");
+    expect_candidate_proposals(ctx, OSPREY_RULE_CB01, 2,
+                               "CB01 exact proposal count");
+    expect_candidate_accounting(ctx, OSPREY_RULE_CB01, 2, 10, 0,
+                                "CB01 exact proposal/kept/dropped totals");
     osprey_free(ctx);
 
     ctx = new_context();
     add_logical(ctx, 0x10, &a, 1, 1);
     fact.element_count = 0;
     g_array_append_val(ctx->mayarray_facts, fact);
-    CHECK(osprey_stage3_base(ctx) == OSPREY_GRAPH_ARITHMETIC,
-          "CB01 rejects zero geometry");
+    CHECK(osprey_stage3_base(ctx) == OSPREY_INVALID_GRAPH,
+          "CB01 rejects zero geometry as malformed graph input");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    add_logical(ctx, 0x10, &a, 1, 1);
+    fact.element_count = 2;
+    fact.element_size = 0;
+    g_array_append_val(ctx->mayarray_facts, fact);
+    CHECK(osprey_stage3_base(ctx) == OSPREY_INVALID_GRAPH,
+          "CB01 rejects zero element size as malformed graph input");
     osprey_free(ctx);
 
     ctx = new_context();
@@ -464,6 +1292,38 @@ static void test_cb01(void)
     g_array_append_val(ctx->mayarray_facts, fact);
     CHECK(osprey_stage3_base(ctx) == OSPREY_GRAPH_ARITHMETIC,
           "CB01 rejects endpoint overflow");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    OspreyRegionId heap = region(OSPREY_REGION_HEAP_SITE, 0x44);
+    OspreyMayArrayFact heap_array;
+    memset(&heap_array, 0, sizeof(heap_array));
+    heap_array.start = address(heap, 0);
+    heap_array.element_count = 2;
+    heap_array.element_size = 8;
+    heap_array.evidence_kind = OSPREY_MAY_ARRAY_CALLOC_GEOMETRY;
+    heap_array.sample_support = 1;
+    OspreyMallocFact allocation;
+    memset(&allocation, 0, sizeof(allocation));
+    allocation.site_pc = heap.site_offset;
+    allocation.requested_size = 8;
+    allocation.sample_support = 1;
+    g_array_append_val(ctx->mayarray_facts, heap_array);
+    g_array_append_val(ctx->alloc_facts, allocation);
+    CHECK(osprey_stage3_base(ctx) == OSPREY_INVALID_GRAPH,
+          "CB01 rejects F06/F05 size contradiction as invalid graph input");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    heap_array.start = address(heap, 0);
+    heap_array.element_count = 2;
+    heap_array.element_size = 8;
+    allocation.site_pc = heap.site_offset + 1;
+    allocation.requested_size = 16;
+    g_array_append_val(ctx->mayarray_facts, heap_array);
+    g_array_append_val(ctx->alloc_facts, allocation);
+    CHECK(osprey_stage3_base(ctx) == OSPREY_INVALID_GRAPH,
+          "CB01 rejects F06/F05 site contradiction as invalid graph input");
     osprey_free(ctx);
 }
 
@@ -490,6 +1350,24 @@ static void test_cb02(void)
         }
     }
     CHECK(found_end, "CB02 adds the high chunk width to hi");
+    uint32_t low_access = access_variable_id(ctx, 0x10, &low);
+    uint32_t high_access = access_variable_id(ctx, 0x10, &high);
+    uint32_t array = array_variable_id(ctx, global, 0, 20, 8);
+    uint32_t ids[3] = { low_access, high_access, array };
+    expect_factor(ctx, OSPREY_RULE_CB02, OSPREY_GRAPH_SECONDARY,
+                  OSPREY_POTENTIAL_IMPLICATION, false, 0.8, 2,
+                  ids, 3, "CB02 exact low-high-array implication");
+    const FactorExpectation cb02_block[] = {
+        { OSPREY_GRAPH_SECONDARY, OSPREY_POTENTIAL_IMPLICATION, false, 0.8,
+          2, ids, 3 },
+    };
+    expect_factor_block(ctx, OSPREY_RULE_CB02, cb02_block,
+                        G_N_ELEMENTS(cb02_block),
+                        "CB02 complete canonical factor block");
+    expect_candidate_proposals(ctx, OSPREY_RULE_CB02, 1,
+                               "CB02 exact proposal count");
+    expect_candidate_accounting(ctx, OSPREY_RULE_CB02, 1, 7, 0,
+                                "CB02 exact proposal/kept/dropped totals");
     osprey_free(ctx);
 
     ctx = new_context();
@@ -513,6 +1391,32 @@ static void test_cb02(void)
           factor->var_ids[0] != factor->var_ids[1],
           "CB02 factor has two distinct extrema antecedents");
     osprey_free(ctx);
+
+    ctx = new_context();
+    OspreyChunk middle = chunk(global, 8, 2);
+    low = chunk(global, 0, 4);
+    high = chunk(global, 16, 8);
+    add_logical(ctx, 0x10, &high, 1, 1);
+    add_logical(ctx, 0x10, &middle, 1, 1);
+    add_logical(ctx, 0x10, &low, 1, 1);
+    add_logical(ctx, 0x10, &low, 1, 1);
+    CHECK(build_secondary(ctx), "CB02 three-chunk extrema");
+    CHECK(rule_count(ctx, OSPREY_RULE_CB02) == 1,
+          "CB02 ignores middle and duplicate logical chunks");
+    uint32_t low_id = access_variable_id(ctx, 0x10, &low);
+    uint32_t high_id = access_variable_id(ctx, 0x10, &high);
+    uint32_t array_id = array_variable_id(ctx, global, 0, 24, 4);
+    uint32_t extrema[3] = { low_id, high_id, array_id };
+    expect_factor(ctx, OSPREY_RULE_CB02, OSPREY_GRAPH_SECONDARY,
+                  OSPREY_POTENTIAL_IMPLICATION, false, 0.8, 2,
+                  extrema, 3, "CB02 exact three-chunk extrema factor");
+    CHECK(!factor_exact(ctx, OSPREY_RULE_CB02, OSPREY_GRAPH_SECONDARY,
+                        OSPREY_POTENTIAL_IMPLICATION, false, 0.8, 2,
+                        (uint32_t[3]){ low_id,
+                                       access_variable_id(ctx, 0x10, &middle),
+                                       array_id }, 3),
+          "CB02 excludes the middle chunk from extrema antecedents");
+    osprey_free(ctx);
 }
 
 static void test_cb03(void)
@@ -533,6 +1437,60 @@ static void test_cb03(void)
     const OspreyVar *union_array = find_array(ctx, global, 0, 24, 8);
     CHECK(union_array != NULL && union_array->direct_support == 1,
           "CB03 counts its derivation witness once across closure rounds");
+    uint32_t first = array_variable_id(ctx, global, 0, 16, 8);
+    uint32_t second = array_variable_id(ctx, global, 8, 24, 8);
+    uint32_t union_id = array_variable_id(ctx, global, 0, 24, 8);
+    uint32_t first_second[2] = { first, second };
+    uint32_t second_first[2] = { second, first };
+    uint32_t first_union[2] = { first, union_id };
+    uint32_t union_first[2] = { union_id, first };
+    uint32_t union_second[2] = { union_id, second };
+    uint32_t second_union[2] = { second, union_id };
+    uint32_t conjunction[3] = { first, second, union_id };
+    expect_factor(ctx, OSPREY_RULE_CB03, OSPREY_GRAPH_SECONDARY,
+                  OSPREY_POTENTIAL_IMPLICATION, false, 0.8, 1,
+                  first_second, 2, "CB03 exact first-to-second factor");
+    expect_factor(ctx, OSPREY_RULE_CB03, OSPREY_GRAPH_SECONDARY,
+                  OSPREY_POTENTIAL_IMPLICATION, false, 0.8, 1,
+                  second_first, 2, "CB03 exact second-to-first factor");
+    expect_factor(ctx, OSPREY_RULE_CB03, OSPREY_GRAPH_SECONDARY,
+                  OSPREY_POTENTIAL_IMPLICATION, false, 0.8, 2,
+                  conjunction, 3, "CB03 exact union implication");
+    expect_factor(ctx, OSPREY_RULE_CB03, OSPREY_GRAPH_SECONDARY,
+                  OSPREY_POTENTIAL_IMPLICATION, false, 0.8, 1,
+                  first_union, 2, "CB03 exact first-union factor");
+    expect_factor(ctx, OSPREY_RULE_CB03, OSPREY_GRAPH_SECONDARY,
+                  OSPREY_POTENTIAL_IMPLICATION, false, 0.8, 1,
+                  union_first, 2, "CB03 exact union-first factor");
+    expect_factor(ctx, OSPREY_RULE_CB03, OSPREY_GRAPH_SECONDARY,
+                  OSPREY_POTENTIAL_IMPLICATION, false, 0.8, 1,
+                  union_second, 2, "CB03 exact union-second factor");
+    expect_factor(ctx, OSPREY_RULE_CB03, OSPREY_GRAPH_SECONDARY,
+                  OSPREY_POTENTIAL_IMPLICATION, false, 0.8, 1,
+                  second_union, 2, "CB03 exact second-union factor");
+    const FactorExpectation cb03_block[] = {
+        { OSPREY_GRAPH_SECONDARY, OSPREY_POTENTIAL_IMPLICATION, false, 0.8,
+          1, first_second, 2 },
+        { OSPREY_GRAPH_SECONDARY, OSPREY_POTENTIAL_IMPLICATION, false, 0.8,
+          1, second_first, 2 },
+        { OSPREY_GRAPH_SECONDARY, OSPREY_POTENTIAL_IMPLICATION, false, 0.8,
+          2, conjunction, 3 },
+        { OSPREY_GRAPH_SECONDARY, OSPREY_POTENTIAL_IMPLICATION, false, 0.8,
+          1, first_union, 2 },
+        { OSPREY_GRAPH_SECONDARY, OSPREY_POTENTIAL_IMPLICATION, false, 0.8,
+          1, union_first, 2 },
+        { OSPREY_GRAPH_SECONDARY, OSPREY_POTENTIAL_IMPLICATION, false, 0.8,
+          1, union_second, 2 },
+        { OSPREY_GRAPH_SECONDARY, OSPREY_POTENTIAL_IMPLICATION, false, 0.8,
+          1, second_union, 2 },
+    };
+    expect_factor_block(ctx, OSPREY_RULE_CB03, cb03_block,
+                        G_N_ELEMENTS(cb03_block),
+                        "CB03 complete canonical factor block");
+    expect_candidate_proposals(ctx, OSPREY_RULE_CB03, 1,
+                               "CB03 exact proposal count");
+    expect_candidate_accounting(ctx, OSPREY_RULE_CB03, 1, 1, 0,
+                                "CB03 exact proposal/kept/dropped totals");
     osprey_free(ctx);
 
     ctx = new_context();
@@ -587,6 +1545,54 @@ static void test_cb04(void)
     CHECK(build_secondary(ctx), "CB04 positive");
     CHECK(rule_count(ctx, OSPREY_RULE_CB04) == 8,
           "CB04 closes exclusions and two valid split supports");
+    uint32_t first = array_variable_id(ctx, global, 0, 16, 8);
+    uint32_t second = array_variable_id(ctx, global, 8, 24, 4);
+    uint32_t left = array_variable_id(ctx, global, 0, 8, 8);
+    uint32_t right = array_variable_id(ctx, global, 16, 24, 4);
+    uint32_t ids[2] = { first, left };
+    expect_factor(ctx, OSPREY_RULE_CB04, OSPREY_GRAPH_SECONDARY,
+                  OSPREY_POTENTIAL_IMPLICATION, false, 0.8, 1,
+                  ids, 2, "CB04 exact left split support");
+    ids[0] = second;
+    ids[1] = right;
+    expect_factor(ctx, OSPREY_RULE_CB04, OSPREY_GRAPH_SECONDARY,
+                  OSPREY_POTENTIAL_IMPLICATION, false, 0.8, 1,
+                  ids, 2, "CB04 exact right split support");
+    uint32_t pairs[][2] = {
+        { left, second }, { second, left },
+        { first, second }, { second, first },
+        { first, right }, { right, first },
+    };
+    for (guint i = 0; i < G_N_ELEMENTS(pairs); i++) {
+        expect_factor(ctx, OSPREY_RULE_CB04, OSPREY_GRAPH_SECONDARY,
+                      OSPREY_POTENTIAL_IMPLICATION, true, 0.2, 1,
+                      pairs[i], 2, "CB04 exact exclusion direction");
+    }
+    const FactorExpectation cb04_block[] = {
+        { OSPREY_GRAPH_SECONDARY, OSPREY_POTENTIAL_IMPLICATION, false, 0.8,
+          1, (uint32_t[2]){ first, left }, 2 },
+        { OSPREY_GRAPH_SECONDARY, OSPREY_POTENTIAL_IMPLICATION, false, 0.8,
+          1, (uint32_t[2]){ second, right }, 2 },
+        { OSPREY_GRAPH_SECONDARY, OSPREY_POTENTIAL_IMPLICATION, true, 0.2,
+          1, pairs[0], 2 },
+        { OSPREY_GRAPH_SECONDARY, OSPREY_POTENTIAL_IMPLICATION, true, 0.2,
+          1, pairs[1], 2 },
+        { OSPREY_GRAPH_SECONDARY, OSPREY_POTENTIAL_IMPLICATION, true, 0.2,
+          1, pairs[2], 2 },
+        { OSPREY_GRAPH_SECONDARY, OSPREY_POTENTIAL_IMPLICATION, true, 0.2,
+          1, pairs[3], 2 },
+        { OSPREY_GRAPH_SECONDARY, OSPREY_POTENTIAL_IMPLICATION, true, 0.2,
+          1, pairs[4], 2 },
+        { OSPREY_GRAPH_SECONDARY, OSPREY_POTENTIAL_IMPLICATION, true, 0.2,
+          1, pairs[5], 2 },
+    };
+    expect_factor_block(ctx, OSPREY_RULE_CB04, cb04_block,
+                        G_N_ELEMENTS(cb04_block),
+                        "CB04 complete canonical factor block");
+    expect_candidate_proposals(ctx, OSPREY_RULE_CB04, 2,
+                               "CB04 exact proposal count");
+    expect_candidate_accounting(ctx, OSPREY_RULE_CB04, 2, 2, 0,
+                                "CB04 exact proposal/kept/dropped totals");
     osprey_free(ctx);
 
     ctx = new_context();
@@ -612,6 +1618,46 @@ static void test_cb04(void)
     CHECK(rule_count(ctx, OSPREY_RULE_CB04) == 2,
           "CB04 includes incompatible arrays at the equality boundary");
     osprey_free(ctx);
+
+    ctx = new_context();
+    OspreyChunk split_extent = chunk(global, 0, 16);
+    add_extent(ctx, &split_extent);
+    CHECK(seed_array(ctx, global, 0, 8, 8).inserted,
+          "CB04 left-short first seed");
+    CHECK(seed_array(ctx, global, 4, 16, 4).inserted,
+          "CB04 left-short second seed");
+    CHECK(build_secondary(ctx), "CB04 left split too short");
+    CHECK(find_array(ctx, global, 8, 16, 4) != NULL,
+          "CB04 retains a valid right split when left is short");
+    CHECK(rule_count(ctx, OSPREY_RULE_CB04) >= 3,
+          "CB04 emits the exclusion and valid right split support");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    OspreyChunk right_split_extent = chunk(global, 0, 24);
+    add_extent(ctx, &right_split_extent);
+    CHECK(seed_array(ctx, global, 0, 16, 8).inserted,
+          "CB04 right-short first seed");
+    CHECK(seed_array(ctx, global, 8, 19, 4).inserted,
+          "CB04 right-short second seed");
+    CHECK(build_secondary(ctx), "CB04 right split too short");
+    CHECK(find_array(ctx, global, 0, 8, 8) != NULL,
+          "CB04 retains a valid left split when right is short");
+    CHECK(rule_count(ctx, OSPREY_RULE_CB04) >= 3,
+          "CB04 emits the exclusion and valid left split support");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    OspreyChunk boundary = chunk(global, INT64_MAX - 16, 16);
+    add_extent(ctx, &boundary);
+    CHECK(seed_array(ctx, global, INT64_MAX - 16, INT64_MAX - 8, 8).inserted,
+          "CB04 checked-boundary first seed");
+    CHECK(seed_array(ctx, global, INT64_MAX - 12, INT64_MAX - 4, 4).inserted,
+          "CB04 checked-boundary second seed");
+    CHECK(build_secondary(ctx), "CB04 checked offset boundary");
+    CHECK(find_array(ctx, global, INT64_MAX - 8, INT64_MAX - 4, 4) != NULL,
+          "CB04 computes a boundary-safe right split");
+    osprey_free(ctx);
 }
 
 static void test_cb05(void)
@@ -628,6 +1674,47 @@ static void test_cb05(void)
     CHECK(build_secondary(ctx), "CB05 positive");
     CHECK(rule_count(ctx, OSPREY_RULE_CB05) == 4,
           "CB05 emits exclusion and two residual supports");
+    uint32_t array = array_variable_id(ctx, global, 0, 32, 8);
+    uint32_t scalar_id = chunk_variable_id(ctx, OSPREY_PRED_SCALAR, &scalar);
+    uint32_t left = array_variable_id(ctx, global, 0, 8, 8);
+    uint32_t right = array_variable_id(ctx, global, 16, 32, 8);
+    expect_factor(ctx, OSPREY_RULE_CB05, OSPREY_GRAPH_SECONDARY,
+                  OSPREY_POTENTIAL_IMPLICATION, false, 0.8, 2,
+                  (uint32_t[3]){ array, scalar_id, left }, 3,
+                  "CB05 exact left residual support");
+    expect_factor(ctx, OSPREY_RULE_CB05, OSPREY_GRAPH_SECONDARY,
+                  OSPREY_POTENTIAL_IMPLICATION, false, 0.8, 2,
+                  (uint32_t[3]){ array, scalar_id, right }, 3,
+                  "CB05 exact right residual support");
+    expect_factor(ctx, OSPREY_RULE_CB05, OSPREY_GRAPH_SECONDARY,
+                  OSPREY_POTENTIAL_IMPLICATION, true, 0.2, 1,
+                  (uint32_t[2]){ scalar_id, array }, 2,
+                  "CB05 exact scalar-to-array exclusion");
+    expect_factor(ctx, OSPREY_RULE_CB05, OSPREY_GRAPH_SECONDARY,
+                  OSPREY_POTENTIAL_IMPLICATION, true, 0.2, 1,
+                  (uint32_t[2]){ array, scalar_id }, 2,
+                  "CB05 exact array-to-scalar exclusion");
+    uint32_t cb05_left[3] = { array, scalar_id, left };
+    uint32_t cb05_right[3] = { array, scalar_id, right };
+    uint32_t cb05_scalar_exclusion[2] = { scalar_id, array };
+    uint32_t cb05_array_exclusion[2] = { array, scalar_id };
+    const FactorExpectation cb05_block[] = {
+        { OSPREY_GRAPH_SECONDARY, OSPREY_POTENTIAL_IMPLICATION, false, 0.8,
+          2, cb05_left, 3 },
+        { OSPREY_GRAPH_SECONDARY, OSPREY_POTENTIAL_IMPLICATION, false, 0.8,
+          2, cb05_right, 3 },
+        { OSPREY_GRAPH_SECONDARY, OSPREY_POTENTIAL_IMPLICATION, true, 0.2,
+          1, cb05_scalar_exclusion, 2 },
+        { OSPREY_GRAPH_SECONDARY, OSPREY_POTENTIAL_IMPLICATION, true, 0.2,
+          1, cb05_array_exclusion, 2 },
+    };
+    expect_factor_block(ctx, OSPREY_RULE_CB05, cb05_block,
+                        G_N_ELEMENTS(cb05_block),
+                        "CB05 complete canonical factor block");
+    expect_candidate_proposals(ctx, OSPREY_RULE_CB05, 2,
+                               "CB05 exact proposal count");
+    expect_candidate_accounting(ctx, OSPREY_RULE_CB05, 2, 2, 0,
+                                "CB05 exact proposal/kept/dropped totals");
     osprey_free(ctx);
 
     ctx = new_context();
@@ -640,6 +1727,64 @@ static void test_cb05(void)
     CHECK(build_secondary(ctx), "CB05 one-condition-off");
     CHECK(rule_count(ctx, OSPREY_RULE_CB05) == 0,
           "CB05 excludes a scalar at the half-open hi");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    OspreyChunk at_lo = chunk(global, 0, 8);
+    add_extent(ctx, &extent);
+    CHECK(seed_array(ctx, global, 0, 32, 8).inserted,
+          "CB05 lo-boundary array");
+    CHECK(seed_scalar(ctx, &at_lo).inserted,
+          "CB05 lo-boundary scalar");
+    CHECK(build_secondary(ctx), "CB05 scalar at lo");
+    CHECK(rule_count(ctx, OSPREY_RULE_CB05) == 3,
+          "CB05 keeps only the right residual at lo");
+    CHECK(array_variable_id(ctx, global, 8, 32, 8) != UINT32_MAX,
+          "CB05 creates the right residual at lo");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    OspreyChunk before_hi = chunk(global, 24, 8);
+    add_extent(ctx, &extent);
+    CHECK(seed_array(ctx, global, 0, 32, 8).inserted,
+          "CB05 before-hi array");
+    CHECK(seed_scalar(ctx, &before_hi).inserted,
+          "CB05 before-hi scalar");
+    CHECK(build_secondary(ctx), "CB05 scalar immediately before hi");
+    CHECK(rule_count(ctx, OSPREY_RULE_CB05) == 3,
+          "CB05 keeps only the left residual before hi");
+    CHECK(array_variable_id(ctx, global, 0, 24, 8) != UINT32_MAX,
+          "CB05 creates the left residual before hi");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    OspreyChunk crossing = chunk(global, 28, 8);
+    OspreyChunk larger_extent = chunk(global, 0, 40);
+    add_extent(ctx, &larger_extent);
+    CHECK(seed_array(ctx, global, 0, 32, 8).inserted,
+          "CB05 crossing array");
+    CHECK(seed_scalar(ctx, &crossing).inserted,
+          "CB05 crossing scalar");
+    CHECK(build_secondary(ctx), "CB05 scalar crossing hi");
+    CHECK(rule_count(ctx, OSPREY_RULE_CB05) == 3,
+          "CB05 uses start containment for a crossing scalar");
+    CHECK(array_variable_id(ctx, global, 0, 28, 8) != UINT32_MAX,
+          "CB05 retains valid left residual when right split is absent");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    OspreyChunk boundary_extent = chunk(global, INT64_MAX - 8, 8);
+    OspreyChunk overflow_scalar = chunk(global, INT64_MAX - 3, 8);
+    add_extent(ctx, &boundary_extent);
+    CHECK(seed_array(ctx, global, INT64_MAX - 8, INT64_MAX, 8).inserted,
+          "CB05 overflow array");
+    CHECK(seed_scalar(ctx, &overflow_scalar).inserted,
+          "CB05 overflow scalar");
+    CHECK(build_base(ctx), "CB05 overflow base construction");
+    CHECK(osprey_stage3_secondary(ctx) == OSPREY_GRAPH_ARITHMETIC,
+          "CB05 reports overflowed scalar endpoint");
+    CHECK(ctx->last_status == OSPREY_GRAPH_ARITHMETIC,
+          "CB05 overflow status is arithmetic");
     osprey_free(ctx);
 }
 
@@ -664,6 +1809,22 @@ static void test_cb06(void)
     CHECK(rule_count(ctx, OSPREY_RULE_CB06) == 1 &&
           g_array_index(ctx->graph->vars, OspreyVar, 0).hard_false,
           "CB06 emits exact hard-false factor");
+    uint32_t malformed_id = 0;
+    expect_factor(ctx, OSPREY_RULE_CB06, OSPREY_GRAPH_SECONDARY,
+                  OSPREY_POTENTIAL_HARD_FALSE, false, 0.0,
+                  UINT16_MAX, &malformed_id, 1,
+                  "CB06 exact hard-false identity");
+    const FactorExpectation cb06_block[] = {
+        { OSPREY_GRAPH_SECONDARY, OSPREY_POTENTIAL_HARD_FALSE, false, 0.0,
+          UINT16_MAX, &malformed_id, 1 },
+    };
+    expect_factor_block(ctx, OSPREY_RULE_CB06, cb06_block,
+                        G_N_ELEMENTS(cb06_block),
+                        "CB06 complete canonical factor block");
+    expect_candidate_proposals(ctx, OSPREY_RULE_CB06, 0,
+                               "CB06 exact proposal count");
+    expect_candidate_accounting(ctx, OSPREY_RULE_CB06, 0, 0, 0,
+                                "CB06 exact proposal/kept/dropped totals");
     osprey_free(ctx);
 
     ctx = new_context();
@@ -717,6 +1878,23 @@ static void test_cb07(void)
     CHECK(build_secondary(ctx), "CB07 positive");
     CHECK(rule_count(ctx, OSPREY_RULE_CB07) == 1,
           "CB07 matches complete BaseAddr identity");
+    uint32_t access = access_variable_id(ctx, 0x10, &a);
+    uint32_t start = start_variable_id(ctx, &a.address);
+    uint32_t ids[2] = { access, start };
+    expect_factor(ctx, OSPREY_RULE_CB07, OSPREY_GRAPH_SECONDARY,
+                  OSPREY_POTENTIAL_IMPLICATION, false, 0.8, 1,
+                  ids, 2, "CB07 exact access-to-start factor");
+    const FactorExpectation cb07_block[] = {
+        { OSPREY_GRAPH_SECONDARY, OSPREY_POTENTIAL_IMPLICATION, false, 0.8,
+          1, ids, 2 },
+    };
+    expect_factor_block(ctx, OSPREY_RULE_CB07, cb07_block,
+                        G_N_ELEMENTS(cb07_block),
+                        "CB07 complete canonical factor block");
+    expect_candidate_proposals(ctx, OSPREY_RULE_CB07, 1,
+                               "CB07 exact proposal count");
+    expect_candidate_accounting(ctx, OSPREY_RULE_CB07, 1, 7, 0,
+                                "CB07 exact proposal/kept/dropped totals");
     osprey_free(ctx);
 
     ctx = new_context();
@@ -727,6 +1905,44 @@ static void test_cb07(void)
     CHECK(build_secondary(ctx), "CB07 one-condition-off");
     CHECK(rule_count(ctx, OSPREY_RULE_CB07) == 0,
           "CB07 rejects a PC mismatch");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    OspreyRegionId stack = region(OSPREY_REGION_STACK_FUNCTION, 9);
+    OspreyChunk other_region = chunk(stack, 0, 8);
+    add_logical(ctx, 0x10, &a, 1, 1);
+    add_logical(ctx, 0x10, &b, 1, 1);
+    base.pc = 0x10;
+    base.chunk = other_region;
+    base.base = other_region.address;
+    g_array_append_val(ctx->base_facts, base);
+    CHECK(build_secondary(ctx), "CB07 region mismatch");
+    CHECK(rule_count(ctx, OSPREY_RULE_CB07) == 0,
+          "CB07 rejects a BaseAddr region mismatch");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    OspreyChunk unaccessed = chunk(global, 16, 8);
+    add_logical(ctx, 0x10, &a, 1, 1);
+    add_logical(ctx, 0x10, &b, 1, 1);
+    base.pc = 0x10;
+    base.chunk = unaccessed;
+    base.base = unaccessed.address;
+    g_array_append_val(ctx->base_facts, base);
+    CHECK(build_secondary(ctx), "CB07 chunk mismatch");
+    CHECK(rule_count(ctx, OSPREY_RULE_CB07) == 0,
+          "CB07 rejects an unaccessed chunk mismatch");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    add_logical(ctx, 0x10, &a, 1, 1);
+    add_logical(ctx, 0x10, &b, 1, 1);
+    base.pc = 0x10;
+    base.chunk = a;
+    base.base = address(stack, 0);
+    g_array_append_val(ctx->base_facts, base);
+    CHECK(osprey_stage3_base(ctx) == OSPREY_INVALID_GRAPH,
+          "CB07 rejects a BaseAddr base-region mismatch");
     osprey_free(ctx);
 }
 
@@ -741,6 +1957,23 @@ static void test_cb08(void)
     CHECK(build_secondary(ctx), "CB08 positive");
     CHECK(rule_count(ctx, OSPREY_RULE_CB08) == 1,
           "CB08 emits the most-frequent address");
+    uint32_t access = access_variable_id(ctx, 0x10, &a);
+    uint32_t start = start_variable_id(ctx, &a.address);
+    uint32_t ids[2] = { access, start };
+    expect_factor(ctx, OSPREY_RULE_CB08, OSPREY_GRAPH_SECONDARY,
+                  OSPREY_POTENTIAL_IMPLICATION, false, 0.25, 1,
+                  ids, 2, "CB08 exact logical-support factor");
+    const FactorExpectation cb08_block[] = {
+        { OSPREY_GRAPH_SECONDARY, OSPREY_POTENTIAL_IMPLICATION, false, 0.25,
+          1, ids, 2 },
+    };
+    expect_factor_block(ctx, OSPREY_RULE_CB08, cb08_block,
+                        G_N_ELEMENTS(cb08_block),
+                        "CB08 complete canonical factor block");
+    expect_candidate_proposals(ctx, OSPREY_RULE_CB08, 1,
+                               "CB08 exact proposal count");
+    expect_candidate_accounting(ctx, OSPREY_RULE_CB08, 1, 6, 0,
+                                "CB08 exact proposal/kept/dropped totals");
     osprey_free(ctx);
 
     ctx = new_context();
@@ -753,6 +1986,19 @@ static void test_cb08(void)
     CHECK(build_secondary(ctx), "CB08 same-address width frequencies");
     CHECK(rule_count(ctx, OSPREY_RULE_CB08) == 1,
           "CB08 uses only chunks carrying the R07 maximum count");
+    uint32_t narrow_access = access_variable_id(ctx, 0x10, &narrow);
+    uint32_t narrow_start = start_variable_id(ctx, &narrow.address);
+    uint32_t narrow_ids[2] = { narrow_access, narrow_start };
+    expect_factor(ctx, OSPREY_RULE_CB08, OSPREY_GRAPH_SECONDARY,
+                  OSPREY_POTENTIAL_IMPLICATION, false, 0.25, 1,
+                  narrow_ids, 2, "CB08 exact winning-width factor");
+    CHECK(!factor_exact(ctx, OSPREY_RULE_CB08, OSPREY_GRAPH_SECONDARY,
+                        OSPREY_POTENTIAL_IMPLICATION, false, 0.25, 1,
+                        (uint32_t[2]){
+                            access_variable_id(ctx, 0x10, &wide),
+                            start_variable_id(ctx, &wide.address)
+                        }, 2),
+          "CB08 excludes lower-frequency width at tied address");
     osprey_free(ctx);
 
     ctx = new_context();
@@ -761,6 +2007,27 @@ static void test_cb08(void)
     CHECK(build_secondary(ctx), "CB08 tied addresses");
     CHECK(rule_count(ctx, OSPREY_RULE_CB08) == 2,
           "CB08 retains every R07 maximum address");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    OspreyChunk third = chunk(global, 16, 8);
+    add_logical(ctx, 0x10, &third, 3, 1);
+    add_logical(ctx, 0x10, &b, 3, 1);
+    add_logical(ctx, 0x10, &a, 3, 1);
+    CHECK(build_secondary(ctx), "CB08 three-way dynamic tie");
+    CHECK(rule_count(ctx, OSPREY_RULE_CB08) == 3,
+          "CB08 retains all three tied maxima");
+    OspreyChunk tied_chunks[3] = { a, b, third };
+    for (guint i = 0; i < G_N_ELEMENTS(tied_chunks); i++) {
+        uint32_t tied_access = access_variable_id(ctx, 0x10,
+                                                   &tied_chunks[i]);
+        uint32_t tied_start = start_variable_id(ctx,
+                                                 &tied_chunks[i].address);
+        uint32_t tied_ids[2] = { tied_access, tied_start };
+        expect_factor(ctx, OSPREY_RULE_CB08, OSPREY_GRAPH_SECONDARY,
+                      OSPREY_POTENTIAL_IMPLICATION, false, 0.25, 1,
+                      tied_ids, 2, "CB08 exact tied maximum factor");
+    }
     osprey_free(ctx);
 
     ctx = new_context();
@@ -791,6 +2058,28 @@ static void test_cb09(void)
     CHECK(build_secondary(ctx), "CB09 positive");
     CHECK(rule_count(ctx, OSPREY_RULE_CB09) == 1,
           "CB09 emits one ordered negative implication");
+    uint32_t first_start = start_variable_id(ctx, &a.address);
+    uint32_t second_start = start_variable_id(ctx, &b.address);
+    uint32_t ids[2] = { first_start, second_start };
+    expect_factor(ctx, OSPREY_RULE_CB09, OSPREY_GRAPH_SECONDARY,
+                  OSPREY_POTENTIAL_IMPLICATION, true, 0.2, 1,
+                  ids, 2, "CB09 exact ordered exclusion");
+    const FactorExpectation cb09_block[] = {
+        { OSPREY_GRAPH_SECONDARY, OSPREY_POTENTIAL_IMPLICATION, true, 0.2,
+          1, ids, 2 },
+    };
+    expect_factor_block(ctx, OSPREY_RULE_CB09, cb09_block,
+                        G_N_ELEMENTS(cb09_block),
+                        "CB09 complete canonical factor block");
+    expect_candidate_proposals(ctx, OSPREY_RULE_CB09, 0,
+                               "CB09 exact proposal count");
+    expect_candidate_accounting(ctx, OSPREY_RULE_CB09, 0, 7, 0,
+                                "CB09 exact proposal/kept/dropped totals");
+    uint32_t reverse_ids[2] = { second_start, first_start };
+    CHECK(!factor_exact(ctx, OSPREY_RULE_CB09, OSPREY_GRAPH_SECONDARY,
+                        OSPREY_POTENTIAL_IMPLICATION, true, 0.2, 1,
+                        reverse_ids, 2),
+          "CB09 does not invent reverse ordering");
     osprey_free(ctx);
 
     ctx = new_context();
@@ -800,27 +2089,553 @@ static void test_cb09(void)
     CHECK(rule_count(ctx, OSPREY_RULE_CB09) == 0,
           "CB09 rejects equal starts");
     osprey_free(ctx);
+
+    ctx = new_context();
+    add_logical(ctx, 0x10, &b, 1, 1);
+    add_logical(ctx, 0x10, &a, 1, 1);
+    CHECK(seed_array_start(ctx, &a.address).inserted,
+          "CB09 reversed lower start");
+    CHECK(seed_array_start(ctx, &b.address).inserted,
+          "CB09 reversed higher start");
+    CHECK(build_secondary(ctx), "CB09 reversed input order");
+    CHECK(rule_count(ctx, OSPREY_RULE_CB09) == 1,
+          "CB09 canonicalizes reversed input order");
+    first_start = start_variable_id(ctx, &a.address);
+    second_start = start_variable_id(ctx, &b.address);
+    ids[0] = first_start;
+    ids[1] = second_start;
+    expect_factor(ctx, OSPREY_RULE_CB09, OSPREY_GRAPH_SECONDARY,
+                  OSPREY_POTENTIAL_IMPLICATION, true, 0.2, 1,
+                  ids, 2, "CB09 reversed input keeps low-to-high factor");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    OspreyRegionId stack = region(OSPREY_REGION_STACK_FUNCTION, 11);
+    OspreyChunk other_region = chunk(stack, 8, 8);
+    add_logical(ctx, 0x10, &a, 1, 1);
+    add_logical(ctx, 0x10, &other_region, 1, 1);
+    CHECK(seed_array_start(ctx, &a.address).inserted,
+          "CB09 region lower start");
+    CHECK(seed_array_start(ctx, &other_region.address).inserted,
+          "CB09 region higher start");
+    CHECK(build_secondary(ctx), "CB09 region mismatch");
+    CHECK(rule_count(ctx, OSPREY_RULE_CB09) == 0,
+          "CB09 rejects a region mismatch");
+    osprey_free(ctx);
+}
+
+typedef OspreyContext *(*PermutationBuilder)(bool reverse);
+typedef void (*RuleTest)(void);
+
+typedef struct Stage3RuleCase {
+    uint16_t rule;
+    const char *name;
+    RuleTest test;
+} Stage3RuleCase;
+
+static OspreyContext *permutation_context(uint16_t rule, bool reverse)
+{
+    OspreyContext *ctx = new_context();
+    OspreyRegionId global = region(OSPREY_REGION_GLOBAL, 0);
+    OspreyChunk a = chunk(global, 0, 8);
+    OspreyChunk b = chunk(global, 8, 8);
+    OspreyChunk c = chunk(global, 16, 8);
+    OspreyStatus status;
+
+    switch (rule) {
+    case OSPREY_RULE_CA01:
+        if (reverse) {
+            add_logical(ctx, 0x20, &b, 1, 1);
+            add_logical(ctx, 0x10, &a, 1, 1);
+        } else {
+            add_logical(ctx, 0x10, &a, 1, 1);
+            add_logical(ctx, 0x20, &b, 1, 1);
+        }
+        status = osprey_stage3_base(ctx);
+        break;
+    case OSPREY_RULE_CA02:
+        if (reverse) {
+            add_logical(ctx, 0x20, &b, 1, 1);
+            add_logical(ctx, 0x10, &a, 1, 1);
+        } else {
+            add_logical(ctx, 0x10, &a, 1, 1);
+            add_logical(ctx, 0x20, &b, 1, 1);
+        }
+        status = osprey_stage3_base(ctx);
+        break;
+    case OSPREY_RULE_CA03: {
+        OspreyChunk overlap = chunk(global, 4, 8);
+        if (reverse) {
+            add_logical(ctx, 0x20, &overlap, 1, 1);
+            add_logical(ctx, 0x10, &a, 1, 1);
+        } else {
+            add_logical(ctx, 0x10, &a, 1, 1);
+            add_logical(ctx, 0x20, &overlap, 1, 1);
+        }
+        status = osprey_stage3_base(ctx);
+        break;
+    }
+    case OSPREY_RULE_CA04:
+        if (reverse) {
+            add_logical(ctx, 0x20, &b, 1, 1);
+            add_logical(ctx, 0x10, &a, 1, 1);
+        } else {
+            add_logical(ctx, 0x10, &a, 1, 1);
+            add_logical(ctx, 0x20, &b, 1, 1);
+        }
+        status = osprey_stage3_base(ctx);
+        break;
+    case OSPREY_RULE_CA05:
+        if (reverse) {
+            add_logical(ctx, 0x10, &c, 1, 1);
+            add_logical(ctx, 0x10, &b, 1, 1);
+            add_logical(ctx, 0x10, &a, 1, 1);
+        } else {
+            add_logical(ctx, 0x10, &a, 1, 1);
+            add_logical(ctx, 0x10, &b, 1, 1);
+            add_logical(ctx, 0x10, &c, 1, 1);
+        }
+        status = osprey_stage3_base(ctx);
+        break;
+    case OSPREY_RULE_CA06:
+        if (reverse) {
+            add_logical(ctx, 0x20, &a, 1, 1);
+            add_logical(ctx, 0x10, &a, 1, 1);
+        } else {
+            add_logical(ctx, 0x10, &a, 1, 1);
+            add_logical(ctx, 0x20, &a, 1, 1);
+        }
+        status = osprey_stage3_base(ctx);
+        break;
+    case OSPREY_RULE_CA07:
+        if (reverse) {
+            add_logical(ctx, 0x20, &b, 1, 4);
+            add_logical(ctx, 0x10, &a, 1, 4);
+        } else {
+            add_logical(ctx, 0x10, &a, 1, 4);
+            add_logical(ctx, 0x20, &b, 1, 4);
+        }
+        status = osprey_stage3_base(ctx);
+        break;
+    case OSPREY_RULE_CA08: {
+        OspreyAddress base_zero = address(global, 0);
+        OspreyAddress base_eight = address(global, 8);
+        OspreyVarPayload first_field;
+        OspreyVarPayload second_field;
+        memset(&first_field, 0, sizeof(first_field));
+        memset(&second_field, 0, sizeof(second_field));
+        first_field.attached.chunk = a;
+        first_field.attached.base = base_zero;
+        second_field.attached.chunk = a;
+        second_field.attached.base = base_eight;
+        add_logical(ctx, 0x10, &a, 1, 1);
+        OspreyChunk full_extent = chunk(global, 0, 16);
+        add_extent(ctx, &full_extent);
+        if (reverse) {
+            osprey_intern_var(ctx, OSPREY_PRED_FIELD_OF, &second_field);
+            osprey_intern_var(ctx, OSPREY_PRED_FIELD_OF, &first_field);
+        } else {
+            osprey_intern_var(ctx, OSPREY_PRED_FIELD_OF, &first_field);
+            osprey_intern_var(ctx, OSPREY_PRED_FIELD_OF, &second_field);
+        }
+        status = osprey_stage3_base(ctx);
+        break;
+    }
+    case OSPREY_RULE_CB01: {
+        OspreyMayArrayFact first_fact;
+        OspreyMayArrayFact second_fact;
+        memset(&first_fact, 0, sizeof(first_fact));
+        memset(&second_fact, 0, sizeof(second_fact));
+        first_fact.start = a.address;
+        first_fact.element_count = 1;
+        first_fact.element_size = 8;
+        first_fact.evidence_kind = OSPREY_MAY_ARRAY_CALLOC_GEOMETRY;
+        first_fact.sample_support = 1;
+        second_fact = first_fact;
+        second_fact.start = b.address;
+        if (reverse) {
+            add_logical(ctx, 0x20, &b, 1, 1);
+            add_logical(ctx, 0x10, &a, 1, 1);
+            g_array_append_val(ctx->mayarray_facts, second_fact);
+            g_array_append_val(ctx->mayarray_facts, first_fact);
+        } else {
+            add_logical(ctx, 0x10, &a, 1, 1);
+            add_logical(ctx, 0x20, &b, 1, 1);
+            g_array_append_val(ctx->mayarray_facts, first_fact);
+            g_array_append_val(ctx->mayarray_facts, second_fact);
+        }
+        status = build_secondary(ctx) ? OSPREY_OK : ctx->last_status;
+        break;
+    }
+    case OSPREY_RULE_CB02:
+        if (reverse) {
+            add_logical(ctx, 0x10, &c, 1, 1);
+            add_logical(ctx, 0x10, &b, 1, 1);
+            add_logical(ctx, 0x10, &a, 1, 1);
+        } else {
+            add_logical(ctx, 0x10, &a, 1, 1);
+            add_logical(ctx, 0x10, &b, 1, 1);
+            add_logical(ctx, 0x10, &c, 1, 1);
+        }
+        status = build_secondary(ctx) ? OSPREY_OK : ctx->last_status;
+        break;
+    case OSPREY_RULE_CB03: {
+        OspreyChunk extent = chunk(global, 0, 24);
+        add_extent(ctx, &extent);
+        if (reverse) {
+            seed_array(ctx, global, 8, 24, 8);
+            seed_array(ctx, global, 0, 16, 8);
+        } else {
+            seed_array(ctx, global, 0, 16, 8);
+            seed_array(ctx, global, 8, 24, 8);
+        }
+        status = build_secondary(ctx) ? OSPREY_OK : ctx->last_status;
+        break;
+    }
+    case OSPREY_RULE_CB04: {
+        OspreyChunk extent = chunk(global, 0, 24);
+        add_extent(ctx, &extent);
+        if (reverse) {
+            seed_array(ctx, global, 8, 24, 4);
+            seed_array(ctx, global, 0, 16, 8);
+        } else {
+            seed_array(ctx, global, 0, 16, 8);
+            seed_array(ctx, global, 8, 24, 4);
+        }
+        status = build_secondary(ctx) ? OSPREY_OK : ctx->last_status;
+        break;
+    }
+    case OSPREY_RULE_CB05: {
+        OspreyChunk scalar = chunk(global, 8, 8);
+        OspreyChunk extent = chunk(global, 0, 32);
+        add_extent(ctx, &extent);
+        if (reverse) {
+            (void)seed_scalar(ctx, &scalar);
+            (void)seed_array(ctx, global, 0, 32, 8);
+        } else {
+            (void)seed_array(ctx, global, 0, 32, 8);
+            (void)seed_scalar(ctx, &scalar);
+        }
+        status = build_secondary(ctx) ? OSPREY_OK : ctx->last_status;
+        break;
+    }
+    case OSPREY_RULE_CB06: {
+        OspreyChunk extent = chunk(global, 0, 16);
+        add_logical(ctx, 0x10, &a, 1, 1);
+        add_extent(ctx, &extent);
+        status = osprey_stage3_base(ctx);
+        if (status == OSPREY_OK) {
+            OspreyVar malformed;
+            memset(&malformed, 0, sizeof(malformed));
+            malformed.id = ctx->graph->vars->len;
+            malformed.kind = OSPREY_PRED_ARRAY;
+            malformed.payload.segment.a1 = address(global, 0);
+            malformed.payload.segment.a2 = address(global, 4);
+            malformed.payload.segment.size = 8;
+            g_array_append_val(ctx->graph->vars, malformed);
+            status = osprey_stage3_secondary(ctx);
+        }
+        break;
+    }
+    case OSPREY_RULE_CB07: {
+        OspreyBaseFact first_base;
+        OspreyBaseFact second_base;
+        memset(&first_base, 0, sizeof(first_base));
+        memset(&second_base, 0, sizeof(second_base));
+        first_base.pc = 0x10;
+        first_base.chunk = a;
+        first_base.base = a.address;
+        second_base = first_base;
+        second_base.chunk = b;
+        second_base.base = b.address;
+        if (reverse) {
+            add_logical(ctx, 0x10, &b, 1, 1);
+            add_logical(ctx, 0x10, &a, 1, 1);
+            g_array_append_val(ctx->base_facts, second_base);
+            g_array_append_val(ctx->base_facts, first_base);
+        } else {
+            add_logical(ctx, 0x10, &a, 1, 1);
+            add_logical(ctx, 0x10, &b, 1, 1);
+            g_array_append_val(ctx->base_facts, first_base);
+            g_array_append_val(ctx->base_facts, second_base);
+        }
+        status = build_secondary(ctx) ? OSPREY_OK : ctx->last_status;
+        break;
+    }
+    case OSPREY_RULE_CB08:
+        if (reverse) {
+            add_logical(ctx, 0x10, &c, 3, 1);
+            add_logical(ctx, 0x10, &b, 3, 1);
+            add_logical(ctx, 0x10, &a, 3, 1);
+        } else {
+            add_logical(ctx, 0x10, &a, 3, 1);
+            add_logical(ctx, 0x10, &b, 3, 1);
+            add_logical(ctx, 0x10, &c, 3, 1);
+        }
+        status = build_secondary(ctx) ? OSPREY_OK : ctx->last_status;
+        break;
+    case OSPREY_RULE_CB09: {
+        OspreyBaseFact first_base;
+        OspreyBaseFact second_base;
+        memset(&first_base, 0, sizeof(first_base));
+        memset(&second_base, 0, sizeof(second_base));
+        first_base.pc = 0x10;
+        first_base.chunk = a;
+        first_base.base = a.address;
+        second_base = first_base;
+        second_base.chunk = b;
+        second_base.base = b.address;
+        if (reverse) {
+            add_logical(ctx, 0x10, &b, 1, 1);
+            add_logical(ctx, 0x10, &a, 1, 1);
+            g_array_append_val(ctx->base_facts, second_base);
+            g_array_append_val(ctx->base_facts, first_base);
+        } else {
+            add_logical(ctx, 0x10, &a, 1, 1);
+            add_logical(ctx, 0x10, &b, 1, 1);
+            g_array_append_val(ctx->base_facts, first_base);
+            g_array_append_val(ctx->base_facts, second_base);
+        }
+        status = build_secondary(ctx) ? OSPREY_OK : ctx->last_status;
+        break;
+    }
+    default:
+        status = OSPREY_INVALID_GRAPH;
+        break;
+    }
+    CHECK(status == OSPREY_OK, "permutation fixture builds");
+    return ctx;
+}
+
+static OspreyContext *permutation_near_miss_context(uint16_t rule,
+                                                     bool reverse)
+{
+    OspreyContext *ctx = new_context();
+    OspreyRegionId global = region(OSPREY_REGION_GLOBAL, 0);
+    OspreyChunk a = chunk(global, 0, 8);
+    OspreyChunk b = chunk(global, 8, 8);
+    OspreyStatus status;
+
+    switch (rule) {
+    case OSPREY_RULE_CA01:
+    case OSPREY_RULE_CA04:
+        status = osprey_stage3_base(ctx);
+        break;
+    case OSPREY_RULE_CA02: {
+        OspreyChunk gap = chunk(global, 17, 8);
+        if (reverse) {
+            add_logical(ctx, 0x20, &gap, 1, 1);
+            add_logical(ctx, 0x10, &a, 1, 1);
+        } else {
+            add_logical(ctx, 0x10, &a, 1, 1);
+            add_logical(ctx, 0x20, &gap, 1, 1);
+        }
+        status = osprey_stage3_base(ctx);
+        break;
+    }
+    case OSPREY_RULE_CA03:
+        if (reverse) {
+            add_logical(ctx, 0x20, &b, 1, 1);
+            add_logical(ctx, 0x10, &a, 1, 1);
+        } else {
+            add_logical(ctx, 0x10, &a, 1, 1);
+            add_logical(ctx, 0x20, &b, 1, 1);
+        }
+        status = osprey_stage3_base(ctx);
+        break;
+    case OSPREY_RULE_CA05:
+        if (reverse) {
+            add_logical(ctx, 0x20, &b, 1, 1);
+            add_logical(ctx, 0x10, &a, 1, 1);
+        } else {
+            add_logical(ctx, 0x10, &a, 1, 1);
+            add_logical(ctx, 0x20, &b, 1, 1);
+        }
+        status = osprey_stage3_base(ctx);
+        break;
+    case OSPREY_RULE_CA06:
+    case OSPREY_RULE_CA07:
+        if (reverse) {
+            add_logical(ctx, 0x10, &b, 1, 1);
+            add_logical(ctx, 0x10, &a, 1, 1);
+        } else {
+            add_logical(ctx, 0x10, &a, 1, 1);
+            add_logical(ctx, 0x10, &b, 1, 1);
+        }
+        status = osprey_stage3_base(ctx);
+        break;
+    case OSPREY_RULE_CA08:
+        add_logical(ctx, 0x10, &a, 1, 1);
+        status = osprey_stage3_base(ctx);
+        break;
+    case OSPREY_RULE_CB01:
+        add_logical(ctx, 0x10, &a, 1, 1);
+        status = build_secondary(ctx) ? OSPREY_OK : ctx->last_status;
+        break;
+    case OSPREY_RULE_CB02:
+        add_logical(ctx, 0x10, &a, 1, 1);
+        status = build_secondary(ctx) ? OSPREY_OK : ctx->last_status;
+        break;
+    case OSPREY_RULE_CB03: {
+        OspreyChunk extent = chunk(global, 0, 24);
+        add_extent(ctx, &extent);
+        if (reverse) {
+            (void)seed_array(ctx, global, 1, 16, 8);
+            (void)seed_array(ctx, global, 0, 16, 8);
+        } else {
+            (void)seed_array(ctx, global, 0, 16, 8);
+            (void)seed_array(ctx, global, 1, 16, 8);
+        }
+        status = build_secondary(ctx) ? OSPREY_OK : ctx->last_status;
+        break;
+    }
+    case OSPREY_RULE_CB04: {
+        OspreyChunk extent = chunk(global, 0, 24);
+        add_extent(ctx, &extent);
+        if (reverse) {
+            (void)seed_array(ctx, global, 4, 11, 4);
+            (void)seed_array(ctx, global, 0, 8, 8);
+        } else {
+            (void)seed_array(ctx, global, 0, 8, 8);
+            (void)seed_array(ctx, global, 4, 11, 4);
+        }
+        status = build_secondary(ctx) ? OSPREY_OK : ctx->last_status;
+        break;
+    }
+    case OSPREY_RULE_CB05: {
+        OspreyChunk extent = chunk(global, 0, 32);
+        OspreyChunk at_hi = chunk(global, 32, 8);
+        add_extent(ctx, &extent);
+        (void)seed_array(ctx, global, 0, 32, 8);
+        (void)seed_scalar(ctx, &at_hi);
+        status = build_secondary(ctx) ? OSPREY_OK : ctx->last_status;
+        break;
+    }
+    case OSPREY_RULE_CB06:
+        add_logical(ctx, 0x10, &a, 1, 1);
+        (void)seed_array(ctx, global, 0, 8, 8);
+        status = build_secondary(ctx) ? OSPREY_OK : ctx->last_status;
+        break;
+    case OSPREY_RULE_CB07: {
+        OspreyBaseFact base;
+        memset(&base, 0, sizeof(base));
+        base.pc = 0x20;
+        base.chunk = a;
+        base.base = a.address;
+        add_logical(ctx, 0x10, &a, 1, 1);
+        add_logical(ctx, 0x10, &b, 1, 1);
+        g_array_append_val(ctx->base_facts, base);
+        status = build_secondary(ctx) ? OSPREY_OK : ctx->last_status;
+        break;
+    }
+    case OSPREY_RULE_CB08:
+        add_logical(ctx, 0x10, &a, 3, 1);
+        status = build_secondary(ctx) ? OSPREY_OK : ctx->last_status;
+        break;
+    case OSPREY_RULE_CB09:
+        if (reverse) {
+            add_logical(ctx, 0x10, &a, 1, 1);
+            add_logical(ctx, 0x10, &a, 1, 1);
+        } else {
+            add_logical(ctx, 0x10, &a, 1, 1);
+            add_logical(ctx, 0x10, &a, 1, 1);
+        }
+        status = build_secondary(ctx) ? OSPREY_OK : ctx->last_status;
+        break;
+    default:
+        status = OSPREY_INVALID_GRAPH;
+        break;
+    }
+    CHECK(status == OSPREY_OK, "near-miss permutation fixture builds");
+    return ctx;
+}
+
+static void test_rule_permutations(const Stage3RuleCase *cases,
+                                    guint case_count)
+{
+    for (guint i = 0; i < case_count; i++) {
+        OspreyContext *forward = permutation_context(cases[i].rule, false);
+        OspreyContext *reverse = permutation_context(cases[i].rule, true);
+        CHECK(variable_sets_equal(forward, reverse),
+              cases[i].name);
+        CHECK(candidate_accounting_equal(forward->graph, reverse->graph),
+              cases[i].name);
+        CHECK(rule_factor_sets_equal(forward, reverse, cases[i].rule),
+              cases[i].name);
+        osprey_free(reverse);
+        osprey_free(forward);
+    }
+}
+
+static const Stage3RuleCase stage3_rule_cases[] = {
+    { OSPREY_RULE_CA01, "CA01", test_ca01 },
+    { OSPREY_RULE_CA02, "CA02", test_ca02 },
+    { OSPREY_RULE_CA03, "CA03", test_ca03 },
+    { OSPREY_RULE_CA04, "CA04", test_ca04 },
+    { OSPREY_RULE_CA05, "CA05", test_ca05 },
+    { OSPREY_RULE_CA06, "CA06", test_ca06 },
+    { OSPREY_RULE_CA07, "CA07", test_ca07 },
+    { OSPREY_RULE_CA08, "CA08", test_ca08 },
+    { OSPREY_RULE_CB01, "CB01", test_cb01 },
+    { OSPREY_RULE_CB02, "CB02", test_cb02 },
+    { OSPREY_RULE_CB03, "CB03", test_cb03 },
+    { OSPREY_RULE_CB04, "CB04", test_cb04 },
+    { OSPREY_RULE_CB05, "CB05", test_cb05 },
+    { OSPREY_RULE_CB06, "CB06", test_cb06 },
+    { OSPREY_RULE_CB07, "CB07", test_cb07 },
+    { OSPREY_RULE_CB08, "CB08", test_cb08 },
+    { OSPREY_RULE_CB09, "CB09", test_cb09 },
+};
+
+static void test_near_miss_permutations(void)
+{
+    for (guint i = 0; i < G_N_ELEMENTS(stage3_rule_cases); i++) {
+        OspreyContext *forward = permutation_near_miss_context(
+            stage3_rule_cases[i].rule, false);
+        OspreyContext *reverse = permutation_near_miss_context(
+            stage3_rule_cases[i].rule, true);
+        CHECK(variable_sets_equal(forward, reverse),
+              stage3_rule_cases[i].name);
+        CHECK(candidate_accounting_equal(forward->graph, reverse->graph),
+              stage3_rule_cases[i].name);
+        CHECK(rule_factor_sets_equal(forward, reverse,
+                                     stage3_rule_cases[i].rule),
+              stage3_rule_cases[i].name);
+        osprey_free(reverse);
+        osprey_free(forward);
+    }
+}
+
+static void validate_rule_registry(void)
+{
+    bool seen[OSPREY_RULE_COUNT];
+    memset(seen, 0, sizeof(seen));
+    CHECK(G_N_ELEMENTS(stage3_rule_cases) == 17,
+          "exactly seventeen CA/CB cases are registered");
+    for (guint i = 0; i < G_N_ELEMENTS(stage3_rule_cases); i++) {
+        uint16_t rule = stage3_rule_cases[i].rule;
+        CHECK(rule >= OSPREY_RULE_CA01 && rule <= OSPREY_RULE_CB09,
+              "registered CA/CB code is in range");
+        CHECK(!seen[rule], "registered CA/CB codes are unique");
+        seen[rule] = true;
+    }
+    for (uint16_t rule = OSPREY_RULE_CA01;
+         rule <= OSPREY_RULE_CB09; rule++) {
+        CHECK(seen[rule], "every CA/CB code is registered");
+    }
 }
 
 int main(void)
 {
-    RUN(test_ca01);
-    RUN(test_ca02);
-    RUN(test_ca03);
-    RUN(test_ca04);
-    RUN(test_ca05);
-    RUN(test_ca06);
-    RUN(test_ca07);
-    RUN(test_ca08);
-    RUN(test_cb01);
-    RUN(test_cb02);
-    RUN(test_cb03);
-    RUN(test_cb04);
-    RUN(test_cb05);
-    RUN(test_cb06);
-    RUN(test_cb07);
-    RUN(test_cb08);
-    RUN(test_cb09);
+    validate_rule_registry();
+    for (guint i = 0; i < G_N_ELEMENTS(stage3_rule_cases); i++) {
+        registered++;
+        stage3_rule_cases[i].test();
+        executed++;
+    }
+    test_rule_permutations(stage3_rule_cases,
+                           G_N_ELEMENTS(stage3_rule_cases));
+    test_near_miss_permutations();
     CHECK(registered == executed, "every CA/CB rule row executed");
     if (failures != 0 || registered != executed) {
         fprintf(stderr, "FAIL stage3_rules (%u failures, %u/%u)\n",

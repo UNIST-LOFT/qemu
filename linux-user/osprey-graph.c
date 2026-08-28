@@ -905,29 +905,43 @@ static bool raw_delta(uint64_t raw, uint64_t base, int64_t *out)
     return true;
 }
 
-static bool region_instance_span(const OspreyRegionInstance *instance,
-                                  int64_t *lo, int64_t *hi)
+static OspreyStatus region_instance_span(const OspreyRegionInstance *instance,
+                                         int64_t *lo, int64_t *hi)
 {
-    return instance != NULL && region_valid(&instance->region) &&
-           raw_delta(instance->raw_min, instance->raw_base, lo) &&
-           raw_delta(instance->raw_max, instance->raw_base, hi) &&
-           *lo <= *hi;
+    if (instance == NULL || !region_valid(&instance->region) ||
+        instance->raw_min > instance->raw_max) {
+        return OSPREY_INVALID_GRAPH;
+    }
+    if (!raw_delta(instance->raw_min, instance->raw_base, lo) ||
+        !raw_delta(instance->raw_max, instance->raw_base, hi)) {
+        return OSPREY_GRAPH_ARITHMETIC;
+    }
+    return *lo <= *hi ? OSPREY_OK : OSPREY_INVALID_GRAPH;
 }
 
-static bool extent_add_region_instance(OspreyGraph *graph,
-                                       const OspreyRegionInstance *instance)
+static OspreyStatus extent_add_region_instance(
+    OspreyGraph *graph, const OspreyRegionInstance *instance)
 {
     int64_t lo, hi;
-    if (!region_instance_span(instance, &lo, &hi)) return false;
-    return extent_add(graph, &instance->region, lo, hi);
+    OspreyStatus status = region_instance_span(instance, &lo, &hi);
+    if (status != OSPREY_OK) return status;
+    return extent_add(graph, &instance->region, lo, hi)
+        ? OSPREY_OK : OSPREY_INVALID_GRAPH;
 }
 
-static bool extent_add_nonheap_chunk(OspreyGraph *graph,
-                                     const OspreyChunk *chunk)
+static OspreyStatus extent_add_nonheap_chunk(OspreyGraph *graph,
+                                             const OspreyChunk *chunk)
 {
-    if (!chunk_identity_valid(chunk)) return false;
-    if (chunk->address.region.kind == OSPREY_REGION_HEAP_SITE) return true;
-    return extent_add_chunk(graph, chunk);
+    if (!chunk_identity_valid(chunk)) return OSPREY_INVALID_GRAPH;
+    if (chunk->address.region.kind == OSPREY_REGION_HEAP_SITE) {
+        return OSPREY_OK;
+    }
+    int64_t end;
+    if (!signed_size_end(chunk->address.offset, chunk->size, &end)) {
+        return OSPREY_GRAPH_ARITHMETIC;
+    }
+    return extent_add_chunk(graph, chunk)
+        ? OSPREY_OK : OSPREY_INVALID_GRAPH;
 }
 
 static bool extent_catalog_contains_chunk(const OspreyGraph *graph,
@@ -955,13 +969,24 @@ static bool f06_matches_alloc(const OspreyContext *ctx,
     return false;
 }
 
-static bool extent_catalog_validate(const OspreyContext *ctx,
-                                    const OspreyGraph *graph)
+static OspreyStatus extent_catalog_validate(const OspreyContext *ctx,
+                                            const OspreyGraph *graph)
 {
 #define CHECK_HEAP_CHUNK(_chunk) \
     do { \
-        if ((_chunk).address.region.kind == OSPREY_REGION_HEAP_SITE && \
-            !extent_catalog_contains_chunk(graph, &(_chunk))) return false; \
+        if ((_chunk).address.region.kind == OSPREY_REGION_HEAP_SITE) { \
+            int64_t chunk_end; \
+            if (!chunk_identity_valid(&(_chunk))) { \
+                return OSPREY_INVALID_GRAPH; \
+            } \
+            if (!signed_size_end((_chunk).address.offset, (_chunk).size, \
+                                 &chunk_end)) { \
+                return OSPREY_GRAPH_ARITHMETIC; \
+            } \
+            if (!extent_catalog_contains_chunk(graph, &(_chunk))) { \
+                return OSPREY_INVALID_GRAPH; \
+            } \
+        } \
     } while (0)
     for (guint i = 0; i < ctx->access_facts->len; i++) {
         const OspreyAccessFact *fact = &g_array_index(
@@ -991,9 +1016,10 @@ static bool extent_catalog_validate(const OspreyContext *ctx,
             ctx->region_instances, OspreyRegionInstance, i);
         if (instance->region.kind != OSPREY_REGION_HEAP_SITE) continue;
         int64_t lo, hi;
-        if (!region_instance_span(instance, &lo, &hi) ||
-            !extent_contains(graph, &instance->region, lo, hi)) {
-            return false;
+        OspreyStatus status = region_instance_span(instance, &lo, &hi);
+        if (status != OSPREY_OK) return status;
+        if (!extent_contains(graph, &instance->region, lo, hi)) {
+            return OSPREY_INVALID_GRAPH;
         }
     }
 
@@ -1004,26 +1030,28 @@ static bool extent_catalog_validate(const OspreyContext *ctx,
         int64_t end;
         if (!address_valid(&fact->start) ||
             fact->evidence_kind != OSPREY_MAY_ARRAY_CALLOC_GEOMETRY ||
-            fact->element_count == 0 || fact->element_size == 0 ||
-            !osprey_check_mul(fact->element_count, fact->element_size,
+            fact->element_count == 0 || fact->element_size == 0) {
+            return OSPREY_INVALID_GRAPH;
+        }
+        if (!osprey_check_mul(fact->element_count, fact->element_size,
                               &total) || total > (uint64_t)INT64_MAX ||
             !osprey_check_add(fact->start.offset, (int64_t)total, &end)) {
-            return false;
+            return OSPREY_GRAPH_ARITHMETIC;
         }
         if (fact->start.region.kind == OSPREY_REGION_HEAP_SITE &&
             (!f06_matches_alloc(ctx, &fact->start.region, total) ||
              !extent_contains(graph, &fact->start.region,
                               fact->start.offset, end))) {
-            return false;
+            return OSPREY_INVALID_GRAPH;
         }
     }
-    return true;
+    return OSPREY_OK;
 }
 
-static bool build_extent_catalog(OspreyContext *ctx)
+static OspreyStatus build_extent_catalog(OspreyContext *ctx)
 {
     OspreyGraph *graph = ctx->graph;
-    if (graph->extents_built) return true;
+    if (graph->extents_built) return OSPREY_OK;
     g_array_set_size(graph->extents, 0);
 
     /* Heap extents come only from successful F05 sizes.  Region instances
@@ -1032,35 +1060,42 @@ static bool build_extent_catalog(OspreyContext *ctx)
     for (guint i = 0; i < ctx->region_instances->len; i++) {
         const OspreyRegionInstance *instance = &g_array_index(
             ctx->region_instances, OspreyRegionInstance, i);
+        OspreyStatus status;
         if (instance->region.kind == OSPREY_REGION_HEAP_SITE) {
             int64_t instance_lo, instance_hi;
-            if (!region_instance_span(instance, &instance_lo, &instance_hi)) {
-                return false;
-            }
-        } else if (!extent_add_region_instance(graph, instance)) {
-            return false;
+            status = region_instance_span(instance, &instance_lo,
+                                          &instance_hi);
+        } else {
+            status = extent_add_region_instance(graph, instance);
         }
+        if (status != OSPREY_OK) return status;
     }
     for (guint i = 0; i < ctx->access_facts->len; i++) {
         const OspreyAccessFact *fact = &g_array_index(
             ctx->access_facts, OspreyAccessFact, i);
-        if (!extent_add_nonheap_chunk(graph, &fact->chunk)) return false;
+        OspreyStatus status = extent_add_nonheap_chunk(graph, &fact->chunk);
+        if (status != OSPREY_OK) return status;
     }
     for (guint i = 0; i < ctx->base_facts->len; i++) {
         const OspreyBaseFact *fact = &g_array_index(ctx->base_facts,
                                                     OspreyBaseFact, i);
-        if (!extent_add_nonheap_chunk(graph, &fact->chunk)) return false;
+        OspreyStatus status = extent_add_nonheap_chunk(graph, &fact->chunk);
+        if (status != OSPREY_OK) return status;
     }
     for (guint i = 0; i < ctx->copy_facts->len; i++) {
         const OspreyCopyFact *fact = &g_array_index(ctx->copy_facts,
                                                     OspreyCopyFact, i);
-        if (!extent_add_nonheap_chunk(graph, &fact->source) ||
-            !extent_add_nonheap_chunk(graph, &fact->destination)) return false;
+        OspreyStatus status = extent_add_nonheap_chunk(graph, &fact->source);
+        if (status != OSPREY_OK) return status;
+        status = extent_add_nonheap_chunk(graph, &fact->destination);
+        if (status != OSPREY_OK) return status;
     }
     for (guint i = 0; i < ctx->points_facts->len; i++) {
         const OspreyPointsToFact *fact = &g_array_index(ctx->points_facts,
                                                         OspreyPointsToFact, i);
-        if (!extent_add_nonheap_chunk(graph, &fact->pointer_chunk)) return false;
+        OspreyStatus status = extent_add_nonheap_chunk(
+            graph, &fact->pointer_chunk);
+        if (status != OSPREY_OK) return status;
     }
     for (guint i = 0; i < ctx->alloc_facts->len; i++) {
         const OspreyMallocFact *fact = &g_array_index(ctx->alloc_facts,
@@ -1069,15 +1104,19 @@ static bool build_extent_catalog(OspreyContext *ctx)
         memset(&region, 0, sizeof(region));
         region.kind = OSPREY_REGION_HEAP_SITE;
         region.site_offset = fact->site_pc;
-        if (fact->requested_size > (uint64_t)INT64_MAX ||
-            !extent_add(graph, &region, 0, (int64_t)fact->requested_size)) {
-            return false;
+        if (fact->requested_size > (uint64_t)INT64_MAX) {
+            return OSPREY_GRAPH_ARITHMETIC;
+        }
+        if (!extent_add(graph, &region, 0,
+                        (int64_t)fact->requested_size)) {
+            return OSPREY_INVALID_GRAPH;
         }
     }
     g_array_sort(graph->extents, extent_compare);
-    if (!extent_catalog_validate(ctx, graph)) return false;
+    OspreyStatus status = extent_catalog_validate(ctx, graph);
+    if (status != OSPREY_OK) return status;
     graph->extents_built = true;
-    return true;
+    return OSPREY_OK;
 }
 
 static bool extent_for(const OspreyGraph *graph, const OspreyRegionId *region,
@@ -1349,9 +1388,17 @@ OspreyStatus osprey_candidate_select(OspreyContext *ctx,
         graph_set_error(ctx, OSPREY_INVALID_GRAPH);
         return OSPREY_INVALID_GRAPH;
     }
-    if (!build_extent_catalog(ctx)) {
-        graph_set_error(ctx, OSPREY_GRAPH_ARITHMETIC);
-        return OSPREY_GRAPH_ARITHMETIC;
+    for (size_t i = 0; i < count; i++) {
+        uint16_t rule = proposals[i].source_rule;
+        if (rule < OSPREY_RULE_COUNT &&
+            ctx->graph->candidate_proposals[rule] != UINT64_MAX) {
+            ctx->graph->candidate_proposals[rule]++;
+        }
+    }
+    OspreyStatus extent_status = build_extent_catalog(ctx);
+    if (extent_status != OSPREY_OK) {
+        graph_set_error(ctx, extent_status);
+        return extent_status;
     }
 
     GArray *entries = g_array_new(FALSE, FALSE, sizeof(CandidateEntry));

@@ -742,8 +742,10 @@ static OspreyStatus cb01_payload(const OspreyMayArrayFact *fact,
     int64_t end;
     if (fact == NULL || array_payload == NULL ||
         fact->evidence_kind != OSPREY_MAY_ARRAY_CALLOC_GEOMETRY ||
-        fact->element_count == 0 || fact->element_size == 0 ||
-        fact->element_size > (uint64_t)INT64_MAX ||
+        fact->element_count == 0 || fact->element_size == 0) {
+        return OSPREY_INVALID_GRAPH;
+    }
+    if (fact->element_size > (uint64_t)INT64_MAX ||
         !osprey_check_mul(fact->element_count, fact->element_size, &span) ||
         span == 0 || span > (uint64_t)INT64_MAX ||
         !osprey_check_add(fact->start.offset, (int64_t)span, &end)) {
