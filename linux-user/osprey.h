@@ -94,6 +94,7 @@ typedef enum OspreyStatus {
     OSPREY_NON_CONVERGED,
     OSPREY_INVALID_MODEL,
     OSPREY_UNSUPPORTED_EXECUTION,
+    OSPREY_RELATION_ARITHMETIC,
 } OspreyStatus;
 
 typedef struct OspreyDecodedObject {

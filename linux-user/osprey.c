@@ -620,6 +620,9 @@ OspreyContext *osprey_new(const OspreyConfig *config) {
     ctx->mayarray_facts = g_array_new(FALSE, FALSE, sizeof(OspreyMayArrayFact));
     ctx->region_instances = g_array_new(FALSE, FALSE,
                                         sizeof(OspreyRegionInstance));
+    ctx->logical_access_facts = g_array_new(FALSE, FALSE,
+                                            sizeof(OspreyLogicalAccess));
+    ctx->relations = NULL;
     ctx->runtime_regions = g_array_new(FALSE, FALSE, sizeof(OspreyRuntimeRegion));
     ctx->last_status = OSPREY_DISABLED;
     ctx->tx_status = OSPREY_DISABLED;
@@ -646,6 +649,10 @@ void osprey_free(OspreyContext *ctx) {
     g_array_free(ctx->mayarray_facts, TRUE);
     g_array_free(ctx->runtime_regions, TRUE);
     g_array_free(ctx->region_instances, TRUE);
+    g_array_free(ctx->logical_access_facts, TRUE);
+    if (ctx->relations != NULL) {
+        osprey_relations_free(ctx->relations);
+    }
     osprey_free_cpu_origins();
     osprey_free_runtime_regions();
     if (ctx->graph) {

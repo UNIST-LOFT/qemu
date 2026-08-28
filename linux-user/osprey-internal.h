@@ -192,6 +192,113 @@ typedef struct OspreyRegionInstance {
 } OspreyRegionInstance;
 
 /* ------------------------------------------------------------------ */
+/* Stage 3.1 parent-local deterministic relations                      */
+/* ------------------------------------------------------------------ */
+
+/* F01's class and direction are intentionally absent from this derived
+ * projection.  The parent creates one row per (pc, complete chunk) while
+ * the validated sample is still available. */
+typedef struct OspreyLogicalAccess {
+    uint64_t pc;
+    OspreyChunk chunk;
+    uint32_t dynamic_count;
+    uint32_t sample_support;
+} OspreyLogicalAccess;
+
+typedef struct OspreyInsnChunkRelation {
+    uint64_t pc;
+    OspreyChunk chunk;
+} OspreyInsnChunkRelation;
+
+typedef struct OspreyChunkRelation {
+    OspreyChunk chunk;
+} OspreyChunkRelation;
+
+typedef struct OspreyInsnRegionRelation {
+    uint64_t pc;
+    OspreyRegionId region;
+} OspreyInsnRegionRelation;
+
+typedef struct OspreyInsnRegionAddressRelation {
+    uint64_t pc;
+    OspreyRegionId region;
+    OspreyAddress address;
+    uint32_t count;
+} OspreyInsnRegionAddressRelation;
+
+typedef struct OspreyAllocRelation {
+    uint64_t site_pc;
+    uint64_t size;
+} OspreyAllocRelation;
+
+typedef enum OspreyRelationHintKind {
+    OSPREY_RELATION_DATA_FLOW = 0,
+    OSPREY_RELATION_UNIFIED_ACCESS = 1,
+    OSPREY_RELATION_POINTS_TO = 2,
+} OspreyRelationHintKind;
+
+typedef struct OspreyHintRelation {
+    OspreyAddress a1;
+    OspreyAddress a2;
+    int64_t size;
+    uint8_t kind;              /* OspreyRelationHintKind */
+    uint8_t reserved[7];
+    uint64_t witness_count;
+} OspreyHintRelation;
+
+/* R01-R12 are separate owned arrays even when their record layouts
+ * coincide.  The indexes are parent-local accelerators only; canonical
+ * output is always produced from the sorted relation arrays. */
+typedef struct OspreyRelations OspreyRelations;
+struct OspreyRelations {
+    GArray *logical_accesses;
+    GArray *r01_accessed;
+    GArray *r02_accessed;
+    GArray *r03_single_chunk;
+    GArray *r04_multi_chunk;
+    GArray *r05_high_address;
+    GArray *r06_low_address;
+    GArray *r07_most_frequent;
+    GArray *r08_constant_alloc;
+    GArray *r09_alloc_unit;
+    GArray *r10_data_flow;
+    GArray *r11_unified_access;
+    GArray *r12_points_to;
+
+    GHashTable *access_by_pc_region;
+    GHashTable *access_by_chunk;
+    GHashTable *access_by_pc_chunk;
+    GHashTable *alloc_by_site;
+    GHashTable *base_by_address;
+    GHashTable *points_by_chunk;
+};
+
+/* Explicit scalar helpers used by Stage 3.1 and its focused tests. */
+bool osprey_relation_same_region(const OspreyRegionId *a,
+                                 const OspreyRegionId *b);
+bool osprey_relation_offset(const OspreyAddress *a,
+                            const OspreyAddress *b, int64_t *out);
+bool osprey_relation_adjacent_chunk(const OspreyChunk *a,
+                                    const OspreyChunk *b);
+bool osprey_relation_overlapping_chunk(const OspreyChunk *a,
+                                      const OspreyChunk *b);
+bool osprey_relation_addr_difference_gcd(const OspreyAddress *addresses,
+                                         size_t count,
+                                         const OspreyRegionId *region,
+                                         int64_t *out);
+bool osprey_relation_size_difference_gcd(const uint64_t *sizes,
+                                         size_t count, uint64_t *out);
+
+OspreyKey osprey_logical_access_key(uint64_t pc, const OspreyChunk *chunk);
+bool osprey_logical_access_equal(const OspreyLogicalAccess *a,
+                                 const OspreyLogicalAccess *b);
+gint osprey_logical_access_compare(gconstpointer a, gconstpointer b);
+
+OspreyStatus osprey_relations_build(OspreyContext *ctx);
+void osprey_relations_free(OspreyRelations *relations);
+void osprey_relations_dump(const OspreyRelations *relations, FILE *out);
+
+/* ------------------------------------------------------------------ */
 /* Origin shadows (per-CPU, process-local; never shared)               */
 /* ------------------------------------------------------------------ */
 
@@ -583,6 +690,10 @@ struct OspreyContext {
     GArray *alloc_facts;       /* OspreyMallocFact */
     GArray *mayarray_facts;    /* OspreyMayArrayFact */
     GArray *region_instances;  /* OspreyRegionInstance (raw->canonical) */
+    /* Parent-local F01 projection used only by Stage 3.1 relations.
+     * Full class/direction F01 rows remain in access_facts. */
+    GArray *logical_access_facts; /* OspreyLogicalAccess */
+    OspreyRelations *relations;   /* rebuilt transactionally for analysis */
 
     uint64_t total_samples;    /* committed unmodified samples */
     uint64_t total_dynamic_observations;
@@ -777,10 +888,9 @@ struct OspreyGraph {
     uint64_t cd04_extensions;      /* CD04 closure extensions */
 };
 
-/* Stage 3 entry (legacy function name): deterministic closure (R01-R12),
- * predicate interning, bounded candidate generation, and static factor
- * instantiation.  Does not solve anything. */
-OspreyStatus osprey_stage2_closure(OspreyContext *ctx);
+/* Stage 3 base graph entry: current candidate/factor construction over
+ * the deterministic relation result.  It does not solve anything. */
+OspreyStatus osprey_stage3_base(OspreyContext *ctx);
 
 /* Ownership: free a factor graph or decoded model (osprey-rules.c /
  * osprey-decode.c). */
@@ -788,11 +898,11 @@ OspreyGraph *osprey_graph_new(void);
 void osprey_graph_free(OspreyGraph *g);
 void osprey_model_free(OspreyModel *m);
 
-/* Stage 3 secondary construction (legacy function name): deterministic
- * rules (CB02-CB09, CC04/CC05, CD07, CD08) whose preconditions are fact-
- * or candidate-driven.  Belief-dependent folding (CC07) is deferred to
- * the Stage 5 dynamic closure. */
-OspreyStatus osprey_stage2_secondary(OspreyContext *ctx);
+/* Stage 3 secondary construction: deterministic rules (CB02-CB09,
+ * CC04/CC05, CD07, CD08) whose preconditions are fact- or candidate-driven.
+ * Belief-dependent folding (CC07) is deferred to the Stage 5 dynamic
+ * closure. */
+OspreyStatus osprey_stage3_secondary(OspreyContext *ctx);
 
 /* Stages 4/5 inference (osprey-infer.c): exact base inference followed
  * by secondary loopy BP.  The current implementation is non-conformant. */

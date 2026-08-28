@@ -508,14 +508,22 @@ static bool alloc_unit_for_region(OspreyContext *ctx,
 /* ------------------------------------------------------------------ */
 
 static void hint_add(OspreyContext *ctx, OspreyAddress a1, OspreyAddress a2,
-                     int64_t s, uint8_t kind) {
+                     int64_t s, uint8_t kind, uint64_t instances) {
     OspreyGraph *g = ctx->graph;
     for (guint i = 0; i < g->hints->len; i++) {
         OspreyHint *e = &g_array_index(g->hints, OspreyHint, i);
         if (e->kind == kind && e->size == s &&
             address_equal(&e->a1, &a1) && address_equal(&e->a2, &a2)) {
-            e->instances++;
-            g->hint_instances++;
+            if (UINT64_MAX - e->instances < instances) {
+                e->instances = UINT64_MAX;
+            } else {
+                e->instances += instances;
+            }
+            if (UINT64_MAX - g->hint_instances < instances) {
+                g->hint_instances = UINT64_MAX;
+            } else {
+                g->hint_instances += instances;
+            }
             return;
         }
     }
@@ -525,90 +533,45 @@ static void hint_add(OspreyContext *ctx, OspreyAddress a1, OspreyAddress a2,
     h.a2 = a2;
     h.size = s;
     h.kind = kind;
-    h.instances = 1;
+    h.instances = instances;
     g_array_append_val(g->hints, h);
-    g->hint_instances++;
+    if (UINT64_MAX - g->hint_instances < instances) {
+        g->hint_instances = UINT64_MAX;
+    } else {
+        g->hint_instances += instances;
+    }
 }
 
-/* R10 DataFlowHint: two copies with equal source/destination deltas.
- * O(n^2) over copy facts; copy counts are small in practice and capped
- * by max_facts. */
+/* R10-R12 are materialized by osprey-relations.c.  The graph stage only
+ * transfers those immutable hint rows; it must not reconstruct them from
+ * class-specific F01 rows or from insertion order. */
 static void closure_r10(OspreyContext *ctx) {
-    for (guint i = 0; i < ctx->copy_facts->len; i++) {
-        OspreyCopyFact *c = &g_array_index(ctx->copy_facts, OspreyCopyFact, i);
-        for (guint j = i + 1; j < ctx->copy_facts->len; j++) {
-            OspreyCopyFact *c2 = &g_array_index(ctx->copy_facts,
-                                                OspreyCopyFact, j);
-            if (c->source.size != c2->source.size) continue;
-            int64_t s = (int64_t)c->source.size;
-            if (s <= 0) continue;
-            int64_t d1, d2;
-            if (!offset_between(&c2->source.address, &c->source.address, &d1))
-                continue;
-            if (!offset_between(&c2->destination.address,
-                                &c->destination.address, &d2))
-                continue;
-            if (d1 != d2) continue;
-            hint_add(ctx, c->source.address, c->destination.address, s, 0);
-        }
+    if (ctx->relations == NULL) return;
+    for (guint i = 0; i < ctx->relations->r10_data_flow->len; i++) {
+        const OspreyHintRelation *r = &g_array_index(
+            ctx->relations->r10_data_flow, OspreyHintRelation, i);
+        hint_add(ctx, r->a1, r->a2, r->size,
+                 OSPREY_RELATION_DATA_FLOW, r->witness_count);
     }
 }
 
-/* R11 UnifiedAccessPntHint: two distinct instructions each accessing
- * two chunks at the same offset delta. */
 static void closure_r11(OspreyContext *ctx) {
-    for (guint i = 0; i < ctx->access_facts->len; i++) {
-        OspreyAccessFact *a = &g_array_index(ctx->access_facts,
-                                             OspreyAccessFact, i);
-        for (guint j = i + 1; j < ctx->access_facts->len; j++) {
-            OspreyAccessFact *b = &g_array_index(ctx->access_facts,
-                                                 OspreyAccessFact, j);
-            if (a->pc != b->pc) continue; /* same instruction i1 */
-            int64_t d;
-            if (!offset_between(&b->chunk.address, &a->chunk.address, &d))
-                continue;
-            if (d == 0) continue;
-            /* find an instruction pair (c,e) with the same delta */
-            for (guint k = 0; k < ctx->access_facts->len; k++) {
-                OspreyAccessFact *c = &g_array_index(ctx->access_facts,
-                                                     OspreyAccessFact, k);
-                if (c->pc == a->pc) continue;
-                for (guint l = k + 1; l < ctx->access_facts->len; l++) {
-                    OspreyAccessFact *e = &g_array_index(ctx->access_facts,
-                                                         OspreyAccessFact, l);
-                    if (e->pc != c->pc) continue;
-                    int64_t d2;
-                    if (!offset_between(&e->chunk.address, &c->chunk.address,
-                                        &d2))
-                        continue;
-                    if (d2 != d) continue;
-                    hint_add(ctx, a->chunk.address, b->chunk.address, d, 1);
-                    break;
-                }
-            }
-        }
+    if (ctx->relations == NULL) return;
+    for (guint i = 0; i < ctx->relations->r11_unified_access->len; i++) {
+        const OspreyHintRelation *r = &g_array_index(
+            ctx->relations->r11_unified_access, OspreyHintRelation, i);
+        hint_add(ctx, r->a1, r->a2, r->size,
+                 OSPREY_RELATION_UNIFIED_ACCESS, r->witness_count);
     }
 }
 
-/* R12 PointsToHint: two points-to facts whose pointer slots and
- * targets share the same offset delta. */
 static void closure_r12(OspreyContext *ctx) {
-    for (guint i = 0; i < ctx->points_facts->len; i++) {
-        OspreyPointsToFact *a = &g_array_index(ctx->points_facts,
-                                               OspreyPointsToFact, i);
-        for (guint j = i + 1; j < ctx->points_facts->len; j++) {
-            OspreyPointsToFact *b = &g_array_index(ctx->points_facts,
-                                                   OspreyPointsToFact, j);
-            int64_t d, d2;
-            if (!offset_between(&a->pointer_chunk.address,
-                                &b->pointer_chunk.address, &d))
-                continue;
-            if (d == 0) continue;
-            if (!offset_between(&a->target, &b->target, &d2)) continue;
-            if (d2 != d) continue;
-            hint_add(ctx, a->pointer_chunk.address, b->pointer_chunk.address,
-                     d, 2);
-        }
+    if (ctx->relations == NULL) return;
+    for (guint i = 0; i < ctx->relations->r12_points_to->len; i++) {
+        const OspreyHintRelation *r = &g_array_index(
+            ctx->relations->r12_points_to, OspreyHintRelation, i);
+        hint_add(ctx, r->a1, r->a2, r->size,
+                 OSPREY_RELATION_POINTS_TO, r->witness_count);
     }
 }
 
@@ -1587,7 +1550,7 @@ static void cb06_hard_false(OspreyContext *ctx)
 
 /* Stage-3 secondary entry: instantiate remaining deterministic rules
  * (no beliefs needed; CC07 folding comes after the first BP pass). */
-OspreyStatus osprey_stage2_secondary(OspreyContext *ctx)
+OspreyStatus osprey_stage3_secondary(OspreyContext *ctx)
 {
     if (ctx == NULL || !ctx->config.enabled) return OSPREY_DISABLED;
     if (ctx->graph == NULL) return OSPREY_INCOMPLETE_FACTS;
@@ -1656,11 +1619,19 @@ OspreyStatus osprey_stage2_secondary(OspreyContext *ctx)
 }
 
 /* ------------------------------------------------------------------ */
-/* Stage-2 entry                                                       */
+/* Stage-3 base entry                                                  */
 /* ------------------------------------------------------------------ */
 
-OspreyStatus osprey_stage2_closure(OspreyContext *ctx) {
+OspreyStatus osprey_stage3_base(OspreyContext *ctx) {
     if (ctx == NULL || !ctx->config.enabled) return OSPREY_DISABLED;
+    if (ctx->relations == NULL) {
+        OspreyStatus relation_status = osprey_relations_build(ctx);
+        if (relation_status != OSPREY_OK) {
+            osprey_tx_reject(ctx, relation_status, "relations",
+                             "checked relation arithmetic failed");
+            return relation_status;
+        }
+    }
     if (ctx->graph == NULL) {
         ctx->graph = osprey_graph_new();
     }

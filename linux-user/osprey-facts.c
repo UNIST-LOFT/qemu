@@ -3119,6 +3119,82 @@ static bool osprey_run_fact_count_valid(const OspreySharedRun *run) {
     return count == run->total_facts_count;
 }
 
+/* Build the paper-level Access projection before the sample is merged.
+ * F01 identity deliberately keeps direction and operation class, while
+ * Access(i,v,k) does not.  The temporary map therefore keys only on
+ * (pc,complete chunk), sums all dynamic observations with saturation, and
+ * records one sample presence regardless of how many F01 rows supplied it. */
+static GArray *build_sample_logical_accesses(const OspreySharedRun *run)
+{
+    GArray *rows = g_array_new(FALSE, FALSE, sizeof(OspreyLogicalAccess));
+    GHashTable *index = g_hash_table_new_full(
+        osprey_key_hash, osprey_key_equal, osprey_key_free, NULL);
+    const int tables[] = { OSPREY_TABLE_ACCESS,
+                           OSPREY_TABLE_PREFIX_ACCESS };
+
+    for (size_t t = 0; t < G_N_ELEMENTS(tables); t++) {
+        OspreyRunIter it;
+        const void *record;
+        memset(&it, 0, sizeof(it));
+        it.run = run;
+        it.table = tables[t];
+        while (osprey_run_iter_next(&it, &record)) {
+            const OspreyAccessFact *fact = record;
+            OspreyKey key = osprey_logical_access_key(fact->pc,
+                                                       &fact->chunk);
+            gpointer found = g_hash_table_lookup(index, &key);
+            if (found != NULL) {
+                OspreyLogicalAccess *row = &g_array_index(
+                    rows, OspreyLogicalAccess,
+                    (guint)(GPOINTER_TO_SIZE(found) - 1));
+                row->dynamic_count = sat_add_u32(row->dynamic_count,
+                                                 fact->dynamic_count);
+                continue;
+            }
+            OspreyLogicalAccess row;
+            memset(&row, 0, sizeof(row));
+            row.pc = fact->pc;
+            row.chunk = fact->chunk;
+            row.dynamic_count = fact->dynamic_count;
+            row.sample_support = 1;
+            g_array_append_val(rows, row);
+            g_hash_table_insert(index, osprey_key_new(&key),
+                                GSIZE_TO_POINTER((gsize)rows->len));
+        }
+    }
+    g_hash_table_destroy(index);
+    g_array_sort(rows, osprey_logical_access_compare);
+    return rows;
+}
+
+static void merge_logical_accesses(OspreyContext *ctx,
+                                   const GArray *sample_rows)
+{
+    for (guint i = 0; i < sample_rows->len; i++) {
+        const OspreyLogicalAccess *sample = &g_array_index(
+            sample_rows, OspreyLogicalAccess, i);
+        bool found = false;
+        for (guint j = 0; j < ctx->logical_access_facts->len; j++) {
+            OspreyLogicalAccess *committed = &g_array_index(
+                ctx->logical_access_facts, OspreyLogicalAccess, j);
+            if (osprey_logical_access_equal(committed, sample)) {
+                committed->dynamic_count = sat_add_u32(
+                    committed->dynamic_count, sample->dynamic_count);
+                committed->sample_support = sat_add_u32(
+                    committed->sample_support, 1);
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            OspreyLogicalAccess copy = *sample;
+            copy.sample_support = 1;
+            g_array_append_val(ctx->logical_access_facts, copy);
+        }
+    }
+    g_array_sort(ctx->logical_access_facts, osprey_logical_access_compare);
+}
+
 /* Merge one fact family from a table (suffix or prefix family) into
  * the committed parent arrays.  `sample_from` is the parent-array index
  * where this sample's first pass started: a record equal to an entry
@@ -3446,6 +3522,12 @@ OspreyStatus osprey_parent_merge_sample(OspreyContext *ctx,
         return OSPREY_INCOMPLETE_FACTS;
     }
 
+    /* Construct this before mutating any committed array.  The full
+     * shared-run validation above is the complete rejection boundary for
+     * the sample; the derived table is committed alongside the fact
+     * families below. */
+    GArray *sample_logical_accesses = build_sample_logical_accesses(run);
+
     /* Merge `prefix ∪ suffix` as exactly one unmodified sample: iterate
      * the suffix family first, then the frozen prefix family.  A record
      * present in both parts is the same fact within this sample: it
@@ -3507,6 +3589,13 @@ OspreyStatus osprey_parent_merge_sample(OspreyContext *ctx,
                                sample_from);
         merge_region_instances(ctx, run, OSPREY_TABLE_PREFIX_REGION,
                                OSPREY_TABLE_REGION, sample_from);
+    }
+
+    merge_logical_accesses(ctx, sample_logical_accesses);
+    g_array_free(sample_logical_accesses, TRUE);
+    if (ctx->relations != NULL) {
+        osprey_relations_free(ctx->relations);
+        ctx->relations = NULL;
     }
 
     ctx->total_samples = sat_add_u64(ctx->total_samples, 1);
@@ -3829,7 +3918,7 @@ void osprey_dump_canonical(OspreyContext *ctx, const char *path) {
     fclose(f);
 }
 
-/* Analyze entry: Stage 2 deterministic closure, then (later stages)
+/* Analyze entry: Stage 3 deterministic construction, then (later stages)
  * inference and decoding. */
 OspreyStatus osprey_analyze(OspreyContext *ctx) {
     if (ctx == NULL || !ctx->config.enabled) return OSPREY_DISABLED;
@@ -3840,22 +3929,33 @@ OspreyStatus osprey_analyze(OspreyContext *ctx) {
     if (!osprey_tx_ok(ctx)) return osprey_tx_status(ctx);
     ctx->tx_model_ready = false;
 
+    /* Stage 3.1 is independent of predicate/factor construction.  Build
+     * its immutable parent-local relations first so later rule stages do
+     * not rescan class-specific F01 rows. */
+    OspreyStatus relation_status = osprey_relations_build(ctx);
+    if (relation_status != OSPREY_OK) {
+        osprey_tx_reject(ctx, relation_status, "relations",
+                         "deterministic relation construction failed");
+        return relation_status;
+    }
+
     /* Fresh graph per transaction, built off to the side.  The
      * committed graph is replaced only on success. */
     OspreyGraph *old_graph = ctx->graph;
     ctx->staged_graph = osprey_graph_new();
     ctx->graph = ctx->staged_graph;
 
-    OspreyStatus st = osprey_stage2_closure(ctx);
+    OspreyStatus st = osprey_stage3_base(ctx);
     if (st != OSPREY_OK && st != OSPREY_DISABLED) {
-        osprey_tx_reject(ctx, st, "closure", "stage-2 closure failed");
+        osprey_tx_reject(ctx, st, "closure", "stage-3 base construction failed");
         goto fail;
     }
     /* Stage 3a: secondary deterministic rules (CB02-CB09, CC04/CC05,
      * CD07/CD08); CC07 folding happens after the first BP pass. */
-    st = osprey_stage2_secondary(ctx);
+    st = osprey_stage3_secondary(ctx);
     if (st != OSPREY_OK && st != OSPREY_DISABLED) {
-        osprey_tx_reject(ctx, st, "secondary", "stage-2 secondary failed");
+        osprey_tx_reject(ctx, st, "secondary",
+                         "stage-3 secondary construction failed");
         goto fail;
     }
     /* Stage 3b: exact component solving + loopy BP + CC07 folding. */
@@ -3887,7 +3987,7 @@ OspreyStatus osprey_analyze(OspreyContext *ctx) {
         goto fail;
     }
     osprey_tx_install(ctx);
-    log_msg("[osprey] [done] [status %d] [stages closure+secondary+infer+decode]\n",
+    log_msg("[osprey] [done] [status %d] [stages relations+base+secondary+infer+decode]\n",
             (int)st);
     return st;
 

@@ -26,15 +26,19 @@ OSPREY_OBJS := ../../build/x86_64-linux-user/linux-user/osprey.o \
                ../../build/x86_64-linux-user/linux-user/osprey-rules.o \
                ../../build/x86_64-linux-user/linux-user/osprey-infer.o \
                ../../build/x86_64-linux-user/linux-user/osprey-decode.o \
+               ../../build/x86_64-linux-user/linux-user/osprey-relations.o \
                ../../build/x86_64-linux-user/linux-user/provenance.o \
                ../../build/x86_64-linux-user/linux-user/sem-events.o
 UNIT_BIN   := $(WORK)/osprey_unit
 UNIT_ASAN_BIN := $(WORK)/osprey_unit_asan
+REL_UNIT_BIN := $(WORK)/stage3_relations
+REL_ASAN_BIN := $(WORK)/stage3_relations_asan
 OSPREY_SRCS := ../../linux-user/osprey.c \
                ../../linux-user/osprey-facts.c \
                ../../linux-user/osprey-rules.c \
                ../../linux-user/osprey-infer.c \
                ../../linux-user/osprey-decode.c \
+               ../../linux-user/osprey-relations.c \
                ../../linux-user/provenance.c \
                ../../linux-user/sem-events.c
 OSPREY_HEADERS := ../../linux-user/osprey.h \
@@ -65,9 +69,11 @@ TESTS := osprey_deref t01_regions t01_clone t02_chunk_widths t04_mpx t05_enter_f
 GUEST_BINS := $(addprefix $(WORK)/,$(TESTS))
 PLT_FILES  := $(addprefix $(WORK)/,$(addsuffix .plt,$(TESTS)))
 
-.PHONY: check inventory run unit unit-asan unit-asan-osprey guests plts clean
-check: inventory run unit unit-asan-osprey
-run unit unit-asan-osprey: inventory
+.PHONY: check inventory run unit unit-asan unit-asan-osprey \
+        unit-stage3-relations unit-stage3-relations-asan guests plts clean
+check: inventory run unit unit-asan-osprey unit-stage3-relations \
+       unit-stage3-relations-asan
+run unit unit-asan-osprey unit-stage3-relations unit-stage3-relations-asan: inventory
 inventory:
 	@python3 $(INVENTORY)
 run: guests plts
@@ -135,6 +141,24 @@ $(WORK)/%.plt: $(WORK)/% $(GEN_PLT)
 
 $(UNIT_BIN): unit_test.c $(OSPREY_OBJS) | $(WORK)
 	$(CC) $(UNIT_CFLAGS) -o $@ unit_test.c $(OSPREY_OBJS) \
+		-lglib-2.0 -lpthread -lm
+
+unit-stage3-relations: $(REL_UNIT_BIN)
+	@$(REL_UNIT_BIN)
+
+$(REL_UNIT_BIN): stage3_relations_test.c stage3_reference.c \
+		stage3_test_support.c $(OSPREY_OBJS) | $(WORK)
+	$(CC) $(UNIT_CFLAGS) -o $@ stage3_relations_test.c \
+		stage3_reference.c stage3_test_support.c $(OSPREY_OBJS) \
+		-lglib-2.0 -lpthread -lm
+
+unit-stage3-relations-asan: $(REL_ASAN_BIN)
+	@ASAN_OPTIONS=detect_leaks=1 $(REL_ASAN_BIN)
+
+$(REL_ASAN_BIN): stage3_relations_test.c stage3_reference.c \
+		stage3_test_support.c $(OSPREY_ASAN_OBJS) | $(WORK)
+	$(CC) $(ASAN_CFLAGS) -o $@ stage3_relations_test.c \
+		stage3_reference.c stage3_test_support.c $(OSPREY_ASAN_OBJS) \
 		-lglib-2.0 -lpthread -lm
 
 $(UNIT_ASAN_BIN): unit_test.c $(OSPREY_OBJS) | $(WORK)
