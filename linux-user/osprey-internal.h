@@ -150,16 +150,22 @@ typedef struct OspreyPointsToFact {
 
 typedef struct OspreyMallocFact {
     uint64_t site_pc;          /* normalized allocator call site */
-    int64_t requested_size;    /* -1 == failed; 0 == zero-size success */
+    uint64_t requested_size;   /* successful-request bytes only
+                                * (0 == zero-size success); failed
+                                * calls are diagnostics, never facts */
     uint32_t sample_support;
     uint32_t reserved;
 } OspreyMallocFact;
 
+/* MayArray evidence kinds (Stage 2.5): only checked positive calloc
+ * geometry is published. */
+#define OSPREY_MAY_ARRAY_CALLOC_GEOMETRY 0u
+
 typedef struct OspreyMayArrayFact {
     OspreyAddress start;
-    uint32_t element_count;
-    uint32_t element_size;
-    uint32_t evidence_kind;      /* 0 = allocation-argument heuristic */
+    uint64_t element_count;    /* positive calloc count */
+    uint64_t element_size;     /* positive calloc element size */
+    uint32_t evidence_kind;    /* OSPREY_MAY_ARRAY_* */
     uint32_t sample_support;
 } OspreyMayArrayFact;
 
@@ -305,7 +311,7 @@ typedef struct OspreyCpuOriginState {
 /* Shared run (fixed layout, no pointers)                              */
 /* ------------------------------------------------------------------ */
 
-#define OSPREY_SHARED_VERSION 9u
+#define OSPREY_SHARED_VERSION 10u
 
 struct OspreySharedRun {
     uint32_t version;

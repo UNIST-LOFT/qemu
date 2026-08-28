@@ -2193,27 +2193,85 @@ static void record_region_instance(const OspreyRegionId *region,
     qemu_mutex_unlock(&g_shared_mutex);
 }
 
-void osprey_on_alloc_success(CPUArchState *env, target_ulong base,
-                             target_ulong size, target_ulong site_pc,
+void osprey_on_alloc_success(CPUArchState *env,
+                             const OspreyAllocatorObservation *obs,
+                             target_ulong base,
                              uint64_t object_id, uint32_t generation) {
-    if (base == 0 && size != 0) return; /* failure: no object */
+    if (obs == NULL) {
+        if (g_shared_run != NULL) {
+            g_shared_run->bad_identity = 1;
+        }
+        return;
+    }
+    if (obs->kind != OSPREY_ALLOCATOR_MALLOC &&
+        obs->kind != OSPREY_ALLOCATOR_CALLOC &&
+        obs->kind != OSPREY_ALLOCATOR_REALLOC) {
+        if (g_shared_run != NULL) {
+            g_shared_run->bad_identity = 1;
+        }
+        return;
+    }
+    uint64_t norm_pc = 0;
+    if (!osprey_normalize_pc(obs->site_pc, &norm_pc)) {
+        /* Allocation from out-of-image code (libc-internal): the site
+         * is not part of the main image; record nothing. */
+        return;
+    }
     uint64_t raw_base = (uint64_t)base;
-    uint64_t raw_size = (uint64_t)size;
+    uint64_t raw_size = (uint64_t)obs->requested_size;
+    bool positive_calloc = false;
+
+    /* Kind-specific payload validation precedes every publication.
+     * Overflow is meaningful only for calloc.  A disagreeing overflow
+     * flag or product is malformed event identity; an actual product
+     * overflow is arithmetic failure. */
+    if (obs->kind != OSPREY_ALLOCATOR_CALLOC) {
+        if (obs->overflowed || obs->element_count != 0 ||
+            obs->element_size != 0) {
+            if (g_shared_run != NULL) {
+                g_shared_run->bad_identity = 1;
+            }
+            return;
+        }
+    } else {
+        uint64_t product;
+        bool product_overflow = __builtin_mul_overflow(
+            (uint64_t)obs->element_count,
+            (uint64_t)obs->element_size, &product);
+        if (product_overflow) {
+            if (g_shared_run != NULL) {
+                g_shared_run->bad_arithmetic = 1;
+            }
+            return;
+        }
+        if (obs->overflowed || product != raw_size) {
+            if (g_shared_run != NULL) {
+                g_shared_run->bad_identity = 1;
+            }
+            return;
+        }
+        positive_calloc = obs->element_count > 0 && obs->element_size > 0;
+    }
+
+    /* A success event always represents a non-NULL allocation object,
+     * including zero-size success.  NULL outcomes belong exclusively to
+     * the diagnostic path. */
+    if (base == 0) {
+        if (g_shared_run != NULL) {
+            g_shared_run->bad_identity = 1;
+        }
+        return;
+    }
     if (raw_size > INT64_MAX || raw_base > UINT64_MAX - raw_size) {
         if (g_shared_run != NULL) {
             g_shared_run->bad_arithmetic = 1;
         }
         return;
     }
-    uint64_t norm_pc = 0;
-    if (!osprey_normalize_pc(site_pc, &norm_pc)) {
-        /* Allocation from out-of-image code (libc-internal): the site
-         * is not part of the main image; record nothing. */
-        return;
-    }
     ProvenanceObject *obj = provenance_lookup_object(object_id, generation);
     if (obj == NULL || obj->state != PROV_OBJ_LIVE || obj->base != base ||
-        obj->requested_size != size || obj->alloc_pc != site_pc) {
+        obj->requested_size != obs->requested_size ||
+        obj->alloc_pc != obs->site_pc) {
         if (g_shared_run != NULL) {
             g_shared_run->bad_identity = 1;
         }
@@ -2230,7 +2288,7 @@ void osprey_on_alloc_success(CPUArchState *env, target_ulong base,
     h.region.site_offset = norm_pc;
     h.instance_id = g_next_heap_instance++;
     h.base = base;
-    h.size = size;
+    h.size = obs->requested_size;
     h.prov_object_id = object_id;
     h.prov_generation = generation;
     h.live = true;
@@ -2246,7 +2304,7 @@ void osprey_on_alloc_success(CPUArchState *env, target_ulong base,
         OspreyMallocFact fact;
         memset(&fact, 0, sizeof(fact));
         fact.site_pc = norm_pc;
-        fact.requested_size = (int64_t)size;
+        fact.requested_size = raw_size;
         fact.sample_support = 1;
         qemu_mutex_lock(&g_shared_mutex);
         osprey_table_insert_alloc(run, &fact);
@@ -2272,20 +2330,19 @@ void osprey_on_alloc_success(CPUArchState *env, target_ulong base,
         o->prov_generation = generation;
     }
 
-    /* F06 MayArray: the allocation-argument heuristic records the
-     * requested element geometry when the site is a two-argument
-     * calloc-style call.  Calloc is modeled with total size in the
-     * pending op; the count/size split is not recoverable here, so the
-     * fact records a single element of the requested size (kind 0). */
-    if (run != NULL) {
+    /* F06 MayArray: only checked positive calloc geometry is evidence.
+     * malloc/realloc never emit F06; zero-count/zero-element calloc
+     * emits F05 only.  The canonical start is the new heap region at
+     * offset zero; instance IDs and raw bases never enter identity. */
+    if (run != NULL && obs->kind == OSPREY_ALLOCATOR_CALLOC &&
+        positive_calloc) {
         OspreyMayArrayFact mf;
         memset(&mf, 0, sizeof(mf));
         mf.start.region = h.region;
         mf.start.offset = 0;
-        mf.element_count = 1;
-        mf.element_size = (uint32_t)(size > 0xffffffffu
-                                     ? 0xffffffffu : size);
-        mf.evidence_kind = 1; /* direct allocation-size evidence */
+        mf.element_count = (uint64_t)obs->element_count;
+        mf.element_size = (uint64_t)obs->element_size;
+        mf.evidence_kind = OSPREY_MAY_ARRAY_CALLOC_GEOMETRY;
         mf.sample_support = 1;
         qemu_mutex_lock(&g_shared_mutex);
         osprey_table_insert_mayarray(run, &mf);
@@ -2293,23 +2350,24 @@ void osprey_on_alloc_success(CPUArchState *env, target_ulong base,
     }
 }
 
-void osprey_on_alloc_failure(CPUArchState *env, target_ulong site_pc) {
-    (void)env;
-    uint64_t norm_pc = 0;
-    if (!osprey_normalize_pc(site_pc, &norm_pc)) {
+void osprey_on_alloc_failure(const OspreyAllocatorObservation *obs) {
+    if (obs == NULL) {
         return;
     }
-    OspreySharedRun *run = g_shared_run;
-    if (run != NULL) {
-        OspreyMallocFact fact;
-        memset(&fact, 0, sizeof(fact));
-        fact.site_pc = norm_pc;
-        fact.requested_size = -1; /* explicit failure state */
-        fact.sample_support = 1;
-        qemu_mutex_lock(&g_shared_mutex);
-        osprey_table_insert_alloc(run, &fact);
-        qemu_mutex_unlock(&g_shared_mutex);
+    /* Stable diagnostic only: normalized site, allocator kind,
+     * operands, and overflow status.  No shared fact state is touched
+     * (no table insert, no sample support, no census). */
+    uint64_t norm_pc = 0;
+    if (!osprey_normalize_pc(obs->site_pc, &norm_pc)) {
+        return;
     }
+    log_msg("[osprey] [alloc-failure] [site %llx] [kind %d] [size %llu] "
+            "[count %llu] [element %llu] [overflow %d]\n",
+             (unsigned long long)norm_pc, (int)obs->kind,
+             (unsigned long long)obs->requested_size,
+             (unsigned long long)obs->element_count,
+             (unsigned long long)obs->element_size,
+             obs->overflowed ? 1 : 0);
 }
 
 /* Retire the heap instance whose provenance identity matches.  Returns
@@ -2963,6 +3021,63 @@ static bool run_table_contains(const OspreySharedRun *run, int table,
     return false;
 }
 
+/* Stage 2.5 fixed-record semantics.  Production emits F05 and F06
+ * together from one validated calloc success, but the parent still
+ * validates child transport before committing it or exposing it to the
+ * signed canonical-offset rule code. */
+static bool osprey_run_allocator_facts_valid(const OspreySharedRun *run) {
+    static const int alloc_tables[] = {
+        OSPREY_TABLE_ALLOC, OSPREY_TABLE_PREFIX_ALLOC,
+    };
+    static const int may_tables[] = {
+        OSPREY_TABLE_MAYARR, OSPREY_TABLE_PREFIX_MAYARR,
+    };
+
+    for (size_t i = 0; i < G_N_ELEMENTS(alloc_tables); i++) {
+        OspreyRunIter it = { .run = run, .table = alloc_tables[i] };
+        const void *record;
+        while (osprey_run_iter_next(&it, &record)) {
+            const OspreyMallocFact *f = record;
+            if (f->requested_size > INT64_MAX || f->reserved != 0) {
+                return false;
+            }
+        }
+    }
+
+    for (size_t i = 0; i < G_N_ELEMENTS(may_tables); i++) {
+        OspreyRunIter it = { .run = run, .table = may_tables[i] };
+        const void *record;
+        while (osprey_run_iter_next(&it, &record)) {
+            const OspreyMayArrayFact *f = record;
+            uint64_t total;
+            if (f->start.region.kind != OSPREY_REGION_HEAP_SITE ||
+                f->start.region.code_image_id != 0 ||
+                f->start.offset != 0 || f->element_count == 0 ||
+                f->element_size == 0 ||
+                f->evidence_kind != OSPREY_MAY_ARRAY_CALLOC_GEOMETRY ||
+                __builtin_mul_overflow(f->element_count, f->element_size,
+                                       &total) ||
+                total > INT64_MAX) {
+                return false;
+            }
+            OspreyMallocFact alloc;
+            memset(&alloc, 0, sizeof(alloc));
+            alloc.site_pc = f->start.region.site_offset;
+            alloc.requested_size = total;
+            alloc.sample_support = 1;
+            if (!run_table_contains(run, OSPREY_TABLE_ALLOC, &alloc,
+                                    (HashFn)osprey_alloc_hash,
+                                    (VerifyFn)osprey_alloc_eq) &&
+                !run_table_contains(run, OSPREY_TABLE_PREFIX_ALLOC, &alloc,
+                                    (HashFn)osprey_alloc_hash,
+                                    (VerifyFn)osprey_alloc_eq)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 /* Validate the maintained unique-fact counter against the actual
  * `prefix ∪ suffix` population.  A corrupted or stale counter must not
  * weaken max_facts or reject a valid duplicate at the cap. */
@@ -3325,6 +3440,11 @@ OspreyStatus osprey_parent_merge_sample(OspreyContext *ctx,
                          "unique fact count does not match population");
         return OSPREY_INCOMPLETE_FACTS;
     }
+    if (!osprey_run_allocator_facts_valid(run)) {
+        osprey_tx_reject(ctx, OSPREY_INCOMPLETE_FACTS, "merge",
+                         "invalid allocator fact record");
+        return OSPREY_INCOMPLETE_FACTS;
+    }
 
     /* Merge `prefix ∪ suffix` as exactly one unmodified sample: iterate
      * the suffix family first, then the frozen prefix family.  A record
@@ -3423,6 +3543,45 @@ OspreyStatus osprey_parent_merge_sample(OspreyContext *ctx,
  * stable function of the merged facts only: no raw addresses, no
  * pointer values, no hash iteration order.  Used by the t01_regions
  * harness to assert byte-identical output across ASLR/PIE runs. */
+/* Canonical alloc rows sort by every printed field: site, requested
+ * size, support. */
+static gint osprey_alloc_dump_cmp(gconstpointer ap, gconstpointer bp) {
+    const OspreyMallocFact *a = ap;
+    const OspreyMallocFact *b = bp;
+#define CMP(_field) do { \
+        uint64_t av = (uint64_t)(a->_field); \
+        uint64_t bv = (uint64_t)(b->_field); \
+        if (av != bv) return av < bv ? -1 : 1; \
+    } while (0)
+    CMP(site_pc);
+    CMP(requested_size);
+    CMP(sample_support);
+#undef CMP
+    return 0;
+}
+
+/* Canonical may-array rows sort by every printed field in schema
+ * order.  Signed offsets compare by their printed two's-complement
+ * uint64_t representation, matching base/copy/points behavior. */
+static gint osprey_mayarray_dump_cmp(gconstpointer ap, gconstpointer bp) {
+    const OspreyMayArrayFact *a = ap;
+    const OspreyMayArrayFact *b = bp;
+#define CMP(_field) do { \
+        uint64_t av = (uint64_t)(a->_field); \
+        uint64_t bv = (uint64_t)(b->_field); \
+        if (av != bv) return av < bv ? -1 : 1; \
+    } while (0)
+    CMP(start.region.kind);
+    CMP(start.region.site_offset);
+    CMP(start.offset);
+    CMP(element_count);
+    CMP(element_size);
+    CMP(evidence_kind);
+    CMP(sample_support);
+#undef CMP
+    return 0;
+}
+
 void osprey_dump_canonical(OspreyContext *ctx, const char *path) {
     if (ctx == NULL || path == NULL) return;
     FILE *f = fopen(path, "w");
@@ -3619,7 +3778,9 @@ void osprey_dump_canonical(OspreyContext *ctx, const char *path) {
         g_array_free(rows, TRUE);
     }
 
-    /* Alloc facts: sorted by (site_pc, requested_size). */
+    /* Alloc facts: sorted by every printed field (site, requested
+     * size, support).  Successful requested sizes only; failed calls
+     * are diagnostics, never facts. */
     {
         GArray *rows = g_array_new(FALSE, FALSE, sizeof(OspreyMallocFact));
         for (guint i = 0; i < ctx->alloc_facts->len; i++) {
@@ -3627,28 +3788,40 @@ void osprey_dump_canonical(OspreyContext *ctx, const char *path) {
                                                  OspreyMallocFact, i);
             g_array_append_val(rows, *a);
         }
-        for (guint i = 1; i < rows->len; i++) {
-            OspreyMallocFact key = g_array_index(rows, OspreyMallocFact, i);
-            guint j = i;
-            while (j > 0) {
-                OspreyMallocFact *prev = &g_array_index(rows,
-                                                        OspreyMallocFact, j - 1);
-                if (prev->site_pc < key.site_pc ||
-                    (prev->site_pc == key.site_pc &&
-                     prev->requested_size < key.requested_size)) {
-                    break;
-                }
-                g_array_index(rows, OspreyMallocFact, j) = *prev;
-                j--;
-            }
-            g_array_index(rows, OspreyMallocFact, j) = key;
-        }
+        g_array_sort(rows, osprey_alloc_dump_cmp);
         for (guint i = 0; i < rows->len; i++) {
             OspreyMallocFact *a = &g_array_index(rows, OspreyMallocFact, i);
-            fprintf(f, "alloc %llx %lld %u\n",
+            fprintf(f, "alloc %llx %llu %u\n",
                     (unsigned long long)a->site_pc,
-                    (long long)a->requested_size,
+                    (unsigned long long)a->requested_size,
                     (unsigned)a->sample_support);
+        }
+        g_array_free(rows, TRUE);
+    }
+
+    /* May-array facts: sorted by every printed field in schema order
+     * (start kind, start site, start offset, element count, element
+     * size, evidence kind, support). */
+    {
+        GArray *rows = g_array_new(FALSE, FALSE, sizeof(OspreyMayArrayFact));
+        for (guint i = 0; i < ctx->mayarray_facts->len; i++) {
+            OspreyMayArrayFact *m = &g_array_index(ctx->mayarray_facts,
+                                                   OspreyMayArrayFact, i);
+            g_array_append_val(rows, *m);
+        }
+        g_array_sort(rows, osprey_mayarray_dump_cmp);
+        for (guint i = 0; i < rows->len; i++) {
+            OspreyMayArrayFact *m = &g_array_index(rows, OspreyMayArrayFact,
+                                                   i);
+            fprintf(f,
+                    "may-array %u %llx %llx %llu %llu %u %u\n",
+                    (unsigned)m->start.region.kind,
+                    (unsigned long long)m->start.region.site_offset,
+                    (unsigned long long)(uint64_t)m->start.offset,
+                    (unsigned long long)m->element_count,
+                    (unsigned long long)m->element_size,
+                    (unsigned)m->evidence_kind,
+                    (unsigned)m->sample_support);
         }
         g_array_free(rows, TRUE);
     }

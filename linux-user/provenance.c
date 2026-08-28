@@ -228,6 +228,8 @@ void provenance_set_pending(CPUArchState *env, ProvenancePendingKind kind,
     shadow->pending.arg_ptr = arg_ptr;
     shadow->pending.old_object_id = 0;
     shadow->pending.old_generation = 0;
+    shadow->pending.calloc_count = 0;
+    shadow->pending.calloc_element_size = 0;
 }
 
 ProvenancePending provenance_get_pending(CPUArchState *env,

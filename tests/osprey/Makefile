@@ -60,7 +60,7 @@ CC        ?= gcc
 CFLAGS    := -O0 -g -fno-pie -no-pie -fno-stack-protector -U_FORTIFY_SOURCE -fno-builtin
 LDFLAGS   := -no-pie
 
-TESTS := osprey_deref t01_regions t01_clone t02_chunk_widths t04_mpx t05_enter_fault t06_control_reject t07_legacy_width_reject t08_bound_reject t09_address_origins t10_value_origins t11_modeled_copies
+TESTS := osprey_deref t01_regions t01_clone t02_chunk_widths t04_mpx t05_enter_fault t06_control_reject t07_legacy_width_reject t08_bound_reject t09_address_origins t10_value_origins t11_modeled_copies t12_allocator_facts
 
 GUEST_BINS := $(addprefix $(WORK)/,$(TESTS))
 PLT_FILES  := $(addprefix $(WORK)/,$(addsuffix .plt,$(TESTS)))
@@ -84,8 +84,8 @@ plts: $(PLT_FILES)
 $(WORK)/%: $(GUESTS)/%.c | $(WORK)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<
 
-# Stage-1 ASLR gate: canonical facts from two independent PIE runs must
-# be byte-identical even though raw stack/heap/image addresses differ.
+# Canonical F01-F06 ASLR gate: facts from independent PIE runs must be
+# byte-identical even though raw stack/heap/image addresses differ.
 $(WORK)/t01_regions: $(GUESTS)/t01_regions.c | $(WORK)
 	$(CC) -O0 -g -fPIE -pie -fno-stack-protector \
 		-U_FORTIFY_SOURCE -fno-builtin -o $@ $<
@@ -122,6 +122,11 @@ $(WORK)/t10_value_origins: $(GUESTS)/t10_value_origins.c | $(WORK)
 		-U_FORTIFY_SOURCE -fno-builtin -o $@ $<
 
 $(WORK)/t11_modeled_copies: $(GUESTS)/t11_modeled_copies.c | $(WORK)
+	$(CC) -O0 -g -fPIE -pie -fno-omit-frame-pointer -fno-stack-protector \
+		-U_FORTIFY_SOURCE -fno-builtin -o $@ $<
+
+# t12_allocator_facts: exact Stage-2.5 malloc/calloc/realloc matrix.
+$(WORK)/t12_allocator_facts: $(GUESTS)/t12_allocator_facts.c | $(WORK)
 	$(CC) -O0 -g -fPIE -pie -fno-omit-frame-pointer -fno-stack-protector \
 		-U_FORTIFY_SOURCE -fno-builtin -o $@ $<
 

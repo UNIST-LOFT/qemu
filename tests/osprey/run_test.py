@@ -83,7 +83,8 @@ TESTS = [
         # file.  The lifecycle rows are deterministic: two live
         # allocations at one site (1f8), successful same-base reuse
         # (2af), forced-move realloc 16 -> 1 MiB (2e5 -> 312), failed
-        # realloc preserving the old identity (348, alloc 377 -1),
+        # realloc preserving the old identity (348, no alloc row at
+        # failure site 377),
         # realloc(p,0) (3ad), zero-size non-NULL malloc(0) (3e8), and
         # a RET-imm callee whose following stack access proves the caller
         # activation survived.  The checked-in file owns exact row values;
@@ -730,8 +731,8 @@ TESTS = [
         name="t11_modeled_copies_combined",
         guest="t11_modeled_copies",
         mode="dump_compare",
-        # The same exact modeled-copy dump must remain stable when
-        # provenance and OSPREY consume the neutral events together.
+        # The same exact modeled-copy dump must remain stable when provenance
+        # and OSPREY consume the neutral events together.
         memcheck=1,
         env={"BINRADAR_OSPREY_MAX_VARIABLES": "1"},
         dump_stem="t11_combined_dump",
@@ -746,6 +747,107 @@ TESTS = [
             "points_expected": [
                 ("g_pointer_slot2", "alloc_36d"),
             ],
+        },
+        timeout=60,
+    ),
+    dict(
+        name="t12_allocator_facts",
+        mode="dump_compare",
+        memcheck=0,
+        env={"BINRADAR_OSPREY_MAX_VARIABLES": "1"},
+        dump_stem="t12_dump",
+        expected="t12_allocator_facts.expected",
+        rc=(2,),
+        dump_assert={
+            "allocator_rows_expected": [
+                (0x1e5, 0, 1), (0x1e5, 8, 1), (0x1e5, 16, 1),
+                (0x1e5, 24, 1), (0x1e5, 32, 1), (0x1e5, 40, 1),
+                (0x1e5, 48, 1), (0x20e, 0, 1), (0x20e, 24, 1),
+                (0x20e, 48, 1), (0x237, 80, 1),
+            ],
+            "allocator_sites_absent": [0x260, 0x289],
+            "allocator_support": 1,
+            "may_array_rows_expected": [
+                (1, 0x20e, 0, 1, 24, 0, 1),
+                (1, 0x20e, 0, 2, 24, 0, 1),
+                (1, 0x20e, 0, 3, 16, 0, 1),
+            ],
+            "may_array_sites": [0x20e],
+            "may_array_sites_absent": [0x1e5, 0x237],
+            "heap_extents_expected": [(0x1e5, 8), (0x1e5, 0),
+                                       (0x20e, 0), (0x237, 0x50)],
+            "heap_extent_counts_exact": [
+                (0x1e5, 0x0, 1), (0x1e5, 0x8, 2),
+                (0x1e5, 0x10, 1), (0x1e5, 0x18, 3),
+                (0x1e5, 0x20, 1), (0x1e5, 0x28, 1),
+                (0x1e5, 0x30, 1), (0x20e, 0x0, 2),
+                (0x20e, 0x18, 1), (0x20e, 0x30, 3),
+                (0x237, 0x50, 1),
+            ],
+            "heap_sites_absent": [0x260, 0x289],
+            "access_symbols_expected": {
+                "t12_realloc_success_access": {
+                    "min_rows": 1, "max_rows": 1, "is_store": 1,
+                    "size": 1, "region_kind": 1, "region_site": 0x237,
+                    "offset": 0, "support": 1,
+                },
+                "t12_failed_realloc_survivor_access": {
+                    "min_rows": 1, "max_rows": 1, "is_store": 1,
+                    "size": 1, "region_kind": 1, "region_site": 0x1E5,
+                    "offset": 0, "support": 1,
+                },
+            },
+        },
+        timeout=60,
+    ),
+    dict(
+        name="t12_allocator_facts_combined",
+        guest="t12_allocator_facts",
+        mode="dump_compare",
+        memcheck=1,
+        env={"BINRADAR_OSPREY_MAX_VARIABLES": "1"},
+        dump_stem="t12_combined_dump",
+        expected="t12_allocator_facts.expected",
+        rc=(2,),
+        dump_assert={
+            "allocator_rows_expected": [
+                (0x1e5, 0, 1), (0x1e5, 8, 1), (0x1e5, 16, 1),
+                (0x1e5, 24, 1), (0x1e5, 32, 1), (0x1e5, 40, 1),
+                (0x1e5, 48, 1), (0x20e, 0, 1), (0x20e, 24, 1),
+                (0x20e, 48, 1), (0x237, 80, 1),
+            ],
+            "allocator_sites_absent": [0x260, 0x289],
+            "allocator_support": 1,
+            "may_array_rows_expected": [
+                (1, 0x20e, 0, 1, 24, 0, 1),
+                (1, 0x20e, 0, 2, 24, 0, 1),
+                (1, 0x20e, 0, 3, 16, 0, 1),
+            ],
+            "may_array_sites": [0x20e],
+            "may_array_sites_absent": [0x1e5, 0x237],
+            "heap_extents_expected": [(0x1e5, 8), (0x1e5, 0),
+                                       (0x20e, 0), (0x237, 0x50)],
+            "heap_extent_counts_exact": [
+                (0x1e5, 0x0, 1), (0x1e5, 0x8, 2),
+                (0x1e5, 0x10, 1), (0x1e5, 0x18, 3),
+                (0x1e5, 0x20, 1), (0x1e5, 0x28, 1),
+                (0x1e5, 0x30, 1), (0x20e, 0x0, 2),
+                (0x20e, 0x18, 1), (0x20e, 0x30, 3),
+                (0x237, 0x50, 1),
+            ],
+            "heap_sites_absent": [0x260, 0x289],
+            "access_symbols_expected": {
+                "t12_realloc_success_access": {
+                    "min_rows": 1, "max_rows": 1, "is_store": 1,
+                    "size": 1, "region_kind": 1, "region_site": 0x237,
+                    "offset": 0, "support": 1,
+                },
+                "t12_failed_realloc_survivor_access": {
+                    "min_rows": 1, "max_rows": 1, "is_store": 1,
+                    "size": 1, "region_kind": 1, "region_site": 0x1E5,
+                    "offset": 0, "support": 1,
+                },
+            },
         },
         timeout=60,
     ),
@@ -995,11 +1097,11 @@ def run_test(test, workdir, qemu, solver):
 
 
 def run_dump_compare(test, workdir, qemu, solver):
-    """Stage-1 canonical-dump gate: run the guest under three distinct
+    """Canonical F01-F06 dump gate: run the guest under three distinct
     PIE load biases (default + two forced BINRADAR_MMAP_START values),
     require byte-identical dumps (ASLR invariance), then compare every
-    dump against the checked-in exact canonical rows
-    (t01_regions.expected).  Returns (tracer_rc, stderr_text)."""
+    dump against its checked-in exact canonical rows.  Returns
+    (tracer_rc, stderr_text)."""
     guest = os.path.join(workdir, test.get("guest", test["name"]))
     if not os.path.isfile(guest):
         return (None, f"guest binary missing: {guest} (run 'make guests')")
@@ -1064,16 +1166,237 @@ def run_dump_compare(test, workdir, qemu, solver):
     return (rcs[-1], outs[0])
 
 
+def parse_canonical_dump(dump):
+    """Parse and validate the complete canonical F01-F06 dump.
+
+    The C dumper owns canonical ordering; this parser is intentionally
+    independent and rejects malformed rows, duplicate logical keys,
+    non-positive support, and calloc geometry that has no matching F05.
+    """
+    family_order = {
+        "region": 0, "access": 1, "base": 2, "copy": 3,
+        "points": 4, "alloc": 5, "may-array": 6,
+    }
+    records = {name: [] for name in family_order}
+    seen = {name: set() for name in family_order}
+    problems = []
+    previous_family = -1
+    previous_sort = {name: None for name in family_order}
+
+    def decimal(token):
+        if not token or not token.isascii() or not token.isdecimal():
+            raise ValueError("not canonical decimal")
+        value = int(token, 10)
+        if value > (1 << 64) - 1:
+            raise ValueError("decimal exceeds uint64")
+        return value
+
+    def hexadecimal(token):
+        if not token or any(ch not in "0123456789abcdefABCDEF"
+                            for ch in token):
+            raise ValueError("not canonical hexadecimal")
+        value = int(token, 16)
+        if value > (1 << 64) - 1:
+            raise ValueError("hexadecimal exceeds uint64")
+        return value
+
+    def bounded_support(token):
+        value = decimal(token)
+        if value == 0 or value > (1 << 32) - 1:
+            raise ValueError("support is outside 1..UINT32_MAX")
+        return value
+
+    def kind(token):
+        value = decimal(token)
+        if value > 2:
+            raise ValueError("region kind is outside 0..2")
+        return value
+
+    def add_record(tag, row, values, logical_key, sort_key):
+        nonlocal previous_family
+        family = family_order[tag]
+        if family < previous_family:
+            problems.append(f"line {line_no}: family {tag} is out of order")
+        previous_family = max(previous_family, family)
+        prior = previous_sort[tag]
+        if prior is not None and sort_key < prior:
+            problems.append(f"line {line_no}: {tag} rows are not sorted")
+        previous_sort[tag] = sort_key
+        if logical_key in seen[tag]:
+            problems.append(f"line {line_no}: duplicate {tag} logical key")
+        seen[tag].add(logical_key)
+        records[tag].append({"tokens": row, "values": values,
+                             "logical_key": logical_key, "sort_key": sort_key})
+
+    for line_no, line in enumerate(dump.splitlines(), 1):
+        row = line.split()
+        if not row:
+            problems.append(f"line {line_no}: blank canonical row")
+            continue
+        tag = row[0]
+        try:
+            if tag == "region":
+                if len(row) != 6:
+                    raise ValueError("expected 5 region fields")
+                values = (kind(row[1]), hexadecimal(row[2]), decimal(row[3]),
+                          decimal(row[4]), hexadecimal(row[5]))
+                if values[3] == 0:
+                    raise ValueError("region raw class is not positive")
+                add_record(tag, row, values, values[:3], values)
+            elif tag == "access":
+                if len(row) not in (8, 9):
+                    raise ValueError("expected 7 or 8 access fields")
+                op_class = 0 if len(row) == 8 else decimal(row[8])
+                if len(row) == 9 and op_class == 0:
+                    raise ValueError("class-zero access must use base schema")
+                values = (hexadecimal(row[1]), decimal(row[2]), kind(row[3]),
+                          hexadecimal(row[4]), hexadecimal(row[5]),
+                          decimal(row[6]), bounded_support(row[7]), op_class)
+                if values[1] > 1 or values[5] == 0:
+                    raise ValueError("invalid access direction or size")
+                logical_key = values[:6] + (values[7],)
+                sort_key = (values[0], values[1], values[7], values[2],
+                            values[3], values[4], values[5], values[6])
+                add_record(tag, row, values, logical_key, sort_key)
+            elif tag == "base":
+                if len(row) != 13:
+                    raise ValueError("expected 12 base fields")
+                values = (hexadecimal(row[1]), kind(row[2]),
+                          hexadecimal(row[3]), hexadecimal(row[4]),
+                          decimal(row[5]), kind(row[6]), hexadecimal(row[7]),
+                          hexadecimal(row[8]), decimal(row[9]), decimal(row[10]),
+                          hexadecimal(row[11]), bounded_support(row[12]))
+                if values[4] == 0:
+                    raise ValueError("base chunk size is not positive")
+                logical_key = values[:10]
+                add_record(tag, row, values, logical_key, values)
+            elif tag == "copy":
+                if len(row) != 10:
+                    raise ValueError("expected 9 copy fields")
+                values = (kind(row[1]), hexadecimal(row[2]), hexadecimal(row[3]),
+                          decimal(row[4]), kind(row[5]), hexadecimal(row[6]),
+                          hexadecimal(row[7]), decimal(row[8]),
+                          bounded_support(row[9]))
+                if values[3] == 0 or values[7] == 0:
+                    raise ValueError("copy chunk size is not positive")
+                add_record(tag, row, values, values[:8], values)
+            elif tag == "points":
+                if len(row) != 10:
+                    raise ValueError("expected 9 points fields")
+                values = (kind(row[1]), hexadecimal(row[2]), hexadecimal(row[3]),
+                          decimal(row[4]), kind(row[5]), hexadecimal(row[6]),
+                          hexadecimal(row[7]), bounded_support(row[8]),
+                          decimal(row[9]))
+                if values[3] == 0 or values[8] > (1 << 32) - 1:
+                    raise ValueError("invalid points size or weak evidence")
+                add_record(tag, row, values, values[:7], values)
+            elif tag == "alloc":
+                if len(row) != 4:
+                    raise ValueError("expected 3 alloc fields")
+                values = (hexadecimal(row[1]), decimal(row[2]),
+                          bounded_support(row[3]))
+                if values[1] > (1 << 63) - 1:
+                    raise ValueError("alloc size exceeds canonical int64 range")
+                add_record(tag, row, values, values[:2], values)
+            elif tag == "may-array":
+                if len(row) != 8:
+                    raise ValueError("expected 7 may-array fields")
+                values = (kind(row[1]), hexadecimal(row[2]),
+                          hexadecimal(row[3]), decimal(row[4]), decimal(row[5]),
+                          decimal(row[6]), bounded_support(row[7]))
+                if (values[0] != 1 or values[2] != 0 or
+                        values[3] == 0 or values[4] == 0 or values[5] != 0):
+                    raise ValueError("invalid calloc geometry row")
+                add_record(tag, row, values, values[:6], values)
+            else:
+                problems.append(f"line {line_no}: unknown canonical family {tag}")
+        except (TypeError, ValueError) as exc:
+            problems.append(f"line {line_no}: malformed {tag} row ({exc})")
+
+    alloc_keys = {(record["values"][0], record["values"][1])
+                  for record in records["alloc"]}
+    for record in records["may-array"]:
+        _kind, site, _offset, count, element_size, _evidence, _support = \
+            record["values"]
+        if count > ((1 << 64) - 1) // element_size:
+            problems.append("may-array product exceeds uint64")
+            continue
+        total = count * element_size
+        if total > (1 << 63) - 1:
+            problems.append("may-array product exceeds canonical int64 range")
+            continue
+        if (site, total) not in alloc_keys:
+            problems.append("may-array has no matching alloc total")
+
+    return records, problems
+
+
 def check_dump(test, dump, guest):
     """Structural assertions on the canonical dump."""
+    _parsed, parse_problems = parse_canonical_dump(dump)
+    if parse_problems:
+        return parse_problems
     want = test.get("dump_assert", {})
-    if not want:
-        return []
     problems = []
+
+    # Stage 2.5 exact allocator assertions.  The canonical parser above
+    # already owns schemas, ordering, uniqueness, support bounds, and F06
+    # product/F05 consistency; these checks own the fixture matrix.
+    alloc_values = [record["values"] for record in _parsed["alloc"]]
+    expected_alloc = want.get("allocator_rows_expected")
+    if expected_alloc is not None:
+        actual = sorted(alloc_values)
+        expected = sorted(tuple(row) for row in expected_alloc)
+        if actual != expected:
+            problems.append(f"allocator rows {actual} != {expected}")
+    for site in want.get("allocator_sites_absent", []):
+        if any(row[0] == site for row in alloc_values):
+            problems.append(f"allocator site {site:x} unexpectedly has F05")
+    if "allocator_support" in want:
+        support = want["allocator_support"]
+        if any(row[2] != support for row in alloc_values):
+            problems.append(f"allocator support is not {support}")
+
+    may_values = [record["values"] for record in _parsed["may-array"]]
+    expected_may = want.get("may_array_rows_expected")
+    if expected_may is not None:
+        actual = sorted(may_values)
+        expected = sorted(tuple(row) for row in expected_may)
+        if actual != expected:
+            problems.append(f"may-array rows {actual} != {expected}")
+    if want.get("may_array_sites", None) is not None:
+        sites = {row[1] for row in may_values}
+        expected_sites = set(want["may_array_sites"])
+        if sites != expected_sites:
+            problems.append(f"may-array sites {sorted(sites)} != "
+                            f"{sorted(expected_sites)}")
+    for site in want.get("may_array_sites_absent", []):
+        if any(row[1] == site for row in may_values):
+            problems.append(f"may-array site {site:x} unexpectedly present")
+
     regions = [ln.split() for ln in dump.splitlines() if ln.startswith("region ")]
     globals_rows = [r for r in regions if r[1] == "0"]
     heap_rows = [r for r in regions if r[1] == "1"]
     stack_rows = [r for r in regions if r[1] == "2"]
+
+    for site, extent in want.get("heap_extents_expected", []):
+        if not any(int(row[2], 16) == site and int(row[5], 16) == extent
+                   for row in heap_rows):
+            problems.append(f"heap site {site:x} lacks extent {extent:x}")
+    for site in want.get("heap_sites_absent", []):
+        if any(int(row[2], 16) == site for row in heap_rows):
+            problems.append(f"heap site {site:x} unexpectedly present")
+    if "heap_extent_counts_exact" in want:
+        from collections import Counter
+        actual = Counter((int(row[2], 16), int(row[5], 16))
+                         for row in heap_rows)
+        expected = Counter({(site, extent): count
+                            for site, extent, count
+                            in want["heap_extent_counts_exact"]})
+        if actual != expected:
+            problems.append(
+                f"heap extent counts {sorted(actual.items())} != "
+                f"{sorted(expected.items())}")
 
     if "global_rows" in want and len(globals_rows) != want["global_rows"]:
         problems.append(f"global rows {len(globals_rows)} != {want['global_rows']}")
@@ -1114,13 +1437,14 @@ def check_dump(test, dump, guest):
 
     if want.get("failed_realloc_preserved"):
         # failed realloc: the 8-byte instance at site 348 survives with
-        # its original extent; the failed alloc row (size -1) exists
+        # its original extent; the failure site publishes no alloc fact
+        # (failed calls are diagnostics, not facts — Stage 2.5)
         allocs = [ln.split() for ln in dump.splitlines()
                   if ln.startswith("alloc ")]
-        failed = any(a[2] == "-1" for a in allocs)
+        failed = any(a[1] == "377" for a in allocs)
         survivor = any(
             r[2] == "348" and r[5] == "8" for r in heap_rows)
-        if not (failed and survivor):
+        if failed or not survivor:
             problems.append("failed realloc did not preserve old identity")
 
     if want.get("zero_size_nonnull"):
@@ -1198,6 +1522,22 @@ def check_dump(test, dump, guest):
                 problems.append(
                     f"access symbol {symbol} size {row[6]} != "
                     f"{policy['size']}")
+            if "region_kind" in policy and int(row[3]) != policy["region_kind"]:
+                problems.append(
+                    f"access symbol {symbol} region kind {row[3]} != "
+                    f"{policy['region_kind']}")
+            if "region_site" in policy and int(row[4], 16) != policy["region_site"]:
+                problems.append(
+                    f"access symbol {symbol} region site {row[4]} != "
+                    f"{policy['region_site']:x}")
+            if "offset" in policy and int(row[5], 16) != policy["offset"]:
+                problems.append(
+                    f"access symbol {symbol} offset {row[5]} != "
+                    f"{policy['offset']:x}")
+            if "support" in policy and int(row[7]) != policy["support"]:
+                problems.append(
+                    f"access symbol {symbol} support {row[7]} != "
+                    f"{policy['support']}")
         if "max_rows" in policy and len(rows) > policy["max_rows"]:
             problems.append(
                 f"access symbol {symbol} rows {len(rows)} > "

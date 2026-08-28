@@ -32,6 +32,13 @@ SYMBOLIC = Path(__file__).resolve().parents[2] / "tcg/symbolic/symbolic.c"
 SYSCALL = Path(__file__).resolve().parents[2] / "linux-user/syscall.c"
 SNAPSHOT = Path(__file__).resolve().parents[2] / "linux-user/snapshot.c"
 SIGNAL = Path(__file__).resolve().parents[2] / "linux-user/i386/signal.c"
+OSPREY_H = Path(__file__).resolve().parents[2] / "linux-user/osprey.h"
+OSPREY_INTERNAL_H = Path(__file__).resolve().parents[2] / \
+    "linux-user/osprey-internal.h"
+OSPREY_FACTS = Path(__file__).resolve().parents[2] / "linux-user/osprey-facts.c"
+PROVENANCE_H = Path(__file__).resolve().parents[2] / "linux-user/provenance.h"
+PROVENANCE_C = Path(__file__).resolve().parents[2] / "linux-user/provenance.c"
+MODELS_C = Path(__file__).resolve().parents[2] / "tcg/symbolic/models.c"
 
 HELPER_SOURCES = (MEM_HELPER, MPX_HELPER, FPU_HELPER, SEG_HELPER, OPS_SSE)
 SOURCE_FILES = (TRANSLATE, MPX_HELPER, FPU_HELPER, MEM_HELPER, SEG_HELPER,
@@ -905,6 +912,277 @@ def no_direct_osprey(translate_text, errors):
                  "route through the shared gen_helper_sem_* layer")
 
 
+def stage25_allocator_gates(errors):
+    """Bounded Stage-2.5 allocator lifecycle and fact gate.
+
+    This remains deliberately structural: the runtime unit and allocator
+    fixtures own arithmetic, identity, transport, and dump behavior.  The
+    source gate prevents the lifecycle from silently drifting back to
+    positional hooks, failure sentinels, synthetic geometry, or a second
+    allocator fact owner.
+    """
+    paths = {
+        "osprey.h": OSPREY_H,
+        "osprey-internal.h": OSPREY_INTERNAL_H,
+        "osprey-facts.c": OSPREY_FACTS,
+        "osprey-rules.c": Path(__file__).resolve().parents[2] /
+        "linux-user/osprey-rules.c",
+        "provenance.h": PROVENANCE_H,
+        "provenance.c": PROVENANCE_C,
+        "models.c": MODELS_C,
+        "symbolic.c": SYMBOLIC,
+    }
+    try:
+        source = {name: path.read_text() for name, path in paths.items()}
+    except OSError as exc:
+        errors.append(f"semantic inventory: cannot read allocator gate input: {exc}")
+        return
+
+    masked = {name: mask_c_source(text)
+              for name, text in source.items()}
+
+    def issue(name, message):
+        errors.append(f"{name}: {message}")
+
+    def body(name, function):
+        result = function_body(masked[name], function)
+        if result is None:
+            issue(name, f"cannot locate {function} body")
+            return ""
+        return result
+
+    def struct_body(name, struct_name):
+        result = re.search(
+            r"typedef\s+struct(?:\s+\w+)?\s*\{(?P<body>.*?)\}\s*"
+            + re.escape(struct_name) + r"\s*;", masked[name], re.DOTALL)
+        if result is None:
+            issue(name, f"cannot locate {struct_name} layout")
+            return ""
+        return result.group("body")
+
+    # The process-local payload and the fixed records are the only accepted
+    # allocator transport shape.  Keep the kind set closed at three models.
+    enum = re.search(
+        r"typedef\s+enum\s+OspreyAllocatorKind\s*\{(?P<body>.*?)"
+        r"\}\s*OspreyAllocatorKind\s*;", masked["osprey.h"],
+        re.DOTALL)
+    expected_kinds = ["OSPREY_ALLOCATOR_MALLOC",
+                      "OSPREY_ALLOCATOR_CALLOC",
+                      "OSPREY_ALLOCATOR_REALLOC"]
+    if enum is None:
+        issue("osprey.h", "allocator kind enum is absent")
+    elif re.findall(r"\bOSPREY_ALLOCATOR_[A-Z0-9_]+\b",
+                    enum.group("body")) != expected_kinds:
+        issue("osprey.h", "allocator kind set is not malloc/calloc/realloc")
+
+    observation = struct_body("osprey.h", "OspreyAllocatorObservation")
+    for field in ("site_pc", "requested_size", "element_count",
+                  "element_size", "overflowed"):
+        if not re.search(r"\b" + field + r"\b", observation):
+            issue("osprey.h", f"allocator observation lacks {field}")
+    if not re.search(
+            r"osprey_on_alloc_success\s*\(\s*CPUArchState\s*\*\s*env"
+            r"\s*,\s*const\s+OspreyAllocatorObservation\s*\*\s*obs"
+            r"\s*,\s*target_ulong\s+base\s*,\s*uint64_t\s+object_id"
+            r"\s*,\s*uint32_t\s+generation", masked["osprey.h"]):
+        issue("osprey.h", "success hook does not use the typed observation")
+    if not re.search(
+            r"osprey_on_alloc_failure\s*\(\s*const\s+"
+            r"OspreyAllocatorObservation\s*\*\s*obs\s*\)",
+            masked["osprey.h"]):
+        issue("osprey.h", "failure hook does not use the typed observation")
+
+    internal = masked["osprey-internal.h"]
+    if not re.search(r"#define\s+OSPREY_SHARED_VERSION\s+10u\b", internal):
+        issue("osprey-internal.h", "shared transport is not version 10")
+    if re.search(r"#define\s+OSPREY_SHARED_VERSION\s+9u\b", internal):
+        issue("osprey-internal.h", "version-9 transport remains accepted")
+    malloc_record = struct_body("osprey-internal.h", "OspreyMallocFact")
+    may_record = struct_body("osprey-internal.h", "OspreyMayArrayFact")
+    if not re.search(r"\buint64_t\s+requested_size\b", malloc_record):
+        issue("osprey-internal.h", "F05 requested_size is not uint64_t")
+    for field in ("element_count", "element_size"):
+        if not re.search(r"\buint64_t\s+" + field + r"\b", may_record):
+            issue("osprey-internal.h", f"F06 {field} is not uint64_t")
+    if not re.search(
+            r"#define\s+OSPREY_MAY_ARRAY_CALLOC_GEOMETRY\s+0u\b",
+            internal):
+        issue("osprey-internal.h", "calloc geometry evidence kind is absent")
+
+    # Pending state must retain both original calloc operands.  The model
+    # entry performs exactly one target-width product check, before any
+    # caller-saved register clearing, and reuses its result for both paths.
+    pending = struct_body("provenance.h", "ProvenancePending")
+    for field in ("calloc_count", "calloc_element_size", "overflowed"):
+        if not re.search(r"\b" + field + r"\b", pending):
+            issue("provenance.h", f"pending allocator state lacks {field}")
+    pending_set = body("provenance.c", "provenance_set_pending")
+    for field in ("calloc_count", "calloc_element_size"):
+        if not re.search(r"pending\." + field + r"\s*=\s*0", pending_set):
+            issue("provenance.c", f"{field} is not reset with pending state")
+
+    # Symbolic allocation expressions retain the existing source-register
+    # semantics, but the legacy concrete snapshot tracker must receive the
+    # separately checked byte total.  A three-argument model_alloc silently
+    # records calloc's element count instead of count*element_size.
+    if not re.search(
+            r"model_alloc\s*\(\s*CPUX86State\s*\*\s*env\s*,\s*"
+            r"uintptr_t\s+pc\s*,\s*uintptr_t\s+reg_with_size\s*,\s*"
+            r"target_ulong\s+snapshot_size\s*\)", masked["models.c"]):
+        issue("models.c", "model_alloc lacks an exact snapshot-size argument")
+    model_alloc_body = body("models.c", "model_alloc")
+    if not re.search(
+            r"snapshot_trace_pending_allocs\s*\(\s*snapshot_size\s*,\s*pc\s*\)",
+            model_alloc_body):
+        issue("models.c", "legacy allocation tracker ignores snapshot_size")
+
+    symbolic = body("symbolic.c", "is_symbolic_model")
+    calloc = re.search(
+        r"else\s+if\s*\(\s*model\s*==\s*CALLOC\s*\)\s*\{"
+        r"(?P<body>.*?)\}\s*else\s+if\s*\(\s*model\s*==\s*PRINTF",
+        symbolic, re.DOTALL)
+    if calloc is None:
+        issue("symbolic.c", "CALLOC model block is absent")
+        calloc_text = ""
+    else:
+        calloc_text = calloc.group("body")
+    for pattern, message in (
+            (r"target_ulong\s+count\s*=\s*env->regs\[R_EDI\]",
+             "CALLOC does not snapshot RDI count"),
+            (r"target_ulong\s+element_size\s*=\s*env->regs\[R_ESI\]",
+             "CALLOC does not snapshot RSI element size"),
+            (r"shadow->pending\.calloc_count\s*=\s*count",
+             "pending state does not retain calloc count"),
+            (r"shadow->pending\.calloc_element_size\s*=\s*element_size",
+             "pending state does not retain calloc element size"),
+            (r"shadow->pending\.overflowed\s*=\s*overflowed",
+             "pending state does not retain calloc overflow"),
+            (r"snapshot_trace_pending_allocs\s*\(\s*overflowed\s*\?\s*0"
+             r"\s*:\s*total",
+             "legacy snapshot tracker does not use the checked calloc result"),
+            (r"provenance_set_pending\s*\([^;]*overflowed\s*\?\s*0"
+             r"\s*:\s*total",
+             "pending total does not use the checked calloc result"),
+            (r"model_alloc\s*\(\s*env\s*,\s*model_caller_addr\s*,\s*"
+             r"R_EDI\s*,\s*overflowed\s*\?\s*0\s*:\s*total\s*\)",
+             "symbolic CALLOC does not give the legacy tracker the checked total"),
+    ):
+        if not re.search(pattern, calloc_text, re.DOTALL):
+            issue("symbolic.c", message)
+    products = re.findall(r"__builtin_mul_overflow\s*\(", calloc_text)
+    if len(products) != 1:
+        issue("symbolic.c", "CALLOC must have one checked multiplication")
+    elif not re.search(
+            r"__builtin_mul_overflow\s*\(\s*count\s*,\s*element_size"
+            r"\s*,\s*&total\s*\)", calloc_text):
+        issue("symbolic.c", "CALLOC product check does not use captured operands")
+    clear_pos = calloc_text.find("clear_call_args_temps")
+    for assignment in ("target_ulong count", "target_ulong element_size"):
+        if clear_pos >= 0 and calloc_text.find(assignment) > clear_pos:
+            issue("symbolic.c", "CALLOC operands are captured after caller-state clear")
+
+    # Every provenance allocation creation in the modeled return path must
+    # be paired with the typed success hook carrying its exact tag identity.
+    success_body = symbolic
+    creates = list(re.finditer(r"\bprovenance_create_object\s*\(",
+                               success_body))
+    successes = list(re.finditer(r"\bosprey_on_alloc_success\s*\(",
+                                 success_body))
+    failures = list(re.finditer(r"\bosprey_on_alloc_failure\s*\(",
+                                success_body))
+    if len(creates) != len(successes):
+        issue("symbolic.c", "provenance allocation creations do not pair with success hooks")
+    for index, match in enumerate(creates):
+        end = creates[index + 1].start() if index + 1 < len(creates) \
+            else len(success_body)
+        if not re.search(r"\bosprey_on_alloc_success\s*\(",
+                         success_body[match.start():end]):
+            issue("symbolic.c", "allocation creation has no success event")
+    for match in re.finditer(
+            r"\bosprey_on_alloc_success\s*\((?P<args>.*?)\);",
+            success_body, re.DOTALL):
+        args = match.group("args")
+        if "base" not in args or "tag.object_id" not in args or \
+                "tag.generation" not in args:
+            issue("symbolic.c", "success event does not carry base and tag identity")
+    if not failures:
+        issue("symbolic.c", "allocator failure paths have no diagnostic hook")
+    if re.search(r"\bosprey_table_insert_(?:alloc|mayarray)\s*\(",
+                 success_body):
+        issue("symbolic.c", "allocator fact tables are written outside osprey-facts.c")
+
+    facts = body("osprey-facts.c", "osprey_on_alloc_success")
+    failure = body("osprey-facts.c", "osprey_on_alloc_failure")
+    lookup = facts.find("provenance_lookup_object(object_id, generation)")
+    if lookup < 0:
+        issue("osprey-facts.c", "success path lacks authoritative identity lookup")
+    for expression, message in (
+            (r"obj->state\s*!=\s*PROV_OBJ_LIVE", "success path lacks LIVE check"),
+            (r"obj->base\s*!=\s*base", "success path lacks base check"),
+            (r"obj->requested_size\s*!=\s*obs->requested_size",
+             "success path lacks requested-size check"),
+            (r"obj->alloc_pc\s*!=\s*obs->site_pc",
+             "success path lacks allocation-PC check"),
+            (r"raw_size\s*>\s*INT64_MAX", "success path lacks canonical size bound"),
+            (r"raw_base\s*>\s*UINT64_MAX\s*-\s*raw_size",
+             "success path lacks base-end overflow check"),
+    ):
+        if not re.search(expression, facts):
+            issue("osprey-facts.c", message)
+    for publication in ("g_array_append_val(g_heap_instances",
+                        "record_region_instance(",
+                        "osprey_table_insert_alloc("):
+        position = facts.find(publication)
+        if lookup >= 0 and (position < 0 or position < lookup):
+            issue("osprey-facts.c", f"{publication} precedes event validation")
+
+    if not re.search(r"__builtin_mul_overflow", facts) or \
+            not re.search(r"product\s*!=\s*raw_size", facts):
+        issue("osprey-facts.c", "calloc product is not rechecked against F05 size")
+    if not re.search(r"obs->overflowed\s*\|\|\s*product\s*!=\s*raw_size",
+                     facts):
+        issue("osprey-facts.c", "calloc overflow flag/product mismatch is not rejected")
+    if not re.search(
+            r"obs->element_count\s*>\s*0\s*&&\s*"
+            r"obs->element_size\s*>\s*0", facts):
+        issue("osprey-facts.c", "F06 positive geometry guard is absent")
+    if not re.search(
+            r"obs->kind\s*==\s*OSPREY_ALLOCATOR_CALLOC\s*&&\s*"
+            r"positive_calloc", facts):
+        issue("osprey-facts.c", "F06 is not restricted to successful calloc")
+    if not re.search(r"OSPREY_MAY_ARRAY_CALLOC_GEOMETRY", facts):
+        issue("osprey-facts.c", "F06 lacks named calloc evidence")
+    if re.search(r"element_count\s*=\s*1", facts):
+        issue("osprey-facts.c", "synthetic one-element F06 remains")
+    if re.search(r"requested_size\s*=\s*-\s*1", facts + masked["symbolic.c"]):
+        issue("osprey-facts.c", "negative F05 sentinel remains")
+    if re.search(r"element_size\s*=\s*[^;\n]*UINT32_MAX", facts):
+        issue("osprey-facts.c", "F06 element size is clamped")
+    if re.search(r"requested_size\s*[^;\n]{0,80}[/%]", facts):
+        issue("osprey-facts.c", "F06 uses a factored F05 total heuristic")
+    if re.search(r"osprey_table_insert_(?:alloc|mayarray)\s*\(", failure):
+        issue("osprey-facts.c", "failure diagnostic writes a fact table")
+    if "alloc-failure" not in source["osprey-facts.c"]:
+        issue("osprey-facts.c", "failure diagnostic is absent")
+
+    rules = masked["osprey-rules.c"]
+    if re.search(r"requested_size\s*<\s*0|requested_size\s*(?:==|!=)\s*-\s*1",
+                 rules):
+        issue("osprey-rules.c", "negative F05 compatibility filter remains")
+
+    # Definitions, not test callsites, establish ownership of fixed-table
+    # publication.  A second implementation would bypass the transaction.
+    for function in ("osprey_table_insert_alloc", "osprey_table_insert_mayarray"):
+        definition = re.findall(
+            r"\bint\s+" + function + r"\s*\(",
+            masked["osprey-facts.c"])
+        if len(definition) != 1:
+            issue("osprey-facts.c", f"{function} has {len(definition)} definitions")
+        for name in ("symbolic.c", "provenance.c"):
+            if re.search(r"\bint\s+" + function + r"\s*\(", masked[name]):
+                issue(name, f"{function} is not owned by osprey-facts.c")
+
+
 def stage24_source_gates(translate_text, source_by_name, errors):
     """Bounded Stage-2.4 source gate:
     - the obsolete osprey_on_mem_{load,store}_address names are absent
@@ -1219,6 +1497,8 @@ def main():
     # libc models route copies through the combined event, and the
     # placeholder VALUE layout is gone.
     stage24_source_gates(translate_text, source_by_name, errors)
+    # Stage 2.5 allocator payload, lifecycle, and F05/F06 source gate.
+    stage25_allocator_gates(errors)
 
     # Every fixed manifest token must resolve not only to a spelling in the
     # source tree, but to an event carrying that row's class and interval

@@ -182,13 +182,43 @@ void osprey_on_mem_access_class(CPUArchState *env, target_ulong addr,
                                 uint64_t size, uint64_t pc,
                                 uint32_t is_store, uint32_t op_class);
 
-/* Successful-return allocator hooks (site = call PC of the allocator).
- * A failed/overflowed allocation creates no heap region and no size
- * fact.  A successful zero-size return keeps a zero-size instance. */
-void osprey_on_alloc_success(CPUArchState *env, target_ulong base,
-                             target_ulong size, target_ulong site_pc,
+/* ------------------------------------------------------------------ */
+/* Allocator observation (Stage 2.5)                                   */
+/* ------------------------------------------------------------------ */
+
+typedef enum OspreyAllocatorKind {
+    OSPREY_ALLOCATOR_MALLOC = 0,
+    OSPREY_ALLOCATOR_CALLOC,
+    OSPREY_ALLOCATOR_REALLOC,
+} OspreyAllocatorKind;
+
+/* One immutable process-local allocator observation.  Constructed at
+ * the modeled return hook from the per-CPU pending operation; never
+ * stored in shared memory and never pointing at child-owned state.
+ * malloc/realloc carry zero element fields; calloc carries its original
+ * concrete operands (even on failure) plus the checked total in
+ * requested_size on success. */
+typedef struct OspreyAllocatorObservation {
+    OspreyAllocatorKind kind;
+    target_ulong site_pc;         /* raw call PC (normalized here) */
+    target_ulong requested_size;  /* checked total bytes */
+    target_ulong element_count;   /* calloc only */
+    target_ulong element_size;    /* calloc only */
+    bool overflowed;              /* failed calloc product */
+} OspreyAllocatorObservation;
+
+/* Successful-return allocator hook.  Publishes the heap region
+ * instance, F05, optional F06 (checked positive calloc geometry), and
+ * the return ADDRESS origin only after the complete event validation
+ * succeeds.  A failed/overflowed allocation creates no heap region and
+ * no fact.  A successful zero-size return keeps a zero-size instance. */
+void osprey_on_alloc_success(CPUArchState *env,
+                             const OspreyAllocatorObservation *obs,
+                             target_ulong base,
                              uint64_t object_id, uint32_t generation);
-void osprey_on_alloc_failure(CPUArchState *env, target_ulong site_pc);
+/* Failed allocator diagnostic only: emits a stable log row; never
+ * touches shared fact state. */
+void osprey_on_alloc_failure(const OspreyAllocatorObservation *obs);
 /* Identity-based retire (provenance-authoritative heap lifecycle). */
 void osprey_on_free_identity(CPUArchState *env, uint64_t object_id,
                              uint32_t generation, target_ulong site_pc);

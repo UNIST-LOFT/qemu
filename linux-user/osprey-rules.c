@@ -415,7 +415,6 @@ static bool region_extent(OspreyContext *ctx, const OspreyRegionId *region,
         for (guint i = 0; i < ctx->alloc_facts->len; i++) {
             OspreyMallocFact *f = &g_array_index(ctx->alloc_facts,
                                                  OspreyMallocFact, i);
-            if (f->requested_size < 0) continue;
             if (f->site_pc != region->site_offset) continue;
             int64_t e = f->requested_size;
             if (!any) { l = 0; h = e; any = true; }
@@ -468,9 +467,8 @@ static bool alloc_unit_for_region(OspreyContext *ctx,
     for (guint i = 0; i < ctx->alloc_facts->len; i++) {
         OspreyMallocFact *f = &g_array_index(ctx->alloc_facts,
                                              OspreyMallocFact, i);
-        if (f->requested_size < 0) continue;
         if (f->site_pc != region->site_offset) continue;
-        int64_t s = f->requested_size;
+        int64_t s = (int64_t)f->requested_size;
         bool seen = false;
         for (guint j = 0; j < sizes->len; j++) {
             if (g_array_index(sizes, int64_t, j) == s) { seen = true; break; }
@@ -826,7 +824,6 @@ static void instantiate_cc01_cc02(OspreyContext *ctx) {
     for (guint i = 0; i < ctx->alloc_facts->len; i++) {
         OspreyMallocFact *f = &g_array_index(ctx->alloc_facts,
                                              OspreyMallocFact, i);
-        if (f->requested_size < 0) continue;
         if (g_hash_table_lookup(sites, GSIZE_TO_POINTER((gsize)f->site_pc)) !=
             NULL)
             continue;

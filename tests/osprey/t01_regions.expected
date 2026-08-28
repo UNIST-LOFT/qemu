@@ -188,6 +188,5 @@ alloc 2af 32 1
 alloc 2e5 16 1
 alloc 312 1048576 1
 alloc 348 8 1
-alloc 377 -1 1
 alloc 3ad 8 1
 alloc 3e8 0 1

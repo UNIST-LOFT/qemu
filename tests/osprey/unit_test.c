@@ -282,7 +282,7 @@ static void test_version_mismatch_rejection(void)
     OspreyConfig c = test_config();
     OspreyContext *ctx = osprey_new(&c);
     OspreySharedRun *run = new_run(&c);
-    run->version = 999;
+    run->version = 9;
 
     OspreyStatus st = osprey_parent_merge_sample(ctx, run);
     CHECK(st == OSPREY_INCOMPLETE_FACTS, "version merge status");
@@ -298,7 +298,7 @@ static void test_version_mismatch_rejection(void)
     reset_log();
     ctx = osprey_new(&c);
     run = new_run(&c);
-    run->version = 999;
+    run->version = 9;
     CHECK(!osprey_shared_run_freeze_prefix(ctx, run),
           "malformed prefix freeze fails");
     osprey_shared_run_prepare(ctx, run, 2);
@@ -806,16 +806,28 @@ static void test_heap_identity_lifecycle(void)
 
     PtrTag t1 = provenance_create_object(0x1000, 32, 0x400200,
                                           PROV_PRODUCER_MALLOC_RETURN);
-    osprey_on_alloc_success(env, 0x1000, 32, 0x400200,
-                            t1.object_id, t1.generation);
+    {
+        OspreyAllocatorObservation obs = {
+            .kind = OSPREY_ALLOCATOR_MALLOC,
+            .site_pc = 0x400200,
+            .requested_size = 32,
+        };
+        osprey_on_alloc_success(env, &obs, 0x1000, t1.object_id, t1.generation);
+    }
 
     /* same-base reuse: retire t1, allocate again at the same base */
     osprey_on_free_identity(env, t1.object_id, t1.generation, 0x400300);
     provenance_retire_object(0x1000);
     PtrTag t2 = provenance_create_object(0x1000, 64, 0x400200,
                                           PROV_PRODUCER_MALLOC_RETURN);
-    osprey_on_alloc_success(env, 0x1000, 64, 0x400200,
-                            t2.object_id, t2.generation);
+    {
+        OspreyAllocatorObservation obs = {
+            .kind = OSPREY_ALLOCATOR_MALLOC,
+            .site_pc = 0x400200,
+            .requested_size = 64,
+        };
+        osprey_on_alloc_success(env, &obs, 0x1000, t2.object_id, t2.generation);
+    }
 
     CHECK(osprey_parent_merge_sample(ctx, run) == OSPREY_OK, "merge ok");
     CHECK(ctx->region_instances->len == 2, "two instances at same base");
@@ -882,12 +894,24 @@ static void test_realloc_lifecycle_variants(void)
 
     PtrTag old = provenance_create_object(0x2000, 16, 0x400210,
                                            PROV_PRODUCER_MALLOC_RETURN);
-    osprey_on_alloc_success(env, 0x2000, 16, 0x400210,
-                            old.object_id, old.generation);
+    {
+        OspreyAllocatorObservation obs = {
+            .kind = OSPREY_ALLOCATOR_MALLOC,
+            .site_pc = 0x400210,
+            .requested_size = 16,
+        };
+        osprey_on_alloc_success(env, &obs, 0x2000, old.object_id, old.generation);
+    }
 
     /* Failed realloc publishes only the failure observation; the old
      * provenance identity and OSPREY runtime instance remain live. */
-    osprey_on_alloc_failure(env, 0x400220);
+    {
+        OspreyAllocatorObservation obs = {
+            .kind = OSPREY_ALLOCATOR_REALLOC,
+            .site_pc = 0x400220,
+        };
+        osprey_on_alloc_failure(&obs);
+    }
     CHECK(osprey_region_of_addr(env, 0x2000, &r, &off, false),
           "failed realloc preserves old instance");
 
@@ -897,8 +921,14 @@ static void test_realloc_lifecycle_variants(void)
     provenance_retire_object(0x2000);
     PtrTag same = provenance_create_object(0x2000, 64, 0x400230,
                                             PROV_PRODUCER_REALLOC_RETURN);
-    osprey_on_alloc_success(env, 0x2000, 64, 0x400230,
-                            same.object_id, same.generation);
+    {
+        OspreyAllocatorObservation obs = {
+            .kind = OSPREY_ALLOCATOR_REALLOC,
+            .site_pc = 0x400230,
+            .requested_size = 64,
+        };
+        osprey_on_alloc_success(env, &obs, 0x2000, same.object_id, same.generation);
+    }
     CHECK(osprey_region_of_addr(env, 0x203f, &r, &off, false) && off == 63,
           "in-place realloc installs new extent");
     CHECK(same.object_id != old.object_id,
@@ -910,8 +940,14 @@ static void test_realloc_lifecycle_variants(void)
     provenance_retire_object(0x2000);
     PtrTag moved = provenance_create_object(0x3000, 128, 0x400240,
                                              PROV_PRODUCER_REALLOC_RETURN);
-    osprey_on_alloc_success(env, 0x3000, 128, 0x400240,
-                            moved.object_id, moved.generation);
+    {
+        OspreyAllocatorObservation obs = {
+            .kind = OSPREY_ALLOCATOR_REALLOC,
+            .site_pc = 0x400240,
+            .requested_size = 128,
+        };
+        osprey_on_alloc_success(env, &obs, 0x3000, moved.object_id, moved.generation);
+    }
     CHECK(!osprey_region_of_addr(env, 0x2000, &r, &off, false),
           "moved realloc retires old numeric base");
     CHECK(osprey_region_of_addr(env, 0x307f, &r, &off, false) && off == 127,
@@ -927,8 +963,14 @@ static void test_realloc_lifecycle_variants(void)
      * instance with an empty half-open span. */
     PtrTag zero = provenance_create_object(0x4000, 0, 0x400260,
                                             PROV_PRODUCER_REALLOC_RETURN);
-    osprey_on_alloc_success(env, 0x4000, 0, 0x400260,
-                            zero.object_id, zero.generation);
+    {
+        OspreyAllocatorObservation obs = {
+            .kind = OSPREY_ALLOCATOR_REALLOC,
+            .site_pc = 0x400260,
+            .requested_size = 0,
+        };
+        osprey_on_alloc_success(env, &obs, 0x4000, zero.object_id, zero.generation);
+    }
 
     CHECK(osprey_parent_merge_sample(ctx, run) == OSPREY_OK, "merge ok");
     int same_base_rows = 0;
@@ -946,15 +988,17 @@ static void test_realloc_lifecycle_variants(void)
     CHECK(same_base_rows == 2,
           "in-place realloc preserves two distinct lifecycle rows");
     CHECK(zero_rows == 1, "zero-size success records empty instance");
-    bool saw_failure = false;
+    /* Failed realloc is a diagnostic, not a fact: no alloc row at the
+     * failure site, and the old identity stayed live. */
+    bool saw_failure_fact = false;
     for (guint i = 0; i < ctx->alloc_facts->len; i++) {
         OspreyMallocFact *f = &g_array_index(ctx->alloc_facts,
                                              OspreyMallocFact, i);
-        if (f->site_pc == 0x220 && f->requested_size == -1) {
-            saw_failure = true;
+        if (f->site_pc == 0x220) {
+            saw_failure_fact = true;
         }
     }
-    CHECK(saw_failure, "failed realloc lifecycle row is explicit");
+    CHECK(!saw_failure_fact, "failed realloc publishes no alloc fact");
 
     osprey_free(ctx);
     g_free(run);
@@ -1743,6 +1787,839 @@ static void test_pre_sample_fatal(void)
     osprey_clear_pre_sample_fatal();
 }
 
+
+/* ------------------------------------------------------------------ */
+/* Stage 2.5: allocator facts, calloc geometry, complete dump contract */
+/* ------------------------------------------------------------------ */
+
+static void fill_alloc_fact(OspreyMallocFact *f, uint64_t site,
+                            uint64_t size) {
+    memset(f, 0, sizeof(*f));
+    f->site_pc = site;
+    f->requested_size = size;
+    f->sample_support = 1;
+}
+
+static void fill_mayarray_fact(OspreyMayArrayFact *f, uint8_t kind,
+                               uint64_t site, int64_t off,
+                               uint64_t count, uint64_t esz,
+                               uint32_t evidence) {
+    memset(f, 0, sizeof(*f));
+    f->start.region.kind = kind;
+    f->start.region.code_image_id = 0;
+    f->start.region.site_offset = site;
+    f->start.offset = off;
+    f->element_count = count;
+    f->element_size = esz;
+    f->evidence_kind = evidence;
+    f->sample_support = 1;
+}
+
+/* F05 only after a successful allocation; failures, calloc overflow,
+ * NULL zero-size returns, out-of-image sites, and stale provenance
+ * identities publish nothing. */
+static void test_allocator_fact_success_boundary(void)
+{
+    reset_log();
+    OspreyConfig c = test_config();
+    OspreyContext *ctx = osprey_new(&c);
+    OspreySharedRun *run = new_run(&c);
+    osprey_set_image_bounds(0x400000, 0x401000);
+    osprey_child_use_shared_run(ctx, run);
+    CPUArchState *env = g_malloc0(sizeof(CPUArchState));
+    provenance_init();
+
+    /* Successful malloc: F05 (site, 24), no F06. */
+    PtrTag t = provenance_create_object(0x1000, 24, 0x400200,
+                                        PROV_PRODUCER_MALLOC_RETURN);
+    OspreyAllocatorObservation obs = {
+        .kind = OSPREY_ALLOCATOR_MALLOC,
+        .site_pc = 0x400200,
+        .requested_size = 24,
+    };
+    osprey_on_alloc_success(env, &obs, 0x1000, t.object_id, t.generation);
+    CHECK(ctx->alloc_facts->len == 0, "facts committed only after merge");
+
+    /* Failed malloc: diagnostic only, no fact, no region. */
+    OspreyAllocatorObservation fail = {
+        .kind = OSPREY_ALLOCATOR_MALLOC,
+        .site_pc = 0x400210,
+        .requested_size = 32,
+    };
+    osprey_on_alloc_failure(&fail);
+    OspreyRegionId r;
+    int64_t off;
+    CHECK(!osprey_region_of_addr(env, 0x9000, &r, &off, false),
+          "failed allocation creates no region");
+
+    /* Out-of-image site: ordinary skip. */
+    PtrTag t2 = provenance_create_object(0x2000, 48, 0x999999,
+                                         PROV_PRODUCER_MALLOC_RETURN);
+    OspreyAllocatorObservation out_img = {
+        .kind = OSPREY_ALLOCATOR_MALLOC,
+        .site_pc = 0x999999,
+        .requested_size = 48,
+    };
+    osprey_on_alloc_success(env, &out_img, 0x2000, t2.object_id,
+                            t2.generation);
+
+    /* Successful calloc(3,16): F05 total 48 plus real F06. */
+    PtrTag tc = provenance_create_object(0x5000, 48, 0x400240,
+                                         PROV_PRODUCER_CALLOC_RETURN);
+    OspreyAllocatorObservation calloc_obs = {
+        .kind = OSPREY_ALLOCATOR_CALLOC,
+        .site_pc = 0x400240,
+        .requested_size = 48,
+        .element_count = 3,
+        .element_size = 16,
+    };
+    osprey_on_alloc_success(env, &calloc_obs, 0x5000, tc.object_id,
+                            tc.generation);
+
+    /* Zero-size malloc success: F05 size 0. */
+    PtrTag tz = provenance_create_object(0x6000, 0, 0x400250,
+                                         PROV_PRODUCER_MALLOC_RETURN);
+    OspreyAllocatorObservation zero = {
+        .kind = OSPREY_ALLOCATOR_MALLOC,
+        .site_pc = 0x400250,
+        .requested_size = 0,
+    };
+    osprey_on_alloc_success(env, &zero, 0x6000, tz.object_id, tz.generation);
+
+    /* Width boundary: both geometry fields exceed uint32_t while their
+     * checked product remains inside the canonical signed-size bound. */
+    uint64_t wide_count = (uint64_t)UINT32_MAX + 1;
+    uint64_t wide_element_size = 2;
+    uint64_t wide_total = wide_count * wide_element_size;
+    PtrTag tw = provenance_create_object(0x7000, wide_total, 0x400260,
+                                         PROV_PRODUCER_CALLOC_RETURN);
+    OspreyAllocatorObservation wide = {
+        .kind = OSPREY_ALLOCATOR_CALLOC,
+        .site_pc = 0x400260,
+        .requested_size = wide_total,
+        .element_count = wide_count,
+        .element_size = wide_element_size,
+    };
+    osprey_on_alloc_success(env, &wide, 0x7000, tw.object_id,
+                            tw.generation);
+
+    /* Stale provenance identity and malformed allocator kind are
+     * sticky transaction failures on their own runs: each rejects its
+     * sample fail-closed before any publication. */
+    OspreySharedRun *run2 = new_run(&c);
+    osprey_child_use_shared_run(ctx, run2);
+    OspreyAllocatorObservation stale = {
+        .kind = OSPREY_ALLOCATOR_MALLOC,
+        .site_pc = 0x400220,
+        .requested_size = 64,
+    };
+    osprey_on_alloc_success(env, &stale, 0x3000, 0xdeadbeef, 999);
+    CHECK(run2->bad_identity == 1, "stale identity sticky");
+    CHECK(osprey_parent_merge_sample(ctx, run2) == OSPREY_INCOMPLETE_FACTS,
+          "stale identity merge rejects");
+    CHECK(ctx->alloc_facts->len == 0, "stale identity publishes nothing");
+
+    OspreySharedRun *run3 = new_run(&c);
+    osprey_child_use_shared_run(ctx, run3);
+    OspreyAllocatorObservation bad_kind = {
+        .kind = (OspreyAllocatorKind)77,
+        .site_pc = 0x400230,
+        .requested_size = 8,
+    };
+    osprey_on_alloc_success(env, &bad_kind, 0x4000, 1, 1);
+    CHECK(run3->bad_identity == 1, "malformed kind sticky");
+    CHECK(osprey_parent_merge_sample(ctx, run3) == OSPREY_INCOMPLETE_FACTS,
+          "malformed kind merge rejects");
+
+    OspreySharedRun *run4 = new_run(&c);
+    osprey_child_use_shared_run(ctx, run4);
+    osprey_on_alloc_success(env, NULL, 0x4100, 1, 1);
+    CHECK(run4->bad_identity == 1 && run4->alloc_used == 0,
+          "NULL success observation rejects before publication");
+
+    OspreySharedRun *run5 = new_run(&c);
+    osprey_child_use_shared_run(ctx, run5);
+    OspreyAllocatorObservation null_success = {
+        .kind = OSPREY_ALLOCATOR_MALLOC,
+        .site_pc = 0x400231,
+        .requested_size = 0,
+    };
+    osprey_on_alloc_success(env, &null_success, 0, 1, 1);
+    CHECK(run5->bad_identity == 1 && run5->alloc_used == 0,
+          "NULL zero-size success event rejects as malformed");
+
+    OspreySharedRun *run6 = new_run(&c);
+    osprey_child_use_shared_run(ctx, run6);
+    OspreyAllocatorObservation malloc_overflow = {
+        .kind = OSPREY_ALLOCATOR_MALLOC,
+        .site_pc = 0x400232,
+        .requested_size = 8,
+        .overflowed = true,
+    };
+    osprey_on_alloc_success(env, &malloc_overflow, 0x4200, 1, 1);
+    CHECK(run6->bad_identity == 1 && run6->bad_arithmetic == 0 &&
+          run6->alloc_used == 0,
+          "non-calloc overflow flag is malformed identity");
+
+    CHECK(osprey_parent_merge_sample(ctx, run) == OSPREY_OK, "merge ok");
+    /* Facts: malloc24 + calloc48 + zero + wide calloc = 4 (no
+     * failure, no out-of-image, no stale). */
+    CHECK(ctx->alloc_facts->len == 4, "exactly four F05 rows");
+    bool saw_24 = false, saw_48 = false, saw_0 = false, saw_wide = false;
+    for (guint i = 0; i < ctx->alloc_facts->len; i++) {
+        OspreyMallocFact *f = &g_array_index(ctx->alloc_facts,
+                                             OspreyMallocFact, i);
+        if (f->site_pc == 0x200 && f->requested_size == 24) saw_24 = true;
+        if (f->site_pc == 0x240 && f->requested_size == 48) saw_48 = true;
+        if (f->site_pc == 0x250 && f->requested_size == 0) saw_0 = true;
+        if (f->site_pc == 0x260 && f->requested_size == wide_total) {
+            saw_wide = true;
+        }
+    }
+    CHECK(saw_24, "F05 malloc site+24");
+    CHECK(saw_48, "F05 calloc site+48");
+    CHECK(saw_0, "F05 zero-size success");
+    CHECK(saw_wide, "F05 preserves wide calloc total");
+    /* F06 only from positive calloc geometries. */
+    CHECK(ctx->mayarray_facts->len == 2, "exactly two F06 rows");
+    OspreyMayArrayFact *m = NULL;
+    OspreyMayArrayFact *wide_m = NULL;
+    for (guint i = 0; i < ctx->mayarray_facts->len; i++) {
+        OspreyMayArrayFact *candidate = &g_array_index(
+            ctx->mayarray_facts, OspreyMayArrayFact, i);
+        if (candidate->element_count == 3 &&
+            candidate->element_size == 16) m = candidate;
+        if (candidate->element_count == wide_count &&
+            candidate->element_size == wide_element_size) wide_m = candidate;
+    }
+    CHECK(m != NULL, "F06 carries exact calloc geometry");
+    CHECK(m != NULL && m->evidence_kind == OSPREY_MAY_ARRAY_CALLOC_GEOMETRY,
+          "F06 named evidence kind");
+    CHECK(m != NULL && m->start.region.kind == OSPREY_REGION_HEAP_SITE &&
+          m->start.region.site_offset == 0x240 && m->start.offset == 0,
+          "F06 canonical H_site+0 start");
+    CHECK(wide_m != NULL && wide_m->element_count == wide_count &&
+          wide_m->element_size == wide_element_size,
+          "F06 preserves 64-bit geometry");
+
+    osprey_free(ctx);
+    g_free(run);
+    g_free(run2);
+    g_free(run3);
+    g_free(run4);
+    g_free(run5);
+    g_free(run6);
+    g_free(env);
+    osprey_clear_pre_sample_fatal();
+}
+
+/* F06 only from checked positive calloc geometry: exact (3,16) and
+ * (1,24), same-total distinct geometries, zero-operand rejection,
+ * overflow/product-mismatch rejection, no malloc/realloc F06, 64-bit
+ * fields, and matching F05 totals. */
+static void test_calloc_geometry_f06(void)
+{
+    reset_log();
+    OspreyConfig c = test_config();
+    OspreyContext *ctx = osprey_new(&c);
+    OspreySharedRun *run = new_run(&c);
+    osprey_set_image_bounds(0x400000, 0x401000);
+    osprey_child_use_shared_run(ctx, run);
+    CPUArchState *env = g_malloc0(sizeof(CPUArchState));
+    provenance_init();
+
+    /* calloc(3,16) at one site and calloc(1,24) at another. */
+    PtrTag c1 = provenance_create_object(0x1000, 48, 0x400200,
+                                         PROV_PRODUCER_CALLOC_RETURN);
+    OspreyAllocatorObservation o1 = {
+        .kind = OSPREY_ALLOCATOR_CALLOC,
+        .site_pc = 0x400200,
+        .requested_size = 48,
+        .element_count = 3,
+        .element_size = 16,
+    };
+    osprey_on_alloc_success(env, &o1, 0x1000, c1.object_id, c1.generation);
+
+    PtrTag c2 = provenance_create_object(0x2000, 24, 0x400210,
+                                         PROV_PRODUCER_CALLOC_RETURN);
+    OspreyAllocatorObservation o2 = {
+        .kind = OSPREY_ALLOCATOR_CALLOC,
+        .site_pc = 0x400210,
+        .requested_size = 24,
+        .element_count = 1,
+        .element_size = 24,
+    };
+    osprey_on_alloc_success(env, &o2, 0x2000, c2.object_id, c2.generation);
+
+    /* Two positive calloc geometries with the same total at one site:
+     * one F05 (site,total), two distinct F06 rows. */
+    PtrTag c3 = provenance_create_object(0x3000, 48, 0x400200,
+                                         PROV_PRODUCER_CALLOC_RETURN);
+    OspreyAllocatorObservation o3 = {
+        .kind = OSPREY_ALLOCATOR_CALLOC,
+        .site_pc = 0x400200,
+        .requested_size = 48,
+        .element_count = 2,
+        .element_size = 24,
+    };
+    osprey_on_alloc_success(env, &o3, 0x3000, c3.object_id, c3.generation);
+
+    /* Matching malloc/realloc totals remain F05-only even when they
+     * could be factored into the same geometry. */
+    PtrTag m = provenance_create_object(0x3500, 48, 0x400218,
+                                         PROV_PRODUCER_MALLOC_RETURN);
+    OspreyAllocatorObservation mo = {
+        .kind = OSPREY_ALLOCATOR_MALLOC,
+        .site_pc = 0x400218,
+        .requested_size = 48,
+    };
+    osprey_on_alloc_success(env, &mo, 0x3500, m.object_id, m.generation);
+    PtrTag rr = provenance_create_object(0x3600, 48, 0x400219,
+                                         PROV_PRODUCER_REALLOC_RETURN);
+    OspreyAllocatorObservation rro = {
+        .kind = OSPREY_ALLOCATOR_REALLOC,
+        .site_pc = 0x400219,
+        .requested_size = 48,
+    };
+    osprey_on_alloc_success(env, &rro, 0x3600, rr.object_id, rr.generation);
+
+    /* Zero count and zero element size: F05 only. */
+    PtrTag z1 = provenance_create_object(0x4000, 0, 0x400220,
+                                         PROV_PRODUCER_CALLOC_RETURN);
+    OspreyAllocatorObservation z1o = {
+        .kind = OSPREY_ALLOCATOR_CALLOC,
+        .site_pc = 0x400220,
+        .requested_size = 0,
+        .element_count = 0,
+        .element_size = 16,
+    };
+    osprey_on_alloc_success(env, &z1o, 0x4000, z1.object_id, z1.generation);
+
+    PtrTag z2 = provenance_create_object(0x5000, 0, 0x400230,
+                                         PROV_PRODUCER_CALLOC_RETURN);
+    OspreyAllocatorObservation z2o = {
+        .kind = OSPREY_ALLOCATOR_CALLOC,
+        .site_pc = 0x400230,
+        .requested_size = 0,
+        .element_count = 4,
+        .element_size = 0,
+    };
+    osprey_on_alloc_success(env, &z2o, 0x5000, z2.object_id, z2.generation);
+
+    CHECK(osprey_parent_merge_sample(ctx, run) == OSPREY_OK,
+          "geometry baseline merge");
+    CHECK(ctx->alloc_facts->len == 6,
+          "malloc/realloc and calloc F05 totals");
+    CHECK(ctx->mayarray_facts->len == 3,
+          "only positive calloc observations emit F06");
+
+    /* Product mismatch: inconsistent internal event, sticky failure. */
+    OspreySharedRun *run2 = new_run(&c);
+    osprey_child_use_shared_run(ctx, run2);
+    provenance_init();
+    PtrTag pm = provenance_create_object(0x6000, 48, 0x400240,
+                                         PROV_PRODUCER_CALLOC_RETURN);
+    OspreyAllocatorObservation pmo = {
+        .kind = OSPREY_ALLOCATOR_CALLOC,
+        .site_pc = 0x400240,
+        .requested_size = 48,
+        .element_count = 5,
+        .element_size = 16,
+    };
+    osprey_on_alloc_success(env, &pmo, 0x6000, pm.object_id, pm.generation);
+    CHECK(run2->bad_identity == 1 && run2->bad_arithmetic == 0,
+          "product mismatch is an identity failure");
+    CHECK(run2->alloc_used == 0, "product mismatch publishes no F05");
+    CHECK(run2->mayarray_used == 0, "product mismatch publishes no F06");
+    CHECK(osprey_parent_merge_sample(ctx, run2) == OSPREY_INCOMPLETE_FACTS,
+          "product mismatch merge rejects");
+    CHECK(ctx->alloc_facts->len == 6 && ctx->mayarray_facts->len == 3,
+          "product mismatch committed nothing");
+
+    /* Product overflow is arithmetic-invalid before provenance lookup or
+     * any table publication. */
+    OspreySharedRun *run3 = new_run(&c);
+    osprey_child_use_shared_run(ctx, run3);
+    OspreyAllocatorObservation overflow = {
+        .kind = OSPREY_ALLOCATOR_CALLOC,
+        .site_pc = 0x400241,
+        .requested_size = 0,
+        .element_count = UINT64_MAX,
+        .element_size = 2,
+        .overflowed = true,
+    };
+    osprey_on_alloc_success(env, &overflow, 0, 0, 0);
+    CHECK(run3->bad_arithmetic == 1, "calloc overflow arithmetic sticky");
+    CHECK(run3->alloc_used == 0 && run3->mayarray_used == 0,
+          "calloc overflow publishes no facts");
+    CHECK(osprey_parent_merge_sample(ctx, run3) == OSPREY_INCOMPLETE_FACTS,
+          "calloc overflow merge rejects");
+
+    /* The signed canonical-size bound and base-end arithmetic are both
+     * fail-closed even when the provenance object is otherwise valid. */
+    OspreySharedRun *run4 = new_run(&c);
+    osprey_child_use_shared_run(ctx, run4);
+    uint64_t too_large = (uint64_t)INT64_MAX + 1;
+    PtrTag large = provenance_create_object(0x8000, too_large, 0x400242,
+                                            PROV_PRODUCER_MALLOC_RETURN);
+    OspreyAllocatorObservation large_obs = {
+        .kind = OSPREY_ALLOCATOR_MALLOC,
+        .site_pc = 0x400242,
+        .requested_size = too_large,
+    };
+    osprey_on_alloc_success(env, &large_obs, 0x8000,
+                            large.object_id, large.generation);
+    CHECK(run4->bad_arithmetic == 1 && run4->alloc_used == 0,
+          "oversized allocation rejects before publication");
+    CHECK(osprey_parent_merge_sample(ctx, run4) == OSPREY_INCOMPLETE_FACTS,
+          "oversized allocation merge rejects");
+
+    OspreySharedRun *run5 = new_run(&c);
+    osprey_child_use_shared_run(ctx, run5);
+    PtrTag end = provenance_create_object(UINT64_MAX - 7, 16, 0x400243,
+                                          PROV_PRODUCER_MALLOC_RETURN);
+    OspreyAllocatorObservation end_obs = {
+        .kind = OSPREY_ALLOCATOR_MALLOC,
+        .site_pc = 0x400243,
+        .requested_size = 16,
+    };
+    osprey_on_alloc_success(env, &end_obs, UINT64_MAX - 7,
+                            end.object_id, end.generation);
+    CHECK(run5->bad_arithmetic == 1 && run5->alloc_used == 0,
+          "base-end overflow rejects before publication");
+    CHECK(osprey_parent_merge_sample(ctx, run5) == OSPREY_INCOMPLETE_FACTS,
+          "base-end overflow merge rejects");
+    CHECK(ctx->alloc_facts->len == 6 && ctx->mayarray_facts->len == 3,
+          "arithmetic failures preserve committed baseline");
+
+    osprey_free(ctx);
+    g_free(run);
+    g_free(run2);
+    g_free(run3);
+    g_free(run4);
+    g_free(run5);
+    g_free(env);
+    osprey_clear_pre_sample_fatal();
+}
+
+/* Transport: alloc/may-array keys, duplicates, prefix/suffix union,
+ * cross-sample support, saturation, version pin, failed diagnostics
+ * consume no rows, and may-array table exhaustion rejects at merge. */
+static void test_allocator_transport_support_and_limits(void)
+{
+    reset_log();
+    CHECK(OSPREY_SHARED_VERSION == 10u, "shared format version 10");
+    CHECK(sizeof(OspreyMallocFact) == 24 && _Alignof(OspreyMallocFact) == 8,
+          "version-10 F05 fixed layout");
+    CHECK(sizeof(OspreyMayArrayFact) == 56 &&
+              _Alignof(OspreyMayArrayFact) == 8,
+          "version-10 F06 fixed layout");
+
+    OspreyConfig c = test_config();
+    OspreyContext *ctx = osprey_new(&c);
+    OspreySharedRun *run = new_run(&c);
+
+    /* Duplicate insertion in either order merges in place; support
+     * stays Boolean inside one sample. */
+    OspreyMallocFact a1, a2;
+    fill_alloc_fact(&a1, 0x300, 48);
+    fill_alloc_fact(&a2, 0x310, 24);
+    CHECK(osprey_table_insert_alloc(run, &a1) == 1, "insert alloc 1");
+    CHECK(osprey_table_insert_alloc(run, &a2) == 1, "insert alloc 2");
+    CHECK(osprey_table_insert_alloc(run, &a1) == 0,
+          "alloc duplicate merges in place");
+    CHECK(run->alloc_used == 2, "two unique alloc records");
+    OspreyMayArrayFact m1, m2;
+    fill_mayarray_fact(&m1, OSPREY_REGION_HEAP_SITE, 0x300, 0, 3, 16, 0);
+    fill_mayarray_fact(&m2, OSPREY_REGION_HEAP_SITE, 0x310, 0, 1, 24, 0);
+    CHECK(osprey_table_insert_mayarray(run, &m1) == 1, "insert may 1");
+    CHECK(osprey_table_insert_mayarray(run, &m2) == 1, "insert may 2");
+    CHECK(osprey_table_insert_mayarray(run, &m1) == 0,
+          "may duplicate merges in place");
+    CHECK(run->mayarray_used == 2, "two unique may records");
+
+    /* Prefix/suffix union: same alloc fact in both parts contributes
+     * one Boolean support; a distinct child fact adds one row. */
+    CHECK(osprey_shared_run_freeze_prefix(ctx, run), "freeze");
+    osprey_shared_run_prepare(ctx, run, 1);
+    CHECK(osprey_table_insert_alloc(run, &a1) == 1,
+          "prefix alloc duplicate copied into child");
+    CHECK(osprey_table_insert_mayarray(run, &m1) == 1,
+          "prefix may-array duplicate copied into child");
+    CHECK(run->total_facts_count == 4,
+          "prefix duplicates keep union count");
+    OspreyMallocFact a3;
+    fill_alloc_fact(&a3, 0x320, 96);
+    CHECK(osprey_table_insert_alloc(run, &a3) == 1, "child-only alloc");
+    CHECK(osprey_parent_merge_sample(ctx, run) == OSPREY_OK, "merge ok");
+    CHECK(ctx->alloc_facts->len == 3, "union of three alloc facts");
+    CHECK(ctx->mayarray_facts->len == 2,
+          "union of two may-array facts");
+    for (guint i = 0; i < ctx->mayarray_facts->len; i++) {
+        OspreyMayArrayFact *f = &g_array_index(ctx->mayarray_facts,
+                                               OspreyMayArrayFact, i);
+        CHECK(f->sample_support == 1,
+              "may-array support is Boolean within one sample");
+    }
+    for (guint i = 0; i < ctx->alloc_facts->len; i++) {
+        OspreyMallocFact *f = &g_array_index(ctx->alloc_facts,
+                                             OspreyMallocFact, i);
+        CHECK(f->sample_support == 1, "Boolean support per sample");
+        CHECK(f->requested_size <= INT64_MAX, "unsigned 64-bit size");
+    }
+    /* A later committed sample increments support exactly once. */
+    osprey_shared_run_prepare(ctx, run, 2);
+    CHECK(osprey_table_insert_alloc(run, &a1) == 1,
+          "second-sample alloc duplicate copied into child");
+    CHECK(osprey_table_insert_mayarray(run, &m1) == 1,
+          "second-sample may-array duplicate copied into child");
+    CHECK(run->total_facts_count == 4,
+          "second-sample duplicates keep prefix union count");
+    CHECK(osprey_parent_merge_sample(ctx, run) == OSPREY_OK,
+          "second baseline merge");
+    OspreyMallocFact *fa = NULL;
+    OspreyMayArrayFact *fm = NULL;
+    for (guint i = 0; i < ctx->alloc_facts->len; i++) {
+        OspreyMallocFact *f = &g_array_index(ctx->alloc_facts,
+                                             OspreyMallocFact, i);
+        if (f->site_pc == 0x300 && f->requested_size == 48) fa = f;
+    }
+    for (guint i = 0; i < ctx->mayarray_facts->len; i++) {
+        OspreyMayArrayFact *f = &g_array_index(ctx->mayarray_facts,
+                                               OspreyMayArrayFact, i);
+        if (osprey_mayarray_eq(f, &m1)) fm = f;
+    }
+    CHECK(fa != NULL && fa->sample_support == 2,
+          "F05 support increments once per committed sample");
+    CHECK(fm != NULL && fm->sample_support == 2,
+          "F06 support increments once per committed sample");
+
+    /* Parent-side support accumulation saturates for both families. */
+    if (fa != NULL) fa->sample_support = UINT32_MAX;
+    if (fm != NULL) fm->sample_support = UINT32_MAX;
+    osprey_shared_run_prepare(ctx, run, 3);
+    CHECK(osprey_parent_merge_sample(ctx, run) == OSPREY_OK,
+          "saturation sample merges");
+    CHECK(fa != NULL && fa->sample_support == UINT32_MAX,
+          "F05 support saturates at UINT32_MAX");
+    CHECK(fm != NULL && fm->sample_support == UINT32_MAX,
+          "F06 support saturates at UINT32_MAX");
+
+    /* Failed diagnostics consume no shared rows: run3 stays empty. */
+    OspreySharedRun *run3 = new_run(&c);
+    osprey_child_use_shared_run(ctx, run3);
+    OspreyAllocatorObservation fail = {
+        .kind = OSPREY_ALLOCATOR_MALLOC,
+        .site_pc = 0x400400,
+        .requested_size = 16,
+    };
+    osprey_set_image_bounds(0x400000, 0x401000);
+    osprey_on_alloc_failure(&fail);
+    CHECK(run3->alloc_used == 0 && run3->mayarray_used == 0,
+          "failed diagnostic consumes no shared rows");
+    CHECK(run3->total_facts_count == 0, "failed diagnostic no fact count");
+
+    /* Independent fixed-table exhaustion: each allocator family must
+     * fail closed without borrowing capacity from another family. */
+    OspreySharedRun *alloc_full = new_run(&c);
+    alloc_full->alloc_cap = 1;
+    OspreyMallocFact cap_a, cap_b;
+    fill_alloc_fact(&cap_a, 0x340, 8);
+    fill_alloc_fact(&cap_b, 0x350, 8);
+    CHECK(osprey_table_insert_alloc(alloc_full, &cap_a) == 1,
+          "allocator table first row");
+    CHECK(osprey_table_insert_alloc(alloc_full, &cap_b) < 0 &&
+          alloc_full->overflow == 1,
+          "allocator table exhaustion is sticky");
+
+    OspreySharedRun *may_full = new_run(&c);
+    may_full->mayarray_cap = 1;
+    OspreyMayArrayFact cap_m1, cap_m2;
+    fill_mayarray_fact(&cap_m1, OSPREY_REGION_HEAP_SITE, 0x340, 0,
+                       1, 8, OSPREY_MAY_ARRAY_CALLOC_GEOMETRY);
+    fill_mayarray_fact(&cap_m2, OSPREY_REGION_HEAP_SITE, 0x350, 0,
+                       1, 8, OSPREY_MAY_ARRAY_CALLOC_GEOMETRY);
+    CHECK(osprey_table_insert_mayarray(may_full, &cap_m1) == 1,
+          "may-array table first row");
+    CHECK(osprey_table_insert_mayarray(may_full, &cap_m2) < 0 &&
+          may_full->overflow == 1,
+          "may-array table exhaustion is sticky");
+
+    guint committed_allocs = ctx->alloc_facts->len;
+    guint committed_mays = ctx->mayarray_facts->len;
+    CHECK(osprey_parent_merge_sample(ctx, alloc_full) ==
+              OSPREY_INCOMPLETE_FACTS,
+          "allocator table exhaustion rejects at merge");
+    CHECK(ctx->alloc_facts->len == committed_allocs,
+          "allocator exhaustion commits no partial row");
+
+    /* F05 may be inserted before truthful F06 hits its independent
+     * table cap.  The sticky overflow must reject both atomically. */
+    OspreySharedRun *partial = new_run(&c);
+    partial->mayarray_cap = 1;
+    CHECK(osprey_table_insert_alloc(partial, &cap_a) == 1,
+          "partial sample inserts F05 first");
+    CHECK(osprey_table_insert_mayarray(partial, &cap_m1) == 1,
+          "partial sample inserts first F06");
+    CHECK(osprey_table_insert_mayarray(partial, &cap_m2) < 0 &&
+          partial->overflow == 1,
+          "second F06 exhausts partial sample");
+    CHECK(osprey_parent_merge_sample(ctx, partial) ==
+              OSPREY_INCOMPLETE_FACTS,
+          "partial F05/F06 sample rejects at merge");
+    CHECK(ctx->alloc_facts->len == committed_allocs &&
+          ctx->mayarray_facts->len == committed_mays,
+          "partial allocator sample commits neither family");
+
+    /* The total-fact cap is independent of either table capacity. */
+    OspreySharedRun *fact_full = new_run(&c);
+    fact_full->max_facts_cfg = 1;
+    CHECK(osprey_table_insert_alloc(fact_full, &cap_a) == 1,
+          "total-fact cap first row");
+    CHECK(osprey_table_insert_alloc(fact_full, &cap_b) < 0 &&
+          fact_full->overflow == 1,
+          "total-fact cap exhaustion is sticky");
+
+    OspreySharedRun *bad_may = new_run(&c);
+    OspreyMayArrayFact malformed_may = cap_m1;
+    malformed_may.sample_support = 2;
+    CHECK(osprey_table_insert_mayarray(bad_may, &malformed_may) == 1,
+          "malformed may-array support inserted for validation");
+    CHECK(osprey_parent_merge_sample(ctx, bad_may) ==
+              OSPREY_INCOMPLETE_FACTS,
+          "malformed may-array support rejected");
+    CHECK(ctx->mayarray_facts->len == 2,
+          "malformed may-array support commits nothing");
+
+    OspreySharedRun *bad_alloc = new_run(&c);
+    OspreyMallocFact oversized;
+    fill_alloc_fact(&oversized, 0x360, (uint64_t)INT64_MAX + 1);
+    CHECK(osprey_table_insert_alloc(bad_alloc, &oversized) == 1,
+          "oversized transported F05 inserted for validation");
+    CHECK(osprey_parent_merge_sample(ctx, bad_alloc) ==
+              OSPREY_INCOMPLETE_FACTS,
+          "oversized transported F05 rejects before rules");
+
+    OspreySharedRun *bad_geometry = new_run(&c);
+    OspreyMallocFact geometry_total;
+    OspreyMayArrayFact bad_start;
+    fill_alloc_fact(&geometry_total, 0x370, 48);
+    fill_mayarray_fact(&bad_start, OSPREY_REGION_HEAP_SITE, 0x370, -8,
+                       3, 16, OSPREY_MAY_ARRAY_CALLOC_GEOMETRY);
+    CHECK(osprey_table_insert_alloc(bad_geometry, &geometry_total) == 1,
+          "matching F05 inserted for malformed F06");
+    CHECK(osprey_table_insert_mayarray(bad_geometry, &bad_start) == 1,
+          "malformed F06 start inserted for validation");
+    CHECK(osprey_parent_merge_sample(ctx, bad_geometry) ==
+              OSPREY_INCOMPLETE_FACTS,
+          "noncanonical F06 start rejects before rules");
+
+    OspreySharedRun *missing_total = new_run(&c);
+    OspreyMayArrayFact orphan = cap_m1;
+    orphan.start.region.site_offset = 0x380;
+    CHECK(osprey_table_insert_mayarray(missing_total, &orphan) == 1,
+          "orphan F06 inserted for validation");
+    CHECK(osprey_parent_merge_sample(ctx, missing_total) ==
+              OSPREY_INCOMPLETE_FACTS,
+          "F06 without matching F05 rejects before rules");
+    CHECK(ctx->alloc_facts->len == committed_allocs &&
+          ctx->mayarray_facts->len == committed_mays,
+          "malformed allocator transport commits nothing");
+
+    OspreyConfig tiny = c;
+    tiny.shared_bytes = 1;
+    OspreyContext *tiny_ctx = osprey_new(&tiny);
+    OspreySharedRun *byte_run = new_run(&c);
+    CHECK(osprey_parent_merge_sample(tiny_ctx, byte_run) ==
+              OSPREY_INCOMPLETE_FACTS,
+          "shared-byte layout exhaustion rejects");
+    CHECK(tiny_ctx->alloc_facts->len == 0,
+          "shared-byte rejection commits nothing");
+    osprey_free(tiny_ctx);
+    g_free(byte_run);
+
+    g_free(alloc_full);
+    g_free(may_full);
+    g_free(partial);
+    g_free(fact_full);
+    g_free(bad_may);
+    g_free(bad_alloc);
+    g_free(bad_geometry);
+    g_free(missing_total);
+    g_free(run3);
+    osprey_free(ctx);
+    g_free(run);
+    osprey_clear_pre_sample_fatal();
+}
+
+/* Complete F01-F06 dump contract: exact schemas, all-field order,
+ * canonical F06 starts, 64-bit values, support fields, uniqueness, no raw
+ * addresses, and no negative alloc rows.  Signed copy/points dump order is
+ * pinned separately by test_copy_points_merge_and_dump(). */
+static void test_complete_f01_f06_dump_contract(void)
+{
+    reset_log();
+    OspreyConfig c = test_config();
+    snprintf(c.dump_file, sizeof(c.dump_file), "/tmp/osprey_f06_dump.txt");
+    unlink(c.dump_file);
+    OspreyContext *ctx = osprey_new(&c);
+    OspreySharedRun *run = new_run(&c);
+
+    /* Deliberately shuffled rows from every family. */
+    OspreyAccessFact f;
+    memset(&f, 0, sizeof(f));
+    f.pc = 0x500;
+    f.chunk.address.region.kind = OSPREY_REGION_GLOBAL;
+    f.chunk.address.offset = 0x8000;
+    f.chunk.size = 8;
+    f.dynamic_count = 1;
+    f.sample_support = 1;
+    CHECK(osprey_table_insert_access(run, &f) == 1, "insert access");
+
+    OspreyBaseFact b;
+    memset(&b, 0, sizeof(b));
+    b.pc = 0x510;
+    b.chunk.address.region.kind = OSPREY_REGION_GLOBAL;
+    b.chunk.address.offset = 0x8000;
+    b.chunk.size = 8;
+    b.base.region.kind = OSPREY_REGION_GLOBAL;
+    b.base.offset = 0x8000;
+    b.producer_pc = 0x60;
+    b.sample_support = 1;
+    CHECK(osprey_table_insert_base(run, &b) == 1, "insert base");
+
+    OspreyCopyFact cp;
+    memset(&cp, 0, sizeof(cp));
+    cp.source.address.region.kind = OSPREY_REGION_GLOBAL;
+    cp.source.address.offset = 0x8000;
+    cp.source.size = 8;
+    cp.destination.address.region.kind = OSPREY_REGION_GLOBAL;
+    cp.destination.address.offset = 0x8010;
+    cp.destination.size = 8;
+    cp.sample_support = 1;
+    CHECK(osprey_table_insert_copy(run, &cp) == 1, "insert copy");
+
+    OspreyPointsToFact pt;
+    memset(&pt, 0, sizeof(pt));
+    pt.pointer_chunk.address.region.kind = OSPREY_REGION_GLOBAL;
+    pt.pointer_chunk.address.offset = 0x8020;
+    pt.pointer_chunk.size = 8;
+    pt.target.region.kind = OSPREY_REGION_HEAP_SITE;
+    pt.target.region.site_offset = 0x300;
+    pt.target.offset = 0;
+    pt.sample_support = 1;
+    CHECK(osprey_table_insert_points(run, &pt) == 1, "insert points");
+
+    OspreyMallocFact a1, a2;
+    fill_alloc_fact(&a1, 0x310, 24);
+    fill_alloc_fact(&a2, 0x300, 32);
+    CHECK(osprey_table_insert_alloc(run, &a1) == 1, "insert alloc shuffled");
+    CHECK(osprey_table_insert_alloc(run, &a2) == 1, "insert alloc 2");
+    /* Same-site distinct sizes stay distinct facts. */
+    OspreyMallocFact a3;
+    fill_alloc_fact(&a3, 0x300, 48);
+    CHECK(osprey_table_insert_alloc(run, &a3) == 1, "same site new size");
+
+    /* Positive calloc geometries keep the canonical H_site+0 start;
+     * two distinct pairs may carry the same total. */
+    OspreyMayArrayFact m1, m2, m3;
+    fill_mayarray_fact(&m1, OSPREY_REGION_HEAP_SITE, 0x310, 0, 1, 24, 0);
+    fill_mayarray_fact(&m2, OSPREY_REGION_HEAP_SITE, 0x300, 0, 2, 24, 0);
+    fill_mayarray_fact(&m3, OSPREY_REGION_HEAP_SITE, 0x300, 0, 3, 16, 0);
+    CHECK(osprey_table_insert_mayarray(run, &m1) == 1, "insert may 1");
+    CHECK(osprey_table_insert_mayarray(run, &m2) == 1, "insert may 2");
+    CHECK(osprey_table_insert_mayarray(run, &m3) == 1,
+          "insert same-total may-array geometry");
+
+    /* Valid success size 0 row. */
+    OspreyMallocFact z;
+    fill_alloc_fact(&z, 0x320, 0);
+    CHECK(osprey_table_insert_alloc(run, &z) == 1, "zero-size success");
+
+    CHECK(osprey_parent_merge_sample(ctx, run) == OSPREY_OK, "merge ok");
+    FILE *fp = fopen(c.dump_file, "r");
+    CHECK(fp != NULL, "dump written");
+    char lines[64][256];
+    int n = 0;
+    if (fp != NULL) {
+        char line[256];
+        while (fgets(line, sizeof(line), fp) && n < 64) {
+            size_t len = strlen(line);
+            if (len > 0 && line[len - 1] == '\n') line[len - 1] = '\0';
+            snprintf(lines[n], sizeof(lines[n]), "%s", line);
+            CHECK(strstr(lines[n], "0x") == NULL,
+                  "canonical dump has no raw address prefix");
+            n++;
+        }
+        fclose(fp);
+    }
+    /* Find family boundaries. */
+    int alloc_start = -1, may_start = -1;
+    for (int i = 0; i < n; i++) {
+        if (strncmp(lines[i], "alloc ", 6) == 0 && alloc_start < 0)
+            alloc_start = i;
+        if (strncmp(lines[i], "may-array ", 9) == 0 && may_start < 0)
+            may_start = i;
+    }
+    CHECK(alloc_start >= 0, "alloc rows present");
+    CHECK(may_start >= 0, "may-array rows present");
+    /* Alloc rows sorted by (site, size, support); no negative rows. */
+    int allocs = 0;
+    uint64_t prev_site = 0, prev_size = 0;
+    bool first_alloc = true;
+    for (int i = alloc_start; i < n; i++) {
+        if (strncmp(lines[i], "alloc ", 6) != 0) break;
+        uint64_t site, size; unsigned sup;
+        CHECK(sscanf(lines[i], "alloc %llx %llu %u",
+                     (unsigned long long *)&site,
+                     (unsigned long long *)&size, &sup) == 3,
+              "alloc schema: site size support");
+        CHECK(!strstr(lines[i], "-1"), "no negative alloc row");
+        if (!first_alloc) {
+            CHECK(site > prev_site ||
+                  (site == prev_site && size >= prev_size),
+                  "alloc sorted by site then size");
+        }
+        first_alloc = false;
+        prev_site = site;
+        prev_size = size;
+        allocs++;
+    }
+    CHECK(allocs == 4, "four alloc rows");
+    /* May-array rows sorted in schema order with canonical zero starts
+     * and exact 64-bit geometry. */
+    int mays = 0;
+    for (int i = may_start; i < n; i++) {
+        if (strncmp(lines[i], "may-array ", 9) != 0) break;
+        unsigned kind, ev, sup;
+        unsigned long long site, off, cnt, esz;
+        CHECK(sscanf(lines[i],
+                     "may-array %u %llx %llx %llu %llu %u %u",
+                     &kind, &site, &off, &cnt, &esz, &ev, &sup) == 7,
+              "may-array schema: kind site offset count size evidence "
+              "support");
+        CHECK(cnt > 0 && esz > 0, "positive calloc geometry only");
+        mays++;
+    }
+    CHECK(mays == 3, "three may-array rows");
+    /* Order: geometry (2,24) before (3,16) at site 0x300, then
+     * the site-0x310 row.  Every real F06 start is H_site+0. */
+    CHECK(strstr(lines[may_start],
+                 "may-array 1 300 0 2 24 0 1") == lines[may_start],
+          "may-array first row exact");
+    CHECK(strstr(lines[may_start + 1],
+                 "may-array 1 300 0 3 16 0 1") == lines[may_start + 1],
+          "may-array second row has canonical zero start");
+    CHECK(strstr(lines[may_start + 2],
+                 "may-array 1 310 0 1 24 0 1") == lines[may_start + 2],
+          "may-array third row exact");
+
+    unlink(c.dump_file);
+    osprey_free(ctx);
+    g_free(run);
+    osprey_clear_pre_sample_fatal();
+}
+
 /* ------------------------------------------------------------------ */
 
 int main(void)
@@ -1779,6 +2656,10 @@ int main(void)
     test_chunk_cap_rejection();
     test_mutation_run_isolated();
     test_pre_sample_fatal();
+    test_allocator_fact_success_boundary();
+    test_calloc_geometry_f06();
+    test_allocator_transport_support_and_limits();
+    test_complete_f01_f06_dump_contract();
     test_canonical_dump();
     test_sem_manifest_integrity();
     test_sem_overwrite_fail_closed();
@@ -1797,7 +2678,7 @@ int main(void)
         fprintf(stderr, "%d unit test check(s) FAILED\n", failures);
         return 1;
     }
-    printf("PASS osprey_unit (46/46)\n");
+    printf("PASS osprey_unit (50/50)\n");
     return 0;
 }
 
@@ -2388,8 +3269,14 @@ static void test_address_origin_channels_and_producers(void)
     provenance_init();
     PtrTag t = provenance_create_object(0x10000, 64, 0x400300,
                                         PROV_PRODUCER_MALLOC_RETURN);
-    osprey_on_alloc_success(env, 0x10000, 64, 0x400300,
-                            t.object_id, t.generation);
+    {
+        OspreyAllocatorObservation obs = {
+            .kind = OSPREY_ALLOCATOR_MALLOC,
+            .site_pc = 0x400300,
+            .requested_size = 64,
+        };
+        osprey_on_alloc_success(env, &obs, 0x10000, t.object_id, t.generation);
+    }
     CHECK(st->regs[R_EAX].address.valid &&
           st->regs[R_EAX].address.canonical.region.kind ==
               OSPREY_REGION_HEAP_SITE &&
@@ -2630,8 +3517,14 @@ static void test_address_shadow_reload(void)
     provenance_init();
     PtrTag t = provenance_create_object(0x10000, 64, 0x400300,
                                         PROV_PRODUCER_MALLOC_RETURN);
-    osprey_on_alloc_success(env, 0x10000, 64, 0x400300,
-                            t.object_id, t.generation);
+    {
+        OspreyAllocatorObservation obs = {
+            .kind = OSPREY_ALLOCATOR_MALLOC,
+            .site_pc = 0x400300,
+            .requested_size = 64,
+        };
+        osprey_on_alloc_success(env, &obs, 0x10000, t.object_id, t.generation);
+    }
 
     /* Uninterrupted aligned pointer-width store + reload: the reload
      * restores the origin and sets producer PC to the load. */
@@ -2775,8 +3668,14 @@ static void test_f02_ea_selection(void)
     provenance_init();
     PtrTag t = provenance_create_object(0x10000, 64, 0x400300,
                                         PROV_PRODUCER_MALLOC_RETURN);
-    osprey_on_alloc_success(env, 0x10000, 64, 0x400300,
-                            t.object_id, t.generation);
+    {
+        OspreyAllocatorObservation obs = {
+            .kind = OSPREY_ALLOCATOR_MALLOC,
+            .site_pc = 0x400300,
+            .requested_size = 64,
+        };
+        osprey_on_alloc_success(env, &obs, 0x10000, t.object_id, t.generation);
+    }
 
     /* [base + disp]: base-only accepted with exact reconstruction. */
     install_addr_origin(st, R_R12, 0x10000, &H, 0, 0x300);
@@ -3026,8 +3925,14 @@ static void test_f02_ea_selection(void)
      * origin (t2) while the access reads 8 bytes through it. */
     PtrTag t2 = provenance_create_object(0x30000, 32, 0x400300,
                                          PROV_PRODUCER_MALLOC_RETURN);
-    osprey_on_alloc_success(env, 0x30000, 32, 0x400300,
-                            t2.object_id, t2.generation);
+    {
+        OspreyAllocatorObservation obs = {
+            .kind = OSPREY_ALLOCATOR_MALLOC,
+            .site_pc = 0x400300,
+            .requested_size = 32,
+        };
+        osprey_on_alloc_success(env, &obs, 0x30000, t2.object_id, t2.generation);
+    }
     install_addr_origin(st, R_R12, 0x30000, &H, 0, 0x300);
     st->regs[R_R12].address.prov_object_id = t2.object_id;
     st->regs[R_R12].address.prov_generation = t2.generation;
@@ -3206,8 +4111,14 @@ static void test_value_origin_creation_and_transfer(void)
         provenance_init();
         PtrTag t = provenance_create_object(0x10000, 64, 0x400300,
                                             PROV_PRODUCER_MALLOC_RETURN);
-        osprey_on_alloc_success(env, 0x10000, 64, 0x400300,
-                                t.object_id, t.generation);
+        {
+        OspreyAllocatorObservation obs = {
+            .kind = OSPREY_ALLOCATOR_MALLOC,
+            .site_pc = 0x400300,
+            .requested_size = 64,
+        };
+        osprey_on_alloc_success(env, &obs, 0x10000, t.object_id, t.generation);
+    }
         install_addr_origin(st, R_R13, 0x10000, &H, 0, 0x300);
         st->regs[R_R13].address.prov_object_id = t.object_id;
         st->regs[R_R13].address.prov_generation = t.generation;
@@ -3374,8 +4285,14 @@ static void test_ordinary_f03_f04_publication(void)
     provenance_init();
     PtrTag t = provenance_create_object(0x10000, 64, 0x400300,
                                         PROV_PRODUCER_MALLOC_RETURN);
-    osprey_on_alloc_success(env, 0x10000, 64, 0x400300,
-                            t.object_id, t.generation);
+    {
+        OspreyAllocatorObservation obs = {
+            .kind = OSPREY_ALLOCATOR_MALLOC,
+            .site_pc = 0x400300,
+            .requested_size = 64,
+        };
+        osprey_on_alloc_success(env, &obs, 0x10000, t.object_id, t.generation);
+    }
 
     /* Global-to-global F03 with a matching-width VALUE channel. */
     env->regs[R_R12] = 0x41414141;
@@ -3502,8 +4419,14 @@ static void test_ordinary_f03_f04_publication(void)
     provenance_init();
     PtrTag t2 = provenance_create_object(0x20000, 64, 0x400300,
                                          PROV_PRODUCER_MALLOC_RETURN);
-    osprey_on_alloc_success(env, 0x20000, 64, 0x400300,
-                            t2.object_id, t2.generation);
+    {
+        OspreyAllocatorObservation obs = {
+            .kind = OSPREY_ALLOCATOR_MALLOC,
+            .site_pc = 0x400300,
+            .requested_size = 64,
+        };
+        osprey_on_alloc_success(env, &obs, 0x20000, t2.object_id, t2.generation);
+    }
     install_addr_origin(st, R_R12, 0x20000, &H, 0, 0x300);
     st->regs[R_R12].address.prov_object_id = t2.object_id;
     st->regs[R_R12].address.prov_generation = t2.generation;
@@ -3566,8 +4489,14 @@ static void test_osprey_shadow_overlap_invalidation(void)
     provenance_init();
     PtrTag t = provenance_create_object(0x10000, 64, 0x400300,
                                         PROV_PRODUCER_MALLOC_RETURN);
-    osprey_on_alloc_success(env, 0x10000, 64, 0x400300,
-                            t.object_id, t.generation);
+    {
+        OspreyAllocatorObservation obs = {
+            .kind = OSPREY_ALLOCATOR_MALLOC,
+            .site_pc = 0x400300,
+            .requested_size = 64,
+        };
+        osprey_on_alloc_success(env, &obs, 0x10000, t.object_id, t.generation);
+    }
 
     /* Install a live slot at 0x402100. */
     install_addr_origin(st, R_R12, 0x10000, &H, 0, 0x300);
@@ -3696,8 +4625,14 @@ static void test_modeled_copy_origins_and_facts(void)
     provenance_init();
     PtrTag t = provenance_create_object(0x10000, 64, 0x400300,
                                         PROV_PRODUCER_MALLOC_RETURN);
-    osprey_on_alloc_success(env, 0x10000, 64, 0x400300,
-                            t.object_id, t.generation);
+    {
+        OspreyAllocatorObservation obs = {
+            .kind = OSPREY_ALLOCATOR_MALLOC,
+            .site_pc = 0x400300,
+            .requested_size = 64,
+        };
+        osprey_on_alloc_success(env, &obs, 0x10000, t.object_id, t.generation);
+    }
 
     /* Invalid copy classes are invalidation-only: they may remove a
      * destination slot but cannot authorize F03/F04 or relocation. */
@@ -3854,8 +4789,14 @@ static void test_modeled_copy_origins_and_facts(void)
      * metadata. */
     PtrTag many = provenance_create_object(0x11000, 64, 0x400300,
                                            PROV_PRODUCER_MALLOC_RETURN);
-    osprey_on_alloc_success(env, 0x11000, 64, 0x400300,
-                            many.object_id, many.generation);
+    {
+        OspreyAllocatorObservation obs = {
+            .kind = OSPREY_ALLOCATOR_MALLOC,
+            .site_pc = 0x400300,
+            .requested_size = 64,
+        };
+        osprey_on_alloc_success(env, &obs, 0x11000, many.object_id, many.generation);
+    }
     install_addr_origin(st, R_R12, 0x11000, &H, 0, 0x300);
     st->regs[R_R12].address.prov_object_id = many.object_id;
     st->regs[R_R12].address.prov_generation = many.generation;
@@ -3892,8 +4833,8 @@ static void test_modeled_copy_origins_and_facts(void)
 static void test_copy_points_merge_and_dump(void)
 {
     reset_log();
-    CHECK(OSPREY_SHARED_VERSION == 9u,
-          "shared version unchanged by Stage 2.4");
+    CHECK(OSPREY_SHARED_VERSION == 10u,
+          "shared format version 10 (Stage 2.5)");
     CHECK(sizeof(OspreyValueOrigin) > 8,
           "VALUE origin carries the full source chunk record");
 
@@ -4047,9 +4988,9 @@ static void test_copy_points_merge_and_dump(void)
 static void test_base_fact_producer_merge(void)
 {
     reset_log();
-    /* Shared version 9 layout: the base record now carries producer_pc
-     * as deterministic audit metadata. */
-    CHECK(OSPREY_SHARED_VERSION == 9u, "shared format version 9");
+    /* The version-10 base record carries producer_pc as deterministic
+     * audit metadata. */
+    CHECK(OSPREY_SHARED_VERSION == 10u, "shared format version 10");
     CHECK(offsetof(OspreyBaseFact, producer_pc) <
               offsetof(OspreyBaseFact, sample_support),
           "producer_pc precedes sample_support in the fixed record");

@@ -9105,7 +9105,8 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
             }
         } else if (model == MALLOC) {
             if (symbolic_mode) {
-                model_alloc(env, model_caller_addr, R_EDI);
+                model_alloc(env, model_caller_addr, R_EDI,
+                            env->regs[R_EDI]);
                 clear_call_args_temps();
                 clear_xmm_regs(env);
             } else {
@@ -9134,7 +9135,8 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
                 }
             }
             if (symbolic_mode) {
-                model_alloc(env, model_caller_addr, R_ESI);
+                model_alloc(env, model_caller_addr, R_ESI,
+                            env->regs[R_ESI]);
                 clear_call_args_temps();
                 clear_xmm_regs(env);
             } else {
@@ -9172,37 +9174,34 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
             }
             mode = 2;
         } else if (model == CALLOC) {
+            /* Snapshot both ABI operands before model setup clears
+             * caller-saved state.  One checked target-width product feeds
+             * the legacy snapshot tracker and the pending OSPREY event. */
+            target_ulong count = env->regs[R_EDI];
+            target_ulong element_size = env->regs[R_ESI];
+            target_ulong total = 0;
+            bool overflowed = __builtin_mul_overflow(count, element_size,
+                                                     &total);
             if (symbolic_mode) {
-                trace_mem("[calloc] [size %lx] [pc %lx]\n]", env->regs[R_EDI], model_caller_addr);
-                model_alloc(env, model_caller_addr, R_EDI);
+                trace_mem("[calloc] [size %lx] [pc %lx]\n]", count,
+                          model_caller_addr);
+                model_alloc(env, model_caller_addr, R_EDI,
+                            overflowed ? 0 : total);
                 clear_call_args_temps();
                 clear_xmm_regs(env);
             } else {
-                /* memcheck-only: record pending alloc for return hook.
-                 * calloc(n, size) → total = n * size, in R_EDI * R_ESI */
-                target_ulong total;
-                if (__builtin_mul_overflow(env->regs[R_EDI],
-                                           env->regs[R_ESI], &total)) {
-                    /* Overflow: never create a wrapped-size allocation.
-                     * Record a failed pending op (size 0, overflow flag). */
-                    snapshot_trace_pending_allocs(0, model_caller_addr);
-                } else {
-                    snapshot_trace_pending_allocs(total, model_caller_addr);
-                }
+                /* memcheck-only: preserve the same checked result for the
+                 * legacy allocation tracker. */
+                snapshot_trace_pending_allocs(overflowed ? 0 : total,
+                                              model_caller_addr);
             }
             provenance_set_pending(env, PROV_OP_CALLOC, model_caller_addr,
-                                   0, 0);
-            /* Checked multiplication: on overflow mark the pending op as
-             * overflowed so the return hook creates no wrapped object. */
+                                   overflowed ? 0 : total, 0);
             {
                 PtrRegShadow *shadow = provenance_get_reg_shadow(env);
-                target_ulong total;
-                if (__builtin_mul_overflow(env->regs[R_EDI],
-                                           env->regs[R_ESI], &total)) {
-                    shadow->pending.overflowed = true;
-                } else {
-                    shadow->pending.arg_size = total;
-                }
+                shadow->pending.calloc_count = count;
+                shadow->pending.calloc_element_size = element_size;
+                shadow->pending.overflowed = overflowed;
             }
             mode = 2;
         } else if (model == PRINTF) {
@@ -9471,7 +9470,15 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
                             PROV_PRODUCER_REALLOC_RETURN);
                         provenance_set_reg_tag(env, R_EAX, tag);
                         snapshot_trace_alloc(base, 0, pend.call_pc);
-                        osprey_on_alloc_success(env, base, 0, pend.call_pc,
+                        OspreyAllocatorObservation obs = {
+                            .kind = OSPREY_ALLOCATOR_REALLOC,
+                            .site_pc = pend.call_pc,
+                            .requested_size = 0,
+                            .element_count = 0,
+                            .element_size = 0,
+                            .overflowed = false,
+                        };
+                        osprey_on_alloc_success(env, &obs, base,
                                                 tag.object_id,
                                                 tag.generation);
                         if (symbolic_mode) {
@@ -9508,8 +9515,16 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
                         PROV_PRODUCER_REALLOC_RETURN);
                     provenance_set_reg_tag(env, R_EAX, tag);
                     snapshot_trace_alloc(base, pend.arg_size, pend.call_pc);
-                    osprey_on_alloc_success(env, base, pend.arg_size,
-                                            pend.call_pc, tag.object_id,
+                    OspreyAllocatorObservation obs = {
+                        .kind = OSPREY_ALLOCATOR_REALLOC,
+                        .site_pc = pend.call_pc,
+                        .requested_size = pend.arg_size,
+                        .element_count = 0,
+                        .element_size = 0,
+                        .overflowed = false,
+                    };
+                    osprey_on_alloc_success(env, &obs, base,
+                                            tag.object_id,
                                             tag.generation);
                     if (symbolic_mode) {
                         SymbolicPendingAlloc sym_alloc =
@@ -9528,7 +9543,15 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
                     }
                     provenance_invalidate_reg(env, R_EAX, pc);
                     provenance_clear_pending(env);
-                    osprey_on_alloc_failure(env, pend.call_pc);
+                    OspreyAllocatorObservation obs = {
+                        .kind = OSPREY_ALLOCATOR_REALLOC,
+                        .site_pc = pend.call_pc,
+                        .requested_size = pend.arg_size,
+                        .element_count = 0,
+                        .element_size = 0,
+                        .overflowed = false,
+                    };
+                    osprey_on_alloc_failure(&obs);
                 }
             } else if (pend.overflowed || base == 0) {
                 /* Failed malloc/calloc, or calloc overflow: no object
@@ -9539,7 +9562,21 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
                 }
                 provenance_invalidate_reg(env, R_EAX, pc);
                 provenance_clear_pending(env);
-                osprey_on_alloc_failure(env, pend.call_pc);
+                {
+                    OspreyAllocatorObservation obs = {
+                        .kind = (pend.kind == PROV_OP_CALLOC)
+                            ? OSPREY_ALLOCATOR_CALLOC
+                            : OSPREY_ALLOCATOR_MALLOC,
+                        .site_pc = pend.call_pc,
+                        .requested_size = pend.overflowed ? 0 : pend.arg_size,
+                        .element_count = (pend.kind == PROV_OP_CALLOC)
+                            ? pend.calloc_count : 0,
+                        .element_size = (pend.kind == PROV_OP_CALLOC)
+                            ? pend.calloc_element_size : 0,
+                        .overflowed = pend.overflowed,
+                    };
+                    osprey_on_alloc_failure(&obs);
+                }
             } else {
                 /* Successful malloc/calloc (size may be 0). */
                 PtrProducerKind kind = (pend.kind == PROV_OP_CALLOC)
@@ -9549,9 +9586,22 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
                     base, pend.arg_size, pend.call_pc, kind);
                 provenance_set_reg_tag(env, R_EAX, tag);
                 snapshot_trace_alloc(base, pend.arg_size, pend.call_pc);
-                osprey_on_alloc_success(env, base, pend.arg_size,
-                                        pend.call_pc, tag.object_id,
-                                        tag.generation);
+                {
+                    bool is_calloc = pend.kind == PROV_OP_CALLOC;
+                    OspreyAllocatorObservation obs = {
+                        .kind = is_calloc ? OSPREY_ALLOCATOR_CALLOC
+                                          : OSPREY_ALLOCATOR_MALLOC,
+                        .site_pc = pend.call_pc,
+                        .requested_size = pend.arg_size,
+                        .element_count = is_calloc ? pend.calloc_count : 0,
+                        .element_size = is_calloc
+                            ? pend.calloc_element_size : 0,
+                        .overflowed = false,
+                    };
+                    osprey_on_alloc_success(env, &obs, base,
+                                            tag.object_id,
+                                            tag.generation);
+                }
                 if (symbolic_mode) {
                     SymbolicPendingAlloc sym_alloc =
                         symbolic_trace_get_pending_alloc(pc);

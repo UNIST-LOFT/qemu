@@ -74,6 +74,11 @@ typedef struct {
     target_ulong           arg_ptr;        /* realloc/free old pointer      */
     uint64_t               old_object_id;  /* realloc: old object identity  */
     uint32_t               old_generation; /* realloc: old generation       */
+    /* calloc: original concrete operands (Stage 2.5), captured before
+     * caller-saved state is cleared; event evidence for F06, never
+     * added to ProvenanceObject. */
+    target_ulong           calloc_count;
+    target_ulong           calloc_element_size;
 } ProvenancePending;
 
 /* Per-CPU register shadow.  Stored as a pointer inside CPUArchState
