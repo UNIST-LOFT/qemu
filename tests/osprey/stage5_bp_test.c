@@ -142,6 +142,180 @@ static char *dump_graph(const OspreyContext *ctx, const OspreyBpGraph *graph)
     return data;
 }
 
+static OspreyBpMessages graph_messages(OspreyBpGraph *graph)
+{
+    OspreyBpMessages messages;
+    memset(&messages, 0, sizeof(messages));
+    if (graph != NULL) {
+        messages.vf_current = graph->msg_vf_current;
+        messages.vf_next = graph->msg_vf_next;
+        messages.fv_current = graph->msg_fv_current;
+        messages.fv_next = graph->msg_fv_next;
+        messages.value_count = graph->message_values;
+    }
+    return messages;
+}
+
+static bool message_pair_close(const double *left, const double *right)
+{
+    for (unsigned i = 0; i < 2; i++) {
+        if (left[i] == -INFINITY || right[i] == -INFINITY) {
+            if (left[i] != right[i]) return false;
+        } else if (!isfinite(left[i]) || !isfinite(right[i]) ||
+                   fabs(left[i] - right[i]) > 1e-12) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void set_log_probability_pair(double *pair, double probability)
+{
+    pair[0] = probability == 1.0 ? -INFINITY : log(1.0 - probability);
+    pair[1] = probability == 0.0 ? -INFINITY : log(probability);
+}
+
+static bool compare_round_with_reference(const OspreyContext *ctx,
+                                         OspreyBpGraph *graph,
+                                         OspreyStatus expected_status)
+{
+    OspreyBpMessages production;
+    OspreyBpMessages reference;
+    OspreyBpRoundStats stats;
+    double *vf_current;
+    double *fv_current;
+    double *vf_next;
+    double *fv_next;
+    OspreyStatus production_status;
+    OspreyStatus reference_status;
+    bool matches = true;
+
+    if (ctx == NULL || graph == NULL || graph->message_values == 0 ||
+        graph->message_values > SIZE_MAX / sizeof(double)) return false;
+    vf_current = g_new(double, (size_t)graph->message_values);
+    fv_current = g_new(double, (size_t)graph->message_values);
+    vf_next = g_new(double, (size_t)graph->message_values);
+    fv_next = g_new(double, (size_t)graph->message_values);
+    memcpy(vf_current, graph->msg_vf_current,
+           (size_t)graph->message_values * sizeof(double));
+    memcpy(fv_current, graph->msg_fv_current,
+           (size_t)graph->message_values * sizeof(double));
+    for (uint64_t i = 0; i < graph->message_values; i++) {
+        vf_next[(size_t)i] = NAN;
+        fv_next[(size_t)i] = NAN;
+    }
+    production = graph_messages(graph);
+    reference.vf_current = vf_current;
+    reference.vf_next = vf_next;
+    reference.fv_current = fv_current;
+    reference.fv_next = fv_next;
+    reference.value_count = graph->message_values;
+    production_status = osprey_bp_compute_round(ctx, graph, &production,
+                                                &stats);
+    reference_status = stage5_bp_reference_compute_round(ctx, graph,
+                                                          &reference);
+    if (memcmp(graph->msg_vf_current, vf_current,
+               (size_t)graph->message_values * sizeof(double)) != 0 ||
+        memcmp(graph->msg_fv_current, fv_current,
+               (size_t)graph->message_values * sizeof(double)) != 0) {
+        matches = false;
+    }
+    for (uint64_t i = 0; i < (uint64_t)graph->vars->len * 2u; i++) {
+        if (!isnan(graph->beliefs[(size_t)i])) matches = false;
+    }
+    if (production_status != expected_status ||
+        reference_status != expected_status) {
+        matches = false;
+    }
+    if (production_status == OSPREY_OK && reference_status == OSPREY_OK) {
+        if (stats.variable_messages != graph->edges->len ||
+            stats.factor_messages != graph->edges->len) matches = false;
+        for (guint edge_id = 0; edge_id < graph->edges->len; edge_id++) {
+            size_t index = (size_t)edge_id * 2u;
+            if (!message_pair_close(&production.vf_next[index],
+                                    &reference.vf_next[index]) ||
+                !message_pair_close(&production.fv_next[index],
+                                    &reference.fv_next[index])) {
+                matches = false;
+                break;
+            }
+        }
+    } else {
+        for (uint64_t i = 0; i < graph->message_values; i++) {
+            if (!isnan(production.vf_next[(size_t)i]) ||
+                !isnan(production.fv_next[(size_t)i]) ||
+                !isnan(reference.vf_next[(size_t)i]) ||
+                !isnan(reference.fv_next[(size_t)i])) {
+                matches = false;
+                break;
+            }
+        }
+    }
+    g_free(vf_current);
+    g_free(fv_current);
+    g_free(vf_next);
+    g_free(fv_next);
+    return matches;
+}
+
+static bool add_implication_probability(OspreyContext *ctx, uint16_t rule,
+                                        uint8_t stage, bool negative,
+                                        double probability,
+                                        const uint32_t *antecedents,
+                                        uint32_t count, uint32_t head)
+{
+    OspreyFactorResult result = osprey_factor_add_implication(
+        ctx, rule, stage, negative, probability, antecedents, count, head);
+    CHECK(result.status == OSPREY_OK, "implication inserted");
+    return result.status == OSPREY_OK;
+}
+
+static uint32_t add_scalar(OspreyContext *ctx, OspreyRegionId region,
+                           int64_t offset)
+{
+    OspreyVarPayload payload;
+    OspreyInternResult result;
+    memset(&payload, 0, sizeof(payload));
+    payload.chunk = make_chunk(region, offset, 8);
+    result = osprey_intern_var(ctx, OSPREY_PRED_SCALAR, &payload);
+    CHECK(result.id != UINT32_MAX, "scalar variable inserted");
+    return result.id;
+}
+
+static uint32_t add_field(OspreyContext *ctx, OspreyRegionId region,
+                          int64_t offset, int64_t base_offset)
+{
+    OspreyVarPayload payload;
+    OspreyInternResult result;
+    memset(&payload, 0, sizeof(payload));
+    payload.attached.chunk = make_chunk(region, offset, 8);
+    payload.attached.base = payload.attached.chunk.address;
+    payload.attached.base.offset = base_offset;
+    result = osprey_intern_var(ctx, OSPREY_PRED_FIELD_OF, &payload);
+    CHECK(result.id != UINT32_MAX, "field variable inserted");
+    return result.id;
+}
+
+static uint32_t edge_for_local_rule(const OspreyContext *ctx,
+                                    const OspreyBpGraph *graph,
+                                    uint32_t local_var, uint16_t rule)
+{
+    if (ctx == NULL || graph == NULL || ctx->graph == NULL ||
+        graph->edges == NULL || graph->factors == NULL) return UINT32_MAX;
+    for (guint edge_id = 0; edge_id < graph->edges->len; edge_id++) {
+        const OspreyBpEdge *edge = &g_array_index(graph->edges,
+                                                  OspreyBpEdge, edge_id);
+        if (edge->local_var != local_var ||
+            edge->local_factor >= graph->factors->len) continue;
+        const OspreyBpFactorRef *factor_ref = &g_array_index(
+            graph->factors, OspreyBpFactorRef, edge->local_factor);
+        const OspreyFactor *factor = g_array_index(
+            ctx->graph->factors, OspreyFactor *, factor_ref->graph_factor_id);
+        if (factor != NULL && factor->rule == rule) return edge_id;
+    }
+    return UINT32_MAX;
+}
+
 static void test_bp_configuration(void)
 {
     const char *name = "BINRADAR_OSPREY_MAX_BP_TABLE_MB";
@@ -382,6 +556,381 @@ static void test_secondary_uniform_seed(void)
     osprey_free(ctx);
 }
 
+static void test_round_unary_boundaries(void)
+{
+    const double probabilities[] = {
+        0.0, 1.0, 0.5, DBL_MIN, nextafter(1.0, 0.0)
+    };
+
+    for (unsigned i = 0; i < G_N_ELEMENTS(probabilities); i++) {
+        OspreyContext *ctx = new_context();
+        OspreyRegionId region = make_region(OSPREY_REGION_GLOBAL, 0x110 + i);
+        uint32_t id = add_primitive(ctx, region, 0);
+        OspreyBpGraph *graph = NULL;
+        double expected[2];
+
+        add_prior(ctx, id, probabilities[i]);
+        CHECK(osprey_bp_graph_build(ctx, &graph) == OSPREY_OK && graph != NULL,
+              "unary probability graph builds");
+        if (graph != NULL) {
+            CHECK(compare_round_with_reference(ctx, graph, OSPREY_OK),
+                  "unary probability round matches reference");
+            set_log_probability_pair(expected, probabilities[i]);
+            CHECK(message_pair_close(&graph->msg_fv_next[0], expected),
+                  "unary factor message preserves exact probability support");
+            CHECK(graph->msg_vf_next[0] == -log(2.0) &&
+                      graph->msg_vf_next[1] == -log(2.0),
+                  "unary variable message uses the neutral product");
+        }
+        osprey_bp_graph_free(graph);
+        osprey_free(ctx);
+    }
+}
+
+static void test_round_implication_roles(void)
+{
+    OspreyContext *ctx = new_context();
+    OspreyRegionId region = make_region(OSPREY_REGION_GLOBAL, 0x120);
+    uint32_t a = add_primitive(ctx, region, 0);
+    uint32_t b = add_primitive(ctx, region, 8);
+    uint32_t c = add_primitive(ctx, region, 16);
+    uint32_t antecedent;
+    OspreyBpGraph *graph = NULL;
+
+    add_prior(ctx, a, 0.25);
+    add_prior(ctx, b, 0.75);
+    add_prior(ctx, c, 0.5);
+    antecedent = a;
+    add_implication_probability(ctx, OSPREY_RULE_CB02,
+                                OSPREY_GRAPH_SECONDARY, false, 0.8,
+                                &antecedent, 1, b);
+    antecedent = b;
+    add_implication_probability(ctx, OSPREY_RULE_CB03,
+                                OSPREY_GRAPH_SECONDARY, true, 0.2,
+                                &antecedent, 1, c);
+    CHECK(osprey_bp_graph_build(ctx, &graph) == OSPREY_OK && graph != NULL,
+          "positive and negative implication graph builds");
+    if (graph != NULL) {
+        CHECK(compare_round_with_reference(ctx, graph, OSPREY_OK),
+              "positive and negative implications match reference");
+    }
+    osprey_bp_graph_free(graph);
+    osprey_free(ctx);
+
+    ctx = new_context();
+    region = make_region(OSPREY_REGION_GLOBAL, 0x121);
+    uint32_t scalar = add_scalar(ctx, region, 0);
+    uint32_t field = add_field(ctx, region, 8, 0);
+    graph = NULL;
+    antecedent = scalar;
+    add_implication_probability(ctx, OSPREY_RULE_CA08,
+                                OSPREY_GRAPH_BASE_CA, true, 0.2,
+                                &antecedent, 1, field);
+    antecedent = field;
+    add_implication_probability(ctx, OSPREY_RULE_CA08,
+                                OSPREY_GRAPH_BASE_CA, true, 0.2,
+                                &antecedent, 1, scalar);
+    CHECK(osprey_bp_graph_build(ctx, &graph) == OSPREY_OK && graph != NULL,
+          "CA08 bidirectional-role graph builds");
+    if (graph != NULL) {
+        CHECK(compare_round_with_reference(ctx, graph, OSPREY_OK),
+              "CA08 reverse roles match reference");
+    }
+    osprey_bp_graph_free(graph);
+    osprey_free(ctx);
+}
+
+static void test_round_arity_three_four(void)
+{
+    OspreyContext *ctx = new_context();
+    OspreyRegionId region = make_region(OSPREY_REGION_GLOBAL, 0x130);
+    uint32_t ids[4];
+    uint32_t three[2];
+    uint32_t four[3];
+    OspreyBpGraph *graph = NULL;
+
+    for (unsigned i = 0; i < G_N_ELEMENTS(ids); i++) {
+        ids[i] = add_primitive(ctx, region, (int64_t)i * 8);
+        add_prior(ctx, ids[i], 0.15 + i * 0.2);
+    }
+    three[0] = ids[0];
+    three[1] = ids[1];
+    four[0] = ids[0];
+    four[1] = ids[1];
+    four[2] = ids[2];
+    add_implication_probability(ctx, OSPREY_RULE_CB02,
+                                OSPREY_GRAPH_SECONDARY, false, 0.8,
+                                three, 2, ids[2]);
+    add_implication_probability(ctx, OSPREY_RULE_CC07,
+                                OSPREY_GRAPH_SECONDARY, false, 0.2,
+                                four, 3, ids[3]);
+    CHECK(osprey_bp_graph_build(ctx, &graph) == OSPREY_OK && graph != NULL,
+          "arity-three/four round graph builds");
+    if (graph != NULL) {
+        CHECK(compare_round_with_reference(ctx, graph, OSPREY_OK),
+              "arity-three/four rounds match reference for every role");
+    }
+    osprey_bp_graph_free(graph);
+    osprey_free(ctx);
+}
+
+static void test_round_hard_false(void)
+{
+    OspreyContext *ctx = new_context();
+    OspreyRegionId region = make_region(OSPREY_REGION_GLOBAL, 0x140);
+    uint32_t id = add_primitive(ctx, region, 0);
+    OspreyBpGraph *graph = NULL;
+    OspreyFactorResult result = osprey_factor_add_hard_false(
+        ctx, OSPREY_RULE_CB06, OSPREY_GRAPH_SECONDARY, id);
+
+    CHECK(result.status == OSPREY_OK, "hard-false factor inserted");
+    CHECK(osprey_bp_graph_build(ctx, &graph) == OSPREY_OK && graph != NULL,
+          "hard-false graph builds");
+    if (graph != NULL) {
+        double expected[2] = { 0.0, -INFINITY };
+        CHECK(compare_round_with_reference(ctx, graph, OSPREY_OK),
+              "hard-false round matches reference");
+        CHECK(message_pair_close(&graph->msg_fv_next[0], expected),
+              "hard-false factor preserves exact zero state");
+    }
+    osprey_bp_graph_free(graph);
+    osprey_free(ctx);
+}
+
+static void test_round_recipient_exclusion(void)
+{
+    OspreyContext *ctx = new_context();
+    OspreyRegionId region = make_region(OSPREY_REGION_GLOBAL, 0x150);
+    uint32_t a = add_primitive(ctx, region, 0);
+    uint32_t b = add_primitive(ctx, region, 8);
+    uint32_t antecedent = a;
+    OspreyBpGraph *graph = NULL;
+
+    add_prior(ctx, a, 0.5);
+    add_prior(ctx, b, 0.5);
+    add_implication_probability(ctx, OSPREY_RULE_CB02,
+                                OSPREY_GRAPH_SECONDARY, false, 0.8,
+                                &antecedent, 1, b);
+    CHECK(osprey_bp_graph_build(ctx, &graph) == OSPREY_OK && graph != NULL,
+          "recipient-exclusion graph builds");
+    if (graph != NULL) {
+        uint32_t local_a = local_for_offset(ctx, graph, 0);
+        uint32_t prior_edge = edge_for_local_rule(
+            ctx, graph, local_a, OSPREY_RULE_CA01);
+        uint32_t implication_edge = edge_for_local_rule(
+            ctx, graph, local_a, OSPREY_RULE_CB02);
+        double expected_uniform[2] = { -log(2.0), -log(2.0) };
+        double expected_extreme[2];
+        double expected_factor[2] = { log(0.8 / 1.3), log(0.5 / 1.3) };
+
+        CHECK(local_a != UINT32_MAX && prior_edge != UINT32_MAX &&
+                  implication_edge != UINT32_MAX,
+              "recipient-exclusion edges resolve");
+        if (prior_edge != UINT32_MAX && implication_edge != UINT32_MAX) {
+            set_log_probability_pair(
+                &graph->msg_fv_current[(size_t)prior_edge * 2u], 0.99);
+            set_log_probability_pair(expected_extreme, 0.99);
+            CHECK(compare_round_with_reference(ctx, graph, OSPREY_OK),
+                  "recipient-exclusion round matches reference");
+            CHECK(message_pair_close(
+                      &graph->msg_vf_next[(size_t)prior_edge * 2u],
+                      expected_uniform),
+                  "variable update excludes its recipient factor message");
+            CHECK(message_pair_close(
+                      &graph->msg_vf_next[(size_t)implication_edge * 2u],
+                      expected_extreme),
+                  "other variable message receives the extreme incoming state");
+            CHECK(message_pair_close(
+                      &graph->msg_fv_next[(size_t)implication_edge * 2u],
+                      expected_factor),
+                  "factor update excludes the recipient variable message");
+        }
+    }
+    osprey_bp_graph_free(graph);
+    osprey_free(ctx);
+}
+
+static void test_round_failure_paths(void)
+{
+    OspreyRegionId region = make_region(OSPREY_REGION_GLOBAL, 0x160);
+    OspreyContext *ctx = new_context();
+    uint32_t id = add_primitive(ctx, region, 0);
+    OspreyBpGraph *graph = NULL;
+    OspreyBpMessages messages;
+
+    add_prior(ctx, id, 0.5);
+    CHECK(osprey_bp_graph_build(ctx, &graph) == OSPREY_OK && graph != NULL,
+          "invalid-input graph builds");
+    if (graph != NULL) {
+        messages = graph_messages(graph);
+        graph->msg_fv_current[0] = NAN;
+        CHECK(osprey_bp_compute_round(ctx, graph, &messages, NULL) ==
+                  OSPREY_INVALID_GRAPH,
+              "NaN current message rejects before the round");
+        CHECK(isnan(graph->msg_vf_next[0]) && isnan(graph->msg_fv_next[0]),
+              "NaN rejection leaves next buffers unusable");
+        graph->msg_fv_current[0] = INFINITY;
+        CHECK(osprey_bp_compute_round(ctx, graph, &messages, NULL) ==
+                  OSPREY_INVALID_GRAPH,
+              "positive-infinite current message rejects");
+        CHECK(isnan(graph->msg_vf_next[0]) && isnan(graph->msg_fv_next[0]),
+              "infinite rejection leaves next buffers unusable");
+    }
+    osprey_bp_graph_free(graph);
+    osprey_free(ctx);
+
+    ctx = new_context();
+    id = add_primitive(ctx, region, 0);
+    add_prior(ctx, id, 0.5);
+    graph = NULL;
+    CHECK(osprey_bp_graph_build(ctx, &graph) == OSPREY_OK && graph != NULL,
+          "malformed-adjacency graph builds");
+    if (graph != NULL) {
+        messages = graph_messages(graph);
+        g_array_index(graph->var_edges, uint32_t, 0) = graph->edges->len;
+        CHECK(osprey_bp_compute_round(ctx, graph, &messages, NULL) ==
+                  OSPREY_INVALID_GRAPH,
+              "out-of-range variable adjacency rejects before access");
+        CHECK(isnan(graph->msg_vf_next[0]) && isnan(graph->msg_fv_next[0]),
+              "malformed adjacency leaves next buffers unusable");
+    }
+    osprey_bp_graph_free(graph);
+    osprey_free(ctx);
+
+    ctx = new_context();
+    region = make_region(OSPREY_REGION_GLOBAL, 0x161);
+    uint32_t a = add_primitive(ctx, region, 0);
+    uint32_t b = add_primitive(ctx, region, 8);
+    uint32_t antecedent = a;
+    add_prior(ctx, a, 0.5);
+    OspreyFactorResult hard = osprey_factor_add_hard_false(
+        ctx, OSPREY_RULE_CB06, OSPREY_GRAPH_SECONDARY, a);
+    CHECK(hard.status == OSPREY_OK, "contradictory hard-false factor inserted");
+    add_implication_probability(ctx, OSPREY_RULE_CB02,
+                                OSPREY_GRAPH_SECONDARY, false, 0.8,
+                                &antecedent, 1, b);
+    graph = NULL;
+    CHECK(osprey_bp_graph_build(ctx, &graph) == OSPREY_OK && graph != NULL,
+          "impossible-support graph builds");
+    if (graph != NULL) {
+        uint32_t local_a = local_for_offset(ctx, graph, 0);
+        uint32_t prior_edge = edge_for_local_rule(
+            ctx, graph, local_a, OSPREY_RULE_CA01);
+        uint32_t hard_edge = edge_for_local_rule(
+            ctx, graph, local_a, OSPREY_RULE_CB06);
+        uint32_t implication_edge = edge_for_local_rule(
+            ctx, graph, local_a, OSPREY_RULE_CB02);
+        CHECK(prior_edge != UINT32_MAX && hard_edge != UINT32_MAX &&
+                  implication_edge != UINT32_MAX,
+              "impossible-support edges resolve");
+        if (prior_edge != UINT32_MAX && hard_edge != UINT32_MAX &&
+            implication_edge != UINT32_MAX) {
+            set_log_probability_pair(
+                &graph->msg_fv_current[(size_t)prior_edge * 2u], 1.0);
+            set_log_probability_pair(
+                &graph->msg_fv_current[(size_t)hard_edge * 2u], 0.0);
+            CHECK(compare_round_with_reference(ctx, graph,
+                                               OSPREY_INVALID_MODEL),
+                  "impossible support rejects without a uniform fallback");
+        }
+    }
+    osprey_bp_graph_free(graph);
+    osprey_free(ctx);
+}
+
+static void test_round_validation_boundaries(void)
+{
+    OspreyRegionId region = make_region(OSPREY_REGION_GLOBAL, 0x162);
+    OspreyContext *ctx = new_context();
+    uint32_t id = add_primitive(ctx, region, 0);
+    OspreyBpGraph *graph = NULL;
+    OspreyBpMessages messages;
+
+    add_prior(ctx, id, 0.2);
+    add_prior(ctx, id, 0.3);
+    add_prior(ctx, id, 0.4);
+    CHECK(osprey_bp_graph_build(ctx, &graph) == OSPREY_OK && graph != NULL,
+          "finite-underflow graph builds");
+    if (graph != NULL) {
+        messages = graph_messages(graph);
+        for (guint edge_id = 0; edge_id < graph->edges->len; edge_id++) {
+            graph->msg_fv_current[(size_t)edge_id * 2u] = -DBL_MAX;
+            graph->msg_fv_current[(size_t)edge_id * 2u + 1u] = 0.0;
+        }
+        CHECK(osprey_bp_compute_round(ctx, graph, &messages, NULL) ==
+                  OSPREY_INVALID_GRAPH,
+              "finite message-product underflow rejects");
+        for (uint64_t i = 0; i < graph->message_values; i++) {
+            CHECK(isnan(graph->msg_vf_next[(size_t)i]) &&
+                      isnan(graph->msg_fv_next[(size_t)i]),
+                  "underflow rejection poisons both next buffers");
+        }
+    }
+    osprey_bp_graph_free(graph);
+    osprey_free(ctx);
+
+    ctx = new_context();
+    region = make_region(OSPREY_REGION_GLOBAL, 0x163);
+    uint32_t first = add_primitive(ctx, region, 0);
+    uint32_t second = add_primitive(ctx, region, 8);
+    uint32_t antecedent = first;
+    add_prior(ctx, first, 0.5);
+    add_prior(ctx, second, 0.5);
+    add_secondary(ctx, OSPREY_RULE_CB02, &antecedent, 1, second);
+    graph = NULL;
+    CHECK(osprey_bp_graph_build(ctx, &graph) == OSPREY_OK && graph != NULL,
+          "CSR-gap graph builds");
+    if (graph != NULL) {
+        bool corrupted = false;
+        messages = graph_messages(graph);
+        for (guint local = 0; local < graph->vars->len; local++) {
+            OspreyBpVarRef *ref = &g_array_index(
+                graph->vars, OspreyBpVarRef, local);
+            if (ref->var_edge_count > 1) {
+                ref->var_edge_count--;
+                corrupted = true;
+                break;
+            }
+        }
+        CHECK(corrupted, "CSR-gap fixture removes one owned edge");
+        CHECK(corrupted &&
+                  osprey_bp_compute_round(ctx, graph, &messages, NULL) ==
+                      OSPREY_INVALID_GRAPH,
+              "unowned variable-CSR slot rejects before update");
+    }
+    osprey_bp_graph_free(graph);
+    osprey_free(ctx);
+
+    ctx = new_context();
+    region = make_region(OSPREY_REGION_GLOBAL, 0x164);
+    id = add_primitive(ctx, region, 0);
+    set_seed(ctx, id, 0.25);
+    add_prior(ctx, id, 0.25);
+    graph = NULL;
+    CHECK(osprey_bp_graph_build(ctx, &graph) == OSPREY_OK && graph != NULL,
+          "overlapping-buffer graph builds");
+    if (graph != NULL) {
+        size_t values = (size_t)graph->message_values;
+        double *overlap = g_new(double, values + 1u);
+        double *before = g_new(double, values + 1u);
+        memcpy(overlap, graph->msg_vf_current, values * sizeof(double));
+        overlap[values] = 1.0;
+        memcpy(before, overlap, (values + 1u) * sizeof(double));
+        messages = graph_messages(graph);
+        messages.vf_current = overlap;
+        messages.vf_next = overlap + 1;
+        CHECK(osprey_bp_compute_round(ctx, graph, &messages, NULL) ==
+                  OSPREY_INVALID_GRAPH,
+              "partially overlapping message buffers reject");
+        CHECK(memcmp(overlap, before, (values + 1u) * sizeof(double)) == 0,
+              "overlap rejection does not mutate current messages");
+        g_free(before);
+        g_free(overlap);
+    }
+    osprey_bp_graph_free(graph);
+    osprey_free(ctx);
+}
+
 static OspreyContext *permutation_context(bool reverse)
 {
     OspreyConfig config = bp_config();
@@ -433,6 +982,22 @@ static void test_permutation_dump(void)
         CHECK(left_dump != NULL && right_dump != NULL &&
                   strcmp(left_dump, right_dump) == 0,
               "canonical projection and seed dumps ignore insertion IDs");
+        CHECK(compare_round_with_reference(left, left_graph, OSPREY_OK) &&
+                  compare_round_with_reference(right, right_graph, OSPREY_OK),
+              "permuted one-round messages match the independent reference");
+        if (left_graph->edges->len == right_graph->edges->len) {
+            for (guint edge_id = 0; edge_id < left_graph->edges->len;
+                 edge_id++) {
+                size_t index = (size_t)edge_id * 2u;
+                CHECK(message_pair_close(
+                          &left_graph->msg_vf_next[index],
+                          &right_graph->msg_vf_next[index]) &&
+                          message_pair_close(
+                              &left_graph->msg_fv_next[index],
+                              &right_graph->msg_fv_next[index]),
+                      "permuted one-round messages are canonical");
+            }
+        }
     }
     free(left_dump);
     free(right_dump);
@@ -746,6 +1311,94 @@ static uint32_t next_random(uint32_t *state)
     return *state;
 }
 
+static double generated_probability(uint32_t value)
+{
+    switch (value % 7u) {
+    case 0: return 0.0;
+    case 1: return 1.0;
+    case 2: return DBL_MIN;
+    case 3: return 0.5;
+    case 4: return nextafter(1.0, 0.0);
+    case 5: return 0.2;
+    default: return 0.8;
+    }
+}
+
+static OspreyContext *reverse_clone_context(const OspreyContext *source)
+{
+    OspreyContext *copy;
+    uint32_t *remap;
+
+    if (source == NULL || source->graph == NULL || source->graph->vars == NULL ||
+        source->graph->factors == NULL || source->graph->vars->len == 0) {
+        return NULL;
+    }
+    copy = new_context_with_config(&source->config);
+    if (copy == NULL || copy->graph == NULL) {
+        osprey_free(copy);
+        return NULL;
+    }
+    remap = g_try_new(uint32_t, source->graph->vars->len);
+    if (remap == NULL) {
+        osprey_free(copy);
+        return NULL;
+    }
+    for (guint i = source->graph->vars->len; i > 0; i--) {
+        uint32_t graph_id = i - 1u;
+        const OspreyVar *original = &g_array_index(
+            source->graph->vars, OspreyVar, graph_id);
+        OspreyInternResult result = osprey_intern_var(
+            copy, original->kind, &original->payload);
+        if (result.id == UINT32_MAX) goto fail;
+        OspreyVar duplicate = *original;
+        duplicate.id = result.id;
+        g_array_index(copy->graph->vars, OspreyVar, result.id) = duplicate;
+        remap[graph_id] = result.id;
+    }
+    for (guint i = source->graph->factors->len; i > 0; i--) {
+        const OspreyFactor *factor = g_array_index(
+            source->graph->factors, OspreyFactor *, i - 1u);
+        uint32_t var_ids[OSPREY_FACTOR_MAX_ARITY];
+        for (uint32_t position = 0; position < factor->num_vars; position++) {
+            if (factor->var_ids[position] >= source->graph->vars->len) {
+                goto fail;
+            }
+            var_ids[position] = remap[factor->var_ids[position]];
+        }
+        OspreyFactorResult result = osprey_factor_add_ex(
+            copy, factor->rule, factor->stage, factor->potential_kind,
+            factor->head_idx, factor->negative != 0, factor->p, var_ids,
+            factor->num_vars);
+        if (result.status != OSPREY_OK) goto fail;
+    }
+    g_free(remap);
+    return copy;
+
+fail:
+    g_free(remap);
+    osprey_free(copy);
+    return NULL;
+}
+
+static void dump_generated_round_failure(unsigned sample,
+                                         const OspreyContext *ctx,
+                                         const OspreyBpGraph *graph)
+{
+    fprintf(stderr, "generated round state at seed %u\n", sample);
+    if (ctx != NULL && ctx->graph != NULL) {
+        osprey_graph_dump_file(ctx, stderr);
+    }
+    if (graph == NULL) return;
+    for (guint edge_id = 0; edge_id < graph->edges->len; edge_id++) {
+        size_t index = (size_t)edge_id * 2u;
+        fprintf(stderr, "CURRENT %u vf %a %a fv %a %a\n", edge_id,
+                graph->msg_vf_current[index],
+                graph->msg_vf_current[index + 1u],
+                graph->msg_fv_current[index],
+                graph->msg_fv_current[index + 1u]);
+    }
+}
+
 static void test_generated_projections(void)
 {
     uint32_t state = 0x5eeda11u;
@@ -753,14 +1406,18 @@ static void test_generated_projections(void)
 
     for (unsigned sample = 0; sample < 2000; sample++) {
         OspreyContext *ctx = new_context();
+        OspreyContext *permuted_ctx = NULL;
         OspreyRegionId region = make_region(
             (next_random(&state) & 1u) ? OSPREY_REGION_GLOBAL
                                        : OSPREY_REGION_STACK_FUNCTION,
             0x100 + sample);
-        uint32_t count = 1 + next_random(&state) % 8;
-        uint32_t ids[8];
-        uint32_t order[8];
+        uint32_t count = 1 + next_random(&state) % 12;
+        uint32_t ids[12];
+        uint32_t order[12];
         OspreyBpGraph *graph = NULL;
+        OspreyBpGraph *permuted_graph = NULL;
+        char *graph_dump = NULL;
+        char *permuted_dump = NULL;
         bool ok = true;
 
         for (uint32_t i = 0; i < count; i++) order[i] = i;
@@ -772,43 +1429,124 @@ static void test_generated_projections(void)
         }
         for (uint32_t position = 0; position < count; position++) {
             uint32_t i = order[position];
+            double probability = generated_probability(next_random(&state));
             ids[i] = add_primitive(ctx, region,
                                    (int64_t)i * 8 - (int64_t)(sample & 3u) * 8);
-            set_seed(ctx, ids[i], (double)(next_random(&state) % 1001) / 1000.0);
-            ok = add_prior(ctx, ids[i],
-                           g_array_index(ctx->graph->vars, OspreyVar,
-                                         ids[i]).belief) && ok;
+            set_seed(ctx, ids[i], probability);
+            ok = add_prior(ctx, ids[i], probability) && ok;
+        }
+        if (count >= 2) {
+            uint32_t antecedent = ids[0];
+            ok = add_implication_probability(
+                ctx, OSPREY_RULE_CB01, OSPREY_GRAPH_SECONDARY,
+                (next_random(&state) & 1u) != 0,
+                generated_probability(next_random(&state)), &antecedent, 1,
+                ids[1]) && ok;
         }
         if (count >= 3) {
             uint32_t antecedents[2] = { ids[0], ids[1] };
-            ok = add_secondary(ctx, OSPREY_RULE_CB02, antecedents, 2,
-                               ids[2]) && ok;
+            ok = add_implication_probability(
+                ctx, OSPREY_RULE_CB02, OSPREY_GRAPH_SECONDARY, false,
+                generated_probability(next_random(&state)), antecedents, 2,
+                ids[2]) && ok;
         }
         if (count >= 4) {
             uint32_t antecedents[3] = { ids[0], ids[1], ids[2] };
-            ok = add_secondary(ctx, OSPREY_RULE_CB03, antecedents, 3,
-                               ids[3]) && ok;
+            ok = add_implication_probability(
+                ctx, OSPREY_RULE_CB03, OSPREY_GRAPH_SECONDARY, false,
+                generated_probability(next_random(&state)), antecedents, 3,
+                ids[3]) && ok;
         }
+        if (sample % 19u == 0) {
+            OspreyFactorResult hard = osprey_factor_add_hard_false(
+                ctx, OSPREY_RULE_CB06, OSPREY_GRAPH_SECONDARY,
+                ids[count - 1]);
+            CHECK(hard.status == OSPREY_OK,
+                  "generated hard-false factor inserted");
+            ok = hard.status == OSPREY_OK && ok;
+        }
+        permuted_ctx = reverse_clone_context(ctx);
         OspreyStatus status = osprey_bp_graph_build(ctx, &graph);
+        OspreyStatus permuted_status = permuted_ctx == NULL
+            ? OSPREY_INVALID_GRAPH
+            : osprey_bp_graph_build(permuted_ctx, &permuted_graph);
         bool production_valid = graph != NULL &&
             osprey_bp_graph_validate(ctx, graph);
         bool reference_valid = graph != NULL &&
             stage5_bp_reference_matches(ctx, graph);
-        if (status != OSPREY_OK || graph == NULL || !production_valid ||
-            !reference_valid) {
+        bool permuted_valid = permuted_graph != NULL &&
+            osprey_bp_graph_validate(permuted_ctx, permuted_graph) &&
+            stage5_bp_reference_matches(permuted_ctx, permuted_graph);
+        if (status == OSPREY_OK && permuted_status == OSPREY_OK &&
+            production_valid && reference_valid && permuted_valid) {
+            graph_dump = dump_graph(ctx, graph);
+            permuted_dump = dump_graph(permuted_ctx, permuted_graph);
+        }
+        if (status != OSPREY_OK || permuted_status != OSPREY_OK ||
+            graph == NULL || permuted_graph == NULL || !production_valid ||
+            !reference_valid || !permuted_valid || graph_dump == NULL ||
+            permuted_dump == NULL || strcmp(graph_dump, permuted_dump) != 0) {
             fprintf(stderr, "generated projection mismatch at seed %u "
-                    "status %d vars %u factors %u components %u valid %d ref %d\n",
-                    sample, status, ctx->graph->vars->len,
+                    "status %d/%d vars %u factors %u components %u/%u "
+                    "valid %d/%d ref %d\n", sample, status,
+                    permuted_status, ctx->graph->vars->len,
                     ctx->graph->factors->len,
                     graph == NULL ? 0 : graph->components->len,
-                    production_valid ? 1 : 0, reference_valid ? 1 : 0);
+                    permuted_graph == NULL ? 0 : permuted_graph->components->len,
+                    production_valid ? 1 : 0, permuted_valid ? 1 : 0,
+                    reference_valid ? 1 : 0);
             ok = false;
         }
-        if (ok) generated++;
+        if (ok) {
+            /* Give both canonical projections identical arbitrary current
+             * messages; their next buffers must remain identical despite
+             * reversing every source variable and factor insertion. */
+            for (guint edge_id = 0; edge_id < graph->edges->len; edge_id++) {
+                size_t index = (size_t)edge_id * 2u;
+                double vf_probability =
+                    (double)(next_random(&state) % 1000u + 1u) / 1001.0;
+                double fv_probability =
+                    (double)(next_random(&state) % 1000u + 1u) / 1001.0;
+                set_log_probability_pair(&graph->msg_vf_current[index],
+                                         vf_probability);
+                set_log_probability_pair(&graph->msg_fv_current[index],
+                                         fv_probability);
+                set_log_probability_pair(
+                    &permuted_graph->msg_vf_current[index], vf_probability);
+                set_log_probability_pair(
+                    &permuted_graph->msg_fv_current[index], fv_probability);
+            }
+            ok = compare_round_with_reference(ctx, graph, OSPREY_OK) &&
+                 compare_round_with_reference(permuted_ctx, permuted_graph,
+                                              OSPREY_OK) && ok;
+            if (ok) {
+                for (uint64_t i = 0; i < graph->message_values; i++) {
+                    if (graph->msg_vf_next[(size_t)i] !=
+                            permuted_graph->msg_vf_next[(size_t)i] ||
+                        graph->msg_fv_next[(size_t)i] !=
+                            permuted_graph->msg_fv_next[(size_t)i]) {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+        }
+        if (!ok) {
+            dump_generated_round_failure(sample, ctx, graph);
+            dump_generated_round_failure(sample, permuted_ctx,
+                                         permuted_graph);
+        } else {
+            generated++;
+        }
+        free(graph_dump);
+        free(permuted_dump);
         osprey_bp_graph_free(graph);
+        osprey_bp_graph_free(permuted_graph);
         osprey_free(ctx);
+        osprey_free(permuted_ctx);
     }
-    CHECK(generated == 2000, "all 2000 generated projection cases execute");
+    CHECK(generated == 2000,
+          "all 2000 generated projection and round cases execute");
 }
 
 int main(void)
@@ -819,6 +1557,13 @@ int main(void)
     RUN(test_cross_region_bridge);
     RUN(test_exact_seed_values);
     RUN(test_secondary_uniform_seed);
+    RUN(test_round_unary_boundaries);
+    RUN(test_round_implication_roles);
+    RUN(test_round_arity_three_four);
+    RUN(test_round_hard_false);
+    RUN(test_round_recipient_exclusion);
+    RUN(test_round_failure_paths);
+    RUN(test_round_validation_boundaries);
     RUN(test_permutation_dump);
     RUN(test_malformed_inputs);
     RUN(test_reverse_adjacency_validation);

@@ -1320,33 +1320,45 @@ static void test_exact_log_arithmetic(void)
     double log_norm = 0.0;
     double table[3] = { log(0.2), log(0.3), -INFINITY };
     double impossible[2] = { -INFINITY, -INFINITY };
+    double finite_underflow[2] = { -DBL_MAX, DBL_MAX };
     double normalized_sum = -INFINITY;
 
-    CHECK(osprey_exact_logaddexp(-INFINITY, -INFINITY, &out) &&
+    CHECK(osprey_logaddexp(-INFINITY, -INFINITY, &out) &&
               out == -INFINITY,
           "logaddexp preserves two exact zero weights");
-    CHECK(osprey_exact_logaddexp(log(0.2), -INFINITY, &out) &&
+    CHECK(osprey_logaddexp(log(0.2), -INFINITY, &out) &&
               fabs(out - log(0.2)) < 1e-15,
           "logaddexp handles one exact zero weight");
-    CHECK(!osprey_exact_logaddexp(NAN, 0.0, &out) &&
-              !osprey_exact_logaddexp(INFINITY, 0.0, &out),
+    CHECK(osprey_log_product_add(log(0.2), log(0.3), &out) &&
+              fabs(out - log(0.06)) < 1e-15,
+          "log product addition preserves assignment products");
+    CHECK(osprey_log_product_add(-INFINITY, 0.0, &out) &&
+              out == -INFINITY,
+          "log product addition preserves exact zero support");
+    CHECK(!osprey_log_product_add(-DBL_MAX, -DBL_MAX, &out),
+          "finite log-product underflow rejects instead of becoming hard zero");
+    CHECK(!osprey_logaddexp(NAN, 0.0, &out) &&
+              !osprey_logaddexp(INFINITY, 0.0, &out),
           "logaddexp rejects NaN and positive infinity");
-    CHECK(osprey_exact_log_normalize(table, G_N_ELEMENTS(table), &log_norm) &&
+    CHECK(osprey_log_normalize(table, G_N_ELEMENTS(table), &log_norm) &&
               fabs(log_norm - log(0.5)) < 1e-15,
           "log normalization returns the stable log partition");
     for (unsigned i = 0; i < G_N_ELEMENTS(table); i++) {
         CHECK(table[i] == -INFINITY ||
                   (isfinite(table[i]) && table[i] <= 0.0),
               "normalized log table retains finite nonpositive entries");
-        CHECK(osprey_exact_logaddexp(normalized_sum, table[i],
+        CHECK(osprey_logaddexp(normalized_sum, table[i],
                                      &normalized_sum),
               "normalized entries have valid log support");
     }
     CHECK(fabs(normalized_sum) < 1e-15,
           "normalized log table sums to one");
-    CHECK(!osprey_exact_log_normalize(impossible,
+    CHECK(!osprey_log_normalize(impossible,
                                       G_N_ELEMENTS(impossible), &log_norm),
           "all-zero table rejects during normalization");
+    CHECK(!osprey_log_normalize(finite_underflow,
+                                G_N_ELEMENTS(finite_underflow), &log_norm),
+          "finite normalization underflow rejects instead of becoming hard zero");
 }
 
 static void test_exact_numeric_marginals(void)

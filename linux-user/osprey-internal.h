@@ -1031,7 +1031,29 @@ typedef struct OspreyBpGraph {
     uint64_t workspace_limit;
 } OspreyBpGraph;
 
+/* Stage 5.2 message buffers.  The four non-overlapping arrays contain two
+ * normalized log-probabilities per canonical edge, in state order
+ * {false, true}.  The graph owns the storage; this view permits the round
+ * kernel to keep its input/output contract explicit and test independent
+ * buffers. */
+typedef struct OspreyBpMessages {
+    double *vf_current;
+    double *vf_next;
+    double *fv_current;
+    double *fv_next;
+    uint64_t value_count;
+} OspreyBpMessages;
+
+typedef struct OspreyBpRoundStats {
+    uint32_t variable_messages;
+    uint32_t factor_messages;
+} OspreyBpRoundStats;
+
 /* Stage 5.1 projection and ownership boundary. */
+OspreyStatus osprey_bp_compute_round(const OspreyContext *ctx,
+                                     const OspreyBpGraph *graph,
+                                     OspreyBpMessages *messages,
+                                     OspreyBpRoundStats *stats);
 OspreyStatus osprey_bp_graph_build(OspreyContext *ctx,
                                    OspreyBpGraph **out);
 void osprey_bp_graph_free(OspreyBpGraph *graph);
@@ -1161,9 +1183,10 @@ void osprey_exact_test_set_alloc_fail_after(int64_t allocations);
 
 /* Stage 4.3 numerical primitives.  These accept finite values or exact
  * -INFINITY only and preserve hard zero support. */
-bool osprey_exact_logaddexp(double left, double right, double *out);
-bool osprey_exact_log_normalize(double *table, size_t count,
-                                double *log_norm);
+bool osprey_logaddexp(double left, double right, double *out);
+bool osprey_log_product_add(double left, double right, double *out);
+bool osprey_log_normalize(double *table, size_t count,
+                          double *log_norm);
 
 /* Stages 4/5 inference (osprey-infer.c): Stage 4 topology followed by the
  * still-untrusted secondary BP path. */
