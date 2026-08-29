@@ -71,8 +71,8 @@ static int chunk_compare(const OspreyChunk *a, const OspreyChunk *b)
     return c != 0 ? c : cmp_u64(a->size, b->size);
 }
 
-static int payload_compare(uint8_t kind, const OspreyVarPayload *a,
-                           const OspreyVarPayload *b)
+int osprey_var_payload_compare(uint8_t kind, const OspreyVarPayload *a,
+                               const OspreyVarPayload *b)
 {
     int c;
 
@@ -1338,7 +1338,7 @@ static int candidate_entry_compare(gconstpointer ap, gconstpointer bp)
     if (a->proposal.prior != b->proposal.prior) {
         return a->proposal.prior > b->proposal.prior ? -1 : 1;
     }
-    return payload_compare(a->proposal.predicate_kind,
+    return osprey_var_payload_compare(a->proposal.predicate_kind,
                            &a->proposal.payload, &b->proposal.payload);
 }
 
@@ -1600,7 +1600,7 @@ static int var_display_compare(gconstpointer ap, gconstpointer bp)
     const VarDisplay *a = ap;
     const VarDisplay *b = bp;
     int c = cmp_u64(a->kind, b->kind);
-    return c != 0 ? c : payload_compare(a->kind, &a->payload, &b->payload);
+    return c != 0 ? c : osprey_var_payload_compare(a->kind, &a->payload, &b->payload);
 }
 
 static int factor_display_compare(gconstpointer ap, gconstpointer bp,

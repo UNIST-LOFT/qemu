@@ -836,6 +836,11 @@ typedef union OspreyVarPayload {
     } attached;                    /* field-of / pointer */
 } OspreyVarPayload;
 
+/* Accepted signed canonical payload order shared by Stage 3 selection/dumps
+ * and Stage 4 local-ID assignment. */
+int osprey_var_payload_compare(uint8_t kind, const OspreyVarPayload *a,
+                               const OspreyVarPayload *b);
+
 typedef struct OspreyVar {
     uint32_t id;                   /* stable ordinal into ctx->graph->vars */
     uint8_t kind;                  /* OspreyPredicateKind */
@@ -981,6 +986,32 @@ void osprey_model_free(OspreyModel *m);
  * rules plus the static CB02-CB09 closure.  Belief-dependent folding (CC07)
  * is deferred to the Stage 5 dynamic closure. */
 OspreyStatus osprey_stage3_secondary(OspreyContext *ctx);
+
+/* Stage 4.1 exact-base projection.  The projection owns local IDs,
+ * factor references, and CA-only connectivity; it never aliases graph
+ * storage or mutates graph beliefs. */
+typedef struct OspreyExactFactorRef {
+    uint32_t graph_factor_id;
+    uint32_t num_vars;
+    uint32_t local_vars[OSPREY_FACTOR_MAX_ARITY];
+} OspreyExactFactorRef;
+
+typedef struct OspreyExactComponent {
+    GArray *local_vars;   /* uint32_t, canonical local variable IDs */
+    GArray *factor_refs;  /* uint32_t indexes into OspreyExactBase */
+} OspreyExactComponent;
+
+typedef struct OspreyExactBase {
+    GArray *graph_var_ids; /* local variable ID -> production graph ID */
+    uint32_t *local_by_graph; /* production graph ID -> local ID or UINT32_MAX */
+    uint32_t graph_var_count;
+    GArray *factor_refs;   /* OspreyExactFactorRef */
+    GPtrArray *components; /* OspreyExactComponent* */
+} OspreyExactBase;
+
+OspreyStatus osprey_exact_base_build(OspreyContext *ctx,
+                                     OspreyExactBase **out);
+void osprey_exact_base_free(OspreyExactBase *base);
 
 /* Stages 4/5 inference (osprey-infer.c): exact base inference followed
  * by secondary loopy BP.  The current implementation is non-conformant. */

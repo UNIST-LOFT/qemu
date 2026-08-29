@@ -38,6 +38,8 @@ GRAPH_UNIT_BIN := $(WORK)/stage3_graph
 GRAPH_ASAN_BIN := $(WORK)/stage3_graph_asan
 RULES_UNIT_BIN := $(WORK)/stage3_rules
 RULES_ASAN_BIN := $(WORK)/stage3_rules_asan
+EXACT_UNIT_BIN := $(WORK)/stage4_exact
+EXACT_ASAN_BIN := $(WORK)/stage4_exact_asan
 OSPREY_SRCS := ../../linux-user/osprey.c \
                ../../linux-user/osprey-facts.c \
                ../../linux-user/osprey-graph.c \
@@ -78,13 +80,15 @@ PLT_FILES  := $(addprefix $(WORK)/,$(addsuffix .plt,$(TESTS)))
 .PHONY: check inventory run unit unit-asan unit-asan-osprey \
         unit-stage3-relations unit-stage3-relations-asan \
         unit-stage3-graph unit-stage3-graph-asan \
-        unit-stage3-rules unit-stage3-rules-asan guests plts clean
+        unit-stage3-rules unit-stage3-rules-asan \
+        unit-stage4-exact unit-stage4-exact-asan guests plts clean
 check: inventory run unit unit-asan-osprey unit-stage3-relations \
        unit-stage3-relations-asan unit-stage3-graph unit-stage3-graph-asan \
-       unit-stage3-rules unit-stage3-rules-asan
+       unit-stage3-rules unit-stage3-rules-asan unit-stage4-exact \
+       unit-stage4-exact-asan
 run unit unit-asan-osprey unit-stage3-relations unit-stage3-relations-asan \
 unit-stage3-graph unit-stage3-graph-asan unit-stage3-rules \
-unit-stage3-rules-asan: inventory
+unit-stage3-rules-asan unit-stage4-exact unit-stage4-exact-asan: inventory
 inventory:
 	@python3 $(INVENTORY)
 run: guests plts
@@ -208,6 +212,24 @@ unit-stage3-rules-asan: $(RULES_ASAN_BIN)
 $(RULES_ASAN_BIN): stage3_rules_test.c stage3_test_support.c \
 		$(OSPREY_ASAN_OBJS) | $(WORK)
 	$(CC) $(ASAN_CFLAGS) -o $@ stage3_rules_test.c \
+		stage3_test_support.c $(OSPREY_ASAN_OBJS) \
+		-lglib-2.0 -lpthread -lm
+
+unit-stage4-exact: $(EXACT_UNIT_BIN)
+	@$(EXACT_UNIT_BIN)
+
+$(EXACT_UNIT_BIN): stage4_exact_test.c stage3_test_support.c \
+		$(OSPREY_OBJS) | $(WORK)
+	$(CC) $(UNIT_CFLAGS) -o $@ stage4_exact_test.c \
+		stage3_test_support.c $(OSPREY_OBJS) \
+		-lglib-2.0 -lpthread -lm
+
+unit-stage4-exact-asan: $(EXACT_ASAN_BIN)
+	@ASAN_OPTIONS=detect_leaks=1 $(EXACT_ASAN_BIN)
+
+$(EXACT_ASAN_BIN): stage4_exact_test.c stage3_test_support.c \
+		$(OSPREY_ASAN_OBJS) | $(WORK)
+	$(CC) $(ASAN_CFLAGS) -o $@ stage4_exact_test.c \
 		stage3_test_support.c $(OSPREY_ASAN_OBJS) \
 		-lglib-2.0 -lpthread -lm
 

@@ -1,27 +1,13 @@
 /*
- * OSPREY Stage-3 inference: exact component solving, log-domain loopy
- * belief propagation, and dynamic CC07 heap-folding closure.
+ * OSPREY exact-base projection and legacy inference.
  *
- * Plan (OSPREY_IMPLEMENTATION.md §8):
- *  - Partition variables/factors into connected components (union-find
- *    edges established at instantiation).
- *  - Solve each component with size <= min(max_exact_clique_vars, 16)
- *    exactly by full joint enumeration; larger components start at
- *    uniform beliefs.
- *  - Log-domain loopy BP over the full graph, seeded from exact
- *    beliefs; damping 0.5, tolerance 1e-6 for 10 consecutive rounds,
- *    hard cap 500 rounds; retain best damped iterate on failure.
- *  - CC07: heap chunks at offset >= s_h+s_t fold onto
- *    (o - s_h) mod s_t + s_h once UnfoldableHeap(i,s_h) and
- *    FoldableHeap(i,s_t) clear 0.5 with s_t > 0; folded primitives get
- *    CA01/CC03 stage-2 factors and CC07 implications; BP reruns until
- *    no new variables (metadata: [osprey] [infer] rows).
+ * Stage 4.1's immutable CA-only projection, canonical local maps, retained
+ * factor validation, and base-only components are accepted. The older
+ * exact_pass(), loopy BP, and CC07 scheduling below that boundary remain
+ * non-conformant and must not provide trusted marginals. See
+ * agent-docs/info/OSPREY_TYPE_INFERENCE/STAGE4.md.
  *
- * Generic factor potential (§7.1) is owned by osprey-graph.c.  Priors use
- * {false:1-p,true:p}; implications use max(p,1-p) while an antecedent is
- * false and {head-false:1-p,head-true:p} once all antecedents hold.  Polarity
- * is metadata and never inverts p a second time.  CB06 hard-false uses its
- * distinct exact-zero potential.
+ * Generic factor potentials are owned by osprey-graph.c.
  */
 
 #include "osprey.h"
@@ -65,6 +51,593 @@ static double factor_value(const OspreyFactor *f, const uint32_t *bits) {
     }
     if (!osprey_factor_log_weight(f, assignment, &log_weight)) return 0.0;
     return isinf(log_weight) && log_weight < 0.0 ? 0.0 : exp(log_weight);
+}
+
+/* ------------------------------------------------------------------ */
+/* Stage 4.1: immutable CA-only projection and components              */
+/* ------------------------------------------------------------------ */
+
+static int exact_cmp_u64(uint64_t a, uint64_t b)
+{
+    return a < b ? -1 : a != b;
+}
+
+static int exact_cmp_i64(int64_t a, int64_t b)
+{
+    return a < b ? -1 : a != b;
+}
+
+static int exact_key_compare(const OspreyKey *a, const OspreyKey *b)
+{
+    int c = exact_cmp_u64(a->tag, b->tag);
+    if (c != 0) return c;
+    for (size_t i = 0; i < G_N_ELEMENTS(a->w); i++) {
+        c = exact_cmp_u64(a->w[i], b->w[i]);
+        if (c != 0) return c;
+    }
+    return 0;
+}
+
+static int exact_region_compare(const OspreyRegionId *a,
+                                const OspreyRegionId *b)
+{
+    int c = exact_cmp_u64((uint64_t)a->kind, (uint64_t)b->kind);
+    if (c != 0) return c;
+    c = exact_cmp_u64(a->code_image_id, b->code_image_id);
+    if (c != 0) return c;
+    return exact_cmp_u64(a->site_offset, b->site_offset);
+}
+
+static int exact_address_compare(const OspreyAddress *a,
+                                 const OspreyAddress *b)
+{
+    int c = exact_region_compare(&a->region, &b->region);
+    return c != 0 ? c : exact_cmp_i64(a->offset, b->offset);
+}
+
+static bool exact_region_valid(const OspreyRegionId *region)
+{
+    return region != NULL && region->kind >= OSPREY_REGION_GLOBAL &&
+           region->kind <= OSPREY_REGION_STACK_FUNCTION;
+}
+
+static bool exact_address_valid(const OspreyAddress *address)
+{
+    return address != NULL && exact_region_valid(&address->region);
+}
+
+static bool exact_chunk_valid(const OspreyChunk *chunk)
+{
+    return chunk != NULL && exact_address_valid(&chunk->address) &&
+           chunk->size != 0;
+}
+
+static bool exact_payload_valid(uint8_t kind, const OspreyVarPayload *payload)
+{
+    int64_t span;
+
+    if (payload == NULL) return false;
+    switch (kind) {
+    case OSPREY_PRED_PRIMITIVE_VAR:
+    case OSPREY_PRED_SCALAR:
+        return exact_chunk_valid(&payload->chunk);
+    case OSPREY_PRED_PRIMITIVE_ACCESS:
+        return exact_chunk_valid(&payload->prim_access.chunk);
+    case OSPREY_PRED_UNFOLDABLE_HEAP:
+    case OSPREY_PRED_FOLDABLE_HEAP:
+        return exact_region_valid(&payload->heap_fold.region) &&
+               payload->heap_fold.region.kind == OSPREY_REGION_HEAP_SITE;
+    case OSPREY_PRED_HOMO_SEGMENT:
+        return exact_address_valid(&payload->segment.a1) &&
+               exact_address_valid(&payload->segment.a2) &&
+               payload->segment.size > 0 &&
+               exact_address_compare(&payload->segment.a1,
+                                     &payload->segment.a2) <= 0;
+    case OSPREY_PRED_ARRAY:
+        if (!exact_address_valid(&payload->segment.a1) ||
+            !exact_address_valid(&payload->segment.a2) ||
+            exact_region_compare(&payload->segment.a1.region,
+                                 &payload->segment.a2.region) != 0 ||
+            payload->segment.a1.offset >= payload->segment.a2.offset ||
+            payload->segment.size <= 0) {
+            return false;
+        }
+        return osprey_check_sub(payload->segment.a2.offset,
+                                payload->segment.a1.offset, &span) &&
+               span >= payload->segment.size;
+    case OSPREY_PRED_ARRAY_START:
+        return exact_address_valid(&payload->addr);
+    case OSPREY_PRED_FIELD_OF:
+    case OSPREY_PRED_POINTER:
+        return exact_chunk_valid(&payload->attached.chunk) &&
+               exact_address_valid(&payload->attached.base);
+    default:
+        return false;
+    }
+}
+
+static bool exact_rule_is_base(uint16_t rule)
+{
+    return rule >= OSPREY_RULE_CA01 && rule <= OSPREY_RULE_CA08;
+}
+
+static bool exact_base_implication_valid(const OspreyFactor *factor,
+                                         const OspreyGraph *graph,
+                                         bool negative, uint8_t source_kind,
+                                         uint8_t target_kind,
+                                         bool allow_reverse)
+{
+    if (factor->potential_kind != OSPREY_POTENTIAL_IMPLICATION ||
+        factor->num_vars != 2 || factor->head_idx != 1 ||
+        factor->negative != (negative ? 1 : 0)) {
+        return false;
+    }
+    uint8_t first = g_array_index(graph->vars, OspreyVar,
+                                  factor->var_ids[0]).kind;
+    uint8_t second = g_array_index(graph->vars, OspreyVar,
+                                   factor->var_ids[1]).kind;
+    return (first == source_kind && second == target_kind) ||
+           (allow_reverse && first == target_kind && second == source_kind);
+}
+
+static bool exact_base_factor_valid(const OspreyFactor *factor,
+                                    const OspreyGraph *graph)
+{
+    switch (factor->rule) {
+    case OSPREY_RULE_CA01:
+        return factor->potential_kind == OSPREY_POTENTIAL_PRIOR &&
+               factor->num_vars == 1 && factor->head_idx == 0 &&
+               !factor->negative &&
+               g_array_index(graph->vars, OspreyVar,
+                             factor->var_ids[0]).kind ==
+                   OSPREY_PRED_PRIMITIVE_VAR;
+    case OSPREY_RULE_CA02:
+        return exact_base_implication_valid(
+            factor, graph, false, OSPREY_PRED_PRIMITIVE_VAR,
+            OSPREY_PRED_PRIMITIVE_VAR, false);
+    case OSPREY_RULE_CA03:
+        return exact_base_implication_valid(
+            factor, graph, true, OSPREY_PRED_PRIMITIVE_VAR,
+            OSPREY_PRED_PRIMITIVE_VAR, false);
+    case OSPREY_RULE_CA04:
+        return exact_base_implication_valid(
+            factor, graph, false, OSPREY_PRED_PRIMITIVE_VAR,
+            OSPREY_PRED_PRIMITIVE_ACCESS, false);
+    case OSPREY_RULE_CA05:
+        return exact_base_implication_valid(
+            factor, graph, false, OSPREY_PRED_PRIMITIVE_ACCESS,
+            OSPREY_PRED_PRIMITIVE_VAR, false);
+    case OSPREY_RULE_CA06:
+        return exact_base_implication_valid(
+            factor, graph, false, OSPREY_PRED_PRIMITIVE_ACCESS,
+            OSPREY_PRED_SCALAR, false);
+    case OSPREY_RULE_CA07:
+        return exact_base_implication_valid(
+            factor, graph, false, OSPREY_PRED_SCALAR,
+            OSPREY_PRED_SCALAR, false);
+    case OSPREY_RULE_CA08:
+        return exact_base_implication_valid(
+            factor, graph, true, OSPREY_PRED_SCALAR,
+            OSPREY_PRED_FIELD_OF, true);
+    default:
+        return false;
+    }
+}
+
+static bool exact_factor_valid(const OspreyFactor *factor,
+                               const OspreyGraph *graph)
+{
+    uint32_t variable_count = graph->vars->len;
+
+    if (factor == NULL || factor->id == UINT32_MAX ||
+        factor->rule <= OSPREY_RULE_NONE ||
+        factor->rule >= OSPREY_RULE_COUNT ||
+        (factor->stage != OSPREY_GRAPH_BASE_CA &&
+         factor->stage != OSPREY_GRAPH_SECONDARY) ||
+        (factor->stage == OSPREY_GRAPH_BASE_CA) !=
+            exact_rule_is_base(factor->rule) ||
+        (factor->potential_kind != OSPREY_POTENTIAL_IMPLICATION &&
+         factor->potential_kind != OSPREY_POTENTIAL_PRIOR &&
+         factor->potential_kind != OSPREY_POTENTIAL_HARD_FALSE) ||
+        factor->negative > 1 || !isfinite(factor->p) || factor->p < 0.0 ||
+        factor->p > 1.0 || factor->num_vars == 0 ||
+        factor->num_vars > OSPREY_FACTOR_MAX_ARITY ||
+        factor->var_ids == NULL) {
+        return false;
+    }
+
+    switch (factor->potential_kind) {
+    case OSPREY_POTENTIAL_PRIOR:
+        if (factor->num_vars != 1 || factor->head_idx != 0) return false;
+        break;
+    case OSPREY_POTENTIAL_IMPLICATION:
+        if (factor->num_vars < 2 || factor->head_idx >= factor->num_vars) {
+            return false;
+        }
+        break;
+    case OSPREY_POTENTIAL_HARD_FALSE:
+        if (factor->rule != OSPREY_RULE_CB06 ||
+            factor->stage != OSPREY_GRAPH_SECONDARY ||
+            factor->num_vars != 1 || factor->head_idx != UINT16_MAX ||
+            factor->negative || factor->p != 0.0) {
+            return false;
+        }
+        break;
+    default:
+        return false;
+    }
+
+    for (uint32_t i = 0; i < factor->num_vars; i++) {
+        if (factor->var_ids[i] >= variable_count) return false;
+        for (uint32_t j = 0; j < i; j++) {
+            if (factor->var_ids[j] == factor->var_ids[i]) return false;
+        }
+    }
+    return factor->stage != OSPREY_GRAPH_BASE_CA ||
+           exact_base_factor_valid(factor, graph);
+}
+
+typedef struct OspreyExactVarRef {
+    OspreyKey key;
+    OspreyVarPayload payload;
+    uint32_t graph_var_id;
+    uint8_t kind;
+} OspreyExactVarRef;
+
+static gint exact_var_ref_compare(gconstpointer ap, gconstpointer bp)
+{
+    const OspreyExactVarRef *a = ap;
+    const OspreyExactVarRef *b = bp;
+    int c = exact_cmp_u64(a->kind, b->kind);
+    if (c == 0) {
+        c = osprey_var_payload_compare(a->kind, &a->payload, &b->payload);
+    }
+    if (c == 0) c = exact_key_compare(&a->key, &b->key);
+    return c != 0 ? c : exact_cmp_u64(a->graph_var_id, b->graph_var_id);
+}
+
+static gint exact_u32_compare(gconstpointer ap, gconstpointer bp)
+{
+    const uint32_t *a = ap;
+    const uint32_t *b = bp;
+    return exact_cmp_u64(*a, *b);
+}
+
+static uint32_t exact_uf_find(uint32_t *parent, uint32_t value)
+{
+    while (parent[value] != value) {
+        parent[value] = parent[parent[value]];
+        value = parent[value];
+    }
+    return value;
+}
+
+static void exact_uf_union(uint32_t *parent, uint32_t a, uint32_t b)
+{
+    uint32_t ra = exact_uf_find(parent, a);
+    uint32_t rb = exact_uf_find(parent, b);
+    if (ra == rb) return;
+    if (ra < rb) parent[rb] = ra;
+    else parent[ra] = rb;
+}
+
+static void exact_component_free(gpointer data)
+{
+    OspreyExactComponent *component = data;
+    if (component == NULL) return;
+    if (component->local_vars != NULL) {
+        g_array_free(component->local_vars, TRUE);
+    }
+    if (component->factor_refs != NULL) {
+        g_array_free(component->factor_refs, TRUE);
+    }
+    g_free(component);
+}
+
+void osprey_exact_base_free(OspreyExactBase *base)
+{
+    if (base == NULL) return;
+    if (base->components != NULL) {
+        g_ptr_array_free(base->components, TRUE);
+    }
+    if (base->factor_refs != NULL) {
+        g_array_free(base->factor_refs, TRUE);
+    }
+    g_free(base->local_by_graph);
+    if (base->graph_var_ids != NULL) {
+        g_array_free(base->graph_var_ids, TRUE);
+    }
+    g_free(base);
+}
+
+static OspreyStatus exact_projection_failure(OspreyContext *ctx,
+                                             OspreyStatus status)
+{
+    if (ctx != NULL && (ctx->last_status == OSPREY_OK ||
+                        ctx->last_status == OSPREY_DISABLED)) {
+        ctx->last_status = status;
+    }
+    return status;
+}
+
+typedef struct OspreyExactFactorSortContext {
+    const OspreyGraph *graph;
+} OspreyExactFactorSortContext;
+
+static gint exact_factor_ref_identity_compare(
+    const OspreyExactFactorRef *a, const OspreyExactFactorRef *b,
+    const OspreyGraph *graph)
+{
+    const OspreyFactor *fa = g_array_index(graph->factors,
+                                           OspreyFactor *,
+                                           a->graph_factor_id);
+    const OspreyFactor *fb = g_array_index(graph->factors,
+                                           OspreyFactor *,
+                                           b->graph_factor_id);
+    int c = exact_cmp_u64(fa->stage, fb->stage);
+    if (c != 0) return c;
+    c = exact_cmp_u64(fa->rule, fb->rule);
+    if (c != 0) return c;
+    c = exact_cmp_u64(fa->potential_kind, fb->potential_kind);
+    if (c != 0) return c;
+    c = exact_cmp_u64(fa->negative, fb->negative);
+    if (c != 0) return c;
+    uint64_t ap_bits, bp_bits;
+    memcpy(&ap_bits, &fa->p, sizeof(ap_bits));
+    memcpy(&bp_bits, &fb->p, sizeof(bp_bits));
+    c = exact_cmp_u64(ap_bits, bp_bits);
+    if (c != 0) return c;
+    c = exact_cmp_u64(fa->head_idx, fb->head_idx);
+    if (c != 0) return c;
+    c = exact_cmp_u64(a->num_vars, b->num_vars);
+    if (c != 0) return c;
+    for (uint32_t i = 0; i < a->num_vars; i++) {
+        c = exact_cmp_u64(a->local_vars[i], b->local_vars[i]);
+        if (c != 0) return c;
+    }
+    return 0;
+}
+
+static gint exact_factor_ref_compare(gconstpointer ap, gconstpointer bp,
+                                     gpointer user_data)
+{
+    const OspreyExactFactorRef *a = ap;
+    const OspreyExactFactorRef *b = bp;
+    const OspreyExactFactorSortContext *context = user_data;
+    int c = exact_factor_ref_identity_compare(a, b, context->graph);
+    return c != 0 ? c : exact_cmp_u64(a->graph_factor_id,
+                                       b->graph_factor_id);
+}
+
+static gint exact_component_compare(gconstpointer ap, gconstpointer bp)
+{
+    const OspreyExactComponent *a =
+        *(OspreyExactComponent *const *)ap;
+    const OspreyExactComponent *b =
+        *(OspreyExactComponent *const *)bp;
+    uint32_t a_first = g_array_index(a->local_vars, uint32_t, 0);
+    uint32_t b_first = g_array_index(b->local_vars, uint32_t, 0);
+    if (a_first != b_first) return exact_cmp_u64(a_first, b_first);
+    uint32_t common = a->factor_refs->len < b->factor_refs->len
+        ? a->factor_refs->len : b->factor_refs->len;
+    for (uint32_t i = 0; i < common; i++) {
+        uint32_t af = g_array_index(a->factor_refs, uint32_t, i);
+        uint32_t bf = g_array_index(b->factor_refs, uint32_t, i);
+        if (af != bf) return exact_cmp_u64(af, bf);
+    }
+    return exact_cmp_u64(a->factor_refs->len, b->factor_refs->len);
+}
+
+OspreyStatus osprey_exact_base_build(OspreyContext *ctx,
+                                     OspreyExactBase **out)
+{
+    GArray *all_vars = NULL;
+    GArray *base_factor_ids = NULL;
+    uint8_t *base_marked = NULL;
+    OspreyExactBase *base = NULL;
+    uint32_t *parent = NULL;
+    GHashTable *component_by_root = NULL;
+    OspreyGraph *graph;
+    uint32_t variable_count;
+    OspreyStatus status = OSPREY_OK;
+
+    if (out != NULL) *out = NULL;
+    if (ctx == NULL || out == NULL || ctx->graph == NULL) {
+        return exact_projection_failure(ctx, OSPREY_INVALID_GRAPH);
+    }
+    graph = ctx->graph;
+    if (graph->vars == NULL || graph->factors == NULL) {
+        return exact_projection_failure(ctx, OSPREY_INVALID_GRAPH);
+    }
+    variable_count = graph->vars->len;
+
+    all_vars = g_array_sized_new(FALSE, FALSE, sizeof(OspreyExactVarRef),
+                                 variable_count);
+    for (uint32_t i = 0; i < variable_count; i++) {
+        OspreyVar *variable = &g_array_index(graph->vars, OspreyVar, i);
+        if (variable->id != i || variable->kind <= OSPREY_PRED_NONE ||
+            variable->kind >= OSPREY_PRED_COUNT ||
+            variable->hard_false > 1 || variable->region_limit_hit > 1 ||
+            !isfinite(variable->prior) || variable->prior < 0.0 ||
+            variable->prior > 1.0 ||
+            !exact_payload_valid(variable->kind, &variable->payload)) {
+            status = OSPREY_INVALID_GRAPH;
+            goto fail;
+        }
+        OspreyExactVarRef ref;
+        memset(&ref, 0, sizeof(ref));
+        ref.key = osprey_var_key(variable->kind, &variable->payload);
+        ref.payload = variable->payload;
+        ref.graph_var_id = i;
+        ref.kind = variable->kind;
+        g_array_append_val(all_vars, ref);
+    }
+    g_array_sort(all_vars, exact_var_ref_compare);
+    for (guint i = 1; i < all_vars->len; i++) {
+        OspreyExactVarRef *previous = &g_array_index(all_vars,
+                                                     OspreyExactVarRef,
+                                                     i - 1);
+        OspreyExactVarRef *current = &g_array_index(all_vars,
+                                                     OspreyExactVarRef, i);
+        if (exact_key_compare(&previous->key, &current->key) == 0) {
+            status = OSPREY_INVALID_GRAPH;
+            goto fail;
+        }
+    }
+
+    base_factor_ids = g_array_new(FALSE, FALSE, sizeof(uint32_t));
+    base_marked = g_new0(uint8_t, variable_count);
+    for (uint32_t i = 0; i < graph->factors->len; i++) {
+        OspreyFactor *factor = g_array_index(graph->factors,
+                                             OspreyFactor *, i);
+        if (factor == NULL || factor->id != i ||
+            !exact_factor_valid(factor, graph)) {
+            status = OSPREY_INVALID_GRAPH;
+            goto fail;
+        }
+        if (factor->stage != OSPREY_GRAPH_BASE_CA) continue;
+        g_array_append_val(base_factor_ids, i);
+        for (uint32_t j = 0; j < factor->num_vars; j++) {
+            base_marked[factor->var_ids[j]] = 1;
+        }
+    }
+    if (base_factor_ids->len == 0) {
+        status = OSPREY_INCOMPLETE_FACTS;
+        goto fail;
+    }
+
+    base = g_new0(OspreyExactBase, 1);
+    base->graph_var_count = variable_count;
+    base->graph_var_ids = g_array_new(FALSE, FALSE, sizeof(uint32_t));
+    base->local_by_graph = g_new(uint32_t, variable_count);
+    for (uint32_t i = 0; i < variable_count; i++) {
+        base->local_by_graph[i] = UINT32_MAX;
+    }
+    for (guint i = 0; i < all_vars->len; i++) {
+        OspreyExactVarRef *ref = &g_array_index(all_vars,
+                                                OspreyExactVarRef, i);
+        if (!base_marked[ref->graph_var_id]) continue;
+        uint32_t local_id = base->graph_var_ids->len;
+        g_array_append_val(base->graph_var_ids, ref->graph_var_id);
+        base->local_by_graph[ref->graph_var_id] = local_id;
+    }
+    if (base->graph_var_ids->len == 0) {
+        status = OSPREY_INVALID_GRAPH;
+        goto fail;
+    }
+
+    base->factor_refs = g_array_sized_new(FALSE, FALSE,
+                                          sizeof(OspreyExactFactorRef),
+                                          base_factor_ids->len);
+    for (guint i = 0; i < base_factor_ids->len; i++) {
+        uint32_t graph_factor_id = g_array_index(base_factor_ids, uint32_t, i);
+        OspreyFactor *factor = g_array_index(graph->factors,
+                                             OspreyFactor *,
+                                             graph_factor_id);
+        OspreyExactFactorRef ref;
+        memset(&ref, 0, sizeof(ref));
+        ref.graph_factor_id = graph_factor_id;
+        ref.num_vars = factor->num_vars;
+        for (uint32_t j = 0; j < factor->num_vars; j++) {
+            uint32_t local_id = base->local_by_graph[factor->var_ids[j]];
+            if (local_id == UINT32_MAX) {
+                status = OSPREY_INVALID_GRAPH;
+                goto fail;
+            }
+            ref.local_vars[j] = local_id;
+        }
+        g_array_append_val(base->factor_refs, ref);
+    }
+    OspreyExactFactorSortContext factor_context = { graph };
+    g_array_sort_with_data(base->factor_refs, exact_factor_ref_compare,
+                           &factor_context);
+    for (guint i = 1; i < base->factor_refs->len; i++) {
+        OspreyExactFactorRef *previous = &g_array_index(
+            base->factor_refs, OspreyExactFactorRef, i - 1);
+        OspreyExactFactorRef *current = &g_array_index(
+            base->factor_refs, OspreyExactFactorRef, i);
+        if (exact_factor_ref_identity_compare(previous, current, graph) == 0) {
+            status = OSPREY_INVALID_GRAPH;
+            goto fail;
+        }
+    }
+
+    parent = g_new(uint32_t, base->graph_var_ids->len);
+    for (uint32_t i = 0; i < base->graph_var_ids->len; i++) parent[i] = i;
+    for (guint i = 0; i < base->factor_refs->len; i++) {
+        OspreyExactFactorRef *ref = &g_array_index(base->factor_refs,
+                                                   OspreyExactFactorRef, i);
+        for (uint32_t j = 1; j < ref->num_vars; j++) {
+            exact_uf_union(parent, ref->local_vars[0], ref->local_vars[j]);
+        }
+    }
+
+    base->components = g_ptr_array_new_with_free_func(exact_component_free);
+    component_by_root = g_hash_table_new(g_direct_hash, g_direct_equal);
+    for (uint32_t i = 0; i < base->graph_var_ids->len; i++) {
+        uint32_t root = exact_uf_find(parent, i);
+        OspreyExactComponent *component = g_hash_table_lookup(
+            component_by_root, GSIZE_TO_POINTER(root));
+        if (component == NULL) {
+            component = g_new0(OspreyExactComponent, 1);
+            component->local_vars = g_array_new(FALSE, FALSE,
+                                                sizeof(uint32_t));
+            component->factor_refs = g_array_new(FALSE, FALSE,
+                                                 sizeof(uint32_t));
+            g_ptr_array_add(base->components, component);
+            g_hash_table_insert(component_by_root, GSIZE_TO_POINTER(root),
+                                component);
+        }
+        g_array_append_val(component->local_vars, i);
+    }
+    for (guint i = 0; i < base->factor_refs->len; i++) {
+        OspreyExactFactorRef *ref = &g_array_index(base->factor_refs,
+                                                   OspreyExactFactorRef, i);
+        uint32_t root = exact_uf_find(parent, ref->local_vars[0]);
+        OspreyExactComponent *component = g_hash_table_lookup(
+            component_by_root, GSIZE_TO_POINTER(root));
+        if (component == NULL) {
+            status = OSPREY_INVALID_GRAPH;
+            goto fail;
+        }
+        for (uint32_t j = 1; j < ref->num_vars; j++) {
+            if (exact_uf_find(parent, ref->local_vars[j]) != root) {
+                status = OSPREY_INVALID_GRAPH;
+                goto fail;
+            }
+        }
+        uint32_t factor_ref_id = i;
+        g_array_append_val(component->factor_refs, factor_ref_id);
+    }
+    for (guint i = 0; i < base->components->len; i++) {
+        OspreyExactComponent *component = g_ptr_array_index(
+            base->components, i);
+        g_array_sort(component->local_vars, exact_u32_compare);
+        g_array_sort(component->factor_refs, exact_u32_compare);
+        if (component->local_vars->len == 0 ||
+            component->factor_refs->len == 0) {
+            status = OSPREY_INVALID_GRAPH;
+            goto fail;
+        }
+    }
+    g_ptr_array_sort(base->components, exact_component_compare);
+
+    g_hash_table_destroy(component_by_root);
+    g_free(parent);
+    g_free(base_marked);
+    g_array_free(base_factor_ids, TRUE);
+    g_array_free(all_vars, TRUE);
+    *out = base;
+    return OSPREY_OK;
+
+fail:
+    if (component_by_root != NULL) g_hash_table_destroy(component_by_root);
+    g_free(parent);
+    g_free(base_marked);
+    if (base_factor_ids != NULL) g_array_free(base_factor_ids, TRUE);
+    if (all_vars != NULL) g_array_free(all_vars, TRUE);
+    osprey_exact_base_free(base);
+    return exact_projection_failure(ctx, status);
 }
 
 /* ------------------------------------------------------------------ */
