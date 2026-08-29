@@ -53,6 +53,7 @@ TESTS = [
             ("infer", "[large "),
             ("reject", "[stage infer]"),
         ],
+        expect_log_rows=[("shm", "[iter 2]")],
         expect_inferred=0,
         expect_inferred_max=0,
         expect_queue_min=1,
@@ -864,9 +865,11 @@ TESTS = [
         expect_rows=[
             ("graph", "[stage base]"),
             ("graph", "[stage secondary]"),
-            ("infer", "[large "),
+            ("infer", "[large component 0] [clique "),
+            ("infer", "[limit 1]"),
             ("reject", "[stage infer]"),
         ],
+        expect_log_rows=[("shm", "[iter 2]")],
         expect_inferred=0,
         expect_inferred_max=0,
         expect_queue_min=1,
@@ -892,9 +895,11 @@ TESTS = [
         expect_rows=[
             ("graph", "[stage base]"),
             ("graph", "[stage secondary]"),
-            ("infer", "[large "),
+            ("infer", "[large component 0] [clique "),
+            ("infer", "[limit 1]"),
             ("reject", "[stage infer]"),
         ],
+        expect_log_rows=[("shm", "[iter 2]")],
         expect_inferred=0,
         expect_inferred_max=0,
         expect_queue_min=1,
@@ -928,6 +933,14 @@ def has_row(out, tag, needle):
     """True when some line carries `[osprey] [<tag>]` and the needle."""
     return any(
         f"[osprey] [{tag}]" in line and needle in line
+        for line in out.splitlines()
+    )
+
+
+def has_log_row(out, tag, needle):
+    """True when some log line carries `[<tag>]` and the needle."""
+    return any(
+        f"[{tag}]" in line and needle in line
         for line in out.splitlines()
     )
 
@@ -1208,6 +1221,11 @@ def run_dump_compare(test, workdir, qemu, solver):
         rc, out = run_binradar(spec, guest, qemu, solver, workdir)
         rcs.append(rc)
         outs.append(out)
+        runtime_problems = check(test, rc, out)
+        if runtime_problems:
+            return (None, out +
+                    f"\nruntime assertions failed at bias {i}:\n" +
+                    "\n".join(runtime_problems))
         matches = re.findall(
             r"\[snapshot\] \[entrypoint\].*\[bias ([0-9a-fA-F]+)\]",
             out,
@@ -2057,6 +2075,9 @@ def check(test, rc, out):
     for tag, needle in test.get("expect_rows", []):
         if not has_row(out, tag, needle):
             problems.append(f"missing row [osprey] [{tag}] {needle}")
+    for tag, needle in test.get("expect_log_rows", []):
+        if not has_log_row(out, tag, needle):
+            problems.append(f"missing log row [{tag}] {needle}")
     want = test.get("expect_inferred", 0)
     got = count_inferred(out)
     if got < want:

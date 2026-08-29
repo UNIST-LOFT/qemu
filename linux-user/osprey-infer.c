@@ -2525,6 +2525,34 @@ typedef struct OspreyExactNumericWorkspace {
     uint32_t *preorder;
 } OspreyExactNumericWorkspace;
 
+/* Test-only fault injection for the numerical workspace.  Production keeps
+ * the hook disabled, while focused tests can force a partial allocation
+ * failure and verify atomic belief publication and cleanup. */
+static int64_t exact_test_alloc_fail_after = -1;
+
+void osprey_exact_test_set_alloc_fail_after(int64_t allocations)
+{
+    exact_test_alloc_fail_after = allocations;
+}
+
+static bool exact_test_alloc_allowed(void)
+{
+    if (exact_test_alloc_fail_after < 0) return true;
+    if (exact_test_alloc_fail_after == 0) return false;
+    exact_test_alloc_fail_after--;
+    return true;
+}
+
+static void *exact_try_malloc(size_t bytes)
+{
+    return exact_test_alloc_allowed() ? g_try_malloc(bytes) : NULL;
+}
+
+static void *exact_try_malloc0(size_t bytes)
+{
+    return exact_test_alloc_allowed() ? g_try_malloc0(bytes) : NULL;
+}
+
 /* A log-domain value is either finite or the exact representation of zero.
  * Positive infinity and NaN are never valid intermediate values. */
 static bool exact_log_value_valid(double value)
@@ -2679,8 +2707,8 @@ static bool exact_numeric_edge_map_build(
     count = edge->separator->len;
     if (!exact_array_size(count, sizeof(uint32_t), &bytes)) return false;
     map->count = count;
-    map->parent_positions = g_try_malloc(bytes);
-    map->child_positions = g_try_malloc(bytes);
+    map->parent_positions = exact_try_malloc(bytes);
+    map->child_positions = exact_try_malloc(bytes);
     if (map->parent_positions == NULL || map->child_positions == NULL) {
         g_free(map->parent_positions);
         g_free(map->child_positions);
@@ -2767,7 +2795,7 @@ static bool exact_numeric_order_build(
     if (!exact_array_size(work->clique_count, sizeof(*seen), &seen_bytes)) {
         return false;
     }
-    seen = g_try_malloc0(seen_bytes);
+    seen = exact_try_malloc0(seen_bytes);
     if (seen == NULL) return false;
     work->preorder[0] = 0;
     seen[0] = 1;
@@ -2810,19 +2838,19 @@ static bool exact_numeric_workspace_init(
                           &parent_edge_bytes) ||
         !exact_array_size(work->clique_count, sizeof(*work->preorder),
                           &preorder_bytes)) return false;
-    work->clique_potentials = g_try_malloc0(clique_bytes);
-    work->parent_edge = g_try_malloc(parent_edge_bytes);
-    work->preorder = g_try_malloc(preorder_bytes);
+    work->clique_potentials = exact_try_malloc0(clique_bytes);
+    work->parent_edge = exact_try_malloc(parent_edge_bytes);
+    work->preorder = exact_try_malloc(preorder_bytes);
     if (work->clique_potentials == NULL || work->parent_edge == NULL ||
         work->preorder == NULL) return false;
     if (work->edge_count != 0) {
         size_t edge_bytes;
         if (!exact_array_size(work->edge_count, sizeof(*work->messages),
                               &edge_bytes)) return false;
-        work->messages = g_try_malloc0(edge_bytes);
+        work->messages = exact_try_malloc0(edge_bytes);
         if (!exact_array_size(work->edge_count, sizeof(*work->edge_maps),
                               &edge_bytes)) return false;
-        work->edge_maps = g_try_malloc0(edge_bytes);
+        work->edge_maps = exact_try_malloc0(edge_bytes);
         if (work->messages == NULL || work->edge_maps == NULL) return false;
     }
 
@@ -2834,7 +2862,7 @@ static bool exact_numeric_workspace_init(
             !exact_double_table_size(clique->assignment_cells, &bytes)) {
             return false;
         }
-        work->clique_potentials[i] = g_try_malloc(bytes);
+        work->clique_potentials[i] = exact_try_malloc(bytes);
         if (work->clique_potentials[i] == NULL) return false;
         for (uint64_t j = 0; j < clique->assignment_cells; j++) {
             work->clique_potentials[i][(size_t)j] = 0.0;
@@ -2850,8 +2878,8 @@ static bool exact_numeric_workspace_init(
         work->messages[i].cells = edge->separator_cells;
         work->messages[i].parent_to_child_log_norm = NAN;
         work->messages[i].child_to_parent_log_norm = NAN;
-        work->messages[i].parent_to_child = g_try_malloc(bytes);
-        work->messages[i].child_to_parent = g_try_malloc(bytes);
+        work->messages[i].parent_to_child = exact_try_malloc(bytes);
+        work->messages[i].child_to_parent = exact_try_malloc(bytes);
         if (work->messages[i].parent_to_child == NULL ||
             work->messages[i].child_to_parent == NULL) return false;
         for (uint64_t j = 0; j < edge->separator_cells; j++) {
@@ -3196,6 +3224,7 @@ static OspreyStatus exact_numeric_infer(OspreyContext *ctx,
     uint32_t local_count;
     size_t marginal_bytes;
     double *marginals = NULL;
+    double total_logz = 0.0;
     OspreyStatus status = OSPREY_INVALID_GRAPH;
 
     if (ctx == NULL || ctx->graph == NULL || base == NULL || topology == NULL ||
@@ -3208,7 +3237,7 @@ static OspreyStatus exact_numeric_infer(OspreyContext *ctx,
     if (!exact_double_table_size(local_count, &marginal_bytes)) {
         return exact_projection_failure(ctx, status);
     }
-    marginals = g_try_malloc(marginal_bytes);
+    marginals = exact_try_malloc(marginal_bytes);
     if (marginals == NULL) goto out;
     for (uint32_t i = 0; i < local_count; i++) marginals[i] = NAN;
 
@@ -3218,12 +3247,14 @@ static OspreyStatus exact_numeric_infer(OspreyContext *ctx,
         double component_logz;
         OspreyStatus component_status = exact_numeric_component(
             ctx->graph, base, component, marginals, &component_logz);
-        if (component_status != OSPREY_OK || !isfinite(component_logz)) {
+        if (component_status != OSPREY_OK || !isfinite(component_logz) ||
+            !isfinite(total_logz + component_logz)) {
             status = component_status == OSPREY_OK
                 ? OSPREY_INVALID_GRAPH
                 : component_status;
             goto out;
         }
+        total_logz += component_logz;
     }
     for (uint32_t local = 0; local < local_count; local++) {
         if (!isfinite(marginals[local]) || marginals[local] < 0.0 ||
@@ -3240,6 +3271,7 @@ static OspreyStatus exact_numeric_infer(OspreyContext *ctx,
 
     /* This is the only graph mutation in Stage 4.3.  All component tables,
      * messages, marginals, and log-partition values have succeeded above. */
+    ctx->last_exact_logz = total_logz;
     for (uint32_t local = 0; local < local_count; local++) {
         uint32_t graph_id = g_array_index(base->graph_var_ids, uint32_t, local);
         g_array_index(ctx->graph->vars, OspreyVar, graph_id).belief =

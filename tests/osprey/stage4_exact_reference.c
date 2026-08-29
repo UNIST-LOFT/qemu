@@ -1,6 +1,7 @@
 #include "stage4_exact_reference.h"
 
 #include <limits.h>
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -382,4 +383,199 @@ bool stage4_exact_reference_validate(const OspreyExactBase *base,
         }
     }
     return true;
+}
+
+/* ------------------------------------------------------------------ */
+/* Independent numerical oracle                                       */
+/* ------------------------------------------------------------------ */
+
+static bool ref_log_value_valid(double value)
+{
+    return isfinite(value) || value == -INFINITY;
+}
+
+static bool ref_logaddexp(double left, double right, double *out)
+{
+    double high;
+    double low;
+    double value;
+
+    if (out == NULL || !ref_log_value_valid(left) ||
+        !ref_log_value_valid(right)) return false;
+    if (left == -INFINITY) {
+        *out = right;
+        return true;
+    }
+    if (right == -INFINITY) {
+        *out = left;
+        return true;
+    }
+    high = left > right ? left : right;
+    low = left > right ? right : left;
+    value = high + log1p(exp(low - high));
+    if (!isfinite(value)) return false;
+    *out = value;
+    return true;
+}
+
+static bool ref_log_product(double left, double right, double *out)
+{
+    double value;
+
+    if (out == NULL || !ref_log_value_valid(left) ||
+        !ref_log_value_valid(right)) return false;
+    if (left == -INFINITY || right == -INFINITY) {
+        *out = -INFINITY;
+        return true;
+    }
+    value = left + right;
+    if (!isfinite(value)) return false;
+    *out = value;
+    return true;
+}
+
+static bool ref_factor_valid(const Stage4ReferenceFactor *spec,
+                             uint32_t variable_count)
+{
+    if (spec == NULL || spec->stage != OSPREY_GRAPH_BASE_CA ||
+        !isfinite(spec->probability) || spec->probability < 0.0 ||
+        spec->probability > 1.0 || spec->num_vars == 0 ||
+        spec->num_vars > 2 || spec->num_vars > OSPREY_FACTOR_MAX_ARITY ||
+        spec->negative > 1) return false;
+    if (spec->num_vars == 1) {
+        if (spec->potential_kind != OSPREY_POTENTIAL_PRIOR ||
+            spec->head_idx != 0) return false;
+    } else if (spec->potential_kind != OSPREY_POTENTIAL_IMPLICATION ||
+               spec->head_idx != 1) {
+        return false;
+    }
+    for (uint32_t i = 0; i < spec->num_vars; i++) {
+        if (spec->vars[i] >= variable_count) return false;
+        for (uint32_t j = 0; j < i; j++) {
+            if (spec->vars[j] == spec->vars[i]) return false;
+        }
+    }
+    return true;
+}
+
+OspreyStatus stage4_exact_reference_bruteforce(
+    const Stage4ReferenceProblem *problem, Stage4ReferenceSolution *solution)
+{
+    double numerator[STAGE4_REFERENCE_MAX_VARS];
+    uint32_t canonical_order[STAGE4_REFERENCE_MAX_VARS];
+    uint32_t canonical_by_variable[STAGE4_REFERENCE_MAX_VARS];
+    uint64_t assignments;
+    double logz = -INFINITY;
+
+    if (problem == NULL || solution == NULL || problem->variables == NULL ||
+        problem->factors == NULL || problem->variable_count == 0 ||
+        problem->variable_count > STAGE4_REFERENCE_MAX_VARS ||
+        problem->factor_count == 0) return OSPREY_INVALID_GRAPH;
+    for (uint32_t i = 0; i < problem->variable_count; i++) {
+        if (problem->variables[i].kind <= OSPREY_PRED_NONE ||
+            problem->variables[i].kind >= OSPREY_PRED_COUNT) {
+            return OSPREY_INVALID_GRAPH;
+        }
+        canonical_order[i] = i;
+        numerator[i] = -INFINITY;
+    }
+    for (uint32_t i = 1; i < problem->variable_count; i++) {
+        uint32_t value = canonical_order[i];
+        uint32_t j = i;
+        while (j != 0) {
+            uint32_t previous = canonical_order[j - 1];
+            const Stage4ReferenceVariable *left =
+                &problem->variables[previous];
+            const Stage4ReferenceVariable *right = &problem->variables[value];
+            int comparison = left->kind < right->kind ? -1 :
+                             left->kind != right->kind ? 1 :
+                             osprey_var_payload_compare(
+                                 left->kind, &left->payload, &right->payload);
+            if (comparison <= 0) break;
+            canonical_order[j] = previous;
+            j--;
+        }
+        canonical_order[j] = value;
+    }
+    for (uint32_t i = 0; i < problem->variable_count; i++) {
+        uint32_t variable = canonical_order[i];
+        if (i != 0) {
+            uint32_t previous = canonical_order[i - 1];
+            const Stage4ReferenceVariable *left =
+                &problem->variables[previous];
+            const Stage4ReferenceVariable *right =
+                &problem->variables[variable];
+            if (left->kind == right->kind &&
+                osprey_var_payload_compare(left->kind, &left->payload,
+                                           &right->payload) == 0) {
+                return OSPREY_INVALID_GRAPH;
+            }
+        }
+        canonical_by_variable[variable] = i;
+    }
+    for (uint32_t i = 0; i < problem->factor_count; i++) {
+        if (!ref_factor_valid(&problem->factors[i],
+                              problem->variable_count)) {
+            return OSPREY_INVALID_GRAPH;
+        }
+    }
+    if (problem->variable_count >= sizeof(uint64_t) * 8u) {
+        return OSPREY_INVALID_GRAPH;
+    }
+    assignments = UINT64_C(1) << problem->variable_count;
+    for (uint64_t assignment = 0; assignment < assignments; assignment++) {
+        double log_weight = 0.0;
+        for (uint32_t i = 0; i < problem->factor_count; i++) {
+            const Stage4ReferenceFactor *spec = &problem->factors[i];
+            OspreyFactor factor;
+            uint8_t values[OSPREY_FACTOR_MAX_ARITY] = { 0 };
+            double term;
+
+            memset(&factor, 0, sizeof(factor));
+            factor.rule = spec->rule;
+            factor.stage = spec->stage;
+            factor.potential_kind = spec->potential_kind;
+            factor.head_idx = spec->head_idx;
+            factor.negative = spec->negative;
+            factor.p = spec->probability;
+            factor.num_vars = spec->num_vars;
+            for (uint32_t j = 0; j < spec->num_vars; j++) {
+                values[j] = (uint8_t)(
+                    (assignment >> canonical_by_variable[spec->vars[j]]) & 1u);
+            }
+            if (!osprey_factor_log_weight(&factor, values, &term) ||
+                !ref_log_product(log_weight, term, &log_weight)) {
+                return OSPREY_INVALID_GRAPH;
+            }
+        }
+        if (!ref_logaddexp(logz, log_weight, &logz)) {
+            return OSPREY_INVALID_MODEL;
+        }
+        for (uint32_t i = 0; i < problem->variable_count; i++) {
+            if (((assignment >> canonical_by_variable[i]) & 1u) != 0 &&
+                !ref_logaddexp(numerator[i], log_weight, &numerator[i])) {
+                return OSPREY_INVALID_MODEL;
+            }
+        }
+    }
+    if (!isfinite(logz)) return OSPREY_INVALID_MODEL;
+    solution->logz = logz;
+    for (uint32_t i = 0; i < problem->variable_count; i++) {
+        double marginal;
+        if (numerator[i] == -INFINITY) {
+            marginal = 0.0;
+        } else {
+            double exponent = numerator[i] - logz;
+            marginal = exp(exponent);
+        }
+        if (!isfinite(marginal) || marginal < 0.0 || marginal > 1.0) {
+            return OSPREY_INVALID_MODEL;
+        }
+        solution->marginals[i] = marginal;
+    }
+    for (uint32_t i = problem->variable_count;
+         i < STAGE4_REFERENCE_MAX_VARS; i++) {
+        solution->marginals[i] = NAN;
+    }
+    return OSPREY_OK;
 }

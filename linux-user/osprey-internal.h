@@ -724,6 +724,9 @@ struct OspreyContext {
     OspreyModel *model;
     OspreyStatus last_status;
     uint64_t last_analyze_time_ms;
+    /* Last successfully computed Stage-4 base log partition.  This is
+     * diagnostic/test state; failed exact transactions leave it unchanged. */
+    double last_exact_logz;
 
     /* Committed Stage 3 factor graph (parent side). */
     OspreyGraph *graph;
@@ -1069,6 +1072,10 @@ bool osprey_exact_topology_validate(
  * computes exact base marginals in temporary workspaces, and publishes
  * beliefs only after every component succeeds. */
 OspreyStatus osprey_stage4_exact(OspreyContext *ctx);
+
+/* Test-only deterministic allocation fault injection.  A negative value
+ * disables the hook; zero rejects the next exact-numeric allocation. */
+void osprey_exact_test_set_alloc_fail_after(int64_t allocations);
 
 /* Stage 4.3 numerical primitives.  These accept finite values or exact
  * -INFINITY only and preserve hard zero support. */

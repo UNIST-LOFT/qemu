@@ -14,6 +14,7 @@
 
 #include "qemu/thread.h"
 
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -666,6 +667,7 @@ OspreyContext *osprey_new(const OspreyConfig *config) {
     ctx->relations = NULL;
     ctx->runtime_regions = g_array_new(FALSE, FALSE, sizeof(OspreyRuntimeRegion));
     ctx->last_status = OSPREY_DISABLED;
+    ctx->last_exact_logz = NAN;
     ctx->tx_status = OSPREY_DISABLED;
     ctx->tx_stage = NULL;
     ctx->tx_reason = NULL;

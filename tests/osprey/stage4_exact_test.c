@@ -14,6 +14,8 @@
 static unsigned failures;
 static unsigned registered;
 static unsigned executed;
+static unsigned generated_registered;
+static unsigned generated_executed;
 
 static char *topology_dump(const OspreyExactTopology *topology);
 
@@ -1573,6 +1575,743 @@ static void test_exact_bidirectional(void)
     osprey_free(ctx);
 }
 
+#define REFERENCE_MAX_FACTORS 64u
+
+typedef struct ReferenceFixture {
+    Stage4ReferenceVariable variables[STAGE4_REFERENCE_MAX_VARS];
+    uint32_t variable_count;
+    Stage4ReferenceFactor factors[REFERENCE_MAX_FACTORS];
+    uint32_t factor_count;
+} ReferenceFixture;
+
+static uint32_t reference_add_variable(ReferenceFixture *fixture,
+                                       uint8_t kind,
+                                       OspreyRegionId region,
+                                       int64_t offset, uint64_t pc)
+{
+    uint32_t index;
+    Stage4ReferenceVariable *variable;
+
+    if (fixture == NULL || fixture->variable_count >=
+            STAGE4_REFERENCE_MAX_VARS) {
+        CHECK(false, "reference variable capacity is sufficient");
+        return UINT32_MAX;
+    }
+    index = fixture->variable_count++;
+    variable = &fixture->variables[index];
+    memset(variable, 0, sizeof(*variable));
+    variable->kind = kind;
+    switch (kind) {
+    case OSPREY_PRED_PRIMITIVE_VAR:
+    case OSPREY_PRED_SCALAR:
+        variable->payload.chunk = make_chunk(region, offset, 8);
+        break;
+    case OSPREY_PRED_PRIMITIVE_ACCESS:
+        variable->payload.prim_access.chunk = make_chunk(region, offset, 8);
+        variable->payload.prim_access.insn_pc = pc;
+        break;
+    default:
+        CHECK(false, "reference variable kind has a complete fixture helper");
+        break;
+    }
+    return index;
+}
+
+static uint32_t reference_add_field(ReferenceFixture *fixture,
+                                    OspreyRegionId region, int64_t offset,
+                                    OspreyAddress base)
+{
+    uint32_t index;
+    Stage4ReferenceVariable *variable;
+
+    if (fixture == NULL || fixture->variable_count >=
+            STAGE4_REFERENCE_MAX_VARS) {
+        CHECK(false, "reference field capacity is sufficient");
+        return UINT32_MAX;
+    }
+    index = fixture->variable_count++;
+    variable = &fixture->variables[index];
+    memset(variable, 0, sizeof(*variable));
+    variable->kind = OSPREY_PRED_FIELD_OF;
+    variable->payload.attached.chunk = make_chunk(region, offset, 8);
+    variable->payload.attached.base = base;
+    return index;
+}
+
+static bool reference_add_prior(ReferenceFixture *fixture, uint16_t rule,
+                                double probability, uint32_t variable)
+{
+    Stage4ReferenceFactor *factor;
+
+    if (fixture == NULL || fixture->factor_count >= REFERENCE_MAX_FACTORS ||
+        variable >= fixture->variable_count) {
+        CHECK(false, "reference factor capacity is sufficient");
+        return false;
+    }
+    factor = &fixture->factors[fixture->factor_count++];
+    memset(factor, 0, sizeof(*factor));
+    factor->rule = rule;
+    factor->stage = OSPREY_GRAPH_BASE_CA;
+    factor->potential_kind = OSPREY_POTENTIAL_PRIOR;
+    factor->head_idx = 0;
+    factor->probability = probability;
+    factor->num_vars = 1;
+    factor->vars[0] = variable;
+    return true;
+}
+
+static bool reference_add_edge(ReferenceFixture *fixture, uint16_t rule,
+                               bool negative, double probability,
+                               uint32_t source, uint32_t target)
+{
+    Stage4ReferenceFactor *factor;
+
+    if (fixture == NULL || fixture->factor_count >= REFERENCE_MAX_FACTORS ||
+        source >= fixture->variable_count || target >= fixture->variable_count ||
+        source == target) {
+        CHECK(false, "reference edge has valid variables");
+        return false;
+    }
+    factor = &fixture->factors[fixture->factor_count++];
+    memset(factor, 0, sizeof(*factor));
+    factor->rule = rule;
+    factor->stage = OSPREY_GRAPH_BASE_CA;
+    factor->potential_kind = OSPREY_POTENTIAL_IMPLICATION;
+    factor->head_idx = 1;
+    factor->negative = negative ? 1 : 0;
+    factor->probability = probability;
+    factor->num_vars = 2;
+    factor->vars[0] = source;
+    factor->vars[1] = target;
+    return true;
+}
+
+static OspreyContext *reference_build_context(
+    const ReferenceFixture *fixture, const uint32_t *variable_order,
+    const uint32_t *factor_order, uint32_t duplicate_factor,
+    uint32_t *production_ids)
+{
+    OspreyContext *ctx;
+    OspreyConfig config = graph_config();
+
+    if (fixture == NULL || production_ids == NULL) return NULL;
+    ctx = new_graph_context_with_config(&config);
+    for (uint32_t i = 0; i < fixture->variable_count; i++) {
+        uint32_t index = variable_order == NULL ? i : variable_order[i];
+        OspreyInternResult result;
+        if (index >= fixture->variable_count) {
+            CHECK(false, "reference variable insertion order is valid");
+            osprey_free(ctx);
+            return NULL;
+        }
+        result = osprey_intern_var(ctx, fixture->variables[index].kind,
+                                   &fixture->variables[index].payload);
+        CHECK(result.id != UINT32_MAX, "reference variable inserts");
+        if (result.id == UINT32_MAX) {
+            osprey_free(ctx);
+            return NULL;
+        }
+        production_ids[index] = result.id;
+    }
+    for (uint32_t i = 0; i < fixture->factor_count; i++) {
+        uint32_t index = factor_order == NULL ? i : factor_order[i];
+        const Stage4ReferenceFactor *spec;
+        uint32_t ids[OSPREY_FACTOR_MAX_ARITY];
+        OspreyFactorResult result;
+
+        if (index >= fixture->factor_count) {
+            CHECK(false, "reference factor insertion order is valid");
+            osprey_free(ctx);
+            return NULL;
+        }
+        spec = &fixture->factors[index];
+        for (uint32_t j = 0; j < spec->num_vars; j++) {
+            if (spec->vars[j] >= fixture->variable_count) {
+                CHECK(false, "reference factor variables are valid");
+                osprey_free(ctx);
+                return NULL;
+            }
+            ids[j] = production_ids[spec->vars[j]];
+        }
+        result = osprey_factor_add_ex(
+            ctx, spec->rule, spec->stage, spec->potential_kind,
+            spec->head_idx, spec->negative != 0, spec->probability, ids,
+            spec->num_vars);
+        CHECK(result.status == OSPREY_OK && result.id != UINT32_MAX,
+              "reference factor inserts");
+        if (result.status != OSPREY_OK || result.id == UINT32_MAX) {
+            osprey_free(ctx);
+            return NULL;
+        }
+        if (index == duplicate_factor) {
+            OspreyFactorResult duplicate = osprey_factor_add_ex(
+                ctx, spec->rule, spec->stage, spec->potential_kind,
+                spec->head_idx, spec->negative != 0, spec->probability, ids,
+                spec->num_vars);
+            CHECK(duplicate.status == OSPREY_OK && !duplicate.inserted,
+                  "duplicate reference factor is ignored");
+            if (duplicate.status != OSPREY_OK || duplicate.inserted) {
+                osprey_free(ctx);
+                return NULL;
+            }
+        }
+    }
+    return ctx;
+}
+
+static bool reference_results_match(const ReferenceFixture *fixture,
+                                    const OspreyContext *ctx,
+                                    const Stage4ReferenceSolution *solution)
+{
+    bool matched[STAGE4_REFERENCE_MAX_VARS] = { false };
+    bool ok = true;
+
+    if (fixture == NULL || ctx == NULL || ctx->graph == NULL ||
+        solution == NULL || ctx->graph->vars == NULL ||
+        ctx->graph->vars->len != fixture->variable_count ||
+        ctx->graph->factors == NULL ||
+        ctx->graph->factors->len != fixture->factor_count) {
+        CHECK(false, "production graph has exactly the declarative shape");
+        return false;
+    }
+    for (guint graph_id = 0; graph_id < ctx->graph->vars->len; graph_id++) {
+        const OspreyVar *actual = &g_array_index(ctx->graph->vars,
+                                                  OspreyVar, graph_id);
+        OspreyKey actual_key = osprey_var_key(actual->kind, &actual->payload);
+        uint32_t expected_id = UINT32_MAX;
+        for (uint32_t i = 0; i < fixture->variable_count; i++) {
+            OspreyKey expected_key = osprey_var_key(
+                fixture->variables[i].kind, &fixture->variables[i].payload);
+            if (osprey_key_equal(&actual_key, &expected_key)) {
+                if (expected_id != UINT32_MAX) {
+                    CHECK(false, "production variable keys are unique");
+                    ok = false;
+                }
+                expected_id = i;
+            }
+        }
+        if (expected_id == UINT32_MAX || matched[expected_id]) {
+            CHECK(false, "production variable maps by its complete key");
+            ok = false;
+            continue;
+        }
+        matched[expected_id] = true;
+        CHECK(isfinite(actual->belief) && actual->belief >= 0.0 &&
+                  actual->belief <= 1.0,
+              "production marginal is normalized");
+        CHECK(fabs(actual->belief - solution->marginals[expected_id]) <= 1e-10,
+              "production marginal matches independent brute force");
+        if (!isfinite(actual->belief) || actual->belief < 0.0 ||
+            actual->belief > 1.0 ||
+            fabs(actual->belief - solution->marginals[expected_id]) > 1e-10) {
+            ok = false;
+        }
+    }
+    for (uint32_t i = 0; i < fixture->variable_count; i++) {
+        if (!matched[i]) {
+            CHECK(false, "every declarative variable receives one marginal");
+            ok = false;
+        }
+    }
+    {
+        double scale = fmax(1.0, fmax(fabs(ctx->last_exact_logz),
+                                     fabs(solution->logz)));
+        double difference = fabs(ctx->last_exact_logz - solution->logz);
+        CHECK(isfinite(ctx->last_exact_logz) &&
+                  difference <= 1e-10 * scale,
+              "production log partition matches independent brute force");
+        if (!isfinite(ctx->last_exact_logz) || difference > 1e-10 * scale) {
+            ok = false;
+        }
+    }
+    return ok;
+}
+
+static bool reference_run_fixture(const ReferenceFixture *fixture,
+                                  const uint32_t *variable_order,
+                                  const uint32_t *factor_order,
+                                  uint32_t duplicate_factor)
+{
+    Stage4ReferenceProblem problem;
+    Stage4ReferenceSolution solution;
+    uint32_t production_ids[STAGE4_REFERENCE_MAX_VARS] = { 0 };
+    OspreyContext *ctx;
+    OspreyExactBase *base = NULL;
+    OspreyExactTopology *topology = NULL;
+    OspreyStatus reference_status;
+    OspreyStatus status;
+    double beliefs_before[STAGE4_REFERENCE_MAX_VARS];
+    bool ok = true;
+
+    memset(&problem, 0, sizeof(problem));
+    problem.variables = fixture->variables;
+    problem.variable_count = fixture->variable_count;
+    problem.factors = fixture->factors;
+    problem.factor_count = fixture->factor_count;
+    reference_status = stage4_exact_reference_bruteforce(&problem, &solution);
+    CHECK(reference_status == OSPREY_OK ||
+              reference_status == OSPREY_INVALID_MODEL,
+          "declarative reference graph has a valid exact status");
+    if (reference_status != OSPREY_OK &&
+        reference_status != OSPREY_INVALID_MODEL) return false;
+
+    ctx = reference_build_context(fixture, variable_order, factor_order,
+                                  duplicate_factor, production_ids);
+    if (ctx == NULL) return false;
+    for (guint i = 0; i < ctx->graph->vars->len; i++) {
+        beliefs_before[i] = g_array_index(ctx->graph->vars, OspreyVar,
+                                           i).belief;
+    }
+    status = build_test_topology(ctx, &base, &topology);
+    CHECK(status == OSPREY_OK && base != NULL && topology != NULL,
+          "production exact topology accepts declarative graph");
+    if (status != OSPREY_OK || base == NULL || topology == NULL) {
+        ok = false;
+        goto out;
+    }
+    CHECK(base->graph_var_ids->len == fixture->variable_count &&
+              base->factor_refs->len == fixture->factor_count,
+          "exact projection solves only registered base variables/factors");
+    bool topology_matches = stage4_exact_reference_validate(base, topology);
+    CHECK(topology_matches,
+          "generated topology agrees with independent bounded topology oracle");
+    if (base->graph_var_ids->len != fixture->variable_count ||
+        base->factor_refs->len != fixture->factor_count || !topology_matches) {
+        ok = false;
+    }
+    status = osprey_stage4_exact(ctx);
+    CHECK(status == reference_status,
+          "production exact status matches independent brute force");
+    if (status != reference_status) {
+        ok = false;
+    } else if (reference_status == OSPREY_OK) {
+        if (!reference_results_match(fixture, ctx, &solution)) ok = false;
+    } else {
+        for (guint i = 0; i < ctx->graph->vars->len; i++) {
+            if (g_array_index(ctx->graph->vars, OspreyVar, i).belief !=
+                beliefs_before[i]) {
+                CHECK(false, "impossible generated model publishes no belief");
+                ok = false;
+            }
+        }
+        CHECK(isnan(ctx->last_exact_logz),
+              "impossible generated model publishes no partition");
+        if (!isnan(ctx->last_exact_logz)) ok = false;
+    }
+out:
+    osprey_exact_topology_free(topology);
+    osprey_exact_base_free(base);
+    osprey_free(ctx);
+    return ok;
+}
+
+static void test_reference_generic_factors(void)
+{
+    OspreyRegionId global = make_region(OSPREY_REGION_GLOBAL, 0);
+    OspreyRegionId stack = make_region(OSPREY_REGION_STACK_FUNCTION, 0x100);
+    ReferenceFixture fixture;
+    OspreyAddress field_base;
+    uint32_t first;
+    uint32_t second;
+
+    memset(&fixture, 0, sizeof(fixture));
+    first = reference_add_variable(&fixture, OSPREY_PRED_PRIMITIVE_VAR,
+                                   global, 0, 0);
+    reference_add_prior(&fixture, OSPREY_RULE_CA01, 0.6, first);
+    CHECK(reference_run_fixture(&fixture, NULL, NULL, UINT32_MAX),
+          "CA01 reference case matches brute force");
+
+    memset(&fixture, 0, sizeof(fixture));
+    first = reference_add_variable(&fixture, OSPREY_PRED_PRIMITIVE_VAR,
+                                   global, 0, 0);
+    second = reference_add_variable(&fixture, OSPREY_PRED_PRIMITIVE_VAR,
+                                    global, 8, 0);
+    reference_add_prior(&fixture, OSPREY_RULE_CA01, 0.3, first);
+    reference_add_prior(&fixture, OSPREY_RULE_CA01, 0.7, second);
+    reference_add_edge(&fixture, OSPREY_RULE_CA02, false, 0.8, first, second);
+    CHECK(reference_run_fixture(&fixture, NULL, NULL, 2),
+          "CA02 reference case matches brute force");
+
+    reference_add_edge(&fixture, OSPREY_RULE_CA02, false, 0.8, second, first);
+    CHECK(reference_run_fixture(&fixture, NULL, NULL, UINT32_MAX),
+          "CA02 bidirectional reference case matches brute force");
+
+    memset(&fixture, 0, sizeof(fixture));
+    first = reference_add_variable(&fixture, OSPREY_PRED_PRIMITIVE_VAR,
+                                   global, 0, 0);
+    second = reference_add_variable(&fixture, OSPREY_PRED_PRIMITIVE_VAR,
+                                    global, 8, 0);
+    reference_add_prior(&fixture, OSPREY_RULE_CA01, 0.3, first);
+    reference_add_prior(&fixture, OSPREY_RULE_CA01, 0.7, second);
+    reference_add_edge(&fixture, OSPREY_RULE_CA03, true, 0.2, first, second);
+    CHECK(reference_run_fixture(&fixture, NULL, NULL, UINT32_MAX),
+          "CA03 reference case matches brute force");
+
+    reference_add_edge(&fixture, OSPREY_RULE_CA03, true, 0.2, second, first);
+    CHECK(reference_run_fixture(&fixture, NULL, NULL, UINT32_MAX),
+          "CA03 bidirectional reference case matches brute force");
+
+    memset(&fixture, 0, sizeof(fixture));
+    first = reference_add_variable(&fixture, OSPREY_PRED_PRIMITIVE_VAR,
+                                   global, 0, 0);
+    second = reference_add_variable(&fixture, OSPREY_PRED_PRIMITIVE_ACCESS,
+                                    stack, -8, 0x10);
+    reference_add_prior(&fixture, OSPREY_RULE_CA01, 0.4, first);
+    reference_add_edge(&fixture, OSPREY_RULE_CA04, false, 0.8, first, second);
+    CHECK(reference_run_fixture(&fixture, NULL, NULL, UINT32_MAX),
+          "CA04 reference case matches brute force");
+
+    memset(&fixture, 0, sizeof(fixture));
+    first = reference_add_variable(&fixture, OSPREY_PRED_PRIMITIVE_ACCESS,
+                                   stack, -8, 0x11);
+    second = reference_add_variable(&fixture, OSPREY_PRED_PRIMITIVE_VAR,
+                                    global, 8, 0);
+    reference_add_prior(&fixture, OSPREY_RULE_CA01, 0.6, second);
+    reference_add_edge(&fixture, OSPREY_RULE_CA05, false, 0.8, first, second);
+    CHECK(reference_run_fixture(&fixture, NULL, NULL, UINT32_MAX),
+          "CA05 reference case matches brute force");
+
+    memset(&fixture, 0, sizeof(fixture));
+    first = reference_add_variable(&fixture, OSPREY_PRED_PRIMITIVE_ACCESS,
+                                   stack, -8, 0x12);
+    second = reference_add_variable(&fixture, OSPREY_PRED_SCALAR,
+                                    global, 16, 0);
+    reference_add_edge(&fixture, OSPREY_RULE_CA06, false, 0.5, first, second);
+    CHECK(reference_run_fixture(&fixture, NULL, NULL, UINT32_MAX),
+          "CA06 reference case matches brute force");
+
+    memset(&fixture, 0, sizeof(fixture));
+    first = reference_add_variable(&fixture, OSPREY_PRED_SCALAR,
+                                   global, 0, 0);
+    second = reference_add_variable(&fixture, OSPREY_PRED_SCALAR,
+                                    global, 8, 0);
+    reference_add_edge(&fixture, OSPREY_RULE_CA07, false, 0.2, first, second);
+    CHECK(reference_run_fixture(&fixture, NULL, NULL, UINT32_MAX),
+          "CA07 lower-clamp reference case matches brute force");
+
+    memset(&fixture, 0, sizeof(fixture));
+    first = reference_add_variable(&fixture, OSPREY_PRED_SCALAR,
+                                   global, 0, 0);
+    second = reference_add_variable(&fixture, OSPREY_PRED_SCALAR,
+                                    global, 8, 0);
+    reference_add_edge(&fixture, OSPREY_RULE_CA07, false, 0.8, first, second);
+    CHECK(reference_run_fixture(&fixture, NULL, NULL, UINT32_MAX),
+          "CA07 upper-clamp reference case matches brute force");
+
+    memset(&fixture, 0, sizeof(fixture));
+    first = reference_add_variable(&fixture, OSPREY_PRED_SCALAR,
+                                   global, 0, 0);
+    field_base = (OspreyAddress) { global, 0 };
+    second = reference_add_field(&fixture, global, 0, field_base);
+    reference_add_edge(&fixture, OSPREY_RULE_CA08, true, 0.2, first, second);
+    CHECK(reference_run_fixture(&fixture, NULL, NULL, UINT32_MAX),
+          "CA08 reference case matches brute force");
+    reference_add_edge(&fixture, OSPREY_RULE_CA08, true, 0.2, second, first);
+    CHECK(reference_run_fixture(&fixture, NULL, NULL, UINT32_MAX),
+          "late CA08 bidirectional case matches brute force");
+}
+
+static uint64_t reference_rng_next(uint64_t *state)
+{
+    *state = *state * UINT64_C(6364136223846793005) +
+             UINT64_C(1442695040888963407);
+    return *state;
+}
+
+static double reference_generated_probability(uint64_t *state, bool prior)
+{
+    static const double edge_values[] = {
+        0.0, 1.0, 0.2, 0.5, 0.8, DBL_MIN,
+    };
+    static const double prior_values[] = {
+        0.0, 1.0, 0.2, 0.5, 0.8, DBL_MIN,
+    };
+    const double *values = prior ? prior_values : edge_values;
+    size_t count = prior ? G_N_ELEMENTS(prior_values) :
+                          G_N_ELEMENTS(edge_values);
+    double value = values[reference_rng_next(state) % count];
+
+    if (!prior && (reference_rng_next(state) & 7u) == 0) {
+        value = nextafter(1.0, 0.0);
+    }
+    return value;
+}
+
+static void reference_shuffle(uint32_t *values, uint32_t count,
+                              uint64_t *state)
+{
+    if (values == NULL || state == NULL) return;
+    for (uint32_t i = count; i > 1; i--) {
+        uint32_t j = reference_rng_next(state) % i;
+        uint32_t temporary = values[i - 1];
+        values[i - 1] = values[j];
+        values[j] = temporary;
+    }
+}
+
+static void reference_generated_edge(ReferenceFixture *fixture,
+                                     uint64_t *state, uint32_t source,
+                                     uint32_t target)
+{
+    bool negative = (reference_rng_next(state) & 1u) != 0;
+    reference_add_edge(fixture,
+                       negative ? OSPREY_RULE_CA03 : OSPREY_RULE_CA02,
+                       negative, reference_generated_probability(state, false),
+                       source, target);
+}
+
+static void reference_generate_fixture(uint32_t seed,
+                                        ReferenceFixture *fixture,
+                                        uint64_t *state_out)
+{
+    uint64_t state = UINT64_C(0x9e3779b97f4a7c15) ^ seed;
+    OspreyRegionId global = make_region(OSPREY_REGION_GLOBAL, seed & 3u);
+    OspreyRegionId stack = make_region(OSPREY_REGION_STACK_FUNCTION,
+                                       0x100 + (seed & 1u) * 0x100);
+    uint32_t shape;
+
+    memset(fixture, 0, sizeof(*fixture));
+    uint32_t variable_count = 1 + reference_rng_next(&state) %
+                                    STAGE4_REFERENCE_MAX_VARS;
+    bool add_ca05 = variable_count >= 2 && (seed & 7u) == 0;
+    uint32_t primitive_first = add_ca05 ? 1 : 0;
+    uint32_t primitive_count = variable_count - primitive_first;
+    for (uint32_t i = 0; i < variable_count; i++) {
+        OspreyRegionId region = (i & 1u) == 0 ? global : stack;
+        int64_t offset = (i & 1u) == 0
+            ? (int64_t)i * 8
+            : -((int64_t)i + 1) * 8;
+        uint8_t kind = add_ca05 && i == 0
+            ? OSPREY_PRED_PRIMITIVE_ACCESS
+            : OSPREY_PRED_PRIMITIVE_VAR;
+        uint32_t id = reference_add_variable(
+            fixture, kind, region, offset, UINT64_C(0x1000) + seed);
+        if (kind == OSPREY_PRED_PRIMITIVE_VAR) {
+            reference_add_prior(
+                fixture, OSPREY_RULE_CA01,
+                reference_generated_probability(&state, true), id);
+        }
+    }
+    if (add_ca05) {
+        reference_add_edge(
+            fixture, OSPREY_RULE_CA05, false,
+            reference_generated_probability(&state, false), 0, 1);
+    }
+
+    shape = reference_rng_next(&state) % 4;
+    if (shape == 1 && primitive_count >= 3 && primitive_count <= 6) {
+        for (uint32_t i = 0; i < primitive_count; i++) {
+            reference_generated_edge(
+                fixture, &state, primitive_first + i,
+                primitive_first + (i + 1) % primitive_count);
+        }
+    } else if (shape == 2 && primitive_count <= 6) {
+        for (uint32_t i = 1; i < primitive_count; i++) {
+            reference_generated_edge(fixture, &state,
+                                     primitive_first + i, primitive_first);
+        }
+    } else if (shape == 3) {
+        for (uint32_t i = 0; i + 1 < primitive_count; i += 2) {
+            reference_generated_edge(fixture, &state, primitive_first + i,
+                                     primitive_first + i + 1);
+        }
+    } else {
+        for (uint32_t i = 1; i < primitive_count; i++) {
+            reference_generated_edge(fixture, &state,
+                                     primitive_first + i - 1,
+                                     primitive_first + i);
+        }
+    }
+    if (state_out != NULL) *state_out = state;
+}
+
+static void reference_dump_generated_fixture(
+    uint32_t seed, const ReferenceFixture *fixture)
+{
+    fprintf(stderr, "generated Stage-4 reference seed %u: vars %u factors %u\n",
+            seed, fixture->variable_count, fixture->factor_count);
+    for (uint32_t i = 0; i < fixture->variable_count; i++) {
+        const Stage4ReferenceVariable *variable = &fixture->variables[i];
+        OspreyKey key = osprey_var_key(variable->kind, &variable->payload);
+        fprintf(stderr, "  V %u kind %u key", i, variable->kind);
+        for (guint word = 0; word < G_N_ELEMENTS(key.w); word++) {
+            fprintf(stderr, " %016llx",
+                    (unsigned long long)key.w[word]);
+        }
+        fputc('\n', stderr);
+    }
+    for (uint32_t i = 0; i < fixture->factor_count; i++) {
+        const Stage4ReferenceFactor *factor = &fixture->factors[i];
+        uint64_t probability_bits;
+        memcpy(&probability_bits, &factor->probability,
+               sizeof(probability_bits));
+        fprintf(stderr,
+                "  F %u rule %u stage %u potential %u negative %u "
+                "p %016llx head %u arity %u vars",
+                i, factor->rule, factor->stage, factor->potential_kind,
+                factor->negative, (unsigned long long)probability_bits,
+                factor->head_idx, factor->num_vars);
+        for (uint32_t j = 0; j < factor->num_vars; j++) {
+            fprintf(stderr, " %u", factor->vars[j]);
+        }
+        fputc('\n', stderr);
+    }
+}
+
+static bool run_generated_reference_case(uint32_t seed)
+{
+    ReferenceFixture fixture;
+    uint32_t natural_variables[STAGE4_REFERENCE_MAX_VARS];
+    uint32_t natural_factors[REFERENCE_MAX_FACTORS];
+    uint32_t shuffled_variables[STAGE4_REFERENCE_MAX_VARS];
+    uint32_t shuffled_factors[REFERENCE_MAX_FACTORS];
+    uint64_t state;
+    uint32_t duplicate;
+    bool first;
+    bool second;
+
+    reference_generate_fixture(seed, &fixture, &state);
+    for (uint32_t i = 0; i < fixture.variable_count; i++) {
+        natural_variables[i] = i;
+        shuffled_variables[i] = i;
+    }
+    for (uint32_t i = 0; i < fixture.factor_count; i++) {
+        natural_factors[i] = i;
+        shuffled_factors[i] = i;
+    }
+    reference_shuffle(shuffled_variables, fixture.variable_count, &state);
+    reference_shuffle(shuffled_factors, fixture.factor_count, &state);
+    duplicate = fixture.factor_count == 0 ? UINT32_MAX :
+                (uint32_t)(seed % fixture.factor_count);
+    first = reference_run_fixture(&fixture, natural_variables, natural_factors,
+                                  UINT32_MAX);
+    second = reference_run_fixture(&fixture, shuffled_variables,
+                                   shuffled_factors, duplicate);
+    if (!first || !second) {
+        reference_dump_generated_fixture(seed, &fixture);
+    }
+    return first && second;
+}
+
+static void test_generated_reference_corpus(void)
+{
+    enum { GENERATED_CASES = 2000 };
+
+    for (uint32_t seed = 0; seed < GENERATED_CASES; seed++) {
+        bool ok;
+        generated_registered++;
+        ok = run_generated_reference_case(UINT32_C(0x5eed0000) + seed);
+        CHECK(ok, "generated Stage-4 seed matches the independent oracle");
+        generated_executed++;
+    }
+    CHECK(generated_registered == GENERATED_CASES &&
+              generated_executed == GENERATED_CASES,
+          "every generated Stage-4 seed executes exactly once");
+}
+
+static void test_exact_allocation_failure(void)
+{
+    ReferenceFixture fixture;
+    OspreyContext *ctx;
+    uint32_t ids[STAGE4_REFERENCE_MAX_VARS] = { 0 };
+    double first_before = 0.41;
+    double second_before = 0.59;
+
+    memset(&fixture, 0, sizeof(fixture));
+    uint32_t first = reference_add_variable(
+        &fixture, OSPREY_PRED_PRIMITIVE_VAR,
+        make_region(OSPREY_REGION_GLOBAL, 0), 0, 0);
+    uint32_t second = reference_add_variable(
+        &fixture, OSPREY_PRED_PRIMITIVE_VAR,
+        make_region(OSPREY_REGION_GLOBAL, 0), 8, 0);
+    reference_add_prior(&fixture, OSPREY_RULE_CA01, 0.4, first);
+    reference_add_prior(&fixture, OSPREY_RULE_CA01, 0.6, second);
+    reference_add_edge(&fixture, OSPREY_RULE_CA02, false, 0.8,
+                       first, second);
+    ctx = reference_build_context(&fixture, NULL, NULL, UINT32_MAX, ids);
+    CHECK(ctx != NULL, "allocation-failure fixture builds");
+    if (ctx == NULL) return;
+    g_array_index(ctx->graph->vars, OspreyVar, ids[first]).belief =
+        first_before;
+    g_array_index(ctx->graph->vars, OspreyVar, ids[second]).belief =
+        second_before;
+    osprey_exact_test_set_alloc_fail_after(1);
+    OspreyStatus status = osprey_stage4_exact(ctx);
+    osprey_exact_test_set_alloc_fail_after(-1);
+    CHECK(status == OSPREY_INVALID_GRAPH,
+          "deterministic numerical allocation failure rejects");
+    CHECK(g_array_index(ctx->graph->vars, OspreyVar, ids[first]).belief ==
+              first_before &&
+          g_array_index(ctx->graph->vars, OspreyVar, ids[second]).belief ==
+              second_before && isnan(ctx->last_exact_logz),
+          "allocation failure publishes no beliefs or partition");
+    osprey_free(ctx);
+}
+
+static void test_exact_repeated_invocation(void)
+{
+    ReferenceFixture fixture;
+    OspreyContext *ctx;
+    uint32_t ids[STAGE4_REFERENCE_MAX_VARS] = { 0 };
+    double first_belief;
+    double second_belief;
+    double first_logz;
+    double second_logz;
+    OspreyFactor *factor;
+
+    memset(&fixture, 0, sizeof(fixture));
+    uint32_t first = reference_add_variable(
+        &fixture, OSPREY_PRED_PRIMITIVE_VAR,
+        make_region(OSPREY_REGION_GLOBAL, 0), 0, 0);
+    uint32_t second = reference_add_variable(
+        &fixture, OSPREY_PRED_PRIMITIVE_VAR,
+        make_region(OSPREY_REGION_GLOBAL, 0), 8, 0);
+    reference_add_prior(&fixture, OSPREY_RULE_CA01, 0.35, first);
+    reference_add_prior(&fixture, OSPREY_RULE_CA01, 0.65, second);
+    reference_add_edge(&fixture, OSPREY_RULE_CA02, false, 0.8,
+                       first, second);
+
+    ctx = reference_build_context(&fixture, NULL, NULL, UINT32_MAX, ids);
+    CHECK(ctx != NULL, "repeated exact fixture builds");
+    if (ctx == NULL) return;
+    CHECK(osprey_stage4_exact(ctx) == OSPREY_OK,
+          "first exact invocation succeeds");
+    first_belief = g_array_index(ctx->graph->vars, OspreyVar, ids[first]).belief;
+    second_belief = g_array_index(ctx->graph->vars, OspreyVar, ids[second]).belief;
+    first_logz = ctx->last_exact_logz;
+    CHECK(osprey_stage4_exact(ctx) == OSPREY_OK,
+          "second exact invocation succeeds");
+    CHECK(g_array_index(ctx->graph->vars, OspreyVar, ids[first]).belief ==
+              first_belief &&
+          g_array_index(ctx->graph->vars, OspreyVar, ids[second]).belief ==
+              second_belief && ctx->last_exact_logz == first_logz,
+          "repeated success is deterministic");
+
+    factor = g_array_index(ctx->graph->factors, OspreyFactor *, 0);
+    factor->p = NAN;
+    first_belief = g_array_index(ctx->graph->vars, OspreyVar, ids[first]).belief;
+    second_belief = g_array_index(ctx->graph->vars, OspreyVar, ids[second]).belief;
+    first_logz = ctx->last_exact_logz;
+    CHECK(osprey_stage4_exact(ctx) == OSPREY_INVALID_GRAPH,
+          "malformed repeated exact invocation rejects");
+    CHECK(g_array_index(ctx->graph->vars, OspreyVar, ids[first]).belief ==
+              first_belief &&
+          g_array_index(ctx->graph->vars, OspreyVar, ids[second]).belief ==
+              second_belief && ctx->last_exact_logz == first_logz,
+          "repeated rejection preserves committed exact result");
+    factor->p = INFINITY;
+    CHECK(osprey_stage4_exact(ctx) == OSPREY_INVALID_GRAPH,
+          "positive-infinity factor rejects atomically");
+    CHECK(g_array_index(ctx->graph->vars, OspreyVar, ids[first]).belief ==
+              first_belief &&
+          g_array_index(ctx->graph->vars, OspreyVar, ids[second]).belief ==
+              second_belief && ctx->last_exact_logz == first_logz,
+          "positive-infinity rejection preserves exact result");
+    second_logz = ctx->last_exact_logz;
+    CHECK(second_logz == first_logz, "rejection leaves exact log partition intact");
+    osprey_free(ctx);
+}
+
 static void test_exact_atomic_failure(void)
 {
     OspreyContext *ctx = new_graph_context();
@@ -1630,13 +2369,22 @@ int main(void)
     RUN(test_exact_separator_marginals);
     RUN(test_exact_log_domain_chain);
     RUN(test_exact_bidirectional);
+    RUN(test_reference_generic_factors);
+    RUN(test_generated_reference_corpus);
+    RUN(test_exact_allocation_failure);
+    RUN(test_exact_repeated_invocation);
     RUN(test_exact_atomic_failure);
     CHECK(registered == executed, "every Stage 4 exact case executed");
-    if (failures != 0 || registered != executed) {
-        fprintf(stderr, "FAIL stage4_exact (%u failures, %u/%u)\n",
-                failures, executed, registered);
+    CHECK(generated_registered == 2000 && generated_executed == 2000,
+          "all generated Stage-4 cases report exact totals");
+    if (failures != 0 || registered != executed ||
+        generated_registered != 2000 || generated_executed != 2000) {
+        fprintf(stderr, "FAIL stage4_exact (%u failures, %u/%u; generated %u/%u)\n",
+                failures, executed, registered, generated_executed,
+                generated_registered);
         return 1;
     }
-    printf("PASS stage4_exact (%u/%u)\n", executed, registered);
+    printf("PASS stage4_exact (%u/%u; generated %u/%u)\n", executed,
+           registered, generated_executed, generated_registered);
     return 0;
 }
