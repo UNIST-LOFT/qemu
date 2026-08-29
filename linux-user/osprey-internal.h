@@ -1013,8 +1013,64 @@ OspreyStatus osprey_exact_base_build(OspreyContext *ctx,
                                      OspreyExactBase **out);
 void osprey_exact_base_free(OspreyExactBase *base);
 
-/* Stages 4/5 inference (osprey-infer.c): exact base inference followed
- * by secondary loopy BP.  The current implementation is non-conformant. */
+/* Stage 4.2 deterministic bounded junction-tree topology.  All records
+ * below are temporary, owned by OspreyExactTopology, and retain local IDs
+ * rather than pointers into the production graph. */
+typedef struct OspreyExactClique {
+    uint32_t id;                 /* canonical topology ordinal */
+    GArray *local_vars;          /* uint32_t, sorted canonical local IDs */
+    GArray *factor_refs;         /* uint32_t indexes into exact base refs */
+    uint64_t assignment_cells;   /* checked 2^|local_vars| */
+} OspreyExactClique;
+
+typedef struct OspreyExactTreeEdge {
+    uint32_t left;               /* canonical endpoint, left < right */
+    uint32_t right;
+    uint32_t parent;             /* rooted after the tree is selected */
+    uint32_t child;
+    GArray *separator;           /* uint32_t, exact sorted intersection */
+    uint64_t separator_cells;    /* checked 2^|separator| */
+} OspreyExactTreeEdge;
+
+typedef struct OspreyExactTopologyComponent {
+    uint32_t base_component;     /* index into OspreyExactBase::components */
+    GArray *local_vars;          /* copied canonical component variables */
+    GArray *elimination_order;   /* uint32_t local IDs, min-fill order */
+    GPtrArray *elimination_cliques; /* OspreyExactClique*, one per step */
+    GPtrArray *cliques;          /* OspreyExactClique*, maximal canonical */
+    GArray *tree_edges;          /* OspreyExactTreeEdge */
+    uint32_t root_clique;        /* canonical root, always 0 when nonempty */
+    uint32_t max_clique_vars;
+    uint64_t assignment_cells;   /* sum over maximal cliques */
+    uint64_t separator_cells;    /* sum over both directed messages */
+    uint64_t table_bytes;        /* assignment + directed separator tables */
+} OspreyExactTopologyComponent;
+
+typedef struct OspreyExactTopology {
+    GPtrArray *components;       /* OspreyExactTopologyComponent* */
+    GArray *factor_owner;        /* uint32_t flattened canonical clique ID */
+    uint32_t variable_count;
+    uint32_t factor_count;
+    uint64_t clique_count;
+    uint64_t max_clique_vars;
+    uint64_t table_bytes;        /* checked sum over serial components */
+    uint64_t max_component_table_bytes;
+} OspreyExactTopology;
+
+OspreyStatus osprey_exact_topology_build(
+    OspreyContext *ctx, const OspreyExactBase *base,
+    OspreyExactTopology **out);
+void osprey_exact_topology_free(OspreyExactTopology *topology);
+bool osprey_exact_topology_validate(
+    const OspreyContext *ctx, const OspreyExactBase *base,
+    const OspreyExactTopology *topology);
+
+/* Stage 4.2 entrypoint.  It validates and reports the exact topology but
+ * performs no numerical inference or belief publication. */
+OspreyStatus osprey_stage4_exact(OspreyContext *ctx);
+
+/* Stages 4/5 inference (osprey-infer.c): Stage 4 topology followed by the
+ * still-untrusted secondary BP path. */
 OspreyStatus osprey_infer(OspreyContext *ctx);
 
 /* Shared graph builders (osprey-graph.c); used by Stage 3 construction

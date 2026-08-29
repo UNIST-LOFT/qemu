@@ -1,7 +1,8 @@
-/* Stage 4.1 CA-only projection and component-boundary tests. */
+/* Stage 4.1 projection and Stage 4.2 clique-topology tests. */
 
 #include "osprey.h"
 #include "osprey-internal.h"
+#include "stage4_exact_reference.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -11,6 +12,8 @@
 static unsigned failures;
 static unsigned registered;
 static unsigned executed;
+
+static char *topology_dump(const OspreyExactTopology *topology);
 
 #define CHECK(condition, message) do {                                      \
     if (!(condition)) {                                                      \
@@ -61,12 +64,17 @@ static OspreyChunk make_chunk(OspreyRegionId region, int64_t offset,
     return chunk;
 }
 
+static OspreyContext *new_graph_context_with_config(const OspreyConfig *config)
+{
+    OspreyContext *ctx = osprey_new(config);
+    ctx->graph = osprey_graph_new();
+    return ctx;
+}
+
 static OspreyContext *new_graph_context(void)
 {
     OspreyConfig config = graph_config();
-    OspreyContext *ctx = osprey_new(&config);
-    ctx->graph = osprey_graph_new();
-    return ctx;
+    return new_graph_context_with_config(&config);
 }
 
 static uint32_t add_primitive(OspreyContext *ctx, OspreyRegionId region,
@@ -238,6 +246,12 @@ static void test_stage_selection(void)
         CHECK(factor->stage == OSPREY_GRAPH_BASE_CA,
               "secondary factor is absent from projection");
     }
+    OspreyExactTopology *topology = NULL;
+    CHECK(base != NULL &&
+          osprey_exact_topology_build(ctx, base, &topology) == OSPREY_OK &&
+          topology != NULL,
+          "secondary-only variables remain outside exact topology");
+    osprey_exact_topology_free(topology);
     osprey_exact_base_free(base);
     osprey_free(ctx);
 }
@@ -282,6 +296,12 @@ static void test_secondary_contamination(void)
           "secondary contamination projection succeeds");
     CHECK(base != NULL && base->components->len == 2,
           "secondary factor cannot merge CA components");
+    OspreyExactTopology *topology = NULL;
+    CHECK(base != NULL &&
+          osprey_exact_topology_build(ctx, base, &topology) == OSPREY_OK &&
+          topology != NULL && topology->components->len == 2,
+          "secondary factor cannot contaminate topology");
+    osprey_exact_topology_free(topology);
     osprey_exact_base_free(base);
     osprey_free(ctx);
 }
@@ -446,9 +466,20 @@ static char *build_permutation_dump(const unsigned variable_order[3],
     }
 
     OspreyExactBase *base = NULL;
+    OspreyExactTopology *topology = NULL;
     CHECK(osprey_exact_base_build(ctx, &base) == OSPREY_OK,
           "permutation projection succeeds");
-    char *dump = base == NULL ? g_strdup("") : projection_dump(ctx, base);
+    CHECK(base != NULL &&
+          osprey_exact_topology_build(ctx, base, &topology) == OSPREY_OK &&
+          topology != NULL,
+          "permutation topology succeeds");
+    char *projection = base == NULL ? g_strdup("") : projection_dump(ctx, base);
+    char *topology_text = topology == NULL ? g_strdup("") :
+        topology_dump(topology);
+    char *dump = g_strconcat(projection, topology_text, NULL);
+    g_free(projection);
+    g_free(topology_text);
+    osprey_exact_topology_free(topology);
     osprey_exact_base_free(base);
     osprey_free(ctx);
     return dump;
@@ -468,7 +499,7 @@ static void test_insertion_permutations(void)
                 expected = actual;
             } else {
                 CHECK(strcmp(expected, actual) == 0,
-                      "projection canonical order ignores insertion order");
+                      "projection and topology ignore insertion order");
                 g_free(actual);
             }
             cases++;
@@ -485,6 +516,7 @@ static OspreyStatus build_mutated_graph(unsigned mutation)
     OspreyRegionId region = make_region(OSPREY_REGION_GLOBAL, 0);
     uint32_t a = add_primitive(ctx, region, 0);
     uint32_t b = add_primitive(ctx, region, 8);
+    uint32_t c = add_primitive(ctx, region, 16);
     add_prior(ctx, OSPREY_RULE_CA01, OSPREY_GRAPH_BASE_CA, a);
     add_implication(ctx, OSPREY_RULE_CA02, OSPREY_GRAPH_BASE_CA, a, b);
     OspreyFactor *factor = g_array_index(ctx->graph->factors,
@@ -519,6 +551,14 @@ static OspreyStatus build_mutated_graph(unsigned mutation)
     case 8:
         factor->rule = OSPREY_RULE_CA04;
         break;
+    case 9:
+        factor->var_ids = g_renew(uint32_t, factor->var_ids, 3);
+        factor->var_ids[0] = a;
+        factor->var_ids[1] = b;
+        factor->var_ids[2] = c;
+        factor->num_vars = 3;
+        factor->head_idx = 2;
+        break;
     default:
         break;
     }
@@ -536,7 +576,7 @@ static OspreyStatus build_mutated_graph(unsigned mutation)
 
 static void test_malformed_graphs(void)
 {
-    for (unsigned mutation = 0; mutation < 9; mutation++) {
+    for (unsigned mutation = 0; mutation < 10; mutation++) {
         CHECK(build_mutated_graph(mutation) == OSPREY_INVALID_GRAPH,
               "malformed stage/factor/ID input rejects before topology");
     }
@@ -584,6 +624,668 @@ static void test_repeated_ownership(void)
     osprey_free(ctx);
 }
 
+static OspreyStatus build_test_topology(OspreyContext *ctx,
+                                        OspreyExactBase **base_out,
+                                        OspreyExactTopology **topology_out)
+{
+    OspreyStatus status;
+    *base_out = NULL;
+    *topology_out = NULL;
+    status = osprey_exact_base_build(ctx, base_out);
+    if (status != OSPREY_OK) return status;
+    status = osprey_exact_topology_build(ctx, *base_out, topology_out);
+    return status;
+}
+
+static void add_path_graph(OspreyContext *ctx, uint32_t *ids,
+                           unsigned count)
+{
+    OspreyRegionId region = make_region(OSPREY_REGION_GLOBAL, 0);
+    for (unsigned i = 0; i < count; i++) {
+        ids[i] = add_primitive(ctx, region, (int64_t)i * 8);
+        add_prior(ctx, OSPREY_RULE_CA01, OSPREY_GRAPH_BASE_CA, ids[i]);
+        if (i != 0) {
+            add_implication(ctx, OSPREY_RULE_CA02, OSPREY_GRAPH_BASE_CA,
+                            ids[i - 1], ids[i]);
+        }
+    }
+}
+
+static char *topology_dump(const OspreyExactTopology *topology)
+{
+    GString *text = g_string_new("");
+    for (guint i = 0; i < topology->components->len; i++) {
+        const OspreyExactTopologyComponent *component = g_ptr_array_index(
+            topology->components, i);
+        g_string_append_printf(text, "C %u V", i);
+        for (guint j = 0; j < component->local_vars->len; j++) {
+            g_string_append_printf(text, " %u",
+                                   g_array_index(component->local_vars,
+                                                 uint32_t, j));
+        }
+        g_string_append(text, " O");
+        for (guint j = 0; j < component->elimination_order->len; j++) {
+            g_string_append_printf(text, " %u",
+                                   g_array_index(component->elimination_order,
+                                                 uint32_t, j));
+        }
+        g_string_append(text, " M");
+        for (guint j = 0; j < component->cliques->len; j++) {
+            const OspreyExactClique *clique = g_ptr_array_index(
+                component->cliques, j);
+            g_string_append(text, " [");
+            for (guint k = 0; k < clique->local_vars->len; k++) {
+                g_string_append_printf(text, "%s%u", k == 0 ? "" : ",",
+                                       g_array_index(clique->local_vars,
+                                                     uint32_t, k));
+            }
+            g_string_append(text, "]{");
+            for (guint k = 0; k < clique->factor_refs->len; k++) {
+                g_string_append_printf(text, "%s%u", k == 0 ? "" : ",",
+                                       g_array_index(clique->factor_refs,
+                                                     uint32_t, k));
+            }
+            g_string_append_c(text, '}');
+        }
+        g_string_append(text, " E");
+        for (guint j = 0; j < component->tree_edges->len; j++) {
+            const OspreyExactTreeEdge *edge = &g_array_index(
+                component->tree_edges, OspreyExactTreeEdge, j);
+            g_string_append_printf(text, " (%u>%u:", edge->parent,
+                                   edge->child);
+            for (guint k = 0; k < edge->separator->len; k++) {
+                g_string_append_printf(text, "%s%u", k == 0 ? "" : ",",
+                                       g_array_index(edge->separator,
+                                                     uint32_t, k));
+            }
+            g_string_append_c(text, ')');
+        }
+        g_string_append_c(text, '\n');
+    }
+    return g_string_free(text, FALSE);
+}
+
+static void test_chain_width_and_order(void)
+{
+    OspreyConfig config = graph_config();
+    config.max_exact_clique_vars = 2;
+    OspreyContext *ctx = new_graph_context_with_config(&config);
+    OspreyExactBase *base = NULL;
+    OspreyExactTopology *topology = NULL;
+    uint32_t ids[64];
+    add_path_graph(ctx, ids, G_N_ELEMENTS(ids));
+    CHECK(build_test_topology(ctx, &base, &topology) == OSPREY_OK,
+          "64-variable chain fits induced width two");
+    CHECK(topology != NULL && topology->components->len == 1,
+          "chain has one exact component");
+    if (topology != NULL) {
+        OspreyExactTopologyComponent *component = g_ptr_array_index(
+            topology->components, 0);
+        CHECK(component->elimination_order->len == 64 &&
+              component->cliques->len == 63 &&
+              component->tree_edges->len == 62,
+              "chain records every elimination and maximal clique");
+        CHECK(component->max_clique_vars == 2 &&
+              topology->max_clique_vars == 2,
+              "chain width is two, independent of component size");
+        CHECK(component->table_bytes == 4000 &&
+              topology->max_component_table_bytes == 4000,
+              "64-variable chain plans 4000 bytes of numerical workspace");
+        for (unsigned i = 0; i < 64 && i < component->elimination_order->len;
+             i++) {
+            CHECK(g_array_index(component->elimination_order, uint32_t, i) == i,
+                  "chain min-fill tie order is canonical");
+        }
+        CHECK(osprey_exact_topology_validate(ctx, base, topology),
+              "chain topology validates independently");
+        for (guint i = 0; i < topology->factor_owner->len; i++) {
+            CHECK(g_array_index(topology->factor_owner, uint32_t, i) !=
+                      UINT32_MAX,
+                  "every chain factor has one owner");
+        }
+    }
+    osprey_exact_topology_free(topology);
+    osprey_exact_base_free(base);
+    osprey_free(ctx);
+}
+
+static void test_width_boundaries(void)
+{
+    OspreyConfig config = graph_config();
+    OspreyContext *ctx;
+    OspreyExactBase *base;
+    OspreyExactTopology *topology;
+    uint32_t ids[4];
+
+    config.max_exact_clique_vars = 1;
+    ctx = new_graph_context_with_config(&config);
+    add_path_graph(ctx, ids, 4);
+    base = NULL;
+    topology = NULL;
+    CHECK(build_test_topology(ctx, &base, &topology) ==
+              OSPREY_EXACT_COMPONENT_TOO_LARGE && topology == NULL,
+          "chain rejects when induced clique width exceeds one");
+    osprey_exact_topology_free(topology);
+    osprey_exact_base_free(base);
+    osprey_free(ctx);
+
+    config.max_exact_clique_vars = 2;
+    ctx = new_graph_context_with_config(&config);
+    {
+        OspreyRegionId region = make_region(OSPREY_REGION_GLOBAL, 0);
+        for (unsigned i = 0; i < 4; i++) {
+            ids[i] = add_primitive(ctx, region, (int64_t)i * 8);
+            add_prior(ctx, OSPREY_RULE_CA01, OSPREY_GRAPH_BASE_CA, ids[i]);
+        }
+        add_implication(ctx, OSPREY_RULE_CA02, OSPREY_GRAPH_BASE_CA,
+                        ids[0], ids[1]);
+        add_implication(ctx, OSPREY_RULE_CA02, OSPREY_GRAPH_BASE_CA,
+                        ids[1], ids[2]);
+        add_implication(ctx, OSPREY_RULE_CA02, OSPREY_GRAPH_BASE_CA,
+                        ids[2], ids[3]);
+        add_implication(ctx, OSPREY_RULE_CA02, OSPREY_GRAPH_BASE_CA,
+                        ids[3], ids[0]);
+    }
+    base = NULL;
+    topology = NULL;
+    CHECK(build_test_topology(ctx, &base, &topology) ==
+              OSPREY_EXACT_COMPONENT_TOO_LARGE && topology == NULL,
+          "four-cycle rejects induced width three at limit two");
+    osprey_exact_topology_free(topology);
+    osprey_exact_base_free(base);
+    osprey_free(ctx);
+
+    config.max_exact_clique_vars = 3;
+    ctx = new_graph_context_with_config(&config);
+    {
+        OspreyRegionId region = make_region(OSPREY_REGION_GLOBAL, 0);
+        for (unsigned i = 0; i < 4; i++) {
+            ids[i] = add_primitive(ctx, region, (int64_t)i * 8);
+            add_prior(ctx, OSPREY_RULE_CA01, OSPREY_GRAPH_BASE_CA, ids[i]);
+        }
+        add_implication(ctx, OSPREY_RULE_CA02, OSPREY_GRAPH_BASE_CA,
+                        ids[0], ids[1]);
+        add_implication(ctx, OSPREY_RULE_CA02, OSPREY_GRAPH_BASE_CA,
+                        ids[1], ids[2]);
+        add_implication(ctx, OSPREY_RULE_CA02, OSPREY_GRAPH_BASE_CA,
+                        ids[2], ids[3]);
+        add_implication(ctx, OSPREY_RULE_CA02, OSPREY_GRAPH_BASE_CA,
+                        ids[3], ids[0]);
+    }
+    base = NULL;
+    topology = NULL;
+    CHECK(build_test_topology(ctx, &base, &topology) == OSPREY_OK,
+          "four-cycle fits induced width three at limit three");
+    CHECK(topology != NULL && topology->max_clique_vars == 3,
+          "four-cycle records width three");
+    osprey_exact_topology_free(topology);
+    osprey_exact_base_free(base);
+    osprey_free(ctx);
+}
+
+static void add_complete_four_graph(OspreyContext *ctx, uint32_t ids[4])
+{
+    OspreyRegionId region = make_region(OSPREY_REGION_GLOBAL, 0);
+    for (unsigned i = 0; i < 4; i++) {
+        ids[i] = add_primitive(ctx, region, (int64_t)i * 8);
+        add_prior(ctx, OSPREY_RULE_CA01, OSPREY_GRAPH_BASE_CA, ids[i]);
+    }
+    for (unsigned i = 0; i < 4; i++) {
+        for (unsigned j = i + 1; j < 4; j++) {
+            add_implication(ctx, OSPREY_RULE_CA02,
+                            OSPREY_GRAPH_BASE_CA, ids[i], ids[j]);
+        }
+    }
+}
+
+static void test_width_four_clique(void)
+{
+    OspreyConfig config = graph_config();
+    uint32_t ids[4];
+    OspreyContext *ctx;
+    OspreyExactBase *base;
+    OspreyExactTopology *topology;
+
+    config.max_exact_clique_vars = 3;
+    ctx = new_graph_context_with_config(&config);
+    add_complete_four_graph(ctx, ids);
+    base = NULL;
+    topology = NULL;
+    CHECK(build_test_topology(ctx, &base, &topology) ==
+              OSPREY_EXACT_COMPONENT_TOO_LARGE && topology == NULL,
+          "four-variable clique rejects at width limit three");
+    osprey_exact_topology_free(topology);
+    osprey_exact_base_free(base);
+    osprey_free(ctx);
+
+    config.max_exact_clique_vars = 4;
+    ctx = new_graph_context_with_config(&config);
+    add_complete_four_graph(ctx, ids);
+    base = NULL;
+    topology = NULL;
+    CHECK(build_test_topology(ctx, &base, &topology) == OSPREY_OK,
+          "four-variable clique fits width limit four");
+    CHECK(topology != NULL && topology->max_clique_vars == 4 &&
+          topology->components->len == 1 &&
+          ((OspreyExactTopologyComponent *)g_ptr_array_index(
+              topology->components, 0))->cliques->len == 1,
+          "four-variable graph records one width-four clique");
+    osprey_exact_topology_free(topology);
+    osprey_exact_base_free(base);
+    osprey_free(ctx);
+}
+
+static void test_star_and_unary_topology(void)
+{
+    OspreyConfig config = graph_config();
+    OspreyContext *ctx = new_graph_context_with_config(&config);
+    OspreyRegionId region = make_region(OSPREY_REGION_GLOBAL, 0);
+    uint32_t center = add_primitive(ctx, region, 0);
+    uint32_t leaves[8];
+    for (unsigned i = 0; i < G_N_ELEMENTS(leaves); i++) {
+        leaves[i] = add_primitive(ctx, region, (int64_t)(i + 1) * 8);
+        add_prior(ctx, OSPREY_RULE_CA01, OSPREY_GRAPH_BASE_CA, leaves[i]);
+        add_implication(ctx, OSPREY_RULE_CA02, OSPREY_GRAPH_BASE_CA,
+                        leaves[i], center);
+    }
+    add_prior(ctx, OSPREY_RULE_CA01, OSPREY_GRAPH_BASE_CA, center);
+    OspreyExactBase *base = NULL;
+    OspreyExactTopology *topology = NULL;
+    CHECK(build_test_topology(ctx, &base, &topology) == OSPREY_OK,
+          "star fits induced width two");
+    CHECK(topology != NULL && topology->max_clique_vars == 2 &&
+          g_ptr_array_index(topology->components, 0) != NULL,
+          "star leaves eliminate before center");
+    osprey_exact_topology_free(topology);
+    osprey_exact_base_free(base);
+    osprey_free(ctx);
+
+    ctx = new_graph_context_with_config(&config);
+    for (unsigned i = 0; i < 3; i++) {
+        uint32_t id = add_primitive(ctx, region, (int64_t)i * 8);
+        add_prior(ctx, OSPREY_RULE_CA01, OSPREY_GRAPH_BASE_CA, id);
+    }
+    config.max_exact_clique_vars = 1;
+    /* The direct context retains the original config; use a fresh one for
+     * the limit check so independent unary components remain explicit. */
+    osprey_free(ctx);
+    ctx = new_graph_context_with_config(&config);
+    for (unsigned i = 0; i < 3; i++) {
+        uint32_t id = add_primitive(ctx, region, (int64_t)i * 8);
+        add_prior(ctx, OSPREY_RULE_CA01, OSPREY_GRAPH_BASE_CA, id);
+    }
+    base = NULL;
+    topology = NULL;
+    CHECK(build_test_topology(ctx, &base, &topology) == OSPREY_OK,
+          "independent unary components fit limit one");
+    CHECK(topology != NULL && topology->components->len == 3,
+          "unary factors remain separate components");
+    if (topology != NULL) {
+        for (guint i = 0; i < topology->components->len; i++) {
+            OspreyExactTopologyComponent *component = g_ptr_array_index(
+                topology->components, i);
+            CHECK(component->cliques->len == 1 &&
+                  component->tree_edges->len == 0,
+                  "unary component has one clique and no edge");
+        }
+    }
+    osprey_exact_topology_free(topology);
+    osprey_exact_base_free(base);
+    osprey_free(ctx);
+}
+
+static void test_reference_topology_oracle(void)
+{
+    OspreyConfig config = graph_config();
+    OspreyContext *ctx = new_graph_context_with_config(&config);
+    OspreyRegionId region = make_region(OSPREY_REGION_GLOBAL, 0);
+    uint32_t center = add_primitive(ctx, region, 0);
+    uint32_t leaves[4];
+    add_prior(ctx, OSPREY_RULE_CA01, OSPREY_GRAPH_BASE_CA, center);
+    for (unsigned i = 0; i < G_N_ELEMENTS(leaves); i++) {
+        leaves[i] = add_primitive(ctx, region, (int64_t)(i + 1) * 8);
+        add_prior(ctx, OSPREY_RULE_CA01, OSPREY_GRAPH_BASE_CA, leaves[i]);
+        add_implication(ctx, OSPREY_RULE_CA02, OSPREY_GRAPH_BASE_CA,
+                        leaves[i], center);
+    }
+    OspreyExactBase *base = NULL;
+    OspreyExactTopology *topology = NULL;
+    CHECK(build_test_topology(ctx, &base, &topology) == OSPREY_OK &&
+          stage4_exact_reference_validate(base, topology),
+          "independent oracle matches tied star topology");
+    if (topology != NULL) {
+        OspreyExactTopologyComponent *component = g_ptr_array_index(
+            topology->components, 0);
+        CHECK(component->cliques->len == 4 &&
+              component->tree_edges->len == 3,
+              "star produces four maximal cliques and one tree");
+        for (guint i = 0; i < component->tree_edges->len; i++) {
+            OspreyExactTreeEdge *edge = &g_array_index(
+                component->tree_edges, OspreyExactTreeEdge, i);
+            CHECK(edge->parent == 0 && edge->child == i + 1 &&
+                  edge->separator->len == 1 &&
+                  g_array_index(edge->separator, uint32_t, 0) == 0,
+                  "equal-weight clique-tree ties use canonical edges");
+        }
+    }
+    osprey_exact_topology_free(topology);
+    osprey_exact_base_free(base);
+    osprey_free(ctx);
+
+    config.max_exact_clique_vars = 3;
+    ctx = new_graph_context_with_config(&config);
+    uint32_t ids[4];
+    for (unsigned i = 0; i < G_N_ELEMENTS(ids); i++) {
+        ids[i] = add_primitive(ctx, region, (int64_t)i * 8);
+        add_prior(ctx, OSPREY_RULE_CA01, OSPREY_GRAPH_BASE_CA, ids[i]);
+    }
+    for (unsigned i = 0; i < G_N_ELEMENTS(ids); i++) {
+        add_implication(ctx, OSPREY_RULE_CA02, OSPREY_GRAPH_BASE_CA,
+                        ids[i], ids[(i + 1) % G_N_ELEMENTS(ids)]);
+    }
+    base = NULL;
+    topology = NULL;
+    CHECK(build_test_topology(ctx, &base, &topology) == OSPREY_OK &&
+          stage4_exact_reference_validate(base, topology),
+          "independent oracle matches induced four-cycle topology");
+    osprey_exact_topology_free(topology);
+    osprey_exact_base_free(base);
+    osprey_free(ctx);
+}
+
+static void test_cross_region_and_late_topology(void)
+{
+    OspreyContext *ctx = new_graph_context();
+    OspreyRegionId global = make_region(OSPREY_REGION_GLOBAL, 0);
+    OspreyRegionId stack = make_region(OSPREY_REGION_STACK_FUNCTION, 0x100);
+    uint32_t access = add_primitive_access(ctx, global, 0, 0x20);
+    uint32_t value = add_primitive(ctx, stack, -8);
+    add_implication(ctx, OSPREY_RULE_CA05, OSPREY_GRAPH_BASE_CA,
+                    access, value);
+    OspreyExactBase *base = NULL;
+    OspreyExactTopology *topology = NULL;
+    CHECK(build_test_topology(ctx, &base, &topology) == OSPREY_OK,
+          "cross-region CA05 topology succeeds");
+    CHECK(topology != NULL && topology->components->len == 1 &&
+          ((OspreyExactTopologyComponent *)g_ptr_array_index(
+              topology->components, 0))->cliques->len == 1,
+          "cross-region CA05 remains one connected clique");
+    osprey_exact_topology_free(topology);
+    osprey_exact_base_free(base);
+    osprey_free(ctx);
+
+    ctx = new_graph_context();
+    OspreyAddress address = { global, 0 };
+    uint32_t scalar = add_scalar(ctx, global, 0);
+    uint32_t field = add_field(ctx, global, 0, address);
+    add_implication(ctx, OSPREY_RULE_CB02, OSPREY_GRAPH_SECONDARY,
+                    scalar, field);
+    OspreyFactorBatchResult batch = osprey_factor_add_bidirectional(
+        ctx, OSPREY_RULE_CA08, OSPREY_GRAPH_BASE_CA, true, 0.2,
+        scalar, field);
+    CHECK(batch.status == OSPREY_OK, "late CA08 factors remain accepted");
+    base = NULL;
+    topology = NULL;
+    CHECK(build_test_topology(ctx, &base, &topology) == OSPREY_OK,
+          "late CA08 topology succeeds");
+    CHECK(topology != NULL && topology->components->len == 1 &&
+          topology->factor_owner->len == 2,
+          "late CA08 field is included in exact topology");
+    osprey_exact_topology_free(topology);
+    osprey_exact_base_free(base);
+    osprey_free(ctx);
+}
+
+static void test_topology_determinism_and_validator(void)
+{
+    OspreyConfig config = graph_config();
+    OspreyContext *first = new_graph_context_with_config(&config);
+    OspreyContext *second = new_graph_context_with_config(&config);
+    OspreyRegionId region = make_region(OSPREY_REGION_GLOBAL, 0);
+    uint32_t a[4];
+    uint32_t b[4];
+    for (unsigned i = 0; i < 4; i++) {
+        a[i] = add_primitive(first, region, (int64_t)i * 8);
+        add_prior(first, OSPREY_RULE_CA01, OSPREY_GRAPH_BASE_CA, a[i]);
+    }
+    for (unsigned i = 4; i-- > 0;) {
+        b[i] = add_primitive(second, region, (int64_t)i * 8);
+        add_prior(second, OSPREY_RULE_CA01, OSPREY_GRAPH_BASE_CA, b[i]);
+    }
+    add_implication(first, OSPREY_RULE_CA02, OSPREY_GRAPH_BASE_CA, a[0], a[1]);
+    add_implication(first, OSPREY_RULE_CA02, OSPREY_GRAPH_BASE_CA, a[1], a[2]);
+    add_implication(first, OSPREY_RULE_CA02, OSPREY_GRAPH_BASE_CA, a[2], a[3]);
+    add_implication(second, OSPREY_RULE_CA02, OSPREY_GRAPH_BASE_CA, b[2], b[3]);
+    add_implication(second, OSPREY_RULE_CA02, OSPREY_GRAPH_BASE_CA, b[1], b[2]);
+    add_implication(second, OSPREY_RULE_CA02, OSPREY_GRAPH_BASE_CA, b[0], b[1]);
+    OspreyExactBase *base_a = NULL;
+    OspreyExactBase *base_b = NULL;
+    OspreyExactTopology *topology_a = NULL;
+    OspreyExactTopology *topology_b = NULL;
+    CHECK(build_test_topology(first, &base_a, &topology_a) == OSPREY_OK &&
+          build_test_topology(second, &base_b, &topology_b) == OSPREY_OK,
+          "topology insertion permutations succeed");
+    if (topology_a != NULL && topology_b != NULL) {
+        char *dump_a = topology_dump(topology_a);
+        char *dump_b = topology_dump(topology_b);
+        CHECK(strcmp(dump_a, dump_b) == 0,
+              "cliques, separators, owners, and roots are deterministic");
+        g_free(dump_a);
+        g_free(dump_b);
+        CHECK(osprey_exact_topology_validate(first, base_a, topology_a) &&
+              osprey_exact_topology_validate(second, base_b, topology_b),
+              "both permutation topologies validate");
+    }
+    osprey_exact_topology_free(topology_a);
+    osprey_exact_topology_free(topology_b);
+    osprey_exact_base_free(base_a);
+    osprey_exact_base_free(base_b);
+    osprey_free(first);
+    osprey_free(second);
+
+    OspreyContext *ctx = new_graph_context();
+    uint32_t ids[3];
+    add_path_graph(ctx, ids, 3);
+    OspreyExactBase *base = NULL;
+    OspreyExactTopology *topology = NULL;
+    CHECK(build_test_topology(ctx, &base, &topology) == OSPREY_OK,
+          "validator fixture builds");
+    if (topology != NULL) {
+        OspreyExactTopologyComponent *component = g_ptr_array_index(
+            topology->components, 0);
+        if (component->tree_edges->len != 0) {
+            OspreyExactTreeEdge *edge = &g_array_index(
+                component->tree_edges, OspreyExactTreeEdge, 0);
+            uint32_t saved = g_array_index(edge->separator, uint32_t, 0);
+            g_array_index(edge->separator, uint32_t, 0) = UINT32_MAX;
+            CHECK(!osprey_exact_topology_validate(ctx, base, topology),
+                  "validator rejects a corrupted separator");
+            g_array_index(edge->separator, uint32_t, 0) = saved;
+        }
+        uint32_t saved_owner = g_array_index(topology->factor_owner,
+                                              uint32_t, 0);
+        g_array_index(topology->factor_owner, uint32_t, 0) = UINT32_MAX;
+        CHECK(!osprey_exact_topology_validate(ctx, base, topology),
+              "validator rejects an unassigned factor owner");
+        g_array_index(topology->factor_owner, uint32_t, 0) = saved_owner;
+
+        OspreyFactorResult added = osprey_factor_add_implication(
+            ctx, OSPREY_RULE_CA03, OSPREY_GRAPH_BASE_CA, true, 0.2,
+            &ids[0], 1, ids[1]);
+        CHECK(added.status == OSPREY_OK && added.inserted,
+              "stale-projection fixture adds a valid base factor");
+        CHECK(!osprey_exact_topology_validate(ctx, base, topology),
+              "validator rejects a projection missing a base factor");
+    }
+    osprey_exact_topology_free(topology);
+    osprey_exact_base_free(base);
+    osprey_free(ctx);
+
+    ctx = new_graph_context();
+    uint32_t chordal[5];
+    for (unsigned i = 0; i < G_N_ELEMENTS(chordal); i++) {
+        chordal[i] = add_primitive(ctx, region, (int64_t)i * 8);
+        add_prior(ctx, OSPREY_RULE_CA01, OSPREY_GRAPH_BASE_CA, chordal[i]);
+    }
+    const uint32_t chordal_edges[][2] = {
+        { 0, 1 }, { 0, 2 }, { 1, 2 },
+        { 0, 3 }, { 1, 3 },
+        { 0, 4 }, { 2, 4 },
+    };
+    for (unsigned i = 0; i < G_N_ELEMENTS(chordal_edges); i++) {
+        add_implication(ctx, OSPREY_RULE_CA02, OSPREY_GRAPH_BASE_CA,
+                        chordal[chordal_edges[i][0]],
+                        chordal[chordal_edges[i][1]]);
+    }
+    base = NULL;
+    topology = NULL;
+    CHECK(build_test_topology(ctx, &base, &topology) == OSPREY_OK &&
+          stage4_exact_reference_validate(base, topology),
+          "running-intersection fixture matches the independent oracle");
+    if (topology != NULL) {
+        OspreyExactTopologyComponent *component = g_ptr_array_index(
+            topology->components, 0);
+        CHECK(component->cliques->len == 3 &&
+              component->tree_edges->len == 2,
+              "running-intersection fixture has three maximal cliques");
+        if (component->tree_edges->len == 2) {
+            OspreyExactTreeEdge *edge = &g_array_index(
+                component->tree_edges, OspreyExactTreeEdge, 1);
+            CHECK(edge->left == 0 && edge->right == 2 &&
+                  edge->parent == 0 && edge->child == 2 &&
+                  edge->separator != NULL && edge->separator->len == 2,
+                  "fixture starts from the canonical maximum-weight tree");
+            if (edge->separator == NULL || edge->separator->len != 2) {
+                goto invalid_tree_fixture;
+            }
+            uint32_t saved_left = edge->left;
+            uint32_t saved_right = edge->right;
+            uint32_t saved_parent = edge->parent;
+            uint32_t saved_child = edge->child;
+            uint32_t saved_separator[2] = {
+                g_array_index(edge->separator, uint32_t, 0),
+                g_array_index(edge->separator, uint32_t, 1),
+            };
+            edge->left = 1;
+            edge->right = 2;
+            edge->parent = 1;
+            edge->child = 2;
+            g_array_set_size(edge->separator, 0);
+            uint32_t zero = 0;
+            g_array_append_val(edge->separator, zero);
+            CHECK(!osprey_exact_topology_validate(ctx, base, topology),
+                  "validator rejects a disconnected variable-clique subtree");
+            edge->left = saved_left;
+            edge->right = saved_right;
+            edge->parent = saved_parent;
+            edge->child = saved_child;
+            g_array_set_size(edge->separator, 0);
+            g_array_append_vals(edge->separator, saved_separator,
+                                G_N_ELEMENTS(saved_separator));
+        }
+    }
+invalid_tree_fixture:
+    osprey_exact_topology_free(topology);
+    osprey_exact_base_free(base);
+    osprey_free(ctx);
+}
+
+static void restore_env(const char *name, const char *value)
+{
+    if (value != NULL) {
+        g_setenv(name, value, TRUE);
+    } else {
+        g_unsetenv(name);
+    }
+}
+
+static void test_exact_configuration(void)
+{
+    const char *factor_name = "BINRADAR_OSPREY_MAX_FACTORS";
+    const char *clique_name = "BINRADAR_OSPREY_MAX_EXACT_CLIQUE_VARS";
+    const char *table_name = "BINRADAR_OSPREY_MAX_EXACT_TABLE_MB";
+    char *saved_factor = g_strdup(g_getenv(factor_name));
+    char *saved_clique = g_strdup(g_getenv(clique_name));
+    char *saved_table = g_strdup(g_getenv(table_name));
+    OspreyConfig config;
+
+    g_setenv(factor_name, "1234", TRUE);
+    g_unsetenv(clique_name);
+    g_setenv(table_name, "1", TRUE);
+    CHECK(osprey_config_from_env(&config) &&
+          config.max_factors == 1234 &&
+          config.max_exact_clique_vars == 20 &&
+          config.max_exact_table_bytes == 1024u * 1024u,
+          "exact limits parse independently of preceding optional values");
+
+    restore_env(factor_name, saved_factor);
+    restore_env(clique_name, saved_clique);
+    restore_env(table_name, saved_table);
+    g_free(saved_factor);
+    g_free(saved_clique);
+    g_free(saved_table);
+}
+
+static void test_workspace_budget(void)
+{
+    OspreyConfig config = graph_config();
+    config.max_exact_table_bytes = sizeof(double) - 1;
+    OspreyContext *ctx = new_graph_context_with_config(&config);
+    OspreyRegionId region = make_region(OSPREY_REGION_GLOBAL, 0);
+    uint32_t id = add_primitive(ctx, region, 0);
+    add_prior(ctx, OSPREY_RULE_CA01, OSPREY_GRAPH_BASE_CA, id);
+    OspreyExactBase *base = NULL;
+    OspreyExactTopology *topology = NULL;
+    CHECK(build_test_topology(ctx, &base, &topology) ==
+              OSPREY_EXACT_COMPONENT_TOO_LARGE && topology == NULL,
+          "exact table workspace budget rejects before numerical allocation");
+    osprey_exact_topology_free(topology);
+    osprey_exact_base_free(base);
+    osprey_free(ctx);
+
+    config = graph_config();
+    config.max_exact_table_bytes = 159;
+    ctx = new_graph_context_with_config(&config);
+    uint32_t ids[4];
+    add_path_graph(ctx, ids, G_N_ELEMENTS(ids));
+    base = NULL;
+    topology = NULL;
+    CHECK(build_test_topology(ctx, &base, &topology) ==
+              OSPREY_EXACT_COMPONENT_TOO_LARGE && topology == NULL,
+          "cumulative clique and separator workspace rejects one byte low");
+    osprey_exact_topology_free(topology);
+    osprey_exact_base_free(base);
+    osprey_free(ctx);
+
+    config = graph_config();
+    config.max_exact_table_bytes = 160;
+    ctx = new_graph_context_with_config(&config);
+    add_path_graph(ctx, ids, G_N_ELEMENTS(ids));
+    base = NULL;
+    topology = NULL;
+    CHECK(build_test_topology(ctx, &base, &topology) == OSPREY_OK &&
+          topology != NULL && topology->table_bytes == 160 &&
+          topology->max_component_table_bytes == 160,
+          "exact cumulative workspace succeeds at the checked boundary");
+    osprey_exact_topology_free(topology);
+    osprey_exact_base_free(base);
+    osprey_free(ctx);
+
+    config = graph_config();
+    config.max_exact_clique_vars = sizeof(size_t) * 8;
+    ctx = new_graph_context_with_config(&config);
+    id = add_primitive(ctx, region, 0);
+    add_prior(ctx, OSPREY_RULE_CA01, OSPREY_GRAPH_BASE_CA, id);
+    base = NULL;
+    topology = NULL;
+    CHECK(build_test_topology(ctx, &base, &topology) ==
+              OSPREY_EXACT_COMPONENT_TOO_LARGE && topology == NULL,
+          "unrepresentable exact width rejects safely");
+    osprey_exact_topology_free(topology);
+    osprey_exact_base_free(base);
+    osprey_free(ctx);
+}
+
 int main(void)
 {
     RUN(test_stage_selection);
@@ -597,7 +1299,16 @@ int main(void)
     RUN(test_malformed_graphs);
     RUN(test_empty_base);
     RUN(test_repeated_ownership);
-    CHECK(registered == executed, "every Stage 4.1 case executed");
+    RUN(test_chain_width_and_order);
+    RUN(test_width_boundaries);
+    RUN(test_width_four_clique);
+    RUN(test_star_and_unary_topology);
+    RUN(test_reference_topology_oracle);
+    RUN(test_cross_region_and_late_topology);
+    RUN(test_topology_determinism_and_validator);
+    RUN(test_exact_configuration);
+    RUN(test_workspace_budget);
+    CHECK(registered == executed, "every Stage 4 topology case executed");
     if (failures != 0 || registered != executed) {
         fprintf(stderr, "FAIL stage4_exact (%u failures, %u/%u)\n",
                 failures, executed, registered);

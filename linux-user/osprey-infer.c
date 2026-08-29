@@ -1,10 +1,11 @@
 /*
  * OSPREY exact-base projection and legacy inference.
  *
- * Stage 4.1's immutable CA-only projection, canonical local maps, retained
- * factor validation, and base-only components are accepted. The older
- * exact_pass(), loopy BP, and CC07 scheduling below that boundary remain
- * non-conformant and must not provide trusted marginals. See
+ * Stages 4.1-4.2 accept the immutable CA-only projection, canonical local
+ * maps, retained factor validation, deterministic bounded clique topology,
+ * exact factor ownership, and running-intersection validation. Numerical
+ * junction-tree inference, loopy BP, and CC07 scheduling below that boundary
+ * remain non-conformant and must not provide trusted marginals. See
  * agent-docs/info/OSPREY_TYPE_INFERENCE/STAGE4.md.
  *
  * Generic factor potentials are owned by osprey-graph.c.
@@ -13,6 +14,7 @@
 #include "osprey.h"
 #include "osprey-internal.h"
 
+#include <limits.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,7 +27,6 @@ void log_msg(const char *fmt, ...);
 #define OSPREY_BP_CONVERGED_ROUNDS 10u
 #define OSPREY_BP_DAMPING 0.5
 #define OSPREY_BP_MAX_FOLD_ROUNDS 8u
-#define OSPREY_EXACT_MAX_VARS 16u
 #define OSPREY_P_UP 0.8
 #define OSPREY_P_DN 0.2
 
@@ -172,12 +173,18 @@ static bool exact_base_implication_valid(const OspreyFactor *factor,
         factor->negative != (negative ? 1 : 0)) {
         return false;
     }
-    uint8_t first = g_array_index(graph->vars, OspreyVar,
-                                  factor->var_ids[0]).kind;
-    uint8_t second = g_array_index(graph->vars, OspreyVar,
-                                   factor->var_ids[1]).kind;
-    return (first == source_kind && second == target_kind) ||
-           (allow_reverse && first == target_kind && second == source_kind);
+    bool forward = true;
+    bool reverse = allow_reverse;
+    for (uint32_t i = 0; i + 1 < factor->num_vars; i++) {
+        uint8_t kind = g_array_index(graph->vars, OspreyVar,
+                                     factor->var_ids[i]).kind;
+        if (kind != source_kind) forward = false;
+        if (kind != target_kind) reverse = false;
+    }
+    uint8_t last_kind = g_array_index(graph->vars, OspreyVar,
+                                      factor->var_ids[factor->num_vars - 1]).kind;
+    return (forward && last_kind == target_kind) ||
+           (reverse && last_kind == source_kind);
 }
 
 static bool exact_base_factor_valid(const OspreyFactor *factor,
@@ -641,112 +648,1877 @@ fail:
 }
 
 /* ------------------------------------------------------------------ */
-/* Component partition                                                 */
+/* Stage 4.2: bounded clique topology                                 */
 /* ------------------------------------------------------------------ */
 
-static uint32_t uf_find(OspreyGraph *g, uint32_t x) {
-    while (g->uf_parent[x] != x) {
-        g->uf_parent[x] = g->uf_parent[g->uf_parent[x]];
-        x = g->uf_parent[x];
-    }
-    return x;
-}
+#define OSPREY_DEFAULT_EXACT_TABLE_BYTES (256ULL * 1024ULL * 1024ULL)
 
-static void bucket_free(gpointer p) {
-    g_array_free((GArray *)p, TRUE);
-}
+/* A heap entry is generation-checked because min-fill scores are recomputed
+ * only for variables whose live neighborhoods changed.  Canonical local IDs
+ * are already in full predicate-key order in the Stage 4.1 projection. */
+typedef struct ExactHeapEntry {
+    uint64_t fill;
+    uint32_t local;
+    uint32_t generation;
+} ExactHeapEntry;
 
-/* Root -> GArray(uint32 var ids). */
-static GHashTable *component_buckets(OspreyGraph *g) {
-    GHashTable *b = g_hash_table_new_full(g_direct_hash, g_direct_equal,
-                                          NULL, bucket_free);
-    for (uint32_t i = 0; i < g->vars->len; i++) {
-        uint32_t r = uf_find(g, i);
-        GArray *arr = g_hash_table_lookup(b, GSIZE_TO_POINTER(r));
-        if (arr == NULL) {
-            arr = g_array_new(FALSE, FALSE, sizeof(uint32_t));
-            g_hash_table_insert(b, GSIZE_TO_POINTER(r), arr);
-        }
-        uint32_t id = i;
-        g_array_append_val(arr, id);
-    }
-    return b;
-}
+typedef struct ExactCliquePair {
+    uint32_t left;
+    uint32_t right;
+} ExactCliquePair;
 
-/* ------------------------------------------------------------------ */
-/* Exact component solve (joint enumeration)                           */
-/* ------------------------------------------------------------------ */
+typedef struct ExactTreeCandidate {
+    uint32_t left;
+    uint32_t right;
+    uint32_t weight;
+} ExactTreeCandidate;
 
-static bool exact_solve_component(OspreyContext *ctx, const uint32_t *comp,
-                                  uint32_t m) {
-    OspreyGraph *g = ctx->graph;
-    if (m == 0 || m > OSPREY_EXACT_MAX_VARS) return false;
-    uint32_t total = 1u << m;
-    uint32_t *pos = g_new(uint32_t, g->vars->len);
-    for (uint32_t i = 0; i < m; i++) pos[comp[i]] = i;
-    double *joint = g_new(double, total);
-    for (uint32_t a = 0; a < total; a++) {
-        double v = 1.0;
-        for (guint fi = 0; fi < g->factors->len; fi++) {
-            OspreyFactor *f = g_array_index(g->factors, OspreyFactor *, fi);
-            uint32_t bits[16];
-            bool inside = true;
-            for (uint32_t i = 0; i < f->num_vars; i++) {
-                uint32_t var = f->var_ids[i];
-                if (var >= g->vars->len || pos[var] >= m) {
-                    inside = false;
-                    break;
-                }
-                bits[i] = (a >> pos[var]) & 1;
-            }
-            if (!inside) continue;
-            v *= factor_value(f, bits);
-        }
-        joint[a] = v;
-    }
-    double z = 0.0;
-    for (uint32_t a = 0; a < total; a++) z += joint[a];
-    for (uint32_t i = 0; i < m; i++) {
-        double s1 = 0.0;
-        for (uint32_t a = 0; a < total; a++) {
-            if ((a >> i) & 1) s1 += joint[a];
-        }
-        g_array_index(g->vars, OspreyVar, comp[i]).belief =
-            (z > 0.0) ? s1 / z : 0.5;
-    }
-    g_free(joint);
-    g_free(pos);
+static bool exact_u64_add(uint64_t a, uint64_t b, uint64_t *out)
+{
+    if (out == NULL || a > UINT64_MAX - b) return false;
+    *out = a + b;
     return true;
 }
 
-static uint32_t exact_pass(OspreyContext *ctx) {
-    OspreyGraph *g = ctx->graph;
-    GHashTable *buckets = component_buckets(g);
-    uint32_t exact_comps = 0, large_comps = 0, solved_vars = 0;
-    GHashTableIter it;
-    gpointer rk, arr_ptr;
-    g_hash_table_iter_init(&it, buckets);
-    while (g_hash_table_iter_next(&it, &rk, &arr_ptr)) {
-        GArray *arr = (GArray *)arr_ptr;
-        uint32_t m = arr->len;
-        uint32_t cap = ctx->config.max_exact_clique_vars;
-        if (cap > OSPREY_EXACT_MAX_VARS) cap = OSPREY_EXACT_MAX_VARS;
-        if (m > cap) {
-            large_comps++;
-            continue;
+static bool exact_size_mul(size_t a, size_t b, size_t *out)
+{
+    if (out == NULL || (b != 0 && a > SIZE_MAX / b)) return false;
+    *out = a * b;
+    return true;
+}
+
+static bool exact_size_add(size_t a, size_t b, size_t *out)
+{
+    if (out == NULL || a > SIZE_MAX - b) return false;
+    *out = a + b;
+    return true;
+}
+
+static bool exact_assignment_cells(uint32_t variables, uint64_t *out)
+{
+    uint64_t bits = (uint64_t)sizeof(size_t) * 8u;
+    if (bits > sizeof(uint64_t) * 8u) bits = sizeof(uint64_t) * 8u;
+    if (out == NULL || variables >= bits) return false;
+    *out = (uint64_t)((size_t)1 << variables);
+    return true;
+}
+
+static bool exact_topology_limits(const OspreyContext *ctx,
+                                  uint64_t *clique_limit,
+                                  uint64_t *workspace_limit)
+{
+    uint64_t width;
+    uint64_t workspace;
+    uint64_t bits = (uint64_t)sizeof(size_t) * 8u;
+    if (bits > sizeof(uint64_t) * 8u) bits = sizeof(uint64_t) * 8u;
+
+    if (ctx == NULL || clique_limit == NULL || workspace_limit == NULL) {
+        return false;
+    }
+    width = ctx->config.max_exact_clique_vars;
+    if (width == 0) width = 20;
+    if (width >= bits) return false;
+    workspace = ctx->config.max_exact_table_bytes;
+    if (workspace == 0) workspace = OSPREY_DEFAULT_EXACT_TABLE_BYTES;
+#if SIZE_MAX < UINT64_MAX
+    if (workspace > SIZE_MAX) return false;
+#endif
+    *clique_limit = width;
+    *workspace_limit = workspace;
+    return true;
+}
+
+static OspreyExactClique *exact_clique_new(void)
+{
+    OspreyExactClique *clique = g_new0(OspreyExactClique, 1);
+    clique->id = UINT32_MAX;
+    clique->local_vars = g_array_new(FALSE, FALSE, sizeof(uint32_t));
+    clique->factor_refs = g_array_new(FALSE, FALSE, sizeof(uint32_t));
+    return clique;
+}
+
+static OspreyExactClique *exact_clique_clone(const OspreyExactClique *source)
+{
+    OspreyExactClique *copy;
+    if (source == NULL || source->local_vars == NULL) return NULL;
+    copy = exact_clique_new();
+    g_array_append_vals(copy->local_vars, source->local_vars->data,
+                        source->local_vars->len);
+    return copy;
+}
+
+static void exact_clique_free(gpointer data)
+{
+    OspreyExactClique *clique = data;
+    if (clique == NULL) return;
+    if (clique->local_vars != NULL) g_array_free(clique->local_vars, TRUE);
+    if (clique->factor_refs != NULL) g_array_free(clique->factor_refs, TRUE);
+    g_free(clique);
+}
+
+static void exact_tree_edge_clear(OspreyExactTreeEdge *edge)
+{
+    if (edge != NULL && edge->separator != NULL) {
+        g_array_free(edge->separator, TRUE);
+        edge->separator = NULL;
+    }
+}
+
+static void exact_topology_component_free(gpointer data)
+{
+    OspreyExactTopologyComponent *component = data;
+    if (component == NULL) return;
+    if (component->local_vars != NULL) {
+        g_array_free(component->local_vars, TRUE);
+    }
+    if (component->elimination_order != NULL) {
+        g_array_free(component->elimination_order, TRUE);
+    }
+    if (component->elimination_cliques != NULL) {
+        g_ptr_array_free(component->elimination_cliques, TRUE);
+    }
+    if (component->cliques != NULL) {
+        g_ptr_array_free(component->cliques, TRUE);
+    }
+    if (component->tree_edges != NULL) {
+        for (guint i = 0; i < component->tree_edges->len; i++) {
+            exact_tree_edge_clear(&g_array_index(component->tree_edges,
+                                                  OspreyExactTreeEdge, i));
         }
-        if (exact_solve_component(ctx, (uint32_t *)arr->data, m)) {
-            exact_comps++;
-            solved_vars += m;
+        g_array_free(component->tree_edges, TRUE);
+    }
+    g_free(component);
+}
+
+void osprey_exact_topology_free(OspreyExactTopology *topology)
+{
+    if (topology == NULL) return;
+    if (topology->components != NULL) {
+        g_ptr_array_free(topology->components, TRUE);
+    }
+    if (topology->factor_owner != NULL) {
+        g_array_free(topology->factor_owner, TRUE);
+    }
+    g_free(topology);
+}
+
+static int exact_clique_compare(const OspreyExactClique *a,
+                                const OspreyExactClique *b)
+{
+    guint common;
+    if (a == NULL || b == NULL) return a == b ? 0 : (a == NULL ? -1 : 1);
+    common = a->local_vars->len < b->local_vars->len
+        ? a->local_vars->len : b->local_vars->len;
+    for (guint i = 0; i < common; i++) {
+        uint32_t av = g_array_index(a->local_vars, uint32_t, i);
+        uint32_t bv = g_array_index(b->local_vars, uint32_t, i);
+        if (av != bv) return exact_cmp_u64(av, bv);
+    }
+    return exact_cmp_u64(a->local_vars->len, b->local_vars->len);
+}
+
+static gint exact_clique_ptr_compare(gconstpointer ap, gconstpointer bp)
+{
+    const OspreyExactClique *a = *(OspreyExactClique *const *)ap;
+    const OspreyExactClique *b = *(OspreyExactClique *const *)bp;
+    return exact_clique_compare(a, b);
+}
+
+static bool exact_clique_equal(const OspreyExactClique *a,
+                               const OspreyExactClique *b)
+{
+    if (a == NULL || b == NULL || a->local_vars->len != b->local_vars->len) {
+        return false;
+    }
+    for (guint i = 0; i < a->local_vars->len; i++) {
+        if (g_array_index(a->local_vars, uint32_t, i) !=
+            g_array_index(b->local_vars, uint32_t, i)) return false;
+    }
+    return true;
+}
+
+static bool exact_clique_contains(const OspreyExactClique *clique,
+                                  uint32_t local)
+{
+    guint lo = 0;
+    guint hi;
+    if (clique == NULL || clique->local_vars == NULL) return false;
+    hi = clique->local_vars->len;
+    while (lo < hi) {
+        guint mid = lo + (hi - lo) / 2;
+        uint32_t value = g_array_index(clique->local_vars, uint32_t, mid);
+        if (value == local) return true;
+        if (value < local) lo = mid + 1;
+        else hi = mid;
+    }
+    return false;
+}
+
+static bool exact_clique_contains_all(const OspreyExactClique *clique,
+                                      const OspreyExactFactorRef *factor)
+{
+    if (clique == NULL || factor == NULL) return false;
+    for (uint32_t i = 0; i < factor->num_vars; i++) {
+        if (!exact_clique_contains(clique, factor->local_vars[i])) {
+            return false;
         }
     }
-    g_hash_table_destroy(buckets);
+    return true;
+}
+
+static OspreyExactClique *exact_smallest_owner(
+    const OspreyExactTopologyComponent *component,
+    const OspreyExactFactorRef *factor)
+{
+    OspreyExactClique *owner = NULL;
+    if (component == NULL || factor == NULL || component->cliques == NULL) {
+        return NULL;
+    }
+    for (guint i = 0; i < component->cliques->len; i++) {
+        OspreyExactClique *candidate = g_ptr_array_index(component->cliques,
+                                                           i);
+        if (!exact_clique_contains_all(candidate, factor)) continue;
+        if (owner == NULL || candidate->local_vars->len <
+                                owner->local_vars->len ||
+            (candidate->local_vars->len == owner->local_vars->len &&
+             exact_clique_compare(candidate, owner) < 0)) {
+            owner = candidate;
+        }
+    }
+    return owner;
+}
+
+static bool exact_clique_subset(const OspreyExactClique *small,
+                                const OspreyExactClique *large)
+{
+    guint i = 0;
+    guint j = 0;
+    if (small == NULL || large == NULL ||
+        small->local_vars->len >= large->local_vars->len) return false;
+    while (i < small->local_vars->len && j < large->local_vars->len) {
+        uint32_t sv = g_array_index(small->local_vars, uint32_t, i);
+        uint32_t lv = g_array_index(large->local_vars, uint32_t, j);
+        if (sv == lv) {
+            i++;
+            j++;
+        } else if (sv > lv) {
+            j++;
+        } else {
+            return false;
+        }
+    }
+    return i == small->local_vars->len;
+}
+
+static GPtrArray *exact_array_lists_new(uint32_t count)
+{
+    GPtrArray *lists = g_ptr_array_sized_new(count);
+    for (uint32_t i = 0; i < count; i++) {
+        g_ptr_array_add(lists, g_array_new(FALSE, FALSE, sizeof(uint32_t)));
+    }
+    return lists;
+}
+
+static void exact_array_lists_free(GPtrArray *lists)
+{
+    if (lists == NULL) return;
+    for (guint i = 0; i < lists->len; i++) {
+        GArray *array = g_ptr_array_index(lists, i);
+        if (array != NULL) g_array_free(array, TRUE);
+    }
+    g_ptr_array_free(lists, TRUE);
+}
+
+static bool exact_local_position(const GArray *locals, uint32_t local,
+                                 uint32_t *position)
+{
+    guint lo = 0;
+    guint hi;
+    if (locals == NULL || position == NULL) return false;
+    hi = locals->len;
+    while (lo < hi) {
+        guint mid = lo + (hi - lo) / 2;
+        uint32_t value = g_array_index(locals, uint32_t, mid);
+        if (value == local) {
+            *position = mid;
+            return true;
+        }
+        if (value < local) lo = mid + 1;
+        else hi = mid;
+    }
+    return false;
+}
+
+static bool exact_adj_insert(GArray *adj, uint32_t value, bool *inserted)
+{
+    guint lo = 0;
+    guint hi;
+    if (adj == NULL || inserted == NULL) return false;
+    hi = adj->len;
+    while (lo < hi) {
+        guint mid = lo + (hi - lo) / 2;
+        uint32_t current = g_array_index(adj, uint32_t, mid);
+        if (current == value) {
+            *inserted = false;
+            return true;
+        }
+        if (current < value) lo = mid + 1;
+        else hi = mid;
+    }
+    g_array_insert_val(adj, lo, value);
+    *inserted = true;
+    return true;
+}
+
+static bool exact_adj_remove(GArray *adj, uint32_t value)
+{
+    guint lo = 0;
+    guint hi;
+    if (adj == NULL) return false;
+    hi = adj->len;
+    while (lo < hi) {
+        guint mid = lo + (hi - lo) / 2;
+        uint32_t current = g_array_index(adj, uint32_t, mid);
+        if (current == value) {
+            g_array_remove_index(adj, mid);
+            return true;
+        }
+        if (current < value) lo = mid + 1;
+        else hi = mid;
+    }
+    return false;
+}
+
+static bool exact_adj_has(const GArray *adj, uint32_t value)
+{
+    guint lo = 0;
+    guint hi;
+    if (adj == NULL) return false;
+    hi = adj->len;
+    while (lo < hi) {
+        guint mid = lo + (hi - lo) / 2;
+        uint32_t current = g_array_index(adj, uint32_t, mid);
+        if (current == value) return true;
+        if (current < value) lo = mid + 1;
+        else hi = mid;
+    }
+    return false;
+}
+
+static bool exact_adj_edge(GPtrArray *neighbors, uint32_t a, uint32_t b,
+                           bool *inserted)
+{
+    bool first;
+    bool second;
+    if (neighbors == NULL || inserted == NULL || a == b ||
+        a >= neighbors->len || b >= neighbors->len) return false;
+    if (!exact_adj_insert(g_ptr_array_index(neighbors, a), b, &first) ||
+        !exact_adj_insert(g_ptr_array_index(neighbors, b), a, &second)) {
+        return false;
+    }
+    if (first != second) return false;
+    *inserted = first;
+    return true;
+}
+
+static bool exact_heap_before(const ExactHeapEntry *a,
+                              const ExactHeapEntry *b)
+{
+    if (a->fill != b->fill) return a->fill < b->fill;
+    return a->local < b->local;
+}
+
+static void exact_heap_swap(ExactHeapEntry *a, ExactHeapEntry *b)
+{
+    ExactHeapEntry temp = *a;
+    *a = *b;
+    *b = temp;
+}
+
+static void exact_heap_push(GArray *heap, ExactHeapEntry entry)
+{
+    guint index;
+    if (heap == NULL) return;
+    g_array_append_val(heap, entry);
+    index = heap->len - 1;
+    while (index != 0) {
+        guint parent = (index - 1) / 2;
+        ExactHeapEntry *current = &g_array_index(heap, ExactHeapEntry,
+                                                  index);
+        ExactHeapEntry *ancestor = &g_array_index(heap, ExactHeapEntry,
+                                                   parent);
+        if (!exact_heap_before(current, ancestor)) break;
+        exact_heap_swap(current, ancestor);
+        index = parent;
+    }
+}
+
+static bool exact_heap_pop(GArray *heap, ExactHeapEntry *out)
+{
+    ExactHeapEntry replacement;
+    guint index;
+    if (heap == NULL || out == NULL || heap->len == 0) return false;
+    *out = g_array_index(heap, ExactHeapEntry, 0);
+    if (heap->len == 1) {
+        g_array_set_size(heap, 0);
+        return true;
+    }
+    replacement = g_array_index(heap, ExactHeapEntry, heap->len - 1);
+    g_array_set_size(heap, heap->len - 1);
+    g_array_index(heap, ExactHeapEntry, 0) = replacement;
+    index = 0;
+    for (;;) {
+        guint left = index * 2 + 1;
+        guint right = left + 1;
+        guint best = index;
+        if (left < heap->len && exact_heap_before(
+                &g_array_index(heap, ExactHeapEntry, left),
+                &g_array_index(heap, ExactHeapEntry, best))) best = left;
+        if (right < heap->len && exact_heap_before(
+                &g_array_index(heap, ExactHeapEntry, right),
+                &g_array_index(heap, ExactHeapEntry, best))) best = right;
+        if (best == index) break;
+        exact_heap_swap(&g_array_index(heap, ExactHeapEntry, index),
+                        &g_array_index(heap, ExactHeapEntry, best));
+        index = best;
+    }
+    return true;
+}
+
+static bool exact_fill_score(GPtrArray *neighbors, const uint8_t *live,
+                             uint32_t local, uint64_t *score)
+{
+    GArray *adj;
+    uint64_t missing = 0;
+    if (neighbors == NULL || live == NULL || score == NULL ||
+        local >= neighbors->len || !live[local]) return false;
+    adj = g_ptr_array_index(neighbors, local);
+    for (guint i = 0; i < adj->len; i++) {
+        uint32_t a = g_array_index(adj, uint32_t, i);
+        if (!live[a]) continue;
+        for (guint j = i + 1; j < adj->len; j++) {
+            uint32_t b = g_array_index(adj, uint32_t, j);
+            if (!live[b] || exact_adj_has(g_ptr_array_index(neighbors, a), b)) {
+                continue;
+            }
+            if (missing == UINT64_MAX) return false;
+            missing++;
+        }
+    }
+    *score = missing;
+    return true;
+}
+
+static void exact_mark_neighbors(GPtrArray *neighbors, const uint8_t *live,
+                                 uint32_t local, uint8_t *affected)
+{
+    GArray *adj = g_ptr_array_index(neighbors, local);
+    for (guint i = 0; i < adj->len; i++) {
+        uint32_t value = g_array_index(adj, uint32_t, i);
+        if (live[value]) affected[value] = 1;
+    }
+}
+
+static guint exact_pair_hash(gconstpointer data)
+{
+    const ExactCliquePair *pair = data;
+    uint64_t value = ((uint64_t)pair->left << 32) | pair->right;
+    value ^= value >> 33;
+    value *= 0xff51afd7ed558ccdULL;
+    value ^= value >> 33;
+    return (guint)value;
+}
+
+static gboolean exact_pair_equal(gconstpointer ap, gconstpointer bp)
+{
+    const ExactCliquePair *a = ap;
+    const ExactCliquePair *b = bp;
+    return a->left == b->left && a->right == b->right;
+}
+
+static gint exact_tree_candidate_compare(gconstpointer ap, gconstpointer bp)
+{
+    const ExactTreeCandidate *a = ap;
+    const ExactTreeCandidate *b = bp;
+    if (a->weight != b->weight) return a->weight > b->weight ? -1 : 1;
+    if (a->left != b->left) return exact_cmp_u64(a->left, b->left);
+    return exact_cmp_u64(a->right, b->right);
+}
+
+static bool exact_clique_intersection(const OspreyExactClique *a,
+                                      const OspreyExactClique *b,
+                                      GArray *out)
+{
+    guint i = 0;
+    guint j = 0;
+    if (a == NULL || b == NULL || out == NULL) return false;
+    while (i < a->local_vars->len && j < b->local_vars->len) {
+        uint32_t av = g_array_index(a->local_vars, uint32_t, i);
+        uint32_t bv = g_array_index(b->local_vars, uint32_t, j);
+        if (av == bv) {
+            g_array_append_val(out, av);
+            i++;
+            j++;
+        } else if (av < bv) {
+            i++;
+        } else {
+            j++;
+        }
+    }
+    return true;
+}
+
+/* Validate the accepted 4.1 projection again at the topology boundary. */
+static bool exact_topology_base_valid(const OspreyContext *ctx,
+                                      const OspreyExactBase *base)
+{
+    const OspreyGraph *graph;
+    uint32_t graph_var_count;
+    uint32_t local_var_count;
+    uint32_t factor_count;
+    uint32_t expected_factor_count = 0;
+    uint8_t *expected_base_vars = NULL;
+    uint8_t *seen_vars = NULL;
+    uint32_t *component_of_var = NULL;
+    uint8_t *seen_factors = NULL;
+    uint8_t *seen_graph_factors = NULL;
+    uint32_t *factor_component = NULL;
+    bool valid = false;
+
+    if (ctx == NULL || base == NULL || ctx->graph == NULL ||
+        base->graph_var_ids == NULL || base->local_by_graph == NULL ||
+        base->factor_refs == NULL || base->components == NULL) return false;
+    graph = ctx->graph;
+    if (graph->vars == NULL || graph->factors == NULL ||
+        graph->vars->len != base->graph_var_count ||
+        graph->vars->len > UINT32_MAX || graph->factors->len > UINT32_MAX ||
+        base->graph_var_ids->len == 0 ||
+        base->graph_var_ids->len > base->graph_var_count ||
+        base->graph_var_count == 0 || base->factor_refs->len == 0 ||
+        base->components->len == 0) return false;
+    graph_var_count = base->graph_var_count;
+    local_var_count = base->graph_var_ids->len;
+    factor_count = base->factor_refs->len;
+    expected_base_vars = g_new0(uint8_t, graph_var_count);
+    seen_vars = g_new0(uint8_t, local_var_count);
+    component_of_var = g_new(uint32_t, local_var_count);
+    for (uint32_t i = 0; i < local_var_count; i++) {
+        component_of_var[i] = UINT32_MAX;
+    }
+    seen_factors = g_new0(uint8_t, factor_count);
+    seen_graph_factors = g_new0(uint8_t, graph->factors->len);
+    factor_component = g_new(uint32_t, factor_count);
+    for (uint32_t graph_id = 0; graph_id < graph->vars->len; graph_id++) {
+        OspreyVar *var = &g_array_index(graph->vars, OspreyVar, graph_id);
+        if (var->id != graph_id || var->kind <= OSPREY_PRED_NONE ||
+            var->kind >= OSPREY_PRED_COUNT ||
+            !exact_payload_valid(var->kind, &var->payload)) goto out;
+    }
+    for (uint32_t graph_factor_id = 0;
+         graph_factor_id < graph->factors->len; graph_factor_id++) {
+        OspreyFactor *factor = g_array_index(graph->factors,
+                                             OspreyFactor *, graph_factor_id);
+        if (factor == NULL || factor->id != graph_factor_id ||
+            !exact_factor_valid(factor, graph)) goto out;
+        if (factor->stage == OSPREY_GRAPH_BASE_CA) {
+            if (expected_factor_count == UINT32_MAX) goto out;
+            expected_factor_count++;
+            for (uint32_t i = 0; i < factor->num_vars; i++) {
+                expected_base_vars[factor->var_ids[i]] = 1;
+            }
+        }
+    }
+    if (expected_factor_count != factor_count) goto out;
+    for (uint32_t i = 0; i < factor_count; i++) factor_component[i] = UINT32_MAX;
+
+    for (uint32_t local = 0; local < local_var_count; local++) {
+        uint32_t graph_id = g_array_index(base->graph_var_ids, uint32_t,
+                                          local);
+        OspreyVar *var;
+        if (graph_id >= graph->vars->len ||
+            base->local_by_graph[graph_id] != local || seen_vars[local]) {
+            goto out;
+        }
+        var = &g_array_index(graph->vars, OspreyVar, graph_id);
+        if (var->id != graph_id || var->kind <= OSPREY_PRED_NONE ||
+            var->kind >= OSPREY_PRED_COUNT ||
+            !exact_payload_valid(var->kind, &var->payload)) goto out;
+        if (local != 0) {
+            uint32_t previous_graph = g_array_index(base->graph_var_ids,
+                                                    uint32_t, local - 1);
+            OspreyVar *previous = &g_array_index(graph->vars, OspreyVar,
+                                                  previous_graph);
+            int order = exact_cmp_u64(previous->kind, var->kind);
+            if (order == 0) {
+                order = osprey_var_payload_compare(previous->kind,
+                                                   &previous->payload,
+                                                   &var->payload);
+            }
+            if (order >= 0) goto out;
+        }
+    }
+    for (uint32_t graph_id = 0; graph_id < graph_var_count; graph_id++) {
+        uint32_t local = base->local_by_graph[graph_id];
+        if ((local != UINT32_MAX) != (expected_base_vars[graph_id] != 0)) {
+            goto out;
+        }
+        if (local != UINT32_MAX &&
+            (local >= local_var_count ||
+             g_array_index(base->graph_var_ids, uint32_t, local) != graph_id)) {
+            goto out;
+        }
+    }
+
+    for (guint component_id = 0; component_id < base->components->len;
+         component_id++) {
+        OspreyExactComponent *component = g_ptr_array_index(
+            base->components, component_id);
+        if (component == NULL || component->local_vars == NULL ||
+            component->factor_refs == NULL ||
+            component->local_vars->len == 0 || component->factor_refs->len == 0) {
+            goto out;
+        }
+        for (guint j = 0; j < component->local_vars->len; j++) {
+            uint32_t local = g_array_index(component->local_vars, uint32_t, j);
+            if (local >= local_var_count ||
+                component_of_var[local] != UINT32_MAX ||
+                (j != 0 && g_array_index(component->local_vars, uint32_t,
+                                         j - 1) >= local)) goto out;
+            component_of_var[local] = component_id;
+            seen_vars[local] = 1;
+        }
+        for (guint j = 0; j < component->factor_refs->len; j++) {
+            uint32_t ref_id = g_array_index(component->factor_refs,
+                                             uint32_t, j);
+            if (ref_id >= factor_count || seen_factors[ref_id] ||
+                (j != 0 && g_array_index(component->factor_refs, uint32_t,
+                                         j - 1) >= ref_id)) goto out;
+            seen_factors[ref_id] = 1;
+            factor_component[ref_id] = component_id;
+        }
+    }
+    for (uint32_t local = 0; local < local_var_count; local++) {
+        if (!seen_vars[local]) goto out;
+    }
+    for (uint32_t ref_id = 0; ref_id < factor_count; ref_id++) {
+        OspreyExactFactorRef *ref = &g_array_index(base->factor_refs,
+                                                    OspreyExactFactorRef,
+                                                    ref_id);
+        OspreyFactor *factor;
+        if (!seen_factors[ref_id] || ref->num_vars == 0 ||
+            ref->num_vars > OSPREY_FACTOR_MAX_ARITY ||
+            ref->graph_factor_id >= graph->factors->len ||
+            seen_graph_factors[ref->graph_factor_id]) goto out;
+        factor = g_array_index(graph->factors, OspreyFactor *,
+                               ref->graph_factor_id);
+        if (factor == NULL || factor->stage != OSPREY_GRAPH_BASE_CA ||
+            !exact_factor_valid(factor, graph) ||
+            factor->num_vars != ref->num_vars) goto out;
+        seen_graph_factors[ref->graph_factor_id] = 1;
+        for (uint32_t j = 0; j < ref->num_vars; j++) {
+            uint32_t local = ref->local_vars[j];
+            if (local >= local_var_count ||
+                component_of_var[local] != factor_component[ref_id]) {
+                goto out;
+            }
+            for (uint32_t k = 0; k < j; k++) {
+                if (ref->local_vars[k] == local) goto out;
+            }
+            if (g_array_index(base->graph_var_ids, uint32_t, local) !=
+                factor->var_ids[j]) goto out;
+        }
+    }
+    for (uint32_t graph_factor_id = 0;
+         graph_factor_id < graph->factors->len; graph_factor_id++) {
+        OspreyFactor *factor = g_array_index(graph->factors,
+                                             OspreyFactor *, graph_factor_id);
+        if (factor->stage == OSPREY_GRAPH_BASE_CA &&
+            !seen_graph_factors[graph_factor_id]) {
+            goto out;
+        }
+    }
+    valid = true;
+out:
+    g_free(expected_base_vars);
+    g_free(seen_vars);
+    g_free(component_of_var);
+    g_free(seen_factors);
+    g_free(seen_graph_factors);
+    g_free(factor_component);
+    return valid;
+}
+
+static OspreyStatus exact_component_workspace(
+    OspreyExactTopologyComponent *component, uint64_t workspace_limit,
+    uint64_t *required, const char **limit_kind)
+{
+    size_t total_bytes = 0;
+    uint64_t assignment_cells = 0;
+    uint64_t separator_cells = 0;
+
+    if (required != NULL) *required = 0;
+    if (limit_kind != NULL) *limit_kind = NULL;
+    if (component == NULL || component->cliques == NULL ||
+        component->tree_edges == NULL) return OSPREY_INVALID_GRAPH;
+
+    for (guint i = 0; i < component->cliques->len; i++) {
+        OspreyExactClique *clique = g_ptr_array_index(component->cliques, i);
+        uint64_t cells;
+        size_t bytes;
+        if (clique == NULL || clique->local_vars == NULL ||
+            !exact_assignment_cells(clique->local_vars->len, &cells) ||
+            !exact_u64_add(assignment_cells, cells, &assignment_cells) ||
+            cells > SIZE_MAX ||
+            !exact_size_mul((size_t)cells, sizeof(double), &bytes) ||
+            !exact_size_add(total_bytes, bytes, &total_bytes)) {
+            if (required != NULL) *required = UINT64_MAX;
+            if (limit_kind != NULL) *limit_kind = "workspace";
+            return OSPREY_EXACT_COMPONENT_TOO_LARGE;
+        }
+        clique->assignment_cells = cells;
+    }
+    for (guint i = 0; i < component->tree_edges->len; i++) {
+        OspreyExactTreeEdge *edge = &g_array_index(
+            component->tree_edges, OspreyExactTreeEdge, i);
+        uint64_t cells;
+        size_t directed_cells;
+        size_t bytes;
+        if (edge->separator == NULL ||
+            !exact_assignment_cells(edge->separator->len, &cells) ||
+            !exact_size_mul((size_t)cells, 2, &directed_cells) ||
+            !exact_u64_add(separator_cells, (uint64_t)directed_cells,
+                           &separator_cells) ||
+            !exact_size_mul(directed_cells, sizeof(double), &bytes) ||
+            !exact_size_add(total_bytes, bytes, &total_bytes)) {
+            if (required != NULL) *required = UINT64_MAX;
+            if (limit_kind != NULL) *limit_kind = "workspace";
+            return OSPREY_EXACT_COMPONENT_TOO_LARGE;
+        }
+        edge->separator_cells = cells;
+    }
+    component->assignment_cells = assignment_cells;
+    component->separator_cells = separator_cells;
+    component->table_bytes = (uint64_t)total_bytes;
+    if ((uint64_t)total_bytes > workspace_limit) {
+        if (required != NULL) *required = (uint64_t)total_bytes;
+        if (limit_kind != NULL) *limit_kind = "workspace";
+        return OSPREY_EXACT_COMPONENT_TOO_LARGE;
+    }
+    return OSPREY_OK;
+}
+
+static OspreyStatus exact_component_topology_build(
+    const OspreyExactBase *base, uint32_t base_component_id,
+    uint64_t clique_limit, uint64_t workspace_limit,
+    OspreyExactTopologyComponent *component, uint64_t *required,
+    const char **limit_kind)
+{
+    const OspreyExactComponent *source;
+    uint32_t component_size;
+    uint32_t base_variable_count;
+    uint32_t *position_by_local = NULL;
+    GPtrArray *neighbors = NULL;
+    uint8_t *live = NULL;
+    uint8_t *affected = NULL;
+    uint32_t *connectivity = NULL;
+    uint64_t *scores = NULL;
+    uint32_t *generations = NULL;
+    GArray *heap = NULL;
+    GPtrArray *unique_refs = NULL;
+    GPtrArray *incidence = NULL;
+    GPtrArray *max_incidence = NULL;
+    GHashTable *pairs = NULL;
+    GArray *candidates = NULL;
+    GArray *tree_uf = NULL;
+    uint32_t *clique_parent = NULL;
+    GArray *queue = NULL;
+    OspreyStatus status = OSPREY_OK;
+    uint32_t remaining;
+
+    if (required != NULL) *required = 0;
+    if (limit_kind != NULL) *limit_kind = NULL;
+    if (base == NULL || component == NULL ||
+        base_component_id >= base->components->len) return OSPREY_INVALID_GRAPH;
+    source = g_ptr_array_index(base->components, base_component_id);
+    if (source == NULL || source->local_vars == NULL ||
+        source->factor_refs == NULL || source->local_vars->len == 0 ||
+        source->local_vars->len > UINT32_MAX) return OSPREY_INVALID_GRAPH;
+    component_size = source->local_vars->len;
+    base_variable_count = base->graph_var_ids->len;
+
+    component->base_component = base_component_id;
+    component->local_vars = g_array_new(FALSE, FALSE, sizeof(uint32_t));
+    g_array_append_vals(component->local_vars, source->local_vars->data,
+                        source->local_vars->len);
+    component->elimination_order = g_array_new(FALSE, FALSE, sizeof(uint32_t));
+    component->elimination_cliques = g_ptr_array_new_with_free_func(
+        exact_clique_free);
+    component->cliques = g_ptr_array_new_with_free_func(exact_clique_free);
+    component->tree_edges = g_array_new(FALSE, FALSE,
+                                        sizeof(OspreyExactTreeEdge));
+    component->root_clique = UINT32_MAX;
+
+    position_by_local = g_new(uint32_t, base_variable_count);
+    for (uint32_t i = 0; i < base_variable_count; i++) {
+        position_by_local[i] = UINT32_MAX;
+    }
+    for (uint32_t i = 0; i < component_size; i++) {
+        uint32_t local = g_array_index(source->local_vars, uint32_t, i);
+        if (local >= base_variable_count || position_by_local[local] !=
+                                            UINT32_MAX) {
+            status = OSPREY_INVALID_GRAPH;
+            goto cleanup;
+        }
+        position_by_local[local] = i;
+    }
+
+    neighbors = exact_array_lists_new(component_size);
+    connectivity = g_new(uint32_t, component_size);
+    for (uint32_t i = 0; i < component_size; i++) connectivity[i] = i;
+
+    /* Re-derive primal connectivity and adjacency from the retained factor
+     * scopes.  This intentionally does not use graph->uf_parent. */
+    for (guint i = 0; i < source->factor_refs->len; i++) {
+        uint32_t ref_id = g_array_index(source->factor_refs, uint32_t, i);
+        const OspreyExactFactorRef *ref;
+        uint32_t positions[OSPREY_FACTOR_MAX_ARITY];
+        if (ref_id >= base->factor_refs->len) {
+            status = OSPREY_INVALID_GRAPH;
+            goto cleanup;
+        }
+        ref = &g_array_index(base->factor_refs, OspreyExactFactorRef,
+                             ref_id);
+        if (ref->num_vars == 0 || ref->num_vars > OSPREY_FACTOR_MAX_ARITY) {
+            status = OSPREY_INVALID_GRAPH;
+            goto cleanup;
+        }
+        for (uint32_t j = 0; j < ref->num_vars; j++) {
+            uint32_t position;
+            if (!exact_local_position(source->local_vars, ref->local_vars[j],
+                                      &position)) {
+                status = OSPREY_INVALID_GRAPH;
+                goto cleanup;
+            }
+            positions[j] = position;
+            for (uint32_t k = 0; k < j; k++) {
+                if (positions[k] == position) {
+                    status = OSPREY_INVALID_GRAPH;
+                    goto cleanup;
+                }
+            }
+            if (j != 0) exact_uf_union(connectivity, positions[0], position);
+        }
+        for (uint32_t j = 0; j < ref->num_vars; j++) {
+            for (uint32_t k = j + 1; k < ref->num_vars; k++) {
+                bool inserted;
+                if (!exact_adj_edge(neighbors, positions[j], positions[k],
+                                    &inserted)) {
+                    status = OSPREY_INVALID_GRAPH;
+                    goto cleanup;
+                }
+            }
+        }
+    }
+    {
+        uint32_t root = exact_uf_find(connectivity, 0);
+        for (uint32_t i = 1; i < component_size; i++) {
+            if (exact_uf_find(connectivity, i) != root) {
+                status = OSPREY_INVALID_GRAPH;
+                goto cleanup;
+            }
+        }
+    }
+
+    live = g_new0(uint8_t, component_size);
+    affected = g_new0(uint8_t, component_size);
+    scores = g_new0(uint64_t, component_size);
+    generations = g_new0(uint32_t, component_size);
+    heap = g_array_new(FALSE, FALSE, sizeof(ExactHeapEntry));
+    for (uint32_t i = 0; i < component_size; i++) live[i] = 1;
+    for (uint32_t i = 0; i < component_size; i++) {
+        if (!exact_fill_score(neighbors, live, i, &scores[i])) {
+            status = OSPREY_INVALID_GRAPH;
+            goto cleanup;
+        }
+        ExactHeapEntry entry = { scores[i], i, generations[i] };
+        exact_heap_push(heap, entry);
+    }
+
+    remaining = component_size;
+    while (remaining != 0) {
+        ExactHeapEntry entry;
+        uint32_t variable;
+        GArray *variable_neighbors;
+        OspreyExactClique *clique;
+
+        for (;;) {
+            if (!exact_heap_pop(heap, &entry) || entry.local >= component_size) {
+                status = OSPREY_INVALID_GRAPH;
+                goto cleanup;
+            }
+            if (live[entry.local] && entry.generation ==
+                                         generations[entry.local] &&
+                entry.fill == scores[entry.local]) break;
+        }
+        variable = entry.local;
+        variable_neighbors = g_ptr_array_index(neighbors, variable);
+        clique = exact_clique_new();
+        {
+            uint32_t local = g_array_index(source->local_vars, uint32_t,
+                                           variable);
+            g_array_append_val(clique->local_vars, local);
+            g_array_append_val(component->elimination_order, local);
+        }
+        for (guint i = 0; i < variable_neighbors->len; i++) {
+            uint32_t position = g_array_index(variable_neighbors, uint32_t, i);
+            if (live[position]) {
+                uint32_t local = g_array_index(source->local_vars, uint32_t,
+                                               position);
+                g_array_append_val(clique->local_vars, local);
+            }
+        }
+        g_array_sort(clique->local_vars, exact_u32_compare);
+        if (clique->local_vars->len > clique_limit) {
+            g_ptr_array_add(component->elimination_cliques, clique);
+            if (required != NULL) *required = clique->local_vars->len;
+            if (limit_kind != NULL) *limit_kind = "clique";
+            status = OSPREY_EXACT_COMPONENT_TOO_LARGE;
+            goto cleanup;
+        }
+        g_ptr_array_add(component->elimination_cliques, clique);
+
+        memset(affected, 0, component_size);
+        for (guint i = 0; i < variable_neighbors->len; i++) {
+            uint32_t position = g_array_index(variable_neighbors, uint32_t, i);
+            if (live[position]) affected[position] = 1;
+        }
+        for (guint i = 0; i < variable_neighbors->len; i++) {
+            uint32_t left = g_array_index(variable_neighbors, uint32_t, i);
+            if (!live[left]) continue;
+            for (guint j = i + 1; j < variable_neighbors->len; j++) {
+                uint32_t right = g_array_index(variable_neighbors, uint32_t,
+                                                j);
+                bool inserted;
+                if (!live[right]) continue;
+                if (!exact_adj_edge(neighbors, left, right, &inserted)) {
+                    status = OSPREY_INVALID_GRAPH;
+                    goto cleanup;
+                }
+                if (inserted) {
+                    affected[left] = 1;
+                    affected[right] = 1;
+                    exact_mark_neighbors(neighbors, live, left, affected);
+                    exact_mark_neighbors(neighbors, live, right, affected);
+                }
+            }
+        }
+        live[variable] = 0;
+        for (guint i = 0; i < variable_neighbors->len; i++) {
+            uint32_t position = g_array_index(variable_neighbors, uint32_t, i);
+            if (live[position] &&
+                !exact_adj_remove(g_ptr_array_index(neighbors, position),
+                                  variable)) {
+                status = OSPREY_INVALID_GRAPH;
+                goto cleanup;
+            }
+        }
+        g_array_set_size(variable_neighbors, 0);
+        remaining--;
+
+        for (uint32_t i = 0; i < component_size; i++) {
+            if (!affected[i] || !live[i]) continue;
+            if (!exact_fill_score(neighbors, live, i, &scores[i]) ||
+                generations[i] == UINT32_MAX) {
+                status = OSPREY_INVALID_GRAPH;
+                goto cleanup;
+            }
+            generations[i]++;
+            ExactHeapEntry updated = { scores[i], i, generations[i] };
+            exact_heap_push(heap, updated);
+        }
+    }
+
+    /* Deduplicate elimination cliques, then remove strict subsets.  The
+     * incidence lists avoid an unconditional clique-count squared scan: a
+     * possible superset must share at least one member with the candidate. */
+    unique_refs = g_ptr_array_new();
+    for (guint i = 0; i < component->elimination_cliques->len; i++) {
+        g_ptr_array_add(unique_refs,
+                        g_ptr_array_index(component->elimination_cliques, i));
+    }
+    g_ptr_array_sort(unique_refs, exact_clique_ptr_compare);
+    {
+        GPtrArray *unique = g_ptr_array_new();
+        for (guint i = 0; i < unique_refs->len; i++) {
+            OspreyExactClique *clique = g_ptr_array_index(unique_refs, i);
+            if (unique->len == 0 || !exact_clique_equal(
+                    clique, g_ptr_array_index(unique, unique->len - 1))) {
+                g_ptr_array_add(unique, clique);
+            }
+        }
+        g_ptr_array_free(unique_refs, TRUE);
+        unique_refs = unique;
+    }
+    incidence = exact_array_lists_new(component_size);
+    for (guint i = 0; i < unique_refs->len; i++) {
+        OspreyExactClique *clique = g_ptr_array_index(unique_refs, i);
+        for (guint j = 0; j < clique->local_vars->len; j++) {
+            uint32_t local = g_array_index(clique->local_vars, uint32_t, j);
+            uint32_t position = position_by_local[local];
+            if (position == UINT32_MAX) {
+                status = OSPREY_INVALID_GRAPH;
+                goto cleanup;
+            }
+            g_array_append_val(g_ptr_array_index(incidence, position), i);
+        }
+    }
+    for (guint i = 0; i < unique_refs->len; i++) {
+        OspreyExactClique *clique = g_ptr_array_index(unique_refs, i);
+        uint32_t rare_position = UINT32_MAX;
+        guint rare_count = G_MAXUINT;
+        bool dominated = false;
+        for (guint j = 0; j < clique->local_vars->len; j++) {
+            uint32_t local = g_array_index(clique->local_vars, uint32_t, j);
+            uint32_t position = position_by_local[local];
+            GArray *members = g_ptr_array_index(incidence, position);
+            if (members->len < rare_count) {
+                rare_count = members->len;
+                rare_position = position;
+            }
+        }
+        if (rare_position == UINT32_MAX) {
+            status = OSPREY_INVALID_GRAPH;
+            goto cleanup;
+        }
+        GArray *members = g_ptr_array_index(incidence, rare_position);
+        for (guint j = 0; j < members->len; j++) {
+            guint candidate_index = g_array_index(members, uint32_t, j);
+            OspreyExactClique *candidate = g_ptr_array_index(unique_refs,
+                                                              candidate_index);
+            if (candidate_index != i && exact_clique_subset(clique, candidate)) {
+                dominated = true;
+                break;
+            }
+        }
+        if (!dominated) {
+            OspreyExactClique *copy = exact_clique_clone(clique);
+            if (copy == NULL) {
+                status = OSPREY_INVALID_GRAPH;
+                goto cleanup;
+            }
+            g_ptr_array_add(component->cliques, copy);
+        }
+    }
+    g_ptr_array_sort(component->cliques, exact_clique_ptr_compare);
+    if (component->cliques->len == 0) {
+        status = OSPREY_INVALID_GRAPH;
+        goto cleanup;
+    }
+    component->max_clique_vars = 0;
+    for (guint i = 0; i < component->cliques->len; i++) {
+        OspreyExactClique *clique = g_ptr_array_index(component->cliques, i);
+        if (clique->local_vars->len > component->max_clique_vars) {
+            component->max_clique_vars = clique->local_vars->len;
+        }
+    }
+    for (uint32_t i = 0; i < component_size; i++) {
+        uint32_t local = g_array_index(source->local_vars, uint32_t, i);
+        bool present = false;
+        for (guint j = 0; j < component->cliques->len; j++) {
+            if (exact_clique_contains(g_ptr_array_index(component->cliques, j),
+                                      local)) {
+                present = true;
+                break;
+            }
+        }
+        if (!present) {
+            status = OSPREY_INVALID_GRAPH;
+            goto cleanup;
+        }
+    }
+
+    /* Enumerate only clique pairs sharing a variable, using the incidence
+     * index.  The map stores the checked intersection cardinality. */
+    max_incidence = exact_array_lists_new(component_size);
+    for (guint i = 0; i < component->cliques->len; i++) {
+        OspreyExactClique *clique = g_ptr_array_index(component->cliques, i);
+        for (guint j = 0; j < clique->local_vars->len; j++) {
+            uint32_t local = g_array_index(clique->local_vars, uint32_t, j);
+            uint32_t position = position_by_local[local];
+            if (position == UINT32_MAX) {
+                status = OSPREY_INVALID_GRAPH;
+                goto cleanup;
+            }
+            g_array_append_val(g_ptr_array_index(max_incidence, position), i);
+        }
+    }
+    pairs = g_hash_table_new_full(exact_pair_hash, exact_pair_equal,
+                                  g_free, g_free);
+    for (uint32_t position = 0; position < component_size; position++) {
+        GArray *members = g_ptr_array_index(max_incidence, position);
+        for (guint i = 0; i < members->len; i++) {
+            for (guint j = i + 1; j < members->len; j++) {
+                uint32_t a = g_array_index(members, uint32_t, i);
+                uint32_t b = g_array_index(members, uint32_t, j);
+                ExactCliquePair lookup = {
+                    a < b ? a : b, a < b ? b : a
+                };
+                uint32_t *weight = g_hash_table_lookup(pairs, &lookup);
+                if (weight == NULL) {
+                    ExactCliquePair *key = g_new(ExactCliquePair, 1);
+                    uint32_t *value = g_new(uint32_t, 1);
+                    *key = lookup;
+                    *value = 1;
+                    g_hash_table_insert(pairs, key, value);
+                } else if (*weight == UINT32_MAX) {
+                    status = OSPREY_INVALID_GRAPH;
+                    goto cleanup;
+                } else {
+                    (*weight)++;
+                }
+            }
+        }
+    }
+    candidates = g_array_new(FALSE, FALSE, sizeof(ExactTreeCandidate));
+    {
+        GHashTableIter iter;
+        gpointer key_data;
+        gpointer value_data;
+        g_hash_table_iter_init(&iter, pairs);
+        while (g_hash_table_iter_next(&iter, &key_data, &value_data)) {
+            ExactCliquePair *pair = key_data;
+            uint32_t weight = *(uint32_t *)value_data;
+            ExactTreeCandidate candidate = { pair->left, pair->right,
+                                             weight };
+            g_array_append_val(candidates, candidate);
+        }
+    }
+    g_array_sort(candidates, exact_tree_candidate_compare);
+    tree_uf = g_array_sized_new(FALSE, FALSE, sizeof(uint32_t),
+                                component->cliques->len);
+    for (guint i = 0; i < component->cliques->len; i++) {
+        uint32_t value = i;
+        g_array_append_val(tree_uf, value);
+    }
+    for (guint i = 0; i < candidates->len &&
+                       component->tree_edges->len + 1 <
+                           component->cliques->len; i++) {
+        ExactTreeCandidate candidate = g_array_index(candidates,
+                                                      ExactTreeCandidate, i);
+        uint32_t left_root;
+        uint32_t right_root;
+        OspreyExactTreeEdge edge;
+        if (candidate.left >= component->cliques->len ||
+            candidate.right >= component->cliques->len ||
+            candidate.left >= candidate.right) {
+            status = OSPREY_INVALID_GRAPH;
+            goto cleanup;
+        }
+        left_root = exact_uf_find((uint32_t *)tree_uf->data, candidate.left);
+        right_root = exact_uf_find((uint32_t *)tree_uf->data, candidate.right);
+        if (left_root == right_root) continue;
+        memset(&edge, 0, sizeof(edge));
+        edge.left = candidate.left;
+        edge.right = candidate.right;
+        edge.parent = UINT32_MAX;
+        edge.child = UINT32_MAX;
+        edge.separator = g_array_new(FALSE, FALSE, sizeof(uint32_t));
+        if (!exact_clique_intersection(
+                g_ptr_array_index(component->cliques, edge.left),
+                g_ptr_array_index(component->cliques, edge.right),
+                edge.separator) || edge.separator->len != candidate.weight) {
+            exact_tree_edge_clear(&edge);
+            status = OSPREY_INVALID_GRAPH;
+            goto cleanup;
+        }
+        g_array_append_val(component->tree_edges, edge);
+        exact_uf_union((uint32_t *)tree_uf->data, candidate.left,
+                       candidate.right);
+    }
+    if (component->cliques->len == 0 ||
+        component->tree_edges->len + 1 != component->cliques->len) {
+        status = OSPREY_INVALID_GRAPH;
+        goto cleanup;
+    }
+
+    /* Root the selected tree at the smallest canonical clique. */
+    exact_array_lists_free(max_incidence);
+    max_incidence = NULL;
+    max_incidence = exact_array_lists_new(component->cliques->len);
+    for (guint i = 0; i < component->tree_edges->len; i++) {
+        OspreyExactTreeEdge *edge = &g_array_index(
+            component->tree_edges, OspreyExactTreeEdge, i);
+        g_array_append_val(g_ptr_array_index(max_incidence, edge->left), i);
+        g_array_append_val(g_ptr_array_index(max_incidence, edge->right), i);
+    }
+    clique_parent = g_new(uint32_t, component->cliques->len);
+    for (guint i = 0; i < component->cliques->len; i++) {
+        clique_parent[i] = UINT32_MAX;
+    }
+    queue = g_array_new(FALSE, FALSE, sizeof(uint32_t));
+    component->root_clique = 0;
+    clique_parent[0] = 0;
+    {
+        uint32_t root = 0;
+        g_array_append_val(queue, root);
+    }
+    for (guint q = 0; q < queue->len; q++) {
+        uint32_t current = g_array_index(queue, uint32_t, q);
+        GArray *edge_ids = g_ptr_array_index(max_incidence, current);
+        for (guint i = 0; i < edge_ids->len; i++) {
+            uint32_t edge_id = g_array_index(edge_ids, uint32_t, i);
+            OspreyExactTreeEdge *edge = &g_array_index(
+                component->tree_edges, OspreyExactTreeEdge, edge_id);
+            uint32_t other = edge->left == current ? edge->right : edge->left;
+            if (clique_parent[other] == UINT32_MAX) {
+                clique_parent[other] = current;
+                g_array_append_val(queue, other);
+            }
+        }
+    }
+    if (queue->len != component->cliques->len) {
+        status = OSPREY_INVALID_GRAPH;
+        goto cleanup;
+    }
+    for (guint i = 0; i < component->tree_edges->len; i++) {
+        OspreyExactTreeEdge *edge = &g_array_index(
+            component->tree_edges, OspreyExactTreeEdge, i);
+        if (clique_parent[edge->right] == edge->left) {
+            edge->parent = edge->left;
+            edge->child = edge->right;
+        } else if (clique_parent[edge->left] == edge->right) {
+            edge->parent = edge->right;
+            edge->child = edge->left;
+        } else {
+            status = OSPREY_INVALID_GRAPH;
+            goto cleanup;
+        }
+    }
+    /* Edge storage is a canonical rooted representation, not a hash order. */
+    for (guint i = 1; i < component->tree_edges->len; i++) {
+        OspreyExactTreeEdge value = g_array_index(component->tree_edges,
+                                                  OspreyExactTreeEdge, i);
+        guint j = i;
+        while (j != 0) {
+            OspreyExactTreeEdge *previous = &g_array_index(
+                component->tree_edges, OspreyExactTreeEdge, j - 1);
+            if (previous->parent < value.parent ||
+                (previous->parent == value.parent &&
+                 previous->child <= value.child)) break;
+            g_array_index(component->tree_edges, OspreyExactTreeEdge, j) =
+                *previous;
+            j--;
+        }
+        g_array_index(component->tree_edges, OspreyExactTreeEdge, j) = value;
+    }
+
+    status = exact_component_workspace(component, workspace_limit, required,
+                                       limit_kind);
+
+cleanup:
+    if (queue != NULL) g_array_free(queue, TRUE);
+    g_free(clique_parent);
+    if (max_incidence != NULL) exact_array_lists_free(max_incidence);
+    if (tree_uf != NULL) g_array_free(tree_uf, TRUE);
+    if (candidates != NULL) g_array_free(candidates, TRUE);
+    if (pairs != NULL) g_hash_table_destroy(pairs);
+    if (incidence != NULL) exact_array_lists_free(incidence);
+    if (unique_refs != NULL) g_ptr_array_free(unique_refs, TRUE);
+    if (heap != NULL) g_array_free(heap, TRUE);
+    g_free(generations);
+    g_free(scores);
+    g_free(affected);
+    g_free(live);
+    g_free(connectivity);
+    if (neighbors != NULL) exact_array_lists_free(neighbors);
+    g_free(position_by_local);
+    return status;
+}
+
+static void exact_topology_limit_log(uint32_t component,
+                                      const char *kind, uint64_t required,
+                                      uint64_t limit)
+{
+    log_msg("[osprey] [infer] [exact] [large component %u] [%s %llu] "
+            "[limit %llu]\n", component, kind != NULL ? kind : "workspace",
+            (unsigned long long)required, (unsigned long long)limit);
+}
+
+OspreyStatus osprey_exact_topology_build(
+    OspreyContext *ctx, const OspreyExactBase *base,
+    OspreyExactTopology **out)
+{
+    OspreyExactTopology *topology = NULL;
+    uint64_t clique_limit;
+    uint64_t workspace_limit;
+    uint64_t required = 0;
+    const char *limit_kind = NULL;
+    bool limit_logged = false;
+    OspreyStatus status = OSPREY_OK;
+
+    if (out != NULL) *out = NULL;
+    if (ctx == NULL || out == NULL ||
+        !exact_topology_limits(ctx, &clique_limit, &workspace_limit)) {
+        if (ctx != NULL) {
+            exact_topology_limit_log(UINT32_MAX, "configuration", 0, 0);
+        }
+        return exact_projection_failure(ctx,
+                                        OSPREY_EXACT_COMPONENT_TOO_LARGE);
+    }
+    if (!exact_topology_base_valid(ctx, base)) {
+        return exact_projection_failure(ctx, OSPREY_INVALID_GRAPH);
+    }
+
+    topology = g_new0(OspreyExactTopology, 1);
+    topology->components = g_ptr_array_new_with_free_func(
+        exact_topology_component_free);
+    topology->factor_owner = g_array_sized_new(FALSE, FALSE, sizeof(uint32_t),
+                                                base->factor_refs->len);
+    for (guint i = 0; i < base->factor_refs->len; i++) {
+        uint32_t invalid = UINT32_MAX;
+        g_array_append_val(topology->factor_owner, invalid);
+    }
+    topology->variable_count = base->graph_var_ids->len;
+    topology->factor_count = base->factor_refs->len;
+
+    for (guint i = 0; i < base->components->len; i++) {
+        OspreyExactTopologyComponent *component = g_new0(
+            OspreyExactTopologyComponent, 1);
+        status = exact_component_topology_build(
+            base, i, clique_limit, workspace_limit, component, &required,
+            &limit_kind);
+        if (status != OSPREY_OK) {
+            exact_topology_component_free(component);
+            if (status == OSPREY_EXACT_COMPONENT_TOO_LARGE) {
+                exact_topology_limit_log(i, limit_kind, required,
+                                         limit_kind != NULL &&
+                                         strcmp(limit_kind, "clique") == 0
+                                             ? clique_limit : workspace_limit);
+                limit_logged = true;
+            }
+            goto fail;
+        }
+        g_ptr_array_add(topology->components, component);
+    }
+
+    /* Assign stable flattened IDs only after every component has its
+     * canonical maximal-clique order. */
+    for (guint i = 0; i < topology->components->len; i++) {
+        OspreyExactTopologyComponent *component = g_ptr_array_index(
+            topology->components, i);
+        for (guint j = 0; j < component->cliques->len; j++) {
+            OspreyExactClique *clique = g_ptr_array_index(component->cliques,
+                                                           j);
+            if (topology->clique_count >= UINT32_MAX) {
+                status = OSPREY_EXACT_COMPONENT_TOO_LARGE;
+                required = topology->clique_count + 1;
+                limit_kind = "workspace";
+                goto fail;
+            }
+            clique->id = (uint32_t)topology->clique_count;
+            topology->clique_count++;
+        }
+        if (component->max_clique_vars > topology->max_clique_vars) {
+            topology->max_clique_vars = component->max_clique_vars;
+        }
+        if (!exact_u64_add(topology->table_bytes, component->table_bytes,
+                           &topology->table_bytes)) {
+            status = OSPREY_EXACT_COMPONENT_TOO_LARGE;
+            required = UINT64_MAX;
+            limit_kind = "workspace";
+            goto fail;
+        }
+        if (component->table_bytes > topology->max_component_table_bytes) {
+            topology->max_component_table_bytes = component->table_bytes;
+        }
+    }
+
+    /* Assign each retained base factor to the smallest containing maximal
+     * clique.  The base factor order is canonical and owner ties use the
+     * canonical clique list order. */
+    for (guint component_id = 0; component_id < base->components->len;
+         component_id++) {
+        const OspreyExactComponent *source = g_ptr_array_index(
+            base->components, component_id);
+        OspreyExactTopologyComponent *component = g_ptr_array_index(
+            topology->components, component_id);
+        for (guint j = 0; j < source->factor_refs->len; j++) {
+            uint32_t ref_id = g_array_index(source->factor_refs, uint32_t, j);
+            const OspreyExactFactorRef *ref = &g_array_index(
+                base->factor_refs, OspreyExactFactorRef, ref_id);
+            OspreyExactClique *owner = NULL;
+            for (guint k = 0; k < component->cliques->len; k++) {
+                OspreyExactClique *candidate = g_ptr_array_index(
+                    component->cliques, k);
+                if (!exact_clique_contains_all(candidate, ref)) continue;
+                if (owner == NULL ||
+                    candidate->local_vars->len < owner->local_vars->len ||
+                    (candidate->local_vars->len == owner->local_vars->len &&
+                     exact_clique_compare(candidate, owner) < 0)) {
+                    owner = candidate;
+                }
+            }
+            if (owner == NULL || ref_id >= topology->factor_owner->len ||
+                g_array_index(topology->factor_owner, uint32_t, ref_id) !=
+                    UINT32_MAX) {
+                status = OSPREY_INVALID_GRAPH;
+                goto fail;
+            }
+            g_array_append_val(owner->factor_refs, ref_id);
+            g_array_index(topology->factor_owner, uint32_t, ref_id) =
+                owner->id;
+        }
+    }
+    if (!osprey_exact_topology_validate(ctx, base, topology)) {
+        status = OSPREY_INVALID_GRAPH;
+        goto fail;
+    }
+
+    *out = topology;
+    return OSPREY_OK;
+
+fail:
+    if (status == OSPREY_EXACT_COMPONENT_TOO_LARGE && !limit_logged) {
+        exact_topology_limit_log(UINT32_MAX, limit_kind, required,
+                                 limit_kind != NULL &&
+                                 strcmp(limit_kind, "clique") == 0
+                                     ? clique_limit : workspace_limit);
+    }
+    osprey_exact_topology_free(topology);
+    return exact_projection_failure(ctx, status);
+}
+
+static bool exact_component_workspace_valid(
+    const OspreyExactTopologyComponent *component, uint64_t workspace_limit,
+    uint64_t *table_bytes, uint64_t *assignment_cells,
+    uint64_t *separator_cells)
+{
+    size_t total = 0;
+    uint64_t assignments = 0;
+    uint64_t separators = 0;
+    if (component == NULL || component->cliques == NULL ||
+        component->tree_edges == NULL || table_bytes == NULL ||
+        assignment_cells == NULL || separator_cells == NULL) return false;
+    for (guint i = 0; i < component->cliques->len; i++) {
+        const OspreyExactClique *clique = g_ptr_array_index(
+            component->cliques, i);
+        uint64_t cells;
+        size_t bytes;
+        if (clique == NULL || clique->local_vars == NULL ||
+            !exact_assignment_cells(clique->local_vars->len, &cells) ||
+            clique->assignment_cells != cells ||
+            !exact_u64_add(assignments, cells, &assignments) ||
+            !exact_size_mul((size_t)cells, sizeof(double), &bytes) ||
+            !exact_size_add(total, bytes, &total)) return false;
+    }
+    for (guint i = 0; i < component->tree_edges->len; i++) {
+        const OspreyExactTreeEdge *edge = &g_array_index(
+            component->tree_edges, OspreyExactTreeEdge, i);
+        uint64_t cells;
+        size_t directed_cells;
+        size_t bytes;
+        if (edge->separator == NULL || !exact_assignment_cells(
+                edge->separator->len, &cells) ||
+            edge->separator_cells != cells ||
+            !exact_size_mul((size_t)cells, 2, &directed_cells) ||
+            !exact_u64_add(separators, directed_cells, &separators) ||
+            !exact_size_mul(directed_cells, sizeof(double), &bytes) ||
+            !exact_size_add(total, bytes, &total)) return false;
+    }
+    if ((uint64_t)total > workspace_limit ||
+        component->assignment_cells != assignments ||
+        component->separator_cells != separators ||
+        component->table_bytes != (uint64_t)total) return false;
+    *table_bytes = (uint64_t)total;
+    *assignment_cells = assignments;
+    *separator_cells = separators;
+    return true;
+}
+
+static bool exact_topology_membership_valid(
+    const OspreyExactTopologyComponent *component,
+    const OspreyExactClique *clique)
+{
+    if (component == NULL || clique == NULL || clique->local_vars == NULL ||
+        clique->local_vars->len == 0) return false;
+    for (guint i = 0; i < clique->local_vars->len; i++) {
+        uint32_t local = g_array_index(clique->local_vars, uint32_t, i);
+        uint32_t position;
+        if (!exact_local_position(component->local_vars, local, &position)) {
+            return false;
+        }
+        (void)position;
+        if (i != 0 && g_array_index(clique->local_vars, uint32_t, i - 1) >=
+                          local) return false;
+    }
+    return true;
+}
+
+static bool exact_topology_clique_contains_component_local(
+    const OspreyExactTopologyComponent *component,
+    const OspreyExactClique *clique, uint32_t local)
+{
+    uint32_t position;
+    return component != NULL && clique != NULL &&
+           exact_local_position(component->local_vars, local, &position) &&
+           exact_clique_contains(clique, local);
+}
+
+bool osprey_exact_topology_validate(
+    const OspreyContext *ctx, const OspreyExactBase *base,
+    const OspreyExactTopology *topology)
+{
+    uint64_t clique_limit;
+    uint64_t workspace_limit;
+    uint32_t variable_count;
+    uint32_t factor_count;
+    uint8_t *seen_components = NULL;
+    uint8_t *seen_variables = NULL;
+    uint8_t *seen_factors = NULL;
+    bool valid = false;
+    uint64_t actual_cliques = 0;
+    uint64_t actual_max_clique = 0;
+    uint64_t actual_table_bytes = 0;
+    uint64_t actual_max_component_bytes = 0;
+    uint32_t expected_clique_id = 0;
+
+    if (!exact_topology_limits(ctx, &clique_limit, &workspace_limit) ||
+        !exact_topology_base_valid(ctx, base) || topology == NULL ||
+        topology->components == NULL || topology->factor_owner == NULL) {
+        return false;
+    }
+    variable_count = base->graph_var_ids->len;
+    factor_count = base->factor_refs->len;
+    if (topology->variable_count != variable_count ||
+        topology->factor_count != factor_count ||
+        topology->components->len != base->components->len ||
+        topology->factor_owner->len != factor_count ||
+        variable_count == 0 || factor_count == 0) return false;
+
+    seen_components = g_new0(uint8_t, base->components->len);
+    seen_variables = g_new0(uint8_t, variable_count);
+    seen_factors = g_new0(uint8_t, factor_count);
+
+    for (guint component_id = 0; component_id < topology->components->len;
+         component_id++) {
+        const OspreyExactTopologyComponent *component = g_ptr_array_index(
+            topology->components, component_id);
+        const OspreyExactComponent *source;
+        uint32_t component_size;
+        uint8_t *eliminated = NULL;
+        uint32_t *tree_parent = NULL;
+        uint32_t *root_parent = NULL;
+        GHashTable *edge_pairs = NULL;
+        uint64_t table_bytes;
+        uint64_t assignment_cells;
+        uint64_t separator_cells;
+
+        if (component == NULL || component->base_component >=
+                                      base->components->len ||
+            seen_components[component->base_component] ||
+            component->base_component != component_id ||
+            component->local_vars == NULL ||
+            component->local_vars->len == 0 ||
+            component->elimination_order == NULL ||
+            component->elimination_cliques == NULL ||
+            component->cliques == NULL || component->tree_edges == NULL) {
+            goto out;
+        }
+        seen_components[component->base_component] = 1;
+        source = g_ptr_array_index(base->components,
+                                   component->base_component);
+        if (source == NULL || component->local_vars->len !=
+                                  source->local_vars->len ||
+            component->elimination_order->len !=
+                component->local_vars->len ||
+            component->elimination_cliques->len !=
+                component->local_vars->len) goto component_out;
+        component_size = component->local_vars->len;
+        for (guint i = 0; i < component_size; i++) {
+            uint32_t local = g_array_index(component->local_vars, uint32_t, i);
+            if (local != g_array_index(source->local_vars, uint32_t, i) ||
+                (i != 0 && g_array_index(component->local_vars, uint32_t,
+                                          i - 1) >= local) ||
+                local >= variable_count || seen_variables[local]) {
+                goto component_out;
+            }
+            seen_variables[local] = 1;
+        }
+        eliminated = g_new0(uint8_t, component_size);
+        for (guint i = 0; i < component->elimination_order->len; i++) {
+            uint32_t local = g_array_index(component->elimination_order,
+                                           uint32_t, i);
+            uint32_t position;
+            OspreyExactClique *clique = g_ptr_array_index(
+                component->elimination_cliques, i);
+            if (!exact_local_position(component->local_vars, local, &position) ||
+                eliminated[position] || !exact_topology_membership_valid(
+                    component, clique) || clique->local_vars->len >
+                    clique_limit || !exact_clique_contains(clique, local)) {
+                goto component_out;
+            }
+            eliminated[position] = 1;
+        }
+        for (uint32_t i = 0; i < component_size; i++) {
+            if (!eliminated[i]) goto component_out;
+        }
+
+        for (guint i = 0; i < component->cliques->len; i++) {
+            OspreyExactClique *clique = g_ptr_array_index(component->cliques, i);
+            if (clique == NULL || clique->factor_refs == NULL ||
+                clique->id != expected_clique_id ||
+                !exact_topology_membership_valid(component, clique) ||
+                clique->local_vars->len > clique_limit ||
+                (i != 0 && exact_clique_compare(
+                    g_ptr_array_index(component->cliques, i - 1), clique) >= 0)) {
+                goto component_out;
+            }
+            bool was_elimination_clique = false;
+            for (guint j = 0; j < component->elimination_cliques->len; j++) {
+                if (exact_clique_equal(
+                        clique, g_ptr_array_index(
+                            component->elimination_cliques, j))) {
+                    was_elimination_clique = true;
+                    break;
+                }
+            }
+            if (!was_elimination_clique) goto component_out;
+            expected_clique_id++;
+            for (guint j = 0; j < clique->local_vars->len; j++) {
+                uint32_t local = g_array_index(clique->local_vars, uint32_t, j);
+                if (!exact_topology_clique_contains_component_local(
+                        component, clique, local)) goto component_out;
+            }
+        }
+        if (component->cliques->len == 0 || component->root_clique != 0) {
+            goto component_out;
+        }
+        for (guint i = 0; i < component->cliques->len; i++) {
+            for (guint j = 0; j < component->cliques->len; j++) {
+                if (i != j && exact_clique_subset(
+                        g_ptr_array_index(component->cliques, i),
+                        g_ptr_array_index(component->cliques, j))) {
+                    goto component_out;
+                }
+            }
+        }
+        for (uint32_t i = 0; i < component_size; i++) {
+            uint32_t local = g_array_index(component->local_vars, uint32_t, i);
+            bool present = false;
+            for (guint j = 0; j < component->cliques->len; j++) {
+                if (exact_clique_contains(
+                        g_ptr_array_index(component->cliques, j), local)) {
+                    present = true;
+                    break;
+                }
+            }
+            if (!present) goto component_out;
+        }
+
+        edge_pairs = g_hash_table_new_full(exact_pair_hash,
+                                           exact_pair_equal, g_free, NULL);
+        tree_parent = g_new(uint32_t, component->cliques->len);
+        root_parent = g_new(uint32_t, component->cliques->len);
+        for (guint i = 0; i < component->cliques->len; i++) {
+            tree_parent[i] = i;
+            root_parent[i] = UINT32_MAX;
+        }
+        root_parent[0] = 0;
+        if (component->tree_edges->len + 1 != component->cliques->len) {
+            goto component_out;
+        }
+        for (guint i = 0; i < component->tree_edges->len; i++) {
+            OspreyExactTreeEdge *edge = &g_array_index(
+                component->tree_edges, OspreyExactTreeEdge, i);
+            GArray *expected_separator;
+            ExactCliquePair *pair;
+            if (edge->left >= component->cliques->len ||
+                edge->right >= component->cliques->len ||
+                edge->left >= edge->right || edge->parent >=
+                    component->cliques->len || edge->child >=
+                    component->cliques->len || edge->parent == edge->child ||
+                edge->separator == NULL || edge->separator->len == 0)
+                goto component_out;
+            pair = g_new(ExactCliquePair, 1);
+            pair->left = edge->left;
+            pair->right = edge->right;
+            if (g_hash_table_contains(edge_pairs, pair)) {
+                g_free(pair);
+                goto component_out;
+            }
+            g_hash_table_insert(edge_pairs, pair, GINT_TO_POINTER(1));
+            expected_separator = g_array_new(FALSE, FALSE, sizeof(uint32_t));
+            if (!exact_clique_intersection(
+                    g_ptr_array_index(component->cliques, edge->left),
+                    g_ptr_array_index(component->cliques, edge->right),
+                    expected_separator) ||
+                expected_separator->len != edge->separator->len) {
+                g_array_free(expected_separator, TRUE);
+                goto component_out;
+            }
+            for (guint j = 0; j < expected_separator->len; j++) {
+                if (g_array_index(expected_separator, uint32_t, j) !=
+                    g_array_index(edge->separator, uint32_t, j)) {
+                    g_array_free(expected_separator, TRUE);
+                    goto component_out;
+                }
+            }
+            g_array_free(expected_separator, TRUE);
+            if (exact_uf_find(tree_parent, edge->left) ==
+                exact_uf_find(tree_parent, edge->right)) goto component_out;
+            exact_uf_union(tree_parent, edge->left, edge->right);
+            if (root_parent[edge->child] != UINT32_MAX ||
+                (edge->parent != edge->left && edge->parent != edge->right)) {
+                goto component_out;
+            }
+            root_parent[edge->child] = edge->parent;
+            if (!((edge->parent == edge->left && edge->child == edge->right) ||
+                  (edge->parent == edge->right && edge->child == edge->left))) {
+                goto component_out;
+            }
+        }
+        {
+            uint32_t root = exact_uf_find(tree_parent, 0);
+            for (guint i = 1; i < component->cliques->len; i++) {
+                if (exact_uf_find(tree_parent, i) != root ||
+                    root_parent[i] == UINT32_MAX) goto component_out;
+            }
+        }
+        /* In a rooted tree, the cliques containing one variable form a
+         * connected subtree iff exactly one of them is the root of that
+         * subtree: either the global root or a clique whose parent does not
+         * contain the variable. */
+        for (uint32_t local_position = 0; local_position < component_size;
+             local_position++) {
+            uint32_t local = g_array_index(component->local_vars, uint32_t,
+                                           local_position);
+            uint32_t entries = 0;
+            for (guint i = 0; i < component->cliques->len; i++) {
+                OspreyExactClique *clique = g_ptr_array_index(
+                    component->cliques, i);
+                if (!exact_clique_contains(clique, local)) continue;
+                if (i == component->root_clique ||
+                    !exact_clique_contains(g_ptr_array_index(
+                        component->cliques, root_parent[i]), local)) {
+                    entries++;
+                }
+            }
+            if (entries != 1) {
+                goto component_out;
+            }
+        }
+        for (guint i = 0; i < component->cliques->len; i++) {
+            OspreyExactClique *clique = g_ptr_array_index(component->cliques, i);
+            for (guint j = 0; j < clique->factor_refs->len; j++) {
+                uint32_t ref_id = g_array_index(clique->factor_refs,
+                                                uint32_t, j);
+                const OspreyExactFactorRef *ref;
+                if (ref_id >= factor_count || seen_factors[ref_id] ||
+                    (j != 0 && g_array_index(clique->factor_refs, uint32_t,
+                                             j - 1) >= ref_id) ||
+                    g_array_index(topology->factor_owner, uint32_t, ref_id) !=
+                        clique->id) goto component_out;
+                ref = &g_array_index(base->factor_refs,
+                                      OspreyExactFactorRef, ref_id);
+                if (!exact_clique_contains_all(clique, ref) ||
+                    exact_smallest_owner(component, ref) != clique) {
+                    goto component_out;
+                }
+                seen_factors[ref_id] = 1;
+            }
+        }
+        if (!exact_component_workspace_valid(component, workspace_limit,
+                                             &table_bytes, &assignment_cells,
+                                             &separator_cells)) goto component_out;
+        {
+            uint32_t maximum = 0;
+            for (guint i = 0; i < component->cliques->len; i++) {
+                OspreyExactClique *clique = g_ptr_array_index(
+                    component->cliques, i);
+                if (clique->local_vars->len > maximum) maximum =
+                    clique->local_vars->len;
+            }
+            if (component->max_clique_vars == 0 ||
+                component->max_clique_vars > clique_limit ||
+                component->max_clique_vars != maximum) goto component_out;
+        }
+        if (!exact_u64_add(actual_cliques, component->cliques->len,
+                           &actual_cliques) ||
+            !exact_u64_add(actual_table_bytes, table_bytes,
+                           &actual_table_bytes)) goto component_out;
+        if (component->max_clique_vars > actual_max_clique) {
+            actual_max_clique = component->max_clique_vars;
+        }
+        if (table_bytes > actual_max_component_bytes) {
+            actual_max_component_bytes = table_bytes;
+        }
+        g_hash_table_destroy(edge_pairs);
+        edge_pairs = NULL;
+        g_free(tree_parent);
+        tree_parent = NULL;
+        g_free(root_parent);
+        root_parent = NULL;
+        g_free(eliminated);
+        eliminated = NULL;
+        continue;
+
+component_out:
+        if (edge_pairs != NULL) g_hash_table_destroy(edge_pairs);
+        g_free(tree_parent);
+        g_free(root_parent);
+        g_free(eliminated);
+        goto out;
+    }
+    for (guint i = 0; i < base->components->len; i++) {
+        if (!seen_components[i]) goto out;
+    }
+    for (uint32_t i = 0; i < variable_count; i++) {
+        if (!seen_variables[i]) goto out;
+    }
+    for (uint32_t i = 0; i < factor_count; i++) {
+        if (!seen_factors[i] || g_array_index(topology->factor_owner,
+                                              uint32_t, i) == UINT32_MAX) {
+            goto out;
+        }
+    }
+    if (topology->clique_count != actual_cliques ||
+        topology->max_clique_vars != actual_max_clique ||
+        topology->table_bytes != actual_table_bytes ||
+        topology->max_component_table_bytes != actual_max_component_bytes ||
+        expected_clique_id != topology->clique_count) goto out;
+    valid = true;
+out:
+    g_free(seen_components);
+    g_free(seen_variables);
+    g_free(seen_factors);
+    return valid;
+}
+
+OspreyStatus osprey_stage4_exact(OspreyContext *ctx)
+{
+    OspreyExactBase *base = NULL;
+    OspreyExactTopology *topology = NULL;
+    OspreyStatus status;
+
+    if (ctx == NULL || !ctx->config.enabled) return OSPREY_DISABLED;
+    status = osprey_exact_base_build(ctx, &base);
+    if (status != OSPREY_OK) return status;
+    status = osprey_exact_topology_build(ctx, base, &topology);
+    if (status != OSPREY_OK) {
+        osprey_exact_base_free(base);
+        return status;
+    }
     log_msg("[osprey] [infer] [exact] [components %u] [vars %u] "
-            "[large %u]\n", exact_comps, solved_vars, large_comps);
-    if (large_comps != 0 && ctx->last_status == OSPREY_OK) {
-        ctx->last_status = OSPREY_EXACT_COMPONENT_TOO_LARGE;
-    }
-    return exact_comps;
+            "[factors %u] [cliques %llu] [max-clique %llu] "
+            "[table-bytes %llu]\n",
+            topology->components->len, topology->variable_count,
+            topology->factor_count,
+            (unsigned long long)topology->clique_count,
+            (unsigned long long)topology->max_clique_vars,
+            (unsigned long long)topology->table_bytes);
+    osprey_exact_topology_free(topology);
+    osprey_exact_base_free(base);
+    return OSPREY_OK;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1023,13 +2795,14 @@ OspreyStatus osprey_infer(OspreyContext *ctx) {
     }
     OspreyGraph *g = ctx->graph;
 
-    /* 1. exact component solving */
-    exact_pass(ctx);
-    if (ctx->last_status != OSPREY_OK) {
-        return ctx->last_status;
-    }
+    /* Stage 4.2 validates bounded exact topology.  Numerical exact
+     * inference is the next package; the legacy secondary BP path below
+     * remains explicitly untrusted and is retained only for existing
+     * fail-closed integration behavior. */
+    OspreyStatus exact_status = osprey_stage4_exact(ctx);
+    if (exact_status != OSPREY_OK) return exact_status;
 
-    /* 2. loopy BP with folding closure */
+    /* Legacy Stage-5 placeholder: loopy BP with folding closure. */
     uint32_t fold_rounds = 0;
     bool converged = false;
     uint32_t iters = 0;

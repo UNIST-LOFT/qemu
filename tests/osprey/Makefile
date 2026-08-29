@@ -218,19 +218,19 @@ $(RULES_ASAN_BIN): stage3_rules_test.c stage3_test_support.c \
 unit-stage4-exact: $(EXACT_UNIT_BIN)
 	@$(EXACT_UNIT_BIN)
 
-$(EXACT_UNIT_BIN): stage4_exact_test.c stage3_test_support.c \
-		$(OSPREY_OBJS) | $(WORK)
+$(EXACT_UNIT_BIN): stage4_exact_test.c stage4_exact_reference.c \
+		stage4_exact_reference.h stage3_test_support.c $(OSPREY_OBJS) | $(WORK)
 	$(CC) $(UNIT_CFLAGS) -o $@ stage4_exact_test.c \
-		stage3_test_support.c $(OSPREY_OBJS) \
+		stage4_exact_reference.c stage3_test_support.c $(OSPREY_OBJS) \
 		-lglib-2.0 -lpthread -lm
 
 unit-stage4-exact-asan: $(EXACT_ASAN_BIN)
 	@ASAN_OPTIONS=detect_leaks=1 $(EXACT_ASAN_BIN)
 
-$(EXACT_ASAN_BIN): stage4_exact_test.c stage3_test_support.c \
-		$(OSPREY_ASAN_OBJS) | $(WORK)
+$(EXACT_ASAN_BIN): stage4_exact_test.c stage4_exact_reference.c \
+		stage4_exact_reference.h stage3_test_support.c $(OSPREY_ASAN_OBJS) | $(WORK)
 	$(CC) $(ASAN_CFLAGS) -o $@ stage4_exact_test.c \
-		stage3_test_support.c $(OSPREY_ASAN_OBJS) \
+		stage4_exact_reference.c stage3_test_support.c $(OSPREY_ASAN_OBJS) \
 		-lglib-2.0 -lpthread -lm
 
 $(UNIT_ASAN_BIN): unit_test.c $(OSPREY_OBJS) | $(WORK)
