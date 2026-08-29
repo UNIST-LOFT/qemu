@@ -604,7 +604,7 @@ static void test_factor_potentials_and_validation(void)
                                OSPREY_POTENTIAL_IMPLICATION, 1, false, 1.1,
                                implication_ids, 2).status == OSPREY_INVALID_GRAPH,
           "out-of-range probability rejected");
-    CHECK(osprey_factor_add_ex(ctx, OSPREY_RULE_CD09, OSPREY_GRAPH_BASE_CA,
+    CHECK(osprey_factor_add_ex(ctx, OSPREY_RULE_COUNT, OSPREY_GRAPH_BASE_CA,
                                OSPREY_POTENTIAL_PRIOR, 0, false, 0.8,
                                one, 1).status == OSPREY_INVALID_GRAPH,
           "nonexistent rule rejected");

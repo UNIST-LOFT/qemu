@@ -1,6 +1,6 @@
 /*
  * OSPREY deterministic closure (R01-R12), predicate interning, bounded
- * candidate generation, and static factor instantiation (Stage 2).
+ * candidate generation, and static factor instantiation (Stage 3).
  *
  * Parent side only: runs after the baseline sample is merged.  This
  * stage delivers the abstract predicates and rule-instance factors the
@@ -15,7 +15,7 @@
  *    penalizes only the violated assignment by 1-p; split X<->Y into
  *    two directional factors; split multi-head consequents per head;
  *    p_k = min(1, distinct_sample_paths / total_sampled_paths) (§7.2);
- *    p_s = p_up scaled by normalized hint-instance support.
+ *    p_s = p_up; hint-instance counts remain diagnostics only.
  *
  * Candidate discipline (§9):
  *  - addresses only from observed chunks, BaseAddr bases, region bases,
@@ -64,29 +64,6 @@ static bool chunk_equal(const OspreyChunk *a, const OspreyChunk *b) {
     return address_equal(&a->address, &b->address) && a->size == b->size;
 }
 
-static int64_t gcd_i64(int64_t a, int64_t b) {
-    if (a < 0) a = -a;
-    if (b < 0) b = -b;
-    while (b != 0) {
-        int64_t t = a % b;
-        a = b;
-        b = t;
-    }
-    return a;
-}
-
-static void insertion_sort_i64(GArray *a) {
-    for (guint i = 1; i < a->len; i++) {
-        int64_t v = g_array_index(a, int64_t, i);
-        guint j = i;
-        while (j > 0 && g_array_index(a, int64_t, j - 1) > v) {
-            g_array_index(a, int64_t, j) = g_array_index(a, int64_t, j - 1);
-            j--;
-        }
-        g_array_index(a, int64_t, j) = v;
-    }
-}
-
 /* p_k per §7.2: distinct supporting samples over total sampled paths. */
 static bool support_ratio(OspreyContext *ctx, uint32_t sample_support,
                           double *out)
@@ -97,161 +74,6 @@ static bool support_ratio(OspreyContext *ctx, uint32_t sample_support,
     double ratio = (double)sample_support / (double)ctx->total_samples;
     if (ratio > 1.0) ratio = 1.0;
     *out = ratio;
-    return true;
-}
-
-/* ------------------------------------------------------------------ */
-/* Per-(kind,region) candidate limits                                  */
-/* ------------------------------------------------------------------ */
-
-static void kr_account(OspreyContext *ctx, uint8_t kind,
-                       const OspreyRegionId *region, uint64_t kept,
-                       uint64_t dropped) {
-    OspreyGraph *g = ctx->graph;
-    OspreyKey ck = osprey_kind_region_key(kind, region);
-    OspreyKindRegionCount *c = g_hash_table_lookup(g->kind_region, &ck);
-    if (c == NULL) {
-        c = g_new0(OspreyKindRegionCount, 1);
-        g_hash_table_insert(g->kind_region, osprey_key_new(&ck), c);
-    }
-    c->kept += kept;
-    c->dropped += dropped;
-    if (dropped > 0 && g->limit_rows < 4096) {
-        g->limit_rows++;
-        log_msg("[osprey] [limit] [kind %u] [region %llx] [kept %llu] "
-                "[dropped %llu]\n",
-                (unsigned)kind,
-                (unsigned long long)region->site_offset,
-                (unsigned long long)c->kept, (unsigned long long)c->dropped);
-    }
-}
-
-static bool kr_has_space(OspreyContext *ctx, uint8_t kind,
-                         const OspreyRegionId *region) {
-    OspreyGraph *g = ctx->graph;
-    OspreyKey ck = osprey_kind_region_key(kind, region);
-    OspreyKindRegionCount *c = g_hash_table_lookup(g->kind_region, &ck);
-    if (c == NULL) return true;
-    return c->kept < ctx->config.max_candidates_per_kind_region;
-}
-
-/* ------------------------------------------------------------------ */
-/* Region extent (observed access bounds or allocation size)          */
-/* ------------------------------------------------------------------ */
-
-/* Low/high offsets observed for a region across all fact families. */
-static bool region_extent(OspreyContext *ctx, const OspreyRegionId *region,
-                          int64_t *lo, int64_t *hi) {
-    bool any = false;
-    int64_t l = 0, h = 0;
-    for (guint i = 0; i < ctx->access_facts->len; i++) {
-        OspreyAccessFact *f = &g_array_index(ctx->access_facts,
-                                             OspreyAccessFact, i);
-        if (!same_region(&f->chunk.address.region, region)) continue;
-        int64_t o = f->chunk.address.offset;
-        int64_t e = o + (int64_t)f->chunk.size;
-        if (!any || o < l) l = o;
-        if (!any || e > h) h = e;
-        any = true;
-    }
-    for (guint i = 0; i < ctx->base_facts->len; i++) {
-        OspreyBaseFact *b = &g_array_index(ctx->base_facts, OspreyBaseFact, i);
-        if (!same_region(&b->chunk.address.region, region)) continue;
-        int64_t o = b->chunk.address.offset;
-        int64_t e = o + (int64_t)b->chunk.size;
-        if (!any || o < l) l = o;
-        if (!any || e > h) h = e;
-        any = true;
-    }
-    if (region->kind == OSPREY_REGION_HEAP_SITE) {
-        for (guint i = 0; i < ctx->alloc_facts->len; i++) {
-            OspreyMallocFact *f = &g_array_index(ctx->alloc_facts,
-                                                 OspreyMallocFact, i);
-            if (f->site_pc != region->site_offset) continue;
-            int64_t e = f->requested_size;
-            if (!any) { l = 0; h = e; any = true; }
-            else if (e > h) h = e;
-        }
-    }
-    if (!any) return false;
-    *lo = l;
-    *hi = h;
-    return true;
-}
-
-/* Aligned starts for a region: observed chunk start offsets. */
-static void region_start_offsets(OspreyContext *ctx,
-                                 const OspreyRegionId *region,
-                                 GArray *offsets /* int64_t */) {
-    for (guint i = 0; i < ctx->access_facts->len; i++) {
-        OspreyAccessFact *f = &g_array_index(ctx->access_facts,
-                                             OspreyAccessFact, i);
-        if (!same_region(&f->chunk.address.region, region)) continue;
-        int64_t o = f->chunk.address.offset;
-        bool seen = false;
-        for (guint j = 0; j < offsets->len; j++) {
-            if (g_array_index(offsets, int64_t, j) == o) { seen = true; break; }
-        }
-        if (!seen) g_array_append_val(offsets, o);
-    }
-    for (guint i = 0; i < ctx->base_facts->len; i++) {
-        OspreyBaseFact *b = &g_array_index(ctx->base_facts, OspreyBaseFact, i);
-        if (!same_region(&b->chunk.address.region, region)) continue;
-        int64_t o = b->chunk.address.offset;
-        bool seen = false;
-        for (guint j = 0; j < offsets->len; j++) {
-            if (g_array_index(offsets, int64_t, j) == o) { seen = true; break; }
-        }
-        if (!seen) g_array_append_val(offsets, o);
-    }
-    insertion_sort_i64(offsets);
-}
-
-/* ------------------------------------------------------------------ */
-/* R08/R09: alloc-unit facts per heap site                             */
-/* ------------------------------------------------------------------ */
-
-static bool alloc_unit_for_region(OspreyContext *ctx,
-                                  const OspreyRegionId *region,
-                                  int64_t *unit_out, bool *singleton_out) {
-    /* sorted distinct successful requested sizes at this site */
-    GArray *sizes = g_array_new(FALSE, FALSE, sizeof(int64_t));
-    for (guint i = 0; i < ctx->alloc_facts->len; i++) {
-        OspreyMallocFact *f = &g_array_index(ctx->alloc_facts,
-                                             OspreyMallocFact, i);
-        if (f->site_pc != region->site_offset) continue;
-        int64_t s = (int64_t)f->requested_size;
-        bool seen = false;
-        for (guint j = 0; j < sizes->len; j++) {
-            if (g_array_index(sizes, int64_t, j) == s) { seen = true; break; }
-        }
-        if (!seen) g_array_append_val(sizes, s);
-    }
-    if (sizes->len == 0) {
-        g_array_free(sizes, TRUE);
-        return false;
-    }
-    insertion_sort_i64(sizes);
-    if (sizes->len == 1) {
-        /* R08 ConstantAllocSize */
-        *unit_out = g_array_index(sizes, int64_t, 0);
-        if (singleton_out) *singleton_out = true;
-    } else {
-        /* R09 AllocUnit: gcd of successive size differences */
-        int64_t g = 0;
-        for (guint i = 1; i < sizes->len; i++) {
-            int64_t d = g_array_index(sizes, int64_t, i) -
-                        g_array_index(sizes, int64_t, i - 1);
-            g = (g == 0) ? d : gcd_i64(g, d);
-        }
-        if (g == 0) {
-            g_array_free(sizes, TRUE);
-            return false;
-        }
-        *unit_out = g;
-        if (singleton_out) *singleton_out = false;
-    }
-    g_array_free(sizes, TRUE);
     return true;
 }
 
@@ -1151,262 +973,733 @@ static OspreyStatus compile_initial_ca_cb(OspreyContext *ctx)
     return compile_cb07_cb08(ctx);
 }
 
-/* CC01/CC02: constant alloc size / alloc unit per heap site. */
-static void instantiate_cc01_cc02(OspreyContext *ctx) {
-    GHashTable *sites = g_hash_table_new_full(g_direct_hash, g_direct_equal,
-                                              NULL, NULL);
-    for (guint i = 0; i < ctx->alloc_facts->len; i++) {
-        OspreyMallocFact *f = &g_array_index(ctx->alloc_facts,
-                                             OspreyMallocFact, i);
-        if (g_hash_table_lookup(sites, GSIZE_TO_POINTER((gsize)f->site_pc)) !=
-            NULL)
-            continue;
-        g_hash_table_insert(sites, GSIZE_TO_POINTER((gsize)f->site_pc),
-                            GSIZE_TO_POINTER(1));
-        OspreyRegionId h;
-        h.kind = OSPREY_REGION_HEAP_SITE;
-        h.code_image_id = 0;
-        h.site_offset = f->site_pc;
-        int64_t unit;
-        bool singleton = false;
-        if (!alloc_unit_for_region(ctx, &h, &unit, &singleton)) continue;
-        if (unit < 0) continue;
-        OspreyVarPayload pf;
-        memset(&pf, 0, sizeof(pf));
-        pf.heap_fold.region = h;
-        pf.heap_fold.size = (uint64_t)unit;
-        uint32_t vfold = osprey_intern_var_id(ctx, OSPREY_PRED_FOLDABLE_HEAP, &pf);
-        if (vfold == UINT32_MAX) continue;
-        uint32_t ids[1] = { vfold };
-        /* CC02: FoldableHeap(i,s) prior (positive support); CC01's
-         * UnfoldableHeap(i,s) ∧ FoldableHeap(i,0) is emitted when a
-         * constant size exists (sizes->len == 1 handled by the same
-         * helper; emit the CC01 pair then). */
-        if (singleton) {
-            /* CC01: ConstantAllocSize(i,s) : p↑ UnfoldableHeap(i,s) ∧
-             * FoldableHeap(i,0); antecedent is a deterministic fact, so
-             * each consequent is a unary positive factor. */
-            OspreyVarPayload pu;
-            memset(&pu, 0, sizeof(pu));
-            pu.heap_fold.region = h;
-            pu.heap_fold.size = (uint64_t)unit;
-            uint32_t vunf = osprey_intern_var_id(ctx, OSPREY_PRED_UNFOLDABLE_HEAP, &pu);
-            OspreyVarPayload pz;
-            memset(&pz, 0, sizeof(pz));
-            pz.heap_fold.region = h;
-            pz.heap_fold.size = 0; /* FoldableHeap(i,0): no foldable tail */
-            uint32_t vzero = osprey_intern_var_id(ctx, OSPREY_PRED_FOLDABLE_HEAP, &pz);
-            if (vunf != UINT32_MAX) {
-                uint32_t ids1[1] = { vunf };
-                osprey_factor_add(ctx, OSPREY_RULE_CC01, UINT16_MAX, false, P_UP,
-                           ids1, 1);
-            }
-            if (vzero != UINT32_MAX) {
-                uint32_t ids1[1] = { vzero };
-                osprey_factor_add(ctx, OSPREY_RULE_CC01, UINT16_MAX, false, P_UP,
-                           ids1, 1);
-            }
+/* CC01/CC02 candidate collection and factor compilation.  R08 and R09
+ * already contain the successful-size classification; do not rescan raw
+ * allocator observations or emit CC02 for a singleton site. */
+static OspreyStatus collect_cc01_cc02(OspreyContext *ctx,
+                                      GArray *proposals)
+{
+    const OspreyRelations *relations = ctx->relations;
+    for (guint i = 0; i < relations->r08_constant_alloc->len; i++) {
+        const OspreyAllocRelation *row = &g_array_index(
+            relations->r08_constant_alloc, OspreyAllocRelation, i);
+        if (row->size > (uint64_t)INT64_MAX) {
+            return rules_error(ctx, OSPREY_GRAPH_ARITHMETIC);
         }
-        /* CC02: AllocUnit(i,s) -> FoldableHeap(i,s) unary prior */
-        osprey_factor_add(ctx, OSPREY_RULE_CC02, UINT16_MAX, false, P_UP, ids, 1);
+        OspreyRegionId region;
+        memset(&region, 0, sizeof(region));
+        region.kind = OSPREY_REGION_HEAP_SITE;
+        region.site_offset = row->site_pc;
+        OspreyVarPayload unfoldable;
+        OspreyVarPayload foldable_zero;
+        memset(&unfoldable, 0, sizeof(unfoldable));
+        memset(&foldable_zero, 0, sizeof(foldable_zero));
+        unfoldable.heap_fold.region = region;
+        unfoldable.heap_fold.size = row->size;
+        foldable_zero.heap_fold.region = region;
+        foldable_zero.heap_fold.size = 0;
+        candidate_append(proposals, OSPREY_PRED_UNFOLDABLE_HEAP,
+                         &unfoldable, 1, P_UP, OSPREY_RULE_CC01);
+        candidate_append(proposals, OSPREY_PRED_FOLDABLE_HEAP,
+                         &foldable_zero, 1, P_UP, OSPREY_RULE_CC01);
     }
-    g_hash_table_destroy(sites);
+    for (guint i = 0; i < relations->r09_alloc_unit->len; i++) {
+        const OspreyAllocRelation *row = &g_array_index(
+            relations->r09_alloc_unit, OspreyAllocRelation, i);
+        if (row->size == 0 || row->size > (uint64_t)INT64_MAX) {
+            return rules_error(ctx, row->size == 0
+                               ? OSPREY_INVALID_GRAPH
+                               : OSPREY_GRAPH_ARITHMETIC);
+        }
+        OspreyRegionId region;
+        memset(&region, 0, sizeof(region));
+        region.kind = OSPREY_REGION_HEAP_SITE;
+        region.site_offset = row->site_pc;
+        OspreyVarPayload foldable;
+        memset(&foldable, 0, sizeof(foldable));
+        foldable.heap_fold.region = region;
+        foldable.heap_fold.size = row->size;
+        candidate_append(proposals, OSPREY_PRED_FOLDABLE_HEAP,
+                         &foldable, 1, P_UP, OSPREY_RULE_CC02);
+    }
+    return OSPREY_OK;
+}
+
+static OspreyStatus compile_cc01_cc02(OspreyContext *ctx)
+{
+    const OspreyRelations *relations = ctx->relations;
+    for (guint i = 0; i < relations->r08_constant_alloc->len; i++) {
+        const OspreyAllocRelation *row = &g_array_index(
+            relations->r08_constant_alloc, OspreyAllocRelation, i);
+        OspreyRegionId region;
+        memset(&region, 0, sizeof(region));
+        region.kind = OSPREY_REGION_HEAP_SITE;
+        region.site_offset = row->site_pc;
+        OspreyVarPayload unfoldable;
+        OspreyVarPayload foldable_zero;
+        memset(&unfoldable, 0, sizeof(unfoldable));
+        memset(&foldable_zero, 0, sizeof(foldable_zero));
+        unfoldable.heap_fold.region = region;
+        unfoldable.heap_fold.size = row->size;
+        foldable_zero.heap_fold.region = region;
+        foldable_zero.heap_fold.size = 0;
+        uint32_t unfoldable_id = rule_var_id(
+            ctx, OSPREY_PRED_UNFOLDABLE_HEAP, &unfoldable);
+        uint32_t zero_id = rule_var_id(
+            ctx, OSPREY_PRED_FOLDABLE_HEAP, &foldable_zero);
+        if (unfoldable_id == UINT32_MAX || zero_id == UINT32_MAX) {
+            return rules_error(ctx, OSPREY_INVALID_GRAPH);
+        }
+        OspreyFactorResult result = osprey_factor_add_prior(
+            ctx, OSPREY_RULE_CC01, OSPREY_GRAPH_SECONDARY, false, P_UP,
+            unfoldable_id);
+        if (result.status != OSPREY_OK) return result.status;
+        result = osprey_factor_add_prior(
+            ctx, OSPREY_RULE_CC01, OSPREY_GRAPH_SECONDARY, false, P_UP,
+            zero_id);
+        if (result.status != OSPREY_OK) return result.status;
+    }
+    for (guint i = 0; i < relations->r09_alloc_unit->len; i++) {
+        const OspreyAllocRelation *row = &g_array_index(
+            relations->r09_alloc_unit, OspreyAllocRelation, i);
+        OspreyRegionId region;
+        memset(&region, 0, sizeof(region));
+        region.kind = OSPREY_REGION_HEAP_SITE;
+        region.site_offset = row->site_pc;
+        OspreyVarPayload foldable;
+        memset(&foldable, 0, sizeof(foldable));
+        foldable.heap_fold.region = region;
+        foldable.heap_fold.size = row->size;
+        uint32_t id = rule_var_id(ctx, OSPREY_PRED_FOLDABLE_HEAP,
+                                  &foldable);
+        if (id == UINT32_MAX) return rules_error(ctx, OSPREY_INVALID_GRAPH);
+        OspreyFactorResult result = osprey_factor_add_prior(
+            ctx, OSPREY_RULE_CC02, OSPREY_GRAPH_SECONDARY, false, P_UP, id);
+        if (result.status != OSPREY_OK) return result.status;
+    }
+    return OSPREY_OK;
 }
 
 /* CC03: PrimitiveVar(v) in heap H_i -> UnfoldableHeap(i, o+s). */
-static void instantiate_cc03(OspreyContext *ctx) {
-    for (guint i = 0; i < ctx->access_facts->len; i++) {
-        OspreyAccessFact *a = &g_array_index(ctx->access_facts,
-                                             OspreyAccessFact, i);
-        if (a->chunk.address.region.kind != OSPREY_REGION_HEAP_SITE)
+static OspreyStatus collect_cc03(OspreyContext *ctx, GArray *proposals)
+{
+    OspreyGraph *graph = ctx->graph;
+    for (guint i = 0; i < graph->vars->len; i++) {
+        const OspreyVar *primitive = &g_array_index(graph->vars,
+                                                    OspreyVar, i);
+        if (primitive->kind != OSPREY_PRED_PRIMITIVE_VAR ||
+            primitive->payload.chunk.address.region.kind !=
+                OSPREY_REGION_HEAP_SITE) {
             continue;
-        OspreyVarPayload pv;
-        memset(&pv, 0, sizeof(pv));
-        pv.chunk = a->chunk;
-        uint32_t v = osprey_intern_var_id(ctx, OSPREY_PRED_PRIMITIVE_VAR, &pv);
-        if (v == UINT32_MAX) continue;
+        }
+        if (primitive->payload.chunk.size > (uint64_t)INT64_MAX) {
+            return rules_error(ctx, OSPREY_GRAPH_ARITHMETIC);
+        }
         int64_t end;
-        if (!osprey_check_add(a->chunk.address.offset,
-                              (int64_t)a->chunk.size, &end))
-            continue;
-        OspreyVarPayload ph;
-        memset(&ph, 0, sizeof(ph));
-        ph.heap_fold.region = a->chunk.address.region;
-        ph.heap_fold.size = (uint64_t)end;
-        uint32_t u = osprey_intern_var_id(ctx, OSPREY_PRED_UNFOLDABLE_HEAP, &ph);
-        if (u == UINT32_MAX) continue;
-        uint32_t ids[2] = { v, u };
-        osprey_factor_add(ctx, OSPREY_RULE_CC03, 1, false, P_UP, ids, 2);
+        if (!osprey_check_add(primitive->payload.chunk.address.offset,
+                              (int64_t)primitive->payload.chunk.size, &end)) {
+            return rules_error(ctx, OSPREY_GRAPH_ARITHMETIC);
+        }
+        if (primitive->payload.chunk.address.offset < 0 || end < 0) {
+            return rules_error(ctx, OSPREY_INVALID_GRAPH);
+        }
+        OspreyVarPayload payload;
+        memset(&payload, 0, sizeof(payload));
+        payload.heap_fold.region = primitive->payload.chunk.address.region;
+        payload.heap_fold.size = (uint64_t)end;
+        candidate_append(proposals, OSPREY_PRED_UNFOLDABLE_HEAP, &payload,
+                         primitive->direct_support, P_UP,
+                         OSPREY_RULE_CC03);
     }
+    return OSPREY_OK;
 }
 
-/* CD06: BaseAddr(i,v1,v2.a) ∧ Accessed(v1) ∧ Accessed(v2) ->
- * FieldOf(v1, v2.a). */
-static void instantiate_cd06(OspreyContext *ctx) {
+static OspreyStatus compile_cc03(OspreyContext *ctx)
+{
+    OspreyGraph *graph = ctx->graph;
+    for (guint i = 0; i < graph->vars->len; i++) {
+        const OspreyVar *primitive = &g_array_index(graph->vars,
+                                                    OspreyVar, i);
+        if (primitive->kind != OSPREY_PRED_PRIMITIVE_VAR ||
+            primitive->payload.chunk.address.region.kind !=
+                OSPREY_REGION_HEAP_SITE) {
+            continue;
+        }
+        if (primitive->payload.chunk.size > (uint64_t)INT64_MAX) {
+            return rules_error(ctx, OSPREY_GRAPH_ARITHMETIC);
+        }
+        int64_t end;
+        if (!osprey_check_add(primitive->payload.chunk.address.offset,
+                              (int64_t)primitive->payload.chunk.size, &end) ||
+            end < 0) {
+            return rules_error(ctx, OSPREY_GRAPH_ARITHMETIC);
+        }
+        OspreyVarPayload payload;
+        memset(&payload, 0, sizeof(payload));
+        payload.heap_fold.region = primitive->payload.chunk.address.region;
+        payload.heap_fold.size = (uint64_t)end;
+        uint32_t unfoldable = rule_var_id(
+            ctx, OSPREY_PRED_UNFOLDABLE_HEAP, &payload);
+        if (unfoldable == UINT32_MAX) {
+            return rules_error(ctx, OSPREY_INVALID_GRAPH);
+        }
+        uint32_t ids[2] = { primitive->id, unfoldable };
+        OspreyFactorResult result = osprey_factor_add_implication(
+            ctx, OSPREY_RULE_CC03, OSPREY_GRAPH_SECONDARY, false, P_UP,
+            &ids[0], 1, ids[1]);
+        if (result.status != OSPREY_OK) return result.status;
+    }
+    return OSPREY_OK;
+}
+
+static const OspreyLogicalAccess *logical_chunk_find(
+    const OspreyRelations *relations, const OspreyChunk *chunk)
+{
+    if (relations == NULL || chunk == NULL) return NULL;
+    for (guint i = 0; i < relations->logical_accesses->len; i++) {
+        const OspreyLogicalAccess *row = &g_array_index(
+            relations->logical_accesses, OspreyLogicalAccess, i);
+        if (chunk_equal(&row->chunk, chunk)) return row;
+    }
+    return NULL;
+}
+
+/* A CD06 field candidate is legal only when the accessed source chunk is at
+ * a checked nonnegative offset from the matched target base.  The complete
+ * field span is validated against the merged region extent when the
+ * candidate is selected; every accessed target width remains a separate
+ * implication witness.  Relation mismatches are ordinary near misses;
+ * checked arithmetic failures reject the graph. */
+static OspreyStatus cd06_field_legal(const OspreyBaseFact *base,
+                                     const OspreyChunkRelation *target,
+                                     bool *legal)
+{
+    if (base == NULL || target == NULL || legal == NULL) {
+        return OSPREY_INVALID_GRAPH;
+    }
+    *legal = false;
+    if (base->chunk.size > (uint64_t)INT64_MAX ||
+        target->chunk.size > (uint64_t)INT64_MAX) {
+        return OSPREY_GRAPH_ARITHMETIC;
+    }
+    int64_t relative;
+    int64_t source_end;
+    int64_t base_end;
+    if (!osprey_check_sub(base->chunk.address.offset,
+                          target->chunk.address.offset, &relative) ||
+        !osprey_check_add(base->chunk.address.offset,
+                          (int64_t)base->chunk.size, &source_end) ||
+        !osprey_check_add(target->chunk.address.offset,
+                          (int64_t)base->chunk.size, &base_end)) {
+        return OSPREY_GRAPH_ARITHMETIC;
+    }
+    (void)source_end;
+    (void)base_end;
+    if (relative < 0) return OSPREY_OK;
+    *legal = true;
+    return OSPREY_OK;
+}
+
+static OspreyStatus collect_cd06(OspreyContext *ctx, GArray *proposals)
+{
+    const OspreyRelations *relations = ctx->relations;
     for (guint i = 0; i < ctx->base_facts->len; i++) {
-        OspreyBaseFact *b = &g_array_index(ctx->base_facts, OspreyBaseFact, i);
-        OspreyVarPayload pv;
-        memset(&pv, 0, sizeof(pv));
-        pv.chunk = b->chunk;
-        uint32_t v = osprey_intern_var_id(ctx, OSPREY_PRED_PRIMITIVE_VAR, &pv);
-        if (v == UINT32_MAX) continue;
-        OspreyVarPayload pf;
-        memset(&pf, 0, sizeof(pf));
-        pf.attached.chunk = b->chunk;
-        pf.attached.base = b->base;
-        uint32_t f = osprey_intern_var_id(ctx, OSPREY_PRED_FIELD_OF, &pf);
-        if (f == UINT32_MAX) continue;
-        uint32_t ids[2] = { v, f };
-        /* CD06: BaseAddr(i,v1,v2.a) ∧ Accessed(v1) ∧ Accessed(v2)
-         * -> FieldOf(v1,v2.a); antecedent facts are committed, so the
-         * binary implication PrimitiveVar(v1) -> FieldOf(v1,v2.a) with
-         * the §7.1 generic potential. */
-        osprey_factor_add(ctx, OSPREY_RULE_CD06, 1, false, P_UP, ids, 2);
+        const OspreyBaseFact *base = &g_array_index(
+            ctx->base_facts, OspreyBaseFact, i);
+        if (logical_chunk_find(relations, &base->chunk) == NULL) {
+            continue;
+        }
+        for (guint j = 0; j < relations->r02_accessed->len; j++) {
+            const OspreyChunkRelation *target = &g_array_index(
+                relations->r02_accessed, OspreyChunkRelation, j);
+            if (!address_equal(&target->chunk.address, &base->base) ||
+                !same_region(&base->chunk.address.region,
+                             &target->chunk.address.region)) {
+                continue;
+            }
+            bool legal;
+            OspreyStatus legal_status = cd06_field_legal(base, target,
+                                                          &legal);
+            if (legal_status != OSPREY_OK) {
+                return rules_error(ctx, legal_status);
+            }
+            if (!legal) continue;
+            OspreyVarPayload field;
+            memset(&field, 0, sizeof(field));
+            field.attached.chunk = base->chunk;
+            field.attached.base = target->chunk.address;
+            candidate_append(proposals, OSPREY_PRED_FIELD_OF, &field, 1,
+                             P_UP, OSPREY_RULE_CD06);
+        }
     }
+    return OSPREY_OK;
 }
 
-/* CD11: PointsTo(v1, v2.a) ∧ Accessed(v1) ∧ Accessed(v2) ->
- * Pointer(v1, v2.a). */
-static void instantiate_cd11(OspreyContext *ctx) {
+static OspreyStatus compile_cd06(OspreyContext *ctx)
+{
+    const OspreyRelations *relations = ctx->relations;
+    for (guint i = 0; i < ctx->base_facts->len; i++) {
+        const OspreyBaseFact *base = &g_array_index(
+            ctx->base_facts, OspreyBaseFact, i);
+        if (logical_chunk_find(relations, &base->chunk) == NULL) {
+            continue;
+        }
+        OspreyVarPayload source_payload;
+        memset(&source_payload, 0, sizeof(source_payload));
+        source_payload.chunk = base->chunk;
+        uint32_t source = rule_var_id(ctx, OSPREY_PRED_PRIMITIVE_VAR,
+                                      &source_payload);
+        if (source == UINT32_MAX) {
+            return rules_error(ctx, OSPREY_INVALID_GRAPH);
+        }
+        for (guint j = 0; j < relations->r02_accessed->len; j++) {
+            const OspreyChunkRelation *target = &g_array_index(
+                relations->r02_accessed, OspreyChunkRelation, j);
+            if (!address_equal(&target->chunk.address, &base->base) ||
+                !same_region(&base->chunk.address.region,
+                             &target->chunk.address.region)) {
+                continue;
+            }
+            bool legal;
+            OspreyStatus legal_status = cd06_field_legal(base, target,
+                                                          &legal);
+            if (legal_status != OSPREY_OK) {
+                return rules_error(ctx, legal_status);
+            }
+            if (!legal) continue;
+            OspreyVarPayload target_payload;
+            OspreyVarPayload field_payload;
+            memset(&target_payload, 0, sizeof(target_payload));
+            memset(&field_payload, 0, sizeof(field_payload));
+            target_payload.chunk = target->chunk;
+            field_payload.attached.chunk = base->chunk;
+            field_payload.attached.base = target->chunk.address;
+            uint32_t target_var_id = rule_var_id(
+                ctx, OSPREY_PRED_PRIMITIVE_VAR, &target_payload);
+            uint32_t field = rule_var_id(ctx, OSPREY_PRED_FIELD_OF,
+                                         &field_payload);
+            if (target_var_id == UINT32_MAX || field == UINT32_MAX) {
+                return rules_error(ctx, OSPREY_INVALID_GRAPH);
+            }
+            uint32_t antecedents[2] = { source, target_var_id };
+            uint32_t num_antecedents = source == target_var_id ? 1 : 2;
+            OspreyFactorResult result = osprey_factor_add_implication(
+                ctx, OSPREY_RULE_CD06, OSPREY_GRAPH_SECONDARY, false, P_UP,
+                antecedents, num_antecedents, field);
+            if (result.status != OSPREY_OK) return result.status;
+        }
+    }
+    return OSPREY_OK;
+}
+
+/* CD11: PointsTo(v1, v2.a) plus access of both chunks -> Pointer(v1,v2.a). */
+static OspreyStatus collect_cd11(OspreyContext *ctx, GArray *proposals)
+{
+    const OspreyRelations *relations = ctx->relations;
     for (guint i = 0; i < ctx->points_facts->len; i++) {
-        OspreyPointsToFact *p = &g_array_index(ctx->points_facts,
-                                               OspreyPointsToFact, i);
-        OspreyVarPayload pv;
-        memset(&pv, 0, sizeof(pv));
-        pv.chunk = p->pointer_chunk;
-        uint32_t v1 = osprey_intern_var_id(ctx, OSPREY_PRED_PRIMITIVE_VAR, &pv);
-        if (v1 == UINT32_MAX) continue;
-        OspreyVarPayload pp;
-        memset(&pp, 0, sizeof(pp));
-        pp.attached.chunk = p->pointer_chunk;
-        pp.attached.base = p->target;
-        uint32_t po = osprey_intern_var_id(ctx, OSPREY_PRED_POINTER, &pp);
-        if (po == UINT32_MAX) continue;
-        uint32_t ids[2] = { v1, po };
-        /* CD11: PointsTo(v1,v2.a) ∧ Accessed(v1) ∧ Accessed(v2)
-         * -> Pointer(v1,v2.a); facts already committed, so binary
-         * PrimitiveVariable(v1) -> Pointer(v1,v2.a). */
-        osprey_factor_add(ctx, OSPREY_RULE_CD11, 1, false, P_UP, ids, 2);
-    }
-}
-
-/* CD10: FieldOf(v,a1) ↔ p↓ FieldOf(v,a2) for a1 != a2 (exclusion). */
-static void instantiate_cd10(OspreyContext *ctx) {
-    OspreyGraph *g = ctx->graph;
-    for (guint i = 0; i < g->vars->len; i++) {
-        OspreyVar *v1 = &g_array_index(g->vars, OspreyVar, i);
-        if (v1->kind != OSPREY_PRED_FIELD_OF) continue;
-        for (guint j = i + 1; j < g->vars->len; j++) {
-            OspreyVar *v2 = &g_array_index(g->vars, OspreyVar, j);
-            if (v2->kind != OSPREY_PRED_FIELD_OF) continue;
-            if (!chunk_equal(&v1->payload.attached.chunk,
-                             &v2->payload.attached.chunk))
-                continue;
-            if (address_equal(&v1->payload.attached.base,
-                              &v2->payload.attached.base))
-                continue;
-            uint32_t ids[2] = { v1->id, v2->id };
-            osprey_factor_add(ctx, OSPREY_RULE_CD10, 0, true, P_DN, ids, 2);
-            osprey_factor_add(ctx, OSPREY_RULE_CD10, 1, true, P_DN, ids, 2);
-        }
-    }
-}
-
-/* CD01/CD02/CD03: hint -> HomoSegment(a1,a2,s). */
-static void instantiate_cd01_03(OspreyContext *ctx) {
-    OspreyGraph *g = ctx->graph;
-    for (guint i = 0; i < g->hints->len; i++) {
-        OspreyHint *h = &g_array_index(g->hints, OspreyHint, i);
-        if (!kr_has_space(ctx, OSPREY_PRED_HOMO_SEGMENT, &h->a1.region)) {
-            kr_account(ctx, OSPREY_PRED_HOMO_SEGMENT, &h->a1.region, 0, 1);
+        const OspreyPointsToFact *points = &g_array_index(
+            ctx->points_facts, OspreyPointsToFact, i);
+        if (logical_chunk_find(relations, &points->pointer_chunk) == NULL) {
             continue;
         }
-        /* §9.3: align starts to observed chunk starts */
-        GArray *starts = g_array_new(FALSE, FALSE, sizeof(int64_t));
-        region_start_offsets(ctx, &h->a1.region, starts);
-        bool aligned = false;
-        for (guint k = 0; k < starts->len; k++) {
-            if (g_array_index(starts, int64_t, k) == h->a1.offset) {
-                aligned = true;
-                break;
+        for (guint j = 0; j < relations->r02_accessed->len; j++) {
+            const OspreyChunkRelation *target = &g_array_index(
+                relations->r02_accessed, OspreyChunkRelation, j);
+            if (!address_equal(&target->chunk.address, &points->target)) {
+                continue;
             }
+            OspreyVarPayload pointer;
+            memset(&pointer, 0, sizeof(pointer));
+            pointer.attached.chunk = points->pointer_chunk;
+            pointer.attached.base = target->chunk.address;
+            candidate_append(proposals, OSPREY_PRED_POINTER, &pointer, 1,
+                             P_UP, OSPREY_RULE_CD11);
         }
-        g_array_free(starts, TRUE);
-        if (!aligned) {
-            kr_account(ctx, OSPREY_PRED_HOMO_SEGMENT, &h->a1.region, 0, 1);
+    }
+    return OSPREY_OK;
+}
+
+static OspreyStatus compile_cd11(OspreyContext *ctx)
+{
+    const OspreyRelations *relations = ctx->relations;
+    for (guint i = 0; i < ctx->points_facts->len; i++) {
+        const OspreyPointsToFact *points = &g_array_index(
+            ctx->points_facts, OspreyPointsToFact, i);
+        if (logical_chunk_find(relations, &points->pointer_chunk) == NULL) {
             continue;
         }
-        OspreyVarPayload pv;
-        memset(&pv, 0, sizeof(pv));
-        pv.segment.a1 = h->a1;
-        pv.segment.a2 = h->a2;
-        pv.segment.size = h->size;
-        uint32_t v = osprey_intern_var_id(ctx, OSPREY_PRED_HOMO_SEGMENT, &pv);
-        if (v == UINT32_MAX) continue;
-        double ps = P_UP;
-        if (ctx->total_samples > 0) {
-            double r = (double)h->instances / (double)ctx->total_samples;
-            ps = P_UP * (r > 1.0 ? 1.0 : r);
-            if (ps < P_DN) ps = P_DN;
+        OspreyVarPayload pointer_payload;
+        memset(&pointer_payload, 0, sizeof(pointer_payload));
+        pointer_payload.chunk = points->pointer_chunk;
+        uint32_t pointer_primitive = rule_var_id(
+            ctx, OSPREY_PRED_PRIMITIVE_VAR, &pointer_payload);
+        if (pointer_primitive == UINT32_MAX) {
+            return rules_error(ctx, OSPREY_INVALID_GRAPH);
         }
-        uint16_t rule = (h->kind == 0) ? OSPREY_RULE_CD01 :
-                        (h->kind == 1) ? OSPREY_RULE_CD03 :
-                                         OSPREY_RULE_CD02;
-        uint32_t ids[1] = { v };
-        osprey_factor_add(ctx, rule, 0, false, ps, ids, 1);
-        kr_account(ctx, OSPREY_PRED_HOMO_SEGMENT, &h->a1.region, 1, 0);
+        for (guint j = 0; j < relations->r02_accessed->len; j++) {
+            const OspreyChunkRelation *target = &g_array_index(
+                relations->r02_accessed, OspreyChunkRelation, j);
+            if (!address_equal(&target->chunk.address, &points->target)) {
+                continue;
+            }
+            OspreyVarPayload target_payload;
+            OspreyVarPayload pointer;
+            memset(&target_payload, 0, sizeof(target_payload));
+            memset(&pointer, 0, sizeof(pointer));
+            target_payload.chunk = target->chunk;
+            pointer.attached.chunk = points->pointer_chunk;
+            pointer.attached.base = target->chunk.address;
+            uint32_t target_var_id = rule_var_id(
+                ctx, OSPREY_PRED_PRIMITIVE_VAR, &target_payload);
+            uint32_t pointer_id = rule_var_id(ctx, OSPREY_PRED_POINTER,
+                                              &pointer);
+            if (target_var_id == UINT32_MAX || pointer_id == UINT32_MAX) {
+                return rules_error(ctx, OSPREY_INVALID_GRAPH);
+            }
+            uint32_t antecedents[2] = {
+                pointer_primitive, target_var_id
+            };
+            uint32_t num_antecedents =
+                pointer_primitive == target_var_id ? 1 : 2;
+            OspreyFactorResult result = osprey_factor_add_implication(
+                ctx, OSPREY_RULE_CD11, OSPREY_GRAPH_SECONDARY, false, P_UP,
+                antecedents, num_antecedents, pointer_id);
+            if (result.status != OSPREY_OK) return result.status;
+        }
+    }
+    return OSPREY_OK;
+}
+
+/* CD10: FieldOf(v,a1) ↔ p_down FieldOf(v,a2) for distinct bases. */
+static OspreyStatus compile_cd10(OspreyContext *ctx)
+{
+    OspreyGraph *graph = ctx->graph;
+    for (guint i = 0; i < graph->vars->len; i++) {
+        const OspreyVar *first = &g_array_index(graph->vars, OspreyVar, i);
+        if (first->kind != OSPREY_PRED_FIELD_OF) continue;
+        for (guint j = i + 1; j < graph->vars->len; j++) {
+            const OspreyVar *second = &g_array_index(graph->vars,
+                                                     OspreyVar, j);
+            if (second->kind != OSPREY_PRED_FIELD_OF ||
+                !chunk_equal(&first->payload.attached.chunk,
+                             &second->payload.attached.chunk) ||
+                address_equal(&first->payload.attached.base,
+                              &second->payload.attached.base)) {
+                continue;
+            }
+            OspreyFactorBatchResult result = osprey_factor_add_bidirectional(
+                ctx, OSPREY_RULE_CD10, OSPREY_GRAPH_SECONDARY, true, P_DN,
+                first->id, second->id);
+            if (result.status != OSPREY_OK) return result.status;
+        }
+    }
+    return OSPREY_OK;
+}
+
+/* CD01/CD02/CD03: R10/R12/R11 hint -> HomoSegment. */
+static bool cd_hint_rule(uint8_t kind, uint16_t *rule)
+{
+    if (rule == NULL) return false;
+    switch (kind) {
+    case OSPREY_RELATION_DATA_FLOW:
+        *rule = OSPREY_RULE_CD01;
+        return true;
+    case OSPREY_RELATION_POINTS_TO:
+        *rule = OSPREY_RULE_CD02;
+        return true;
+    case OSPREY_RELATION_UNIFIED_ACCESS:
+        *rule = OSPREY_RULE_CD03;
+        return true;
+    default:
+        return false;
     }
 }
 
-/* CD04 closure: from (a1,a1',s1) and (a2,a2',s2) with 0 < a2-a1 < s1,
- * extend HomoSegment(a1,a1',(a2-a1)+s2); negative direction excludes.
- * Instances are bounded by the candidate cap. */
-static void closure_cd04(OspreyContext *ctx) {
-    OspreyGraph *g = ctx->graph;
-    guint base_len = g->hints->len;
-    for (guint i = 0; i < base_len; i++) {
-        OspreyHint *h1 = &g_array_index(g->hints, OspreyHint, i);
-        for (guint j = 0; j < base_len; j++) {
-            if (i == j) continue;
-            OspreyHint *h2 = &g_array_index(g->hints, OspreyHint, j);
-            int64_t d;
-            if (!offset_between(&h2->a1, &h1->a1, &d)) continue;
-            if (!(d > 0 && d < h1->size)) continue;
-            if (!same_region_addr(&h1->a1, &h2->a1)) continue;
-            /* union length: (a2-a1) + s2 */
-            int64_t len;
-            if (!osprey_check_add(d, h2->size, &len)) continue;
-            if (len <= 0) continue;
-            if (!kr_has_space(ctx, OSPREY_PRED_HOMO_SEGMENT, &h1->a1.region)) {
-                kr_account(ctx, OSPREY_PRED_HOMO_SEGMENT, &h1->a1.region, 0, 1);
-                continue;
-            }
-            /* cap extended length to observed region extent (§9.3) */
-            int64_t lo, hi;
-            if (!region_extent(ctx, &h1->a1.region, &lo, &hi)) continue;
-            if (h1->a1.offset < lo) continue;
-            int64_t end;
-            if (!osprey_check_add(h1->a1.offset, len, &end)) continue;
-            if (end > hi) continue;
-            /* a1 starts are observed chunk starts by construction
-             * (hints only reference observed chunk addresses) */
-            OspreyAddress a1p = h1->a2;
-            OspreyVarPayload pv;
-            memset(&pv, 0, sizeof(pv));
-            pv.segment.a1 = h1->a1;
-            pv.segment.a2 = a1p;
-            pv.segment.size = len;
-            uint32_t v = osprey_intern_var_id(ctx, OSPREY_PRED_HOMO_SEGMENT, &pv);
-            if (v == UINT32_MAX) continue;
-            uint32_t ids[1] = { v };
-            osprey_factor_add(ctx, OSPREY_RULE_CD04, 0, false, P_UP, ids, 1);
-            g->cd04_extensions++;
+static OspreyStatus collect_cd01_03(OspreyContext *ctx, GArray *proposals)
+{
+    for (guint i = 0; i < ctx->graph->hints->len; i++) {
+        const OspreyHint *hint = &g_array_index(ctx->graph->hints,
+                                                OspreyHint, i);
+        uint16_t rule;
+        if (!cd_hint_rule(hint->kind, &rule)) {
+            return rules_error(ctx, OSPREY_INVALID_GRAPH);
+        }
+        OspreyVarPayload payload;
+        memset(&payload, 0, sizeof(payload));
+        payload.segment.a1 = hint->a1;
+        payload.segment.a2 = hint->a2;
+        payload.segment.size = hint->size;
+        /* p_s is the fixed Stage-3 p_up.  Witness counts stay diagnostic. */
+        candidate_append(proposals, OSPREY_PRED_HOMO_SEGMENT, &payload, 1,
+                         P_UP, rule);
+    }
+    return OSPREY_OK;
+}
+
+static OspreyStatus compile_cd01_03(OspreyContext *ctx)
+{
+    for (guint i = 0; i < ctx->graph->hints->len; i++) {
+        const OspreyHint *hint = &g_array_index(ctx->graph->hints,
+                                                OspreyHint, i);
+        uint16_t rule;
+        if (!cd_hint_rule(hint->kind, &rule)) {
+            return rules_error(ctx, OSPREY_INVALID_GRAPH);
+        }
+        OspreyVarPayload payload;
+        memset(&payload, 0, sizeof(payload));
+        payload.segment.a1 = hint->a1;
+        payload.segment.a2 = hint->a2;
+        payload.segment.size = hint->size;
+        uint32_t homo = rule_var_id(ctx, OSPREY_PRED_HOMO_SEGMENT, &payload);
+        if (homo == UINT32_MAX) return rules_error(ctx, OSPREY_INVALID_GRAPH);
+        OspreyFactorResult result = osprey_factor_add_prior(
+            ctx, rule, OSPREY_GRAPH_SECONDARY, false, P_UP, homo);
+        if (result.status != OSPREY_OK) return result.status;
+    }
+    return OSPREY_OK;
+}
+
+typedef struct Cd04PairKey {
+    uint32_t first;
+    uint32_t second;
+} Cd04PairKey;
+
+typedef struct Cd04UnionKey {
+    uint32_t first;
+    uint32_t second;
+    OspreyVarPayload payload;
+} Cd04UnionKey;
+
+typedef struct Cd04UnionWork {
+    uint32_t first;
+    uint32_t second;
+    OspreyVarPayload payload;
+} Cd04UnionWork;
+
+static bool rule_witness_mark(GHashTable *seen, const void *data, gsize size)
+{
+    GBytes *key = g_bytes_new(data, size);
+    if (g_hash_table_contains(seen, key)) {
+        g_bytes_unref(key);
+        return false;
+    }
+    g_hash_table_add(seen, key);
+    return true;
+}
+
+static int cd04_homo_id_compare(gconstpointer ap, gconstpointer bp,
+                                gpointer user_data)
+{
+    const OspreyGraph *graph = user_data;
+    uint32_t a_id = *(const uint32_t *)ap;
+    uint32_t b_id = *(const uint32_t *)bp;
+    const OspreyVar *a = &g_array_index(graph->vars, OspreyVar, a_id);
+    const OspreyVar *b = &g_array_index(graph->vars, OspreyVar, b_id);
+    int result;
+    result = (a->payload.segment.a1.region.kind !=
+              b->payload.segment.a1.region.kind)
+        ? (a->payload.segment.a1.region.kind <
+           b->payload.segment.a1.region.kind ? -1 : 1) : 0;
+    if (result == 0 && a->payload.segment.a1.region.code_image_id !=
+                       b->payload.segment.a1.region.code_image_id) {
+        result = a->payload.segment.a1.region.code_image_id <
+                 b->payload.segment.a1.region.code_image_id ? -1 : 1;
+    }
+    if (result == 0 && a->payload.segment.a1.region.site_offset !=
+                       b->payload.segment.a1.region.site_offset) {
+        result = a->payload.segment.a1.region.site_offset <
+                 b->payload.segment.a1.region.site_offset ? -1 : 1;
+    }
+    if (result == 0 && a->payload.segment.a1.offset !=
+                       b->payload.segment.a1.offset) {
+        result = a->payload.segment.a1.offset <
+                 b->payload.segment.a1.offset ? -1 : 1;
+    }
+    if (result == 0 && a->payload.segment.a2.region.kind !=
+                       b->payload.segment.a2.region.kind) {
+        result = a->payload.segment.a2.region.kind <
+                 b->payload.segment.a2.region.kind ? -1 : 1;
+    }
+    if (result == 0 && a->payload.segment.a2.region.code_image_id !=
+                       b->payload.segment.a2.region.code_image_id) {
+        result = a->payload.segment.a2.region.code_image_id <
+                 b->payload.segment.a2.region.code_image_id ? -1 : 1;
+    }
+    if (result == 0 && a->payload.segment.a2.region.site_offset !=
+                       b->payload.segment.a2.region.site_offset) {
+        result = a->payload.segment.a2.region.site_offset <
+                 b->payload.segment.a2.region.site_offset ? -1 : 1;
+    }
+    if (result == 0 && a->payload.segment.a2.offset !=
+                       b->payload.segment.a2.offset) {
+        result = a->payload.segment.a2.offset <
+                 b->payload.segment.a2.offset ? -1 : 1;
+    }
+    if (result == 0 && a->payload.segment.size != b->payload.segment.size) {
+        result = a->payload.segment.size < b->payload.segment.size ? -1 : 1;
+    }
+    return result != 0 ? result : (a_id < b_id ? -1 : a_id != b_id);
+}
+
+static OspreyStatus cd04_try_pair(OspreyContext *ctx,
+                                  const OspreyVar *first,
+                                  const OspreyVar *second,
+                                  bool reverse_second,
+                                  GHashTable *pair_seen,
+                                  GHashTable *union_seen,
+                                  GArray *pairs, GArray *unions,
+                                  GArray *proposals)
+{
+    const OspreyAddress *second_start = reverse_second
+        ? &second->payload.segment.a2 : &second->payload.segment.a1;
+    const OspreyAddress *second_partner = reverse_second
+        ? &second->payload.segment.a1 : &second->payload.segment.a2;
+    if (!same_region_addr(&first->payload.segment.a1, second_start) ||
+        !same_region_addr(&first->payload.segment.a2, second_partner)) {
+        return OSPREY_OK;
+    }
+    int64_t delta;
+    int64_t partner_delta;
+    if (!offset_between(second_start, &first->payload.segment.a1, &delta) ||
+        !offset_between(second_partner, &first->payload.segment.a2,
+                        &partner_delta)) {
+        return rules_error(ctx, OSPREY_GRAPH_ARITHMETIC);
+    }
+    if (delta != partner_delta || delta <= 0 ||
+        delta >= first->payload.segment.size) {
+        return OSPREY_OK;
+    }
+    int64_t union_size;
+    if (!osprey_check_add(delta, second->payload.segment.size,
+                          &union_size)) {
+        return rules_error(ctx, OSPREY_GRAPH_ARITHMETIC);
+    }
+    if (union_size <= 0) return rules_error(ctx, OSPREY_INVALID_GRAPH);
+    int64_t end;
+    if (!osprey_check_add(first->payload.segment.a1.offset, union_size,
+                          &end) ||
+        !osprey_check_add(first->payload.segment.a2.offset, union_size,
+                          &end)) {
+        return rules_error(ctx, OSPREY_GRAPH_ARITHMETIC);
+    }
+
+    Cd04PairKey seen_pair = {
+        first->id < second->id ? first->id : second->id,
+        first->id < second->id ? second->id : first->id
+    };
+    if (rule_witness_mark(pair_seen, &seen_pair, sizeof(seen_pair))) {
+        /* `pairs` carries endpoint-canonical roles; using allocation IDs
+         * here would make the directional factors depend on insertion
+         * order. */
+        Cd04PairKey pair = { first->id, second->id };
+        g_array_append_val(pairs, pair);
+    }
+
+    Cd04UnionWork work;
+    memset(&work, 0, sizeof(work));
+    work.first = first->id;
+    work.second = second->id;
+    work.payload.segment.a1 = first->payload.segment.a1;
+    work.payload.segment.a2 = first->payload.segment.a2;
+    work.payload.segment.size = union_size;
+    Cd04UnionKey union_key;
+    memset(&union_key, 0, sizeof(union_key));
+    union_key.first = work.first < work.second ? work.first : work.second;
+    union_key.second = work.first < work.second ? work.second : work.first;
+    union_key.payload = work.payload;
+    if (rule_witness_mark(union_seen, &union_key, sizeof(union_key))) {
+        g_array_append_val(unions, work);
+        candidate_append(proposals, OSPREY_PRED_HOMO_SEGMENT,
+                         &work.payload, 1, P_UP, OSPREY_RULE_CD04);
+    }
+    return OSPREY_OK;
+}
+
+/* CD04 static candidate closure.  P05 candidates, rather than raw hints,
+ * are the inputs; correspondence is checked on both endpoint regions. */
+static OspreyStatus cd04_round(OspreyContext *ctx, GHashTable *pair_seen,
+                               GHashTable *union_seen, bool *changed)
+{
+    OspreyGraph *graph = ctx->graph;
+    guint vars_before = graph->vars->len;
+    guint factors_before = graph->factors->len;
+    GArray *ids = g_array_new(FALSE, FALSE, sizeof(uint32_t));
+    GArray *pairs = g_array_new(FALSE, FALSE, sizeof(Cd04PairKey));
+    GArray *unions = g_array_new(FALSE, FALSE, sizeof(Cd04UnionWork));
+    GArray *proposals = g_array_new(FALSE, FALSE,
+                                    sizeof(OspreyCandidateProposal));
+    for (guint i = 0; i < graph->vars->len; i++) {
+        const OspreyVar *variable = &g_array_index(graph->vars, OspreyVar, i);
+        if (variable->kind == OSPREY_PRED_HOMO_SEGMENT) {
+            uint32_t id = variable->id;
+            g_array_append_val(ids, id);
         }
     }
+    g_array_sort_with_data(ids, cd04_homo_id_compare, graph);
+    OspreyStatus status = OSPREY_OK;
+    for (guint i = 0; i < ids->len && status == OSPREY_OK; i++) {
+        const OspreyVar *first = &g_array_index(
+            graph->vars, OspreyVar, g_array_index(ids, uint32_t, i));
+        for (guint j = i + 1; j < ids->len && status == OSPREY_OK; j++) {
+            const OspreyVar *second = &g_array_index(
+                graph->vars, OspreyVar, g_array_index(ids, uint32_t, j));
+            status = cd04_try_pair(ctx, first, second, false, pair_seen,
+                                   union_seen, pairs, unions, proposals);
+            if (status == OSPREY_OK) {
+                status = cd04_try_pair(ctx, first, second, true, pair_seen,
+                                       union_seen, pairs, unions, proposals);
+            }
+            if (status == OSPREY_OK) {
+                status = cd04_try_pair(ctx, second, first, false, pair_seen,
+                                       union_seen, pairs, unions, proposals);
+            }
+            if (status == OSPREY_OK) {
+                status = cd04_try_pair(ctx, second, first, true, pair_seen,
+                                       union_seen, pairs, unions, proposals);
+            }
+        }
+    }
+    if (status == OSPREY_OK && proposals->len != 0) {
+        status = osprey_candidate_select(
+            ctx, (const OspreyCandidateProposal *)proposals->data,
+            proposals->len);
+    }
+    for (guint i = 0; i < pairs->len && status == OSPREY_OK; i++) {
+        const Cd04PairKey *pair = &g_array_index(pairs, Cd04PairKey, i);
+        OspreyFactorBatchResult result = osprey_factor_add_bidirectional(
+            ctx, OSPREY_RULE_CD04, OSPREY_GRAPH_SECONDARY, false, P_UP,
+            pair->first, pair->second);
+        if (result.status != OSPREY_OK) status = result.status;
+    }
+    for (guint i = 0; i < unions->len && status == OSPREY_OK; i++) {
+        const Cd04UnionWork *work = &g_array_index(unions, Cd04UnionWork, i);
+        uint32_t derived = rule_var_id(ctx, OSPREY_PRED_HOMO_SEGMENT,
+                                       &work->payload);
+        if (derived == UINT32_MAX) {
+            status = rules_error(ctx, OSPREY_INVALID_GRAPH);
+            break;
+        }
+        if (derived == work->first || derived == work->second) continue;
+        uint32_t antecedents[2] = { work->first, work->second };
+        OspreyFactorResult result = osprey_factor_add_implication(
+            ctx, OSPREY_RULE_CD04, OSPREY_GRAPH_SECONDARY, false, P_UP,
+            antecedents, G_N_ELEMENTS(antecedents), derived);
+        if (result.status != OSPREY_OK) status = result.status;
+    }
+    if (status == OSPREY_OK) {
+        graph->cd04_extensions += unions->len;
+    }
+    *changed = graph->vars->len != vars_before ||
+               graph->factors->len != factors_before;
+    g_array_free(proposals, TRUE);
+    g_array_free(unions, TRUE);
+    g_array_free(pairs, TRUE);
+    g_array_free(ids, TRUE);
+    return status;
 }
 
 /* ------------------------------------------------------------------ */
-/* Secondary deterministic rules (CB02-CB09, CC04/CC05, CD07, CD08)     */
+/* Secondary deterministic closure                                  */
 /* ------------------------------------------------------------------ */
 
 /* Array var helpers: extract (lo, hi, stride) from the segment payload. */
@@ -1928,116 +2221,541 @@ static OspreyStatus secondary_array_round(OspreyContext *ctx,
     return status;
 }
 
-/* CC04/CC05: UnfoldableHeap pairwise (exclusion / monotonic support). */
-static void cc04_cc05(OspreyContext *ctx)
+/* CC04/CC05: distinct unfoldable prefixes at one site are mutually
+ * exclusive, while the smaller prefix supports the larger one. */
+static OspreyStatus compile_cc04_cc05(OspreyContext *ctx)
 {
-    OspreyGraph *g = ctx->graph;
-    for (guint i = 0; i < g->vars->len; i++) {
-        OspreyVar *u1 = &g_array_index(g->vars, OspreyVar, i);
-        if (u1->kind != OSPREY_PRED_UNFOLDABLE_HEAP) continue;
-        for (guint j = i + 1; j < g->vars->len; j++) {
-            OspreyVar *u2 = &g_array_index(g->vars, OspreyVar, j);
-            if (u2->kind != OSPREY_PRED_UNFOLDABLE_HEAP) continue;
-            if (!same_region(&u1->payload.heap_fold.region,
-                             &u2->payload.heap_fold.region)) continue;
-            uint64_t s1 = u1->payload.heap_fold.size;
-            uint64_t s2 = u2->payload.heap_fold.size;
-            if (s1 != s2) {
-                /* CC04: exclusion */
-                uint32_t ids[2] = { u1->id, u2->id };
-                osprey_factor_add(ctx, OSPREY_RULE_CC04, 0, true, P_DN, ids, 2);
-                osprey_factor_add(ctx, OSPREY_RULE_CC04, 1, true, P_DN, ids, 2);
-            } else if (s1 < s2) {
-                /* CC05: s1 <= s2 support */
-                uint32_t ids[2] = { u1->id, u2->id };
-                osprey_factor_add(ctx, OSPREY_RULE_CC05, 1, false, P_UP, ids, 2);
+    OspreyGraph *graph = ctx->graph;
+    for (guint i = 0; i < graph->vars->len; i++) {
+        const OspreyVar *first = &g_array_index(graph->vars, OspreyVar, i);
+        if (first->kind != OSPREY_PRED_UNFOLDABLE_HEAP) continue;
+        for (guint j = i + 1; j < graph->vars->len; j++) {
+            const OspreyVar *second = &g_array_index(graph->vars,
+                                                     OspreyVar, j);
+            if (second->kind != OSPREY_PRED_UNFOLDABLE_HEAP ||
+                !same_region(&first->payload.heap_fold.region,
+                             &second->payload.heap_fold.region) ||
+                first->payload.heap_fold.size ==
+                    second->payload.heap_fold.size) {
+                continue;
             }
+            const OspreyVar *small = first;
+            const OspreyVar *large = second;
+            if (small->payload.heap_fold.size > large->payload.heap_fold.size) {
+                small = second;
+                large = first;
+            }
+            OspreyFactorBatchResult exclusion = osprey_factor_add_bidirectional(
+                ctx, OSPREY_RULE_CC04, OSPREY_GRAPH_SECONDARY, true, P_DN,
+                first->id, second->id);
+            if (exclusion.status != OSPREY_OK) return exclusion.status;
+            OspreyFactorResult support = osprey_factor_add_implication(
+                ctx, OSPREY_RULE_CC05, OSPREY_GRAPH_SECONDARY, false, P_UP,
+                &small->id, 1, large->id);
+            if (support.status != OSPREY_OK) return support.status;
         }
     }
+    return OSPREY_OK;
+}
+
+static bool rules_extent_contains(const OspreyGraph *graph,
+                                  const OspreyRegionId *region,
+                                  int64_t lo, int64_t hi);
+
+/* CC06: an array in a heap site supports the site's fold unit. */
+static OspreyStatus collect_cc06(OspreyContext *ctx, GArray *proposals)
+{
+    OspreyGraph *graph = ctx->graph;
+    for (guint i = 0; i < graph->vars->len; i++) {
+        const OspreyVar *array = &g_array_index(graph->vars, OspreyVar, i);
+        if (array->kind != OSPREY_PRED_ARRAY ||
+            array->payload.segment.a1.region.kind !=
+                OSPREY_REGION_HEAP_SITE ||
+            !same_region_addr(&array->payload.segment.a1,
+                               &array->payload.segment.a2) ||
+            array->payload.segment.size <= 0) {
+            continue;
+        }
+        int64_t span;
+        if (!osprey_check_sub(array->payload.segment.a2.offset,
+                              array->payload.segment.a1.offset, &span)) {
+            return rules_error(ctx, OSPREY_GRAPH_ARITHMETIC);
+        }
+        if (span < array->payload.segment.size) continue;
+        if (!rules_extent_contains(graph,
+                                   &array->payload.segment.a1.region,
+                                   array->payload.segment.a1.offset,
+                                   array->payload.segment.a2.offset)) {
+            return rules_error(ctx, OSPREY_INVALID_GRAPH);
+        }
+        OspreyVarPayload foldable;
+        memset(&foldable, 0, sizeof(foldable));
+        foldable.heap_fold.region = array->payload.segment.a1.region;
+        foldable.heap_fold.size = (uint64_t)array->payload.segment.size;
+        candidate_append(proposals, OSPREY_PRED_FOLDABLE_HEAP, &foldable,
+                         1, P_UP, OSPREY_RULE_CC06);
+    }
+    return OSPREY_OK;
+}
+
+static OspreyStatus compile_cc06(OspreyContext *ctx)
+{
+    OspreyGraph *graph = ctx->graph;
+    for (guint i = 0; i < graph->vars->len; i++) {
+        const OspreyVar *array = &g_array_index(graph->vars, OspreyVar, i);
+        if (array->kind != OSPREY_PRED_ARRAY ||
+            array->payload.segment.a1.region.kind !=
+                OSPREY_REGION_HEAP_SITE ||
+            array->payload.segment.size <= 0 ||
+            !same_region_addr(&array->payload.segment.a1,
+                               &array->payload.segment.a2)) {
+            continue;
+        }
+        OspreyVarPayload foldable;
+        memset(&foldable, 0, sizeof(foldable));
+        foldable.heap_fold.region = array->payload.segment.a1.region;
+        foldable.heap_fold.size = (uint64_t)array->payload.segment.size;
+        uint32_t foldable_id = rule_var_id(ctx, OSPREY_PRED_FOLDABLE_HEAP,
+                                           &foldable);
+        if (foldable_id == UINT32_MAX) {
+            return rules_error(ctx, OSPREY_INVALID_GRAPH);
+        }
+        OspreyFactorResult result = osprey_factor_add_implication(
+            ctx, OSPREY_RULE_CC06, OSPREY_GRAPH_SECONDARY, false, P_UP,
+            &array->id, 1, foldable_id);
+        if (result.status != OSPREY_OK) return result.status;
+    }
+    return OSPREY_OK;
+}
+
+static bool rules_extent_contains(const OspreyGraph *graph,
+                                  const OspreyRegionId *region,
+                                  int64_t lo, int64_t hi)
+{
+    if (graph == NULL || region == NULL || !graph->extents_built || lo > hi) {
+        return false;
+    }
+    for (guint i = 0; i < graph->extents->len; i++) {
+        const OspreyRegionExtent *extent = &g_array_index(
+            graph->extents, OspreyRegionExtent, i);
+        if (same_region(&extent->region, region)) {
+            return lo >= extent->lo && hi <= extent->hi;
+        }
+    }
+    return false;
+}
+
+/* Pure CC07 compiler.  Stage 3 does not schedule this rule from beliefs;
+ * Stage 5 supplies explicit selected candidate IDs to this entrypoint. */
+OspreyStatus osprey_compile_cc07(OspreyContext *ctx,
+                                 uint32_t primitive_id,
+                                 uint32_t unfoldable_id,
+                                 uint32_t foldable_id,
+                                 uint32_t folded_primitive_id)
+{
+    if (ctx == NULL || ctx->graph == NULL ||
+        primitive_id >= ctx->graph->vars->len ||
+        unfoldable_id >= ctx->graph->vars->len ||
+        foldable_id >= ctx->graph->vars->len ||
+        folded_primitive_id >= ctx->graph->vars->len) {
+        return rules_error(ctx, OSPREY_INVALID_GRAPH);
+    }
+    OspreyGraph *graph = ctx->graph;
+    const OspreyVar *primitive = &g_array_index(graph->vars, OspreyVar,
+                                                primitive_id);
+    const OspreyVar *unfoldable = &g_array_index(graph->vars, OspreyVar,
+                                                  unfoldable_id);
+    const OspreyVar *foldable = &g_array_index(graph->vars, OspreyVar,
+                                                foldable_id);
+    const OspreyVar *folded = &g_array_index(graph->vars, OspreyVar,
+                                             folded_primitive_id);
+    if (primitive->kind != OSPREY_PRED_PRIMITIVE_VAR ||
+        unfoldable->kind != OSPREY_PRED_UNFOLDABLE_HEAP ||
+        foldable->kind != OSPREY_PRED_FOLDABLE_HEAP ||
+        folded->kind != OSPREY_PRED_PRIMITIVE_VAR ||
+        primitive->payload.chunk.address.region.kind !=
+            OSPREY_REGION_HEAP_SITE ||
+        !same_region(&primitive->payload.chunk.address.region,
+                     &unfoldable->payload.heap_fold.region) ||
+        !same_region(&primitive->payload.chunk.address.region,
+                     &foldable->payload.heap_fold.region) ||
+        !same_region(&primitive->payload.chunk.address.region,
+                     &folded->payload.chunk.address.region)) {
+        return rules_error(ctx, OSPREY_INVALID_GRAPH);
+    }
+    if (primitive->payload.chunk.size > (uint64_t)INT64_MAX ||
+        unfoldable->payload.heap_fold.size > (uint64_t)INT64_MAX ||
+        foldable->payload.heap_fold.size > (uint64_t)INT64_MAX) {
+        return rules_error(ctx, OSPREY_GRAPH_ARITHMETIC);
+    }
+    if (foldable->payload.heap_fold.size == 0) {
+        return rules_error(ctx, OSPREY_INVALID_GRAPH);
+    }
+    int64_t sh = (int64_t)unfoldable->payload.heap_fold.size;
+    int64_t st = (int64_t)foldable->payload.heap_fold.size;
+    int64_t threshold;
+    if (!osprey_check_add(sh, st, &threshold)) {
+        return rules_error(ctx, OSPREY_GRAPH_ARITHMETIC);
+    }
+    int64_t relative;
+    if (!osprey_check_sub(primitive->payload.chunk.address.offset, sh,
+                          &relative)) {
+        return rules_error(ctx, OSPREY_GRAPH_ARITHMETIC);
+    }
+    if (primitive->payload.chunk.address.offset < threshold || relative < 0) {
+        return rules_error(ctx, OSPREY_INVALID_GRAPH);
+    }
+    int64_t folded_offset;
+    if (!osprey_check_add(sh, relative % st, &folded_offset)) {
+        return rules_error(ctx, OSPREY_GRAPH_ARITHMETIC);
+    }
+    int64_t primitive_end;
+    int64_t folded_end;
+    if (!osprey_check_add(primitive->payload.chunk.address.offset,
+                          (int64_t)primitive->payload.chunk.size,
+                          &primitive_end) ||
+        !osprey_check_add(folded_offset,
+                          (int64_t)primitive->payload.chunk.size,
+                          &folded_end)) {
+        return rules_error(ctx, OSPREY_GRAPH_ARITHMETIC);
+    }
+    const OspreyRegionId *heap = &primitive->payload.chunk.address.region;
+    if (!rules_extent_contains(graph, heap,
+                               primitive->payload.chunk.address.offset,
+                               primitive_end) ||
+        !rules_extent_contains(graph, heap, folded_offset, folded_end) ||
+        !rules_extent_contains(graph, heap, 0, sh) ||
+        !rules_extent_contains(graph, heap, 0, st)) {
+        return rules_error(ctx, OSPREY_INVALID_GRAPH);
+    }
+    OspreyChunk expected = primitive->payload.chunk;
+    expected.address.offset = folded_offset;
+    if (!chunk_equal(&expected, &folded->payload.chunk) ||
+        folded_primitive_id == primitive_id) {
+        return rules_error(ctx, OSPREY_INVALID_GRAPH);
+    }
+    uint32_t folded_ids[3] = { primitive_id, unfoldable_id, foldable_id };
+    OspreyFactorResult result = osprey_factor_add_implication(
+        ctx, OSPREY_RULE_CC07, OSPREY_GRAPH_SECONDARY, false, P_UP,
+        folded_ids, G_N_ELEMENTS(folded_ids), folded_primitive_id);
+    if (result.status != OSPREY_OK) return result.status;
+    uint32_t negative_ids[2] = { unfoldable_id, foldable_id };
+    result = osprey_factor_add_implication(
+        ctx, OSPREY_RULE_CC07, OSPREY_GRAPH_SECONDARY, true, P_DN,
+        negative_ids, 2, primitive_id);
+    return result.status;
 }
 
 /* CD07: PrimitiveVar(v) in heap H_i -> FieldOf(v, <H_i,0>). */
-static void cd07_heap_fields(OspreyContext *ctx)
+static OspreyStatus collect_cd07(OspreyContext *ctx, GArray *proposals)
 {
-    for (guint i = 0; i < ctx->access_facts->len; i++) {
-        OspreyAccessFact *a = &g_array_index(ctx->access_facts,
-                                             OspreyAccessFact, i);
-        if (a->chunk.address.region.kind != OSPREY_REGION_HEAP_SITE)
+    OspreyGraph *graph = ctx->graph;
+    for (guint i = 0; i < graph->vars->len; i++) {
+        const OspreyVar *primitive = &g_array_index(graph->vars,
+                                                    OspreyVar, i);
+        if (primitive->kind != OSPREY_PRED_PRIMITIVE_VAR ||
+            primitive->payload.chunk.address.region.kind !=
+                OSPREY_REGION_HEAP_SITE) {
             continue;
-        OspreyVarPayload pv;
-        memset(&pv, 0, sizeof(pv));
-        pv.chunk = a->chunk;
-        uint32_t v = osprey_intern_var_id(ctx, OSPREY_PRED_PRIMITIVE_VAR, &pv);
-        if (v == UINT32_MAX) continue;
-        OspreyVarPayload pf;
-        memset(&pf, 0, sizeof(pf));
-        pf.attached.chunk = a->chunk;
-        pf.attached.base.region = a->chunk.address.region;
-        pf.attached.base.offset = 0;
-        uint32_t f = osprey_intern_var_id(ctx, OSPREY_PRED_FIELD_OF, &pf);
-        if (f == UINT32_MAX) continue;
-        uint32_t ids[2] = { v, f };
-        osprey_factor_add(ctx, OSPREY_RULE_CD07, 1, false, P_UP, ids, 2);
+        }
+        OspreyVarPayload field;
+        memset(&field, 0, sizeof(field));
+        field.attached.chunk = primitive->payload.chunk;
+        field.attached.base.region = primitive->payload.chunk.address.region;
+        field.attached.base.offset = 0;
+        candidate_append(proposals, OSPREY_PRED_FIELD_OF, &field,
+                         primitive->direct_support, P_UP,
+                         OSPREY_RULE_CD07);
     }
+    return OSPREY_OK;
 }
 
-/* CD08: FieldOf(v1,a1) ∧ HomoSegment(a1,a2,s) -> FieldOf(v2,a2) for
- * v1.a=a1+n, v2.a=a2+n, 1<=n<=s.  Creates v2 FieldOf candidates
- * (bounded per region). */
-static void cd08_fields(OspreyContext *ctx)
+static OspreyStatus compile_cd07(OspreyContext *ctx)
 {
-    OspreyGraph *g = ctx->graph;
+    OspreyGraph *graph = ctx->graph;
+    for (guint i = 0; i < graph->vars->len; i++) {
+        const OspreyVar *primitive = &g_array_index(graph->vars,
+                                                    OspreyVar, i);
+        if (primitive->kind != OSPREY_PRED_PRIMITIVE_VAR ||
+            primitive->payload.chunk.address.region.kind !=
+                OSPREY_REGION_HEAP_SITE) {
+            continue;
+        }
+        OspreyVarPayload field;
+        memset(&field, 0, sizeof(field));
+        field.attached.chunk = primitive->payload.chunk;
+        field.attached.base.region = primitive->payload.chunk.address.region;
+        field.attached.base.offset = 0;
+        uint32_t field_id = rule_var_id(ctx, OSPREY_PRED_FIELD_OF, &field);
+        if (field_id == UINT32_MAX) {
+            return rules_error(ctx, OSPREY_INVALID_GRAPH);
+        }
+        OspreyFactorResult result = osprey_factor_add_implication(
+            ctx, OSPREY_RULE_CD07, OSPREY_GRAPH_SECONDARY, false, P_UP,
+            &primitive->id, 1, field_id);
+        if (result.status != OSPREY_OK) return result.status;
+    }
+    return OSPREY_OK;
+}
+
+typedef struct Cd08WorkKey {
+    uint32_t field_id;
+    uint32_t homo_id;
+    OspreyVarPayload payload;
+} Cd08WorkKey;
+
+typedef struct Cd08Work {
+    uint32_t field_id;
+    uint32_t homo_id;
+    OspreyVarPayload payload;
+} Cd08Work;
+
+/* CD08: translate complete, equal-width accessed fields across each
+ * endpoint direction of every selected HomoSegment. */
+static OspreyStatus cd08_round(OspreyContext *ctx, GHashTable *seen,
+                               bool *changed)
+{
+    OspreyGraph *graph = ctx->graph;
+    guint vars_before = graph->vars->len;
+    guint factors_before = graph->factors->len;
     GArray *homos = g_array_new(FALSE, FALSE, sizeof(uint32_t));
     GArray *fields = g_array_new(FALSE, FALSE, sizeof(uint32_t));
-    for (guint i = 0; i < g->vars->len; i++) {
-        OspreyVar *v = &g_array_index(g->vars, OspreyVar, i);
-        if (v->kind == OSPREY_PRED_HOMO_SEGMENT) {
-            uint32_t id = v->id;
+    GArray *works = g_array_new(FALSE, FALSE, sizeof(Cd08Work));
+    GArray *proposals = g_array_new(FALSE, FALSE,
+                                    sizeof(OspreyCandidateProposal));
+    for (guint i = 0; i < graph->vars->len; i++) {
+        const OspreyVar *variable = &g_array_index(graph->vars,
+                                                   OspreyVar, i);
+        if (variable->kind == OSPREY_PRED_HOMO_SEGMENT) {
+            uint32_t id = variable->id;
             g_array_append_val(homos, id);
-        } else if (v->kind == OSPREY_PRED_FIELD_OF) {
-            uint32_t id = v->id;
+        } else if (variable->kind == OSPREY_PRED_FIELD_OF) {
+            uint32_t id = variable->id;
             g_array_append_val(fields, id);
         }
     }
-    for (guint hi = 0; hi < homos->len; hi++) {
-        uint32_t hid = g_array_index(homos, uint32_t, hi);
-        OspreyVar *h = &g_array_index(g->vars, OspreyVar, hid);
-        const OspreyAddress *a1 = &h->payload.segment.a1;
-        const OspreyAddress *a2 = &h->payload.segment.a2;
-        int64_t s = h->payload.segment.size;
-        if (s <= 0) continue;
-        for (guint fi = 0; fi < fields->len; fi++) {
-            uint32_t fid = g_array_index(fields, uint32_t, fi);
-            OspreyVar *f1 = &g_array_index(g->vars, OspreyVar, fid);
-            const OspreyChunk *c1 = &f1->payload.attached.chunk;
-            int64_t n;
-            if (!osprey_check_sub(c1->address.offset, a1->offset, &n))
-                continue;
-            if (!(n >= 1 && n <= s)) continue;
-            if (!same_region(&c1->address.region, &a1->region)) continue;
-            /* partner chunk at a2 + n, same size */
-            if (!kr_has_space(ctx, OSPREY_PRED_FIELD_OF, &a2->region)) {
-                kr_account(ctx, OSPREY_PRED_FIELD_OF, &a2->region, 0, 1);
-                continue;
+
+    OspreyStatus status = OSPREY_OK;
+    for (guint hi = 0; hi < homos->len && status == OSPREY_OK; hi++) {
+        uint32_t homo_id = g_array_index(homos, uint32_t, hi);
+        const OspreyVar *homo = &g_array_index(graph->vars, OspreyVar,
+                                                homo_id);
+        if (homo->payload.segment.size <= 0) {
+            status = rules_error(ctx, OSPREY_INVALID_GRAPH);
+            break;
+        }
+        for (unsigned direction = 0; direction < 2 &&
+             status == OSPREY_OK; direction++) {
+            const OspreyAddress *from = direction == 0
+                ? &homo->payload.segment.a1 : &homo->payload.segment.a2;
+            const OspreyAddress *to = direction == 0
+                ? &homo->payload.segment.a2 : &homo->payload.segment.a1;
+            int64_t segment_end;
+            if (!osprey_check_add(from->offset,
+                                  homo->payload.segment.size,
+                                  &segment_end)) {
+                status = rules_error(ctx, OSPREY_GRAPH_ARITHMETIC);
+                break;
             }
-            OspreyChunk c2 = *c1;
-            c2.address.region = a2->region;
-            int64_t off2;
-            if (!osprey_check_add(a2->offset, n, &off2)) continue;
-            c2.address.offset = off2;
-            OspreyVarPayload pf;
-            memset(&pf, 0, sizeof(pf));
-            pf.attached.chunk = c2;
-            pf.attached.base = *a2;
-            uint32_t f2 = osprey_intern_var_id(ctx, OSPREY_PRED_FIELD_OF, &pf);
-            if (f2 == UINT32_MAX) continue;
-            kr_account(ctx, OSPREY_PRED_FIELD_OF, &a2->region, 1, 0);
-            uint32_t ids[3] = { fid, hid, f2 };
-            osprey_factor_add(ctx, OSPREY_RULE_CD08, 2, false, P_UP, ids, 3);
+            for (guint fi = 0; fi < fields->len && status == OSPREY_OK;
+                 fi++) {
+                uint32_t field_id = g_array_index(fields, uint32_t, fi);
+                const OspreyVar *field = &g_array_index(
+                    graph->vars, OspreyVar, field_id);
+                const OspreyChunk *source = &field->payload.attached.chunk;
+                if (!address_equal(&field->payload.attached.base, from) ||
+                    !same_region(&source->address.region, &from->region)) {
+                    continue;
+                }
+                if (source->size > (uint64_t)INT64_MAX) {
+                    status = rules_error(ctx, OSPREY_GRAPH_ARITHMETIC);
+                    break;
+                }
+                int64_t relative;
+                if (!osprey_check_sub(source->address.offset, from->offset,
+                                      &relative)) {
+                    status = rules_error(ctx, OSPREY_GRAPH_ARITHMETIC);
+                    break;
+                }
+                int64_t source_end;
+                if (!osprey_check_add(source->address.offset,
+                                      (int64_t)source->size, &source_end)) {
+                    status = rules_error(ctx, OSPREY_GRAPH_ARITHMETIC);
+                    break;
+                }
+                if (relative < 0 || relative >= homo->payload.segment.size ||
+                    source_end > segment_end) {
+                    continue;
+                }
+                int64_t target_offset;
+                if (!osprey_check_add(to->offset, relative,
+                                      &target_offset)) {
+                    status = rules_error(ctx, OSPREY_GRAPH_ARITHMETIC);
+                    break;
+                }
+                for (guint ai = 0; ai < ctx->relations->r02_accessed->len;
+                     ai++) {
+                    const OspreyChunkRelation *access = &g_array_index(
+                        ctx->relations->r02_accessed,
+                        OspreyChunkRelation, ai);
+                    if (!same_region(&access->chunk.address.region,
+                                     &to->region) ||
+                        access->chunk.address.offset != target_offset ||
+                        access->chunk.size != source->size) {
+                        continue;
+                    }
+                    int64_t target_end;
+                    if (access->chunk.size > (uint64_t)INT64_MAX ||
+                        !osprey_check_add(target_offset,
+                                          (int64_t)access->chunk.size,
+                                          &target_end)) {
+                        status = rules_error(ctx, OSPREY_GRAPH_ARITHMETIC);
+                        break;
+                    }
+                    int64_t target_segment_end;
+                    if (!osprey_check_add(to->offset,
+                                          homo->payload.segment.size,
+                                          &target_segment_end)) {
+                        status = rules_error(ctx, OSPREY_GRAPH_ARITHMETIC);
+                        break;
+                    }
+                    if (target_end > target_segment_end) continue;
+                    OspreyVarPayload payload;
+                    memset(&payload, 0, sizeof(payload));
+                    payload.attached.chunk = access->chunk;
+                    payload.attached.base = *to;
+                    Cd08WorkKey key;
+                    memset(&key, 0, sizeof(key));
+                    key.field_id = field_id;
+                    key.homo_id = homo_id;
+                    key.payload = payload;
+                    if (!rule_witness_mark(seen, &key, sizeof(key))) {
+                        continue;
+                    }
+                    uint32_t existing = rule_var_id(
+                        ctx, OSPREY_PRED_FIELD_OF, &payload);
+                    if (existing == field_id) continue;
+                    Cd08Work work;
+                    memset(&work, 0, sizeof(work));
+                    work.field_id = field_id;
+                    work.homo_id = homo_id;
+                    work.payload = payload;
+                    g_array_append_val(works, work);
+                    candidate_append(proposals, OSPREY_PRED_FIELD_OF,
+                                     &payload, 1, P_UP, OSPREY_RULE_CD08);
+                }
+            }
         }
     }
-    g_array_free(homos, TRUE);
+    if (status == OSPREY_OK && proposals->len != 0) {
+        status = osprey_candidate_select(
+            ctx, (const OspreyCandidateProposal *)proposals->data,
+            proposals->len);
+    }
+    for (guint i = 0; i < works->len && status == OSPREY_OK; i++) {
+        const Cd08Work *work = &g_array_index(works, Cd08Work, i);
+        uint32_t target = rule_var_id(ctx, OSPREY_PRED_FIELD_OF,
+                                      &work->payload);
+        if (target == UINT32_MAX) {
+            status = rules_error(ctx, OSPREY_INVALID_GRAPH);
+            break;
+        }
+        if (target == work->field_id) continue;
+        uint32_t ids[2] = { work->field_id, work->homo_id };
+        OspreyFactorResult result = osprey_factor_add_implication(
+            ctx, OSPREY_RULE_CD08, OSPREY_GRAPH_SECONDARY, false, P_UP,
+            ids, G_N_ELEMENTS(ids), target);
+        if (result.status != OSPREY_OK) status = result.status;
+    }
+    *changed = graph->vars->len != vars_before ||
+               graph->factors->len != factors_before;
+    g_array_free(proposals, TRUE);
+    g_array_free(works, TRUE);
     g_array_free(fields, TRUE);
+    g_array_free(homos, TRUE);
+    return status;
+}
+
+/* CD05: corresponding primitive chunks of unequal width disfavor their
+ * common HomoSegment.  Field spans, not just starts, must fit each segment. */
+static OspreyStatus compile_cd05(OspreyContext *ctx)
+{
+    OspreyGraph *graph = ctx->graph;
+    for (guint hi = 0; hi < graph->vars->len; hi++) {
+        const OspreyVar *homo = &g_array_index(graph->vars, OspreyVar, hi);
+        if (homo->kind != OSPREY_PRED_HOMO_SEGMENT ||
+            homo->payload.segment.size <= 0) {
+            continue;
+        }
+        const OspreyAddress *from = &homo->payload.segment.a1;
+        const OspreyAddress *to = &homo->payload.segment.a2;
+        int64_t from_end;
+        int64_t to_end;
+        if (!osprey_check_add(from->offset,
+                              homo->payload.segment.size, &from_end) ||
+            !osprey_check_add(to->offset,
+                              homo->payload.segment.size, &to_end)) {
+            return rules_error(ctx, OSPREY_GRAPH_ARITHMETIC);
+        }
+        for (guint i = 0; i < graph->vars->len; i++) {
+            const OspreyVar *left = &g_array_index(graph->vars,
+                                                   OspreyVar, i);
+            if (left->kind != OSPREY_PRED_PRIMITIVE_VAR ||
+                !same_region_addr(&left->payload.chunk.address, from)) {
+                continue;
+            }
+            if (left->payload.chunk.size > (uint64_t)INT64_MAX) {
+                return rules_error(ctx, OSPREY_GRAPH_ARITHMETIC);
+            }
+            int64_t left_offset;
+            int64_t left_end;
+            if (!osprey_check_sub(left->payload.chunk.address.offset,
+                                  from->offset, &left_offset) ||
+                !osprey_check_add(left->payload.chunk.address.offset,
+                                  (int64_t)left->payload.chunk.size,
+                                  &left_end)) {
+                return rules_error(ctx, OSPREY_GRAPH_ARITHMETIC);
+            }
+            if (left_offset <= 0 ||
+                left_offset >= homo->payload.segment.size ||
+                left_end > from_end) {
+                continue;
+            }
+            for (guint j = 0; j < graph->vars->len; j++) {
+                const OspreyVar *right = &g_array_index(graph->vars,
+                                                        OspreyVar, j);
+                if (right->kind != OSPREY_PRED_PRIMITIVE_VAR ||
+                    right->payload.chunk.size == left->payload.chunk.size ||
+                    right->payload.chunk.size > (uint64_t)INT64_MAX ||
+                    !same_region_addr(&right->payload.chunk.address, to)) {
+                    continue;
+                }
+                int64_t right_offset;
+                int64_t right_end;
+                if (!osprey_check_sub(right->payload.chunk.address.offset,
+                                      to->offset, &right_offset) ||
+                    !osprey_check_add(right->payload.chunk.address.offset,
+                                      (int64_t)right->payload.chunk.size,
+                                      &right_end)) {
+                    return rules_error(ctx, OSPREY_GRAPH_ARITHMETIC);
+                }
+                if (right_offset != left_offset ||
+                    right_offset <= 0 ||
+                    right_offset >= homo->payload.segment.size ||
+                    right_end > to_end) {
+                    continue;
+                }
+                uint32_t antecedents[2] = { left->id, right->id };
+                OspreyFactorBatchResult result =
+                    osprey_factor_add_conjunction_bidirectional(
+                        ctx, OSPREY_RULE_CD05, OSPREY_GRAPH_SECONDARY,
+                        true, P_DN, antecedents,
+                        G_N_ELEMENTS(antecedents), homo->id);
+                if (result.status != OSPREY_OK) return result.status;
+            }
+        }
+    }
+    return OSPREY_OK;
 }
 
 /* CB06: retain a defensive hard-false factor for an injected malformed
@@ -2069,8 +2787,39 @@ static OspreyStatus cb06_hard_false(OspreyContext *ctx)
     return OSPREY_OK;
 }
 
-/* Stage-3 secondary entry.  CB03-CB05 are fact/candidate-driven and are
- * exhausted to a fixed point; CC07 remains a later belief-dependent rule. */
+static OspreyStatus collect_stage34_direct(OspreyContext *ctx,
+                                            GArray *proposals)
+{
+    OspreyStatus status = collect_cc01_cc02(ctx, proposals);
+    if (status != OSPREY_OK) return status;
+    status = collect_cc03(ctx, proposals);
+    if (status != OSPREY_OK) return status;
+    status = collect_cd01_03(ctx, proposals);
+    if (status != OSPREY_OK) return status;
+    status = collect_cd06(ctx, proposals);
+    if (status != OSPREY_OK) return status;
+    status = collect_cd11(ctx, proposals);
+    if (status != OSPREY_OK) return status;
+    return collect_cd07(ctx, proposals);
+}
+
+static OspreyStatus compile_stage34_direct(OspreyContext *ctx)
+{
+    OspreyStatus status = compile_cc01_cc02(ctx);
+    if (status != OSPREY_OK) return status;
+    status = compile_cc03(ctx);
+    if (status != OSPREY_OK) return status;
+    status = compile_cd01_03(ctx);
+    if (status != OSPREY_OK) return status;
+    status = compile_cd06(ctx);
+    if (status != OSPREY_OK) return status;
+    status = compile_cd11(ctx);
+    if (status != OSPREY_OK) return status;
+    return compile_cd07(ctx);
+}
+
+/* Stage-3 secondary entry.  All fact/candidate-driven CC/CD rules run here;
+ * CC07 is deliberately left to the later belief-dependent stage. */
 OspreyStatus osprey_stage3_secondary(OspreyContext *ctx)
 {
     if (ctx == NULL || !ctx->config.enabled) return OSPREY_DISABLED;
@@ -2079,31 +2828,80 @@ OspreyStatus osprey_stage3_secondary(OspreyContext *ctx)
     }
     osprey_graph_set_stage(ctx->graph, OSPREY_GRAPH_SECONDARY);
 
-    GHashTable *processed = g_hash_table_new_full(
+    GHashTable *array_processed = g_hash_table_new_full(
         osprey_key_hash, osprey_key_equal, osprey_key_free, NULL);
     OspreyStatus status = OSPREY_OK;
     for (;;) {
         bool changed = false;
-        status = secondary_array_round(ctx, processed, &changed);
+        status = secondary_array_round(ctx, array_processed, &changed);
         if (status != OSPREY_OK || !changed) break;
     }
-    g_hash_table_destroy(processed);
+    g_hash_table_destroy(array_processed);
     if (status != OSPREY_OK) return status;
 
     status = compile_cb09(ctx);
     if (status != OSPREY_OK) return status;
 
-    /* The remaining calls are the pre-existing Stage-3.4 families.  CA08
-     * is deliberately repeated after their field candidates are present. */
-    cc04_cc05(ctx);
-    cd07_heap_fields(ctx);
-    cd08_fields(ctx);
+    /* Collect all direct Stage 3.4 candidates only after the base stage has
+     * interned PrimitiveVar/PrimitiveAccess candidates.  This is required
+     * for CC03, CD06, CD07, and CD11 to consume the complete base set. */
+    GArray *secondary_proposals = g_array_new(
+        FALSE, FALSE, sizeof(OspreyCandidateProposal));
+    status = collect_cc06(ctx, secondary_proposals);
+    if (status == OSPREY_OK) {
+        status = collect_stage34_direct(ctx, secondary_proposals);
+    }
+    if (status == OSPREY_OK && secondary_proposals->len != 0) {
+        status = osprey_candidate_select(
+            ctx, (const OspreyCandidateProposal *)secondary_proposals->data,
+            secondary_proposals->len);
+    }
+    g_array_free(secondary_proposals, TRUE);
+    if (status != OSPREY_OK) return status;
+
+    status = compile_stage34_direct(ctx);
+    if (status != OSPREY_OK) return status;
+    status = compile_cc06(ctx);
+    if (status != OSPREY_OK) return status;
+
+    status = compile_cc04_cc05(ctx);
+    if (status != OSPREY_OK) return status;
+
+    GHashTable *cd04_pairs = g_hash_table_new_full(
+        g_bytes_hash, g_bytes_equal, (GDestroyNotify)g_bytes_unref, NULL);
+    GHashTable *cd04_unions = g_hash_table_new_full(
+        g_bytes_hash, g_bytes_equal, (GDestroyNotify)g_bytes_unref, NULL);
+    for (;;) {
+        bool changed = false;
+        status = cd04_round(ctx, cd04_pairs, cd04_unions, &changed);
+        if (status != OSPREY_OK || !changed) break;
+    }
+    g_hash_table_destroy(cd04_unions);
+    g_hash_table_destroy(cd04_pairs);
+    if (status != OSPREY_OK) return status;
+
+    GHashTable *cd08_seen = g_hash_table_new_full(
+        g_bytes_hash, g_bytes_equal, (GDestroyNotify)g_bytes_unref, NULL);
+    for (;;) {
+        bool changed = false;
+        status = cd08_round(ctx, cd08_seen, &changed);
+        if (status != OSPREY_OK || !changed) break;
+    }
+    g_hash_table_destroy(cd08_seen);
+    if (status != OSPREY_OK) return status;
+
+    status = compile_cd05(ctx);
+    if (status != OSPREY_OK) return status;
     status = compile_ca08(ctx);
+    if (status != OSPREY_OK) return status;
+    status = compile_cd10(ctx);
     if (status != OSPREY_OK) return status;
     status = cb06_hard_false(ctx);
     if (status != OSPREY_OK) return status;
 
-    if (ctx->last_status != OSPREY_OK) return ctx->last_status;
+    if (ctx->last_status != OSPREY_OK && ctx->last_status != OSPREY_DISABLED) {
+        return ctx->last_status;
+    }
     OspreyGraph *graph = ctx->graph;
     log_msg("[osprey] [graph] [stage secondary] [vars %u] [factors %u]\n",
             graph->vars->len, graph->factors->len);
@@ -2132,7 +2930,6 @@ OspreyStatus osprey_stage3_base(OspreyContext *ctx)
     OspreyGraph *graph = ctx->graph;
     osprey_graph_set_stage(graph, OSPREY_GRAPH_BASE_CA);
 
-    /* R10-R12 hint extraction remains deterministic and parent-local. */
     closure_r10(ctx);
     closure_r11(ctx);
     closure_r12(ctx);
@@ -2150,26 +2947,29 @@ OspreyStatus osprey_stage3_base(OspreyContext *ctx)
 
     status = compile_initial_ca_cb(ctx);
     if (status != OSPREY_OK) return status;
-
-    /* Stage 3.4 families are retained in this coordinator until their own
-     * review boundary.  Their fields become eligible for CA08 below. */
-    instantiate_cc01_cc02(ctx);
-    instantiate_cc03(ctx);
-    instantiate_cd01_03(ctx);
-    instantiate_cd06(ctx);
-    instantiate_cd11(ctx);
-
-    closure_cd04(ctx);
-    instantiate_cd10(ctx);
     status = compile_ca08(ctx);
     if (status != OSPREY_OK) return status;
 
     uint32_t components = osprey_graph_component_count(graph);
-    if (ctx->last_status != OSPREY_OK) return ctx->last_status;
+    if (ctx->last_status != OSPREY_OK && ctx->last_status != OSPREY_DISABLED) {
+        return ctx->last_status;
+    }
     log_msg("[osprey] [graph] [stage base] [vars %u] [factors %u] "
             "[components %u] [hints %llu] [cd04 %llu]\n",
             graph->vars->len, graph->factors->len, components,
             (unsigned long long)graph->hint_instances,
             (unsigned long long)graph->cd04_extensions);
     return OSPREY_OK;
+}
+
+OspreyStatus osprey_stage3_build(OspreyContext *ctx)
+{
+    if (ctx == NULL || !ctx->config.enabled) return OSPREY_DISABLED;
+    if (ctx->relations == NULL) {
+        OspreyStatus status = osprey_relations_build(ctx);
+        if (status != OSPREY_OK) return status;
+    }
+    OspreyStatus status = osprey_stage3_base(ctx);
+    if (status != OSPREY_OK) return status;
+    return osprey_stage3_secondary(ctx);
 }

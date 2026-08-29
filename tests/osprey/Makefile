@@ -70,7 +70,7 @@ CC        ?= gcc
 CFLAGS    := -O0 -g -fno-pie -no-pie -fno-stack-protector -U_FORTIFY_SOURCE -fno-builtin
 LDFLAGS   := -no-pie
 
-TESTS := osprey_deref t01_regions t01_clone t02_chunk_widths t04_mpx t05_enter_fault t06_control_reject t07_legacy_width_reject t08_bound_reject t09_address_origins t10_value_origins t11_modeled_copies t12_allocator_facts
+TESTS := osprey_deref t01_regions t01_clone t02_chunk_widths t04_mpx t05_enter_fault t06_control_reject t07_legacy_width_reject t08_bound_reject t09_address_origins t10_value_origins t11_modeled_copies t12_allocator_facts t13_rule_graph
 
 GUEST_BINS := $(addprefix $(WORK)/,$(TESTS))
 PLT_FILES  := $(addprefix $(WORK)/,$(addsuffix .plt,$(TESTS)))
@@ -78,13 +78,13 @@ PLT_FILES  := $(addprefix $(WORK)/,$(addsuffix .plt,$(TESTS)))
 .PHONY: check inventory run unit unit-asan unit-asan-osprey \
         unit-stage3-relations unit-stage3-relations-asan \
         unit-stage3-graph unit-stage3-graph-asan \
-        unit-stage3-rules-ca-cb unit-stage3-rules-ca-cb-asan guests plts clean
+        unit-stage3-rules unit-stage3-rules-asan guests plts clean
 check: inventory run unit unit-asan-osprey unit-stage3-relations \
        unit-stage3-relations-asan unit-stage3-graph unit-stage3-graph-asan \
-       unit-stage3-rules-ca-cb unit-stage3-rules-ca-cb-asan
+       unit-stage3-rules unit-stage3-rules-asan
 run unit unit-asan-osprey unit-stage3-relations unit-stage3-relations-asan \
-unit-stage3-graph unit-stage3-graph-asan unit-stage3-rules-ca-cb \
-unit-stage3-rules-ca-cb-asan: inventory
+unit-stage3-graph unit-stage3-graph-asan unit-stage3-rules \
+unit-stage3-rules-asan: inventory
 inventory:
 	@python3 $(INVENTORY)
 run: guests plts
@@ -147,6 +147,11 @@ $(WORK)/t12_allocator_facts: $(GUESTS)/t12_allocator_facts.c | $(WORK)
 	$(CC) -O0 -g -fPIE -pie -fno-omit-frame-pointer -fno-stack-protector \
 		-U_FORTIFY_SOURCE -fno-builtin -o $@ $<
 
+# t13_rule_graph: complete Stage-3 relation/graph integration fixture.
+$(WORK)/t13_rule_graph: $(GUESTS)/t13_rule_graph.c | $(WORK)
+	$(CC) -O0 -g -fPIE -pie -fno-omit-frame-pointer -fno-stack-protector \
+		-U_FORTIFY_SOURCE -fno-builtin -o $@ $<
+
 $(WORK)/%.plt: $(WORK)/% $(GEN_PLT)
 	python3 $(GEN_PLT) -o $@ $<
 
@@ -188,7 +193,7 @@ $(GRAPH_ASAN_BIN): stage3_graph_test.c stage3_test_support.c \
 	$(CC) $(ASAN_CFLAGS) -o $@ stage3_graph_test.c \
 		stage3_test_support.c $(OSPREY_ASAN_OBJS) -lglib-2.0 -lpthread -lm
 
-unit-stage3-rules-ca-cb: $(RULES_UNIT_BIN)
+unit-stage3-rules: $(RULES_UNIT_BIN)
 	@$(RULES_UNIT_BIN)
 
 $(RULES_UNIT_BIN): stage3_rules_test.c stage3_test_support.c \
@@ -197,7 +202,7 @@ $(RULES_UNIT_BIN): stage3_rules_test.c stage3_test_support.c \
 		stage3_test_support.c $(OSPREY_OBJS) \
 		-lglib-2.0 -lpthread -lm
 
-unit-stage3-rules-ca-cb-asan: $(RULES_ASAN_BIN)
+unit-stage3-rules-asan: $(RULES_ASAN_BIN)
 	@ASAN_OPTIONS=detect_leaks=1 $(RULES_ASAN_BIN)
 
 $(RULES_ASAN_BIN): stage3_rules_test.c stage3_test_support.c \

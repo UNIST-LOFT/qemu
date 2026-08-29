@@ -3945,17 +3945,9 @@ OspreyStatus osprey_analyze(OspreyContext *ctx) {
     ctx->staged_graph = osprey_graph_new();
     ctx->graph = ctx->staged_graph;
 
-    OspreyStatus st = osprey_stage3_base(ctx);
+    OspreyStatus st = osprey_stage3_build(ctx);
     if (st != OSPREY_OK && st != OSPREY_DISABLED) {
-        osprey_tx_reject(ctx, st, "closure", "stage-3 base construction failed");
-        goto fail;
-    }
-    /* Stage 3a: secondary deterministic rules (CB02-CB09, CC04/CC05,
-     * CD07/CD08); CC07 folding happens after the first BP pass. */
-    st = osprey_stage3_secondary(ctx);
-    if (st != OSPREY_OK && st != OSPREY_DISABLED) {
-        osprey_tx_reject(ctx, st, "secondary",
-                         "stage-3 secondary construction failed");
+        osprey_tx_reject(ctx, st, "closure", "stage-3 construction failed");
         goto fail;
     }
     if (ctx->config.graph_dump_file[0] != '\0' &&

@@ -1,4 +1,4 @@
-/* Stage 3.3 primitive/scalar/array rule tests. */
+/* Stage 3 CA/CB/CC/CD rule tests. */
 
 #include "osprey.h"
 #include "osprey-internal.h"
@@ -159,6 +159,15 @@ static uint32_t chunk_variable_id(const OspreyContext *ctx, uint8_t kind,
     memset(&payload, 0, sizeof(payload));
     payload.chunk = *value;
     return variable_id(ctx, kind, &payload);
+}
+
+static uint32_t chunk_variable_id_value(const OspreyContext *ctx,
+                                        uint8_t kind,
+                                        OspreyRegionId region_id,
+                                        int64_t offset, uint64_t size)
+{
+    OspreyChunk value = chunk(region_id, offset, size);
+    return chunk_variable_id(ctx, kind, &value);
 }
 
 static uint32_t access_variable_id(const OspreyContext *ctx, uint64_t pc,
@@ -491,6 +500,128 @@ static void add_extent(OspreyContext *ctx, const OspreyChunk *value)
     access.dynamic_count = 1;
     access.sample_support = 1;
     g_array_append_val(ctx->access_facts, access);
+}
+
+static void add_allocation(OspreyContext *ctx, uint64_t site,
+                            uint64_t requested_size)
+{
+    OspreyMallocFact fact;
+    memset(&fact, 0, sizeof(fact));
+    fact.site_pc = site;
+    fact.requested_size = requested_size;
+    fact.sample_support = 1;
+    g_array_append_val(ctx->alloc_facts, fact);
+}
+
+static void add_copy_fact(OspreyContext *ctx, OspreyChunk source,
+                          OspreyChunk destination)
+{
+    OspreyCopyFact fact;
+    memset(&fact, 0, sizeof(fact));
+    fact.source = source;
+    fact.destination = destination;
+    fact.sample_support = 1;
+    g_array_append_val(ctx->copy_facts, fact);
+}
+
+static void add_base_fact(OspreyContext *ctx, OspreyChunk value,
+                          OspreyAddress base)
+{
+    OspreyBaseFact fact;
+    memset(&fact, 0, sizeof(fact));
+    fact.chunk = value;
+    fact.base = base;
+    fact.sample_support = 1;
+    g_array_append_val(ctx->base_facts, fact);
+}
+
+static void add_points_fact(OspreyContext *ctx, OspreyChunk pointer,
+                            OspreyAddress target)
+{
+    OspreyPointsToFact fact;
+    memset(&fact, 0, sizeof(fact));
+    fact.pointer_chunk = pointer;
+    fact.target = target;
+    fact.sample_support = 1;
+    g_array_append_val(ctx->points_facts, fact);
+}
+
+static OspreyInternResult seed_heap_fold(OspreyContext *ctx, uint8_t kind,
+                                         OspreyRegionId region_id,
+                                         uint64_t size)
+{
+    OspreyVarPayload payload;
+    memset(&payload, 0, sizeof(payload));
+    payload.heap_fold.region = region_id;
+    payload.heap_fold.size = size;
+    return osprey_intern_var(ctx, kind, &payload);
+}
+
+static uint32_t heap_fold_variable_id(const OspreyContext *ctx, uint8_t kind,
+                                      OspreyRegionId region_id,
+                                      uint64_t size)
+{
+    OspreyVarPayload payload;
+    memset(&payload, 0, sizeof(payload));
+    payload.heap_fold.region = region_id;
+    payload.heap_fold.size = size;
+    return variable_id(ctx, kind, &payload);
+}
+
+static OspreyInternResult seed_homo(OspreyContext *ctx, OspreyAddress first,
+                                    OspreyAddress second, int64_t size)
+{
+    OspreyVarPayload payload;
+    memset(&payload, 0, sizeof(payload));
+    payload.segment.a1 = first;
+    payload.segment.a2 = second;
+    payload.segment.size = size;
+    return osprey_intern_var(ctx, OSPREY_PRED_HOMO_SEGMENT, &payload);
+}
+
+static uint32_t homo_variable_id(const OspreyContext *ctx,
+                                 OspreyAddress first,
+                                 OspreyAddress second, int64_t size)
+{
+    OspreyVarPayload payload;
+    memset(&payload, 0, sizeof(payload));
+    payload.segment.a1 = first;
+    payload.segment.a2 = second;
+    payload.segment.size = size;
+    return variable_id(ctx, OSPREY_PRED_HOMO_SEGMENT, &payload);
+}
+
+static OspreyInternResult seed_field(OspreyContext *ctx, OspreyChunk value,
+                                     OspreyAddress base)
+{
+    OspreyVarPayload payload;
+    memset(&payload, 0, sizeof(payload));
+    payload.attached.chunk = value;
+    payload.attached.base = base;
+    return osprey_intern_var(ctx, OSPREY_PRED_FIELD_OF, &payload);
+}
+
+static OspreyInternResult seed_primitive(OspreyContext *ctx,
+                                         OspreyChunk value)
+{
+    OspreyVarPayload payload;
+    memset(&payload, 0, sizeof(payload));
+    payload.chunk = value;
+    return osprey_intern_var(ctx, OSPREY_PRED_PRIMITIVE_VAR, &payload);
+}
+
+static OspreyInternResult seed_heap_foldable(OspreyContext *ctx,
+                                             OspreyRegionId region_id,
+                                             uint64_t size)
+{
+    return seed_heap_fold(ctx, OSPREY_PRED_FOLDABLE_HEAP, region_id, size);
+}
+
+static OspreyInternResult seed_heap_unfoldable(OspreyContext *ctx,
+                                               OspreyRegionId region_id,
+                                               uint64_t size)
+{
+    return seed_heap_fold(ctx, OSPREY_PRED_UNFOLDABLE_HEAP, region_id, size);
 }
 
 static OspreyInternResult seed_array(OspreyContext *ctx,
@@ -1893,7 +2024,7 @@ static void test_cb07(void)
                         "CB07 complete canonical factor block");
     expect_candidate_proposals(ctx, OSPREY_RULE_CB07, 1,
                                "CB07 exact proposal count");
-    expect_candidate_accounting(ctx, OSPREY_RULE_CB07, 1, 7, 0,
+    expect_candidate_accounting(ctx, OSPREY_RULE_CB07, 1, 8, 0,
                                 "CB07 exact proposal/kept/dropped totals");
     osprey_free(ctx);
 
@@ -2073,7 +2204,7 @@ static void test_cb09(void)
                         "CB09 complete canonical factor block");
     expect_candidate_proposals(ctx, OSPREY_RULE_CB09, 0,
                                "CB09 exact proposal count");
-    expect_candidate_accounting(ctx, OSPREY_RULE_CB09, 0, 7, 0,
+    expect_candidate_accounting(ctx, OSPREY_RULE_CB09, 0, 9, 0,
                                 "CB09 exact proposal/kept/dropped totals");
     uint32_t reverse_ids[2] = { second_start, first_start };
     CHECK(!factor_exact(ctx, OSPREY_RULE_CB09, OSPREY_GRAPH_SECONDARY,
@@ -2121,6 +2252,1149 @@ static void test_cb09(void)
     CHECK(build_secondary(ctx), "CB09 region mismatch");
     CHECK(rule_count(ctx, OSPREY_RULE_CB09) == 0,
           "CB09 rejects a region mismatch");
+    osprey_free(ctx);
+}
+
+static void test_cc01(void)
+{
+    OspreyContext *ctx = new_context();
+    OspreyRegionId heap = region(OSPREY_REGION_HEAP_SITE, 0x101);
+    add_allocation(ctx, heap.site_offset, 0);
+    CHECK(build_secondary(ctx), "CC01 zero-size singleton");
+    CHECK(rule_count(ctx, OSPREY_RULE_CC01) == 2 &&
+          rule_count(ctx, OSPREY_RULE_CC02) == 0,
+          "CC01 emits only its two singleton priors");
+    uint32_t unfoldable = heap_fold_variable_id(
+        ctx, OSPREY_PRED_UNFOLDABLE_HEAP, heap, 0);
+    uint32_t foldable = heap_fold_variable_id(
+        ctx, OSPREY_PRED_FOLDABLE_HEAP, heap, 0);
+    expect_factor(ctx, OSPREY_RULE_CC01, OSPREY_GRAPH_SECONDARY,
+                  OSPREY_POTENTIAL_PRIOR, false, 0.8, 0,
+                  &unfoldable, 1, "CC01 zero-size unfoldable prior");
+    expect_factor(ctx, OSPREY_RULE_CC01, OSPREY_GRAPH_SECONDARY,
+                  OSPREY_POTENTIAL_PRIOR, false, 0.8, 0,
+                  &foldable, 1, "CC01 zero-size foldable prior");
+    expect_candidate_proposals(ctx, OSPREY_RULE_CC01, 2,
+                               "CC01 singleton proposal count");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    heap = region(OSPREY_REGION_HEAP_SITE, 0x102);
+    add_allocation(ctx, heap.site_offset, ((uint64_t)INT64_MAX));
+    CHECK(build_secondary(ctx), "CC01 maximum singleton");
+    CHECK(rule_count(ctx, OSPREY_RULE_CC01) == 2,
+          "CC01 represents INT64_MAX singleton size");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    heap = region(OSPREY_REGION_HEAP_SITE, 0x103);
+    add_allocation(ctx, heap.site_offset, 0);
+    add_allocation(ctx, heap.site_offset, 16);
+    CHECK(build_secondary(ctx), "CC01 two-size near miss");
+    CHECK(rule_count(ctx, OSPREY_RULE_CC01) == 0 &&
+          rule_count(ctx, OSPREY_RULE_CC02) == 1,
+          "CC01 excludes a varied allocation site");
+    osprey_free(ctx);
+}
+
+static void test_cc02(void)
+{
+    OspreyContext *ctx = new_context();
+    OspreyRegionId heap = region(OSPREY_REGION_HEAP_SITE, 0x201);
+    add_allocation(ctx, heap.site_offset, 48);
+    add_allocation(ctx, heap.site_offset, 0);
+    add_allocation(ctx, heap.site_offset, 16);
+    add_allocation(ctx, heap.site_offset, 16);
+    CHECK(build_secondary(ctx), "CC02 positive GCD");
+    CHECK(rule_count(ctx, OSPREY_RULE_CC02) == 1 &&
+          rule_count(ctx, OSPREY_RULE_CC01) == 0,
+          "CC02 uses the positive GCD for varied sizes");
+    uint32_t unit = heap_fold_variable_id(
+        ctx, OSPREY_PRED_FOLDABLE_HEAP, heap, 16);
+    expect_factor(ctx, OSPREY_RULE_CC02, OSPREY_GRAPH_SECONDARY,
+                  OSPREY_POTENTIAL_PRIOR, false, 0.8, 0,
+                  &unit, 1, "CC02 exact unit prior");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    heap = region(OSPREY_REGION_HEAP_SITE, 0x202);
+    add_allocation(ctx, heap.site_offset, 24);
+    CHECK(build_secondary(ctx), "CC02 constant-only near miss");
+    CHECK(rule_count(ctx, OSPREY_RULE_CC02) == 0,
+          "CC02 excludes singleton allocation sites");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    heap = region(OSPREY_REGION_HEAP_SITE, 0x203);
+    add_allocation(ctx, heap.site_offset, 0);
+    CHECK(osprey_relations_build(ctx) == OSPREY_OK,
+          "CC02 malformed-unit relation setup");
+    OspreyAllocRelation malformed;
+    memset(&malformed, 0, sizeof(malformed));
+    malformed.site_pc = heap.site_offset;
+    malformed.size = 0;
+    g_array_append_val(ctx->relations->r09_alloc_unit, malformed);
+    CHECK(osprey_stage3_secondary(ctx) == OSPREY_INVALID_GRAPH,
+          "CC02 rejects an impossible zero unit");
+    osprey_free(ctx);
+}
+
+static void test_cc03(void)
+{
+    OspreyContext *ctx = new_context();
+    OspreyRegionId heap = region(OSPREY_REGION_HEAP_SITE, 0x301);
+    OspreyChunk value = chunk(heap, 8, 8);
+    add_allocation(ctx, heap.site_offset, 32);
+    add_logical(ctx, 0x10, &value, 1, 1);
+    CHECK(build_secondary(ctx), "CC03 positive");
+    CHECK(rule_count(ctx, OSPREY_RULE_CC03) == 1,
+          "CC03 emits the primitive-to-heap-end implication");
+    uint32_t primitive = chunk_variable_id(ctx, OSPREY_PRED_PRIMITIVE_VAR,
+                                           &value);
+    uint32_t unfoldable = heap_fold_variable_id(
+        ctx, OSPREY_PRED_UNFOLDABLE_HEAP, heap, 16);
+    uint32_t ids[2] = { primitive, unfoldable };
+    expect_factor(ctx, OSPREY_RULE_CC03, OSPREY_GRAPH_SECONDARY,
+                  OSPREY_POTENTIAL_IMPLICATION, false, 0.8, 1,
+                  ids, 2, "CC03 exact checked heap end");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    heap = region(OSPREY_REGION_HEAP_SITE, 0x302);
+    value = chunk(heap, 0, 8);
+    add_allocation(ctx, heap.site_offset, 8);
+    add_logical(ctx, 0x10, &value, 1, 1);
+    CHECK(build_secondary(ctx), "CC03 zero-offset heap chunk");
+    CHECK(rule_count(ctx, OSPREY_RULE_CC03) == 1,
+          "CC03 accepts a heap chunk at offset zero");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    heap = region(OSPREY_REGION_HEAP_SITE, 0x305);
+    value = chunk(heap, 24, 8);
+    add_allocation(ctx, heap.site_offset, 32);
+    add_logical(ctx, 0x10, &value, 1, 1);
+    CHECK(build_secondary(ctx), "CC03 exact extent end");
+    CHECK(rule_count(ctx, OSPREY_RULE_CC03) >= 1,
+          "CC03 permits an exact allocation extent end");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    heap = region(OSPREY_REGION_HEAP_SITE, 0x303);
+    value = chunk(heap, -1, 1);
+    add_allocation(ctx, heap.site_offset, 32);
+    add_logical(ctx, 0x10, &value, 1, 1);
+    CHECK(osprey_stage3_build(ctx) == OSPREY_INVALID_GRAPH,
+          "CC03 rejects a negative heap offset");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    heap = region(OSPREY_REGION_HEAP_SITE, 0x304);
+    value = chunk(heap, INT64_MAX, 1);
+    add_allocation(ctx, heap.site_offset, ((uint64_t)INT64_MAX));
+    add_logical(ctx, 0x10, &value, 1, 1);
+    CHECK(osprey_stage3_build(ctx) == OSPREY_GRAPH_ARITHMETIC,
+          "CC03 rejects heap-end overflow");
+    osprey_free(ctx);
+}
+
+static void test_cc04(void)
+{
+    OspreyContext *ctx = new_context();
+    OspreyRegionId heap = region(OSPREY_REGION_HEAP_SITE, 0x401);
+    CHECK(seed_heap_unfoldable(ctx, heap, 24).inserted,
+          "CC04 largest prefix seed");
+    CHECK(seed_heap_unfoldable(ctx, heap, 8).inserted,
+          "CC04 smallest prefix seed");
+    CHECK(seed_heap_unfoldable(ctx, heap, 16).inserted,
+          "CC04 middle prefix seed");
+    CHECK(build_secondary(ctx), "CC04 permuted prefixes");
+    CHECK(rule_count(ctx, OSPREY_RULE_CC04) == 6,
+          "CC04 emits both directions for all prefix pairs");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    heap = region(OSPREY_REGION_HEAP_SITE, 0x402);
+    CHECK(seed_heap_unfoldable(ctx, heap, 8).inserted,
+          "CC04 equal-prefix seed");
+    CHECK(build_secondary(ctx), "CC04 equal-prefix near miss");
+    CHECK(rule_count(ctx, OSPREY_RULE_CC04) == 0 &&
+          rule_count(ctx, OSPREY_RULE_CC05) == 0,
+          "CC04/CC05 omit equal prefix self-factors");
+    osprey_free(ctx);
+}
+
+static void test_cc05(void)
+{
+    OspreyContext *ctx = new_context();
+    OspreyRegionId heap = region(OSPREY_REGION_HEAP_SITE, 0x501);
+    seed_heap_unfoldable(ctx, heap, 24);
+    seed_heap_unfoldable(ctx, heap, 8);
+    seed_heap_unfoldable(ctx, heap, 16);
+    CHECK(build_secondary(ctx), "CC05 permuted prefixes");
+    CHECK(rule_count(ctx, OSPREY_RULE_CC05) == 3,
+          "CC05 supports every smaller prefix exactly once");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    heap = region(OSPREY_REGION_HEAP_SITE, 0x502);
+    seed_heap_unfoldable(ctx, heap, 8);
+    seed_heap_unfoldable(ctx, region(OSPREY_REGION_HEAP_SITE, 0x503), 16);
+    CHECK(build_secondary(ctx), "CC05 site identity near miss");
+    CHECK(rule_count(ctx, OSPREY_RULE_CC05) == 0,
+          "CC05 does not merge allocation sites");
+    osprey_free(ctx);
+}
+
+static void test_cc06(void)
+{
+    OspreyContext *ctx = new_context();
+    OspreyRegionId heap = region(OSPREY_REGION_HEAP_SITE, 0x601);
+    add_allocation(ctx, heap.site_offset, 32);
+    CHECK(seed_array(ctx, heap, 0, 32, 8).inserted,
+          "CC06 heap array seed");
+    CHECK(build_secondary(ctx), "CC06 positive");
+    CHECK(rule_count(ctx, OSPREY_RULE_CC06) == 1,
+          "CC06 emits the array-to-stride implication");
+    uint32_t array = array_variable_id(ctx, heap, 0, 32, 8);
+    uint32_t foldable = heap_fold_variable_id(
+        ctx, OSPREY_PRED_FOLDABLE_HEAP, heap, 8);
+    uint32_t ids[2] = { array, foldable };
+    expect_factor(ctx, OSPREY_RULE_CC06, OSPREY_GRAPH_SECONDARY,
+                  OSPREY_POTENTIAL_IMPLICATION, false, 0.8, 1,
+                  ids, 2, "CC06 exact stride factor");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    OspreyRegionId global = region(OSPREY_REGION_GLOBAL, 0);
+    OspreyChunk extent = chunk(global, 0, 32);
+    add_extent(ctx, &extent);
+    seed_array(ctx, global, 0, 32, 8);
+    CHECK(build_secondary(ctx), "CC06 non-heap near miss");
+    CHECK(rule_count(ctx, OSPREY_RULE_CC06) == 0,
+          "CC06 requires the matching heap-site region");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    heap = region(OSPREY_REGION_HEAP_SITE, 0x602);
+    add_allocation(ctx, heap.site_offset, 16);
+    CHECK(seed_array(ctx, heap, 0, 32, 8).inserted,
+          "CC06 oversized heap array seed");
+    CHECK(build_base(ctx), "CC06 oversized-array base setup");
+    CHECK(osprey_stage3_secondary(ctx) == OSPREY_INVALID_GRAPH,
+          "CC06 rejects an array beyond the allocation extent");
+    osprey_free(ctx);
+}
+
+static OspreyContext *cc07_context(uint64_t allocation_size,
+                                   uint64_t sh, uint64_t st,
+                                   int64_t value_offset, uint64_t width,
+                                   int64_t folded_offset)
+{
+    OspreyContext *ctx = new_context();
+    OspreyRegionId heap = region(OSPREY_REGION_HEAP_SITE, 0x701);
+    OspreyChunk value = chunk(heap, value_offset, width);
+    OspreyChunk folded = chunk(heap, folded_offset, width);
+    add_allocation(ctx, heap.site_offset, allocation_size);
+    CHECK(osprey_candidate_select(ctx, NULL, 0) == OSPREY_OK,
+          "CC07 allocation extent catalog");
+    seed_primitive(ctx, value);
+    seed_heap_unfoldable(ctx, heap, sh);
+    seed_heap_foldable(ctx, heap, st);
+    seed_primitive(ctx, folded);
+    return ctx;
+}
+
+static void test_cc07(void)
+{
+    OspreyContext *ctx = cc07_context(16, 8, 4, 12, 4, 8);
+    CHECK(osprey_relations_build(ctx) == OSPREY_OK,
+          "CC07 relation fixture");
+    OspreyRegionId heap = region(OSPREY_REGION_HEAP_SITE, 0x701);
+    uint32_t primitive = chunk_variable_id_value(
+        ctx, OSPREY_PRED_PRIMITIVE_VAR, heap, 12, 4);
+    uint32_t folded = chunk_variable_id_value(
+        ctx, OSPREY_PRED_PRIMITIVE_VAR, heap, 8, 4);
+    uint32_t unfoldable = heap_fold_variable_id(
+        ctx, OSPREY_PRED_UNFOLDABLE_HEAP,
+        region(OSPREY_REGION_HEAP_SITE, 0x701), 8);
+    uint32_t foldable = heap_fold_variable_id(
+        ctx, OSPREY_PRED_FOLDABLE_HEAP,
+        region(OSPREY_REGION_HEAP_SITE, 0x701), 4);
+    CHECK(osprey_compile_cc07(ctx, primitive, unfoldable, foldable, folded) ==
+              OSPREY_OK,
+          "CC07 positive compiler");
+    CHECK(rule_count(ctx, OSPREY_RULE_CC07) == 2,
+          "CC07 emits positive and negative factors");
+    uint32_t positive[4] = { primitive, unfoldable, foldable, folded };
+    uint32_t negative[3] = { unfoldable, foldable, primitive };
+    expect_factor(ctx, OSPREY_RULE_CC07, OSPREY_GRAPH_SECONDARY,
+                  OSPREY_POTENTIAL_IMPLICATION, false, 0.8, 3,
+                  positive, 4, "CC07 exact folded implication");
+    expect_factor(ctx, OSPREY_RULE_CC07, OSPREY_GRAPH_SECONDARY,
+                  OSPREY_POTENTIAL_IMPLICATION, true, 0.2, 2,
+                  negative, 3, "CC07 exact source exclusion");
+    osprey_free(ctx);
+
+    ctx = cc07_context(16, 8, 0, 12, 4, 8);
+    CHECK(osprey_relations_build(ctx) == OSPREY_OK,
+          "CC07 zero-stride relation fixture");
+    primitive = chunk_variable_id_value(
+        ctx, OSPREY_PRED_PRIMITIVE_VAR, heap, 12, 4);
+    unfoldable = heap_fold_variable_id(
+        ctx, OSPREY_PRED_UNFOLDABLE_HEAP,
+        region(OSPREY_REGION_HEAP_SITE, 0x701), 8);
+    foldable = heap_fold_variable_id(
+        ctx, OSPREY_PRED_FOLDABLE_HEAP,
+        region(OSPREY_REGION_HEAP_SITE, 0x701), 0);
+    folded = chunk_variable_id_value(
+        ctx, OSPREY_PRED_PRIMITIVE_VAR, heap, 8, 4);
+    CHECK(osprey_compile_cc07(ctx, primitive, unfoldable, foldable, folded) ==
+              OSPREY_INVALID_GRAPH,
+          "CC07 rejects zero stride before modulo");
+    osprey_free(ctx);
+
+    ctx = cc07_context(16, 8, 4, 11, 4, 11);
+    CHECK(osprey_relations_build(ctx) == OSPREY_OK,
+          "CC07 threshold near-miss relation fixture");
+    primitive = chunk_variable_id_value(
+        ctx, OSPREY_PRED_PRIMITIVE_VAR, heap, 11, 4);
+    unfoldable = heap_fold_variable_id(
+        ctx, OSPREY_PRED_UNFOLDABLE_HEAP,
+        region(OSPREY_REGION_HEAP_SITE, 0x701), 8);
+    foldable = heap_fold_variable_id(
+        ctx, OSPREY_PRED_FOLDABLE_HEAP,
+        region(OSPREY_REGION_HEAP_SITE, 0x701), 4);
+    folded = chunk_variable_id_value(
+        ctx, OSPREY_PRED_PRIMITIVE_VAR, heap, 11, 4);
+    CHECK(osprey_compile_cc07(ctx, primitive, unfoldable, foldable, folded) ==
+              OSPREY_INVALID_GRAPH,
+          "CC07 rejects offset below sh plus st");
+    osprey_free(ctx);
+
+    ctx = cc07_context(18, 8, 4, 14, 4, 10);
+    CHECK(osprey_relations_build(ctx) == OSPREY_OK,
+          "CC07 modulo relation fixture");
+    primitive = chunk_variable_id_value(
+        ctx, OSPREY_PRED_PRIMITIVE_VAR, heap, 14, 4);
+    unfoldable = heap_fold_variable_id(
+        ctx, OSPREY_PRED_UNFOLDABLE_HEAP,
+        region(OSPREY_REGION_HEAP_SITE, 0x701), 8);
+    foldable = heap_fold_variable_id(
+        ctx, OSPREY_PRED_FOLDABLE_HEAP,
+        region(OSPREY_REGION_HEAP_SITE, 0x701), 4);
+    folded = chunk_variable_id_value(
+        ctx, OSPREY_PRED_PRIMITIVE_VAR, heap, 10, 4);
+    CHECK(osprey_compile_cc07(ctx, primitive, unfoldable, foldable, folded) ==
+              OSPREY_OK,
+          "CC07 applies the checked modulo offset");
+    osprey_free(ctx);
+
+    ctx = cc07_context(15, 8, 4, 12, 4, 8);
+    CHECK(osprey_relations_build(ctx) == OSPREY_OK,
+          "CC07 short-allocation relation fixture");
+    primitive = chunk_variable_id_value(
+        ctx, OSPREY_PRED_PRIMITIVE_VAR, heap, 12, 4);
+    unfoldable = heap_fold_variable_id(
+        ctx, OSPREY_PRED_UNFOLDABLE_HEAP, heap, 8);
+    foldable = heap_fold_variable_id(
+        ctx, OSPREY_PRED_FOLDABLE_HEAP, heap, 4);
+    folded = chunk_variable_id_value(
+        ctx, OSPREY_PRED_PRIMITIVE_VAR, heap, 8, 4);
+    CHECK(osprey_compile_cc07(ctx, primitive, unfoldable, foldable, folded) ==
+              OSPREY_INVALID_GRAPH,
+          "CC07 rejects a source beyond the allocation extent");
+    osprey_free(ctx);
+
+    ctx = cc07_context(INT64_MAX, INT64_MAX, 1, INT64_MAX, 1, 0);
+    CHECK(osprey_relations_build(ctx) == OSPREY_OK,
+          "CC07 allocation-overflow relation fixture");
+    primitive = chunk_variable_id_value(
+        ctx, OSPREY_PRED_PRIMITIVE_VAR, heap, INT64_MAX, 1);
+    unfoldable = heap_fold_variable_id(
+        ctx, OSPREY_PRED_UNFOLDABLE_HEAP,
+        region(OSPREY_REGION_HEAP_SITE, 0x701), INT64_MAX);
+    foldable = heap_fold_variable_id(
+        ctx, OSPREY_PRED_FOLDABLE_HEAP,
+        region(OSPREY_REGION_HEAP_SITE, 0x701), 1);
+    folded = chunk_variable_id_value(
+        ctx, OSPREY_PRED_PRIMITIVE_VAR, heap, 0, 1);
+    CHECK(osprey_compile_cc07(ctx, primitive, unfoldable, foldable, folded) ==
+              OSPREY_GRAPH_ARITHMETIC,
+          "CC07 rejects allocation extent overflow");
+    osprey_free(ctx);
+}
+
+static void test_cd01(void)
+{
+    OspreyContext *ctx = new_context();
+    OspreyRegionId global = region(OSPREY_REGION_GLOBAL, 0);
+    add_copy_fact(ctx, chunk(global, 0, 8), chunk(global, 100, 8));
+    add_copy_fact(ctx, chunk(global, 16, 8), chunk(global, 116, 8));
+    CHECK(build_secondary(ctx), "CD01 positive");
+    CHECK(rule_count(ctx, OSPREY_RULE_CD01) == 1,
+          "CD01 emits one data-flow prior");
+    uint32_t homo = homo_variable_id(ctx, address(global, 0),
+                                     address(global, 100), 16);
+    expect_factor(ctx, OSPREY_RULE_CD01, OSPREY_GRAPH_SECONDARY,
+                  OSPREY_POTENTIAL_PRIOR, false, 0.8, 0,
+                  &homo, 1, "CD01 exact matched delta");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    add_copy_fact(ctx, chunk(global, 0, 8), chunk(global, 100, 8));
+    add_copy_fact(ctx, chunk(global, 16, 8), chunk(global, 117, 8));
+    CHECK(build_secondary(ctx), "CD01 destination-delta near miss");
+    CHECK(rule_count(ctx, OSPREY_RULE_CD01) == 0,
+          "CD01 rejects mismatched destination delta");
+    osprey_free(ctx);
+}
+
+static void populate_cd02(OspreyContext *ctx, bool reverse)
+{
+    OspreyRegionId global = region(OSPREY_REGION_GLOBAL, 0);
+    OspreyChunk first_target = chunk(global, 0, 8);
+    OspreyChunk first_value = chunk(global, 8, 8);
+    OspreyChunk second_target = chunk(global, 16, 8);
+    OspreyChunk second_value = chunk(global, 24, 8);
+    OspreyChunk pointer = chunk(global, 32, 8);
+    if (!reverse) {
+        add_logical(ctx, 0x10, &first_target, 1, 1);
+        add_logical(ctx, 0x10, &first_value, 1, 1);
+        add_logical(ctx, 0x10, &second_target, 1, 1);
+        add_logical(ctx, 0x10, &second_value, 1, 1);
+        add_base_fact(ctx, first_value, first_target.address);
+        add_base_fact(ctx, second_value, second_target.address);
+        add_points_fact(ctx, pointer, first_target.address);
+        add_points_fact(ctx, pointer, second_target.address);
+    } else {
+        add_logical(ctx, 0x10, &second_value, 1, 1);
+        add_logical(ctx, 0x10, &second_target, 1, 1);
+        add_logical(ctx, 0x10, &first_value, 1, 1);
+        add_logical(ctx, 0x10, &first_target, 1, 1);
+        add_base_fact(ctx, second_value, second_target.address);
+        add_base_fact(ctx, first_value, first_target.address);
+        add_points_fact(ctx, pointer, second_target.address);
+        add_points_fact(ctx, pointer, first_target.address);
+    }
+}
+
+static void test_cd02(void)
+{
+    OspreyContext *ctx = new_context();
+    populate_cd02(ctx, false);
+    CHECK(build_secondary(ctx), "CD02 positive");
+    CHECK(rule_count(ctx, OSPREY_RULE_CD02) == 1,
+          "CD02 emits one points-to prior");
+    OspreyRegionId global = region(OSPREY_REGION_GLOBAL, 0);
+    uint32_t homo = homo_variable_id(ctx, address(global, 0),
+                                     address(global, 16), 8);
+    expect_factor(ctx, OSPREY_RULE_CD02, OSPREY_GRAPH_SECONDARY,
+                  OSPREY_POTENTIAL_PRIOR, false, 0.8, 0,
+                  &homo, 1, "CD02 exact base/access join");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    populate_cd02(ctx, true);
+    CHECK(build_secondary(ctx), "CD02 permuted input");
+    CHECK(rule_count(ctx, OSPREY_RULE_CD02) == 1,
+          "CD02 keeps canonical result under permutation");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    OspreyChunk first_target = chunk(global, 0, 8);
+    OspreyChunk first_value = chunk(global, 8, 8);
+    OspreyChunk second_target = chunk(global, 16, 8);
+    OspreyChunk second_value = chunk(global, 24, 8);
+    OspreyChunk pointer = chunk(global, 32, 8);
+    add_logical(ctx, 0x10, &first_target, 1, 1);
+    add_logical(ctx, 0x10, &first_value, 1, 1);
+    add_logical(ctx, 0x10, &second_target, 1, 1);
+    add_logical(ctx, 0x10, &second_value, 1, 1);
+    add_base_fact(ctx, first_value, first_target.address);
+    add_base_fact(ctx, second_value, second_target.address);
+    add_points_fact(ctx, pointer, address(global, 17));
+    add_points_fact(ctx, pointer, first_target.address);
+    CHECK(build_secondary(ctx), "CD02 target-address near miss");
+    CHECK(rule_count(ctx, OSPREY_RULE_CD02) == 0,
+          "CD02 requires exact pointer targets");
+    osprey_free(ctx);
+}
+
+static void populate_cd03(OspreyContext *ctx, bool reverse,
+                          int64_t second_delta)
+{
+    OspreyRegionId global = region(OSPREY_REGION_GLOBAL, 0);
+    OspreyChunk first = chunk(global, 0, 8);
+    OspreyChunk second = chunk(global, 8, 8);
+    OspreyChunk third = chunk(global, 16, 8);
+    OspreyChunk fourth = chunk(global, 24 + second_delta - 16, 8);
+    if (!reverse) {
+        add_logical(ctx, 0x10, &first, 1, 1);
+        add_logical(ctx, 0x10, &second, 1, 1);
+        add_logical(ctx, 0x20, &third, 1, 1);
+        add_logical(ctx, 0x20, &fourth, 1, 1);
+    } else {
+        add_logical(ctx, 0x20, &fourth, 1, 1);
+        add_logical(ctx, 0x20, &third, 1, 1);
+        add_logical(ctx, 0x10, &second, 1, 1);
+        add_logical(ctx, 0x10, &first, 1, 1);
+    }
+}
+
+static void test_cd03(void)
+{
+    OspreyContext *ctx = new_context();
+    populate_cd03(ctx, false, 16);
+    CHECK(build_secondary(ctx), "CD03 positive");
+    CHECK(rule_count(ctx, OSPREY_RULE_CD03) == 1,
+          "CD03 emits one unified-access prior");
+    OspreyRegionId global = region(OSPREY_REGION_GLOBAL, 0);
+    uint32_t homo = homo_variable_id(ctx, address(global, 0),
+                                     address(global, 8), 16);
+    expect_factor(ctx, OSPREY_RULE_CD03, OSPREY_GRAPH_SECONDARY,
+                  OSPREY_POTENTIAL_PRIOR, false, 0.8, 0,
+                  &homo, 1, "CD03 exact corresponding access delta");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    populate_cd03(ctx, true, 16);
+    CHECK(build_secondary(ctx), "CD03 permuted input");
+    CHECK(rule_count(ctx, OSPREY_RULE_CD03) == 1,
+          "CD03 keeps canonical result under permutation");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    populate_cd03(ctx, false, 17);
+    CHECK(build_secondary(ctx), "CD03 skew near miss");
+    CHECK(rule_count(ctx, OSPREY_RULE_CD03) == 0,
+          "CD03 rejects unequal corresponding deltas");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    OspreyChunk first = chunk(global, 0, 8);
+    OspreyChunk second = chunk(global, 16, 8);
+    add_logical(ctx, 0x10, &first, 1, 1);
+    add_logical(ctx, 0x20, &second, 1, 1);
+    CHECK(build_base(ctx), "CD03 malformed-hint base setup");
+    OspreyHint malformed;
+    memset(&malformed, 0, sizeof(malformed));
+    malformed.a1 = first.address;
+    malformed.a2 = second.address;
+    malformed.size = 8;
+    malformed.kind = UINT8_MAX;
+    malformed.instances = 1;
+    g_array_append_val(ctx->graph->hints, malformed);
+    CHECK(osprey_stage3_secondary(ctx) == OSPREY_INVALID_GRAPH,
+          "CD hint compiler rejects an unknown relation kind");
+    osprey_free(ctx);
+}
+
+static void test_cd04(void)
+{
+    OspreyContext *ctx = new_context();
+    OspreyRegionId global = region(OSPREY_REGION_GLOBAL, 0);
+    OspreyChunk extent = chunk(global, 0, 48);
+    OspreyChunk starts[4] = {
+        chunk(global, 0, 1), chunk(global, 4, 1),
+        chunk(global, 32, 1), chunk(global, 36, 1)
+    };
+    add_extent(ctx, &extent);
+    for (guint i = 0; i < G_N_ELEMENTS(starts); i++) {
+        add_logical(ctx, 0x10 + i, &starts[i], 1, 1);
+    }
+    CHECK(seed_homo(ctx, address(global, 0), address(global, 32), 16).inserted,
+          "CD04 first candidate");
+    CHECK(seed_homo(ctx, address(global, 4), address(global, 36), 8).inserted,
+          "CD04 second candidate");
+    CHECK(build_secondary(ctx), "CD04 positive closure");
+    CHECK(rule_count(ctx, OSPREY_RULE_CD04) >= 3,
+          "CD04 emits directional factors and a checked union");
+    CHECK(homo_variable_id(ctx, address(global, 0), address(global, 32), 12) !=
+              UINT32_MAX,
+          "CD04 interns the union candidate");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    add_extent(ctx, &extent);
+    for (guint i = 0; i < G_N_ELEMENTS(starts); i++) {
+        add_logical(ctx, 0x10 + i, &starts[i], 1, 1);
+    }
+    seed_homo(ctx, address(global, 0), address(global, 32), 16);
+    seed_homo(ctx, address(global, 4), address(global, 37), 8);
+    CHECK(build_secondary(ctx), "CD04 partner-delta near miss");
+    CHECK(rule_count(ctx, OSPREY_RULE_CD04) == 0,
+          "CD04 rejects mismatched partner deltas");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    add_extent(ctx, &extent);
+    add_logical(ctx, 0x10, &starts[0], 1, 1);
+    add_logical(ctx, 0x20, &starts[2], 1, 1);
+    seed_homo(ctx, address(global, 0), address(global, 32), 16);
+    seed_homo(ctx, address(global, 0), address(global, 32), 8);
+    CHECK(build_secondary(ctx), "CD04 zero-delta near miss");
+    CHECK(rule_count(ctx, OSPREY_RULE_CD04) == 0,
+          "CD04 requires a positive endpoint delta");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    add_extent(ctx, &extent);
+    for (guint i = 0; i < G_N_ELEMENTS(starts); i++) {
+        add_logical(ctx, 0x10 + i, &starts[i], 1, 1);
+    }
+    seed_homo(ctx, address(global, 0), address(global, 32), 4);
+    seed_homo(ctx, address(global, 4), address(global, 36), 8);
+    CHECK(build_secondary(ctx), "CD04 touching-segment near miss");
+    CHECK(rule_count(ctx, OSPREY_RULE_CD04) == 0,
+          "CD04 excludes delta equal to the first segment size");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    OspreyRegionId stack = region(OSPREY_REGION_STACK_FUNCTION, 0x404);
+    OspreyChunk overflow_starts[4] = {
+        chunk(global, 0, 1), chunk(global, 4, 1),
+        chunk(stack, INT64_MAX - 10, 1), chunk(stack, INT64_MAX - 6, 1),
+    };
+    for (guint i = 0; i < G_N_ELEMENTS(overflow_starts); i++) {
+        add_logical(ctx, 0x30 + i, &overflow_starts[i], 1, 1);
+    }
+    seed_homo(ctx, overflow_starts[0].address,
+              overflow_starts[2].address, 8);
+    seed_homo(ctx, overflow_starts[1].address,
+              overflow_starts[3].address, 8);
+    CHECK(build_base(ctx), "CD04 overflow base setup");
+    CHECK(osprey_stage3_secondary(ctx) == OSPREY_GRAPH_ARITHMETIC,
+          "CD04 rejects an overflowing union endpoint");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    OspreyChunk chain_extent = chunk(global, 0, 48);
+    OspreyChunk chain_starts[6] = {
+        chunk(global, 0, 1), chunk(global, 4, 1), chunk(global, 8, 1),
+        chunk(global, 32, 1), chunk(global, 36, 1), chunk(global, 40, 1),
+    };
+    add_extent(ctx, &chain_extent);
+    for (guint i = 0; i < G_N_ELEMENTS(chain_starts); i++) {
+        add_logical(ctx, 0x40 + i, &chain_starts[i], 1, 1);
+    }
+    seed_homo(ctx, address(global, 0), address(global, 32), 8);
+    seed_homo(ctx, address(global, 4), address(global, 36), 8);
+    seed_homo(ctx, address(global, 8), address(global, 40), 8);
+    CHECK(build_secondary(ctx), "CD04 multi-round union closure");
+    CHECK(homo_variable_id(ctx, address(global, 0),
+                           address(global, 32), 16) != UINT32_MAX,
+          "CD04 reaches a union requiring a derived intermediate");
+    osprey_free(ctx);
+}
+
+static void test_cd05(void)
+{
+    OspreyContext *ctx = new_context();
+    OspreyRegionId global = region(OSPREY_REGION_GLOBAL, 0);
+    OspreyChunk extent = chunk(global, 0, 32);
+    OspreyChunk first = chunk(global, 4, 4);
+    OspreyChunk second = chunk(global, 20, 8);
+    add_extent(ctx, &extent);
+    add_logical(ctx, 0x10, &first, 1, 1);
+    add_logical(ctx, 0x20, &second, 1, 1);
+    CHECK(seed_homo(ctx, address(global, 0), address(global, 16), 16).inserted,
+          "CD05 segment seed");
+    CHECK(build_secondary(ctx), "CD05 positive");
+    CHECK(rule_count(ctx, OSPREY_RULE_CD05) == 3,
+          "CD05 emits all three negative directions");
+    uint32_t first_id = chunk_variable_id(ctx, OSPREY_PRED_PRIMITIVE_VAR,
+                                          &first);
+    uint32_t second_id = chunk_variable_id(ctx, OSPREY_PRED_PRIMITIVE_VAR,
+                                           &second);
+    uint32_t homo = homo_variable_id(ctx, address(global, 0),
+                                     address(global, 16), 16);
+    uint32_t pair[3] = { first_id, second_id, homo };
+    expect_factor(ctx, OSPREY_RULE_CD05, OSPREY_GRAPH_SECONDARY,
+                  OSPREY_POTENTIAL_IMPLICATION, true, 0.2, 2,
+                  pair, 3, "CD05 conjunction-to-segment factor");
+    uint32_t reverse_first[2] = { homo, first_id };
+    uint32_t reverse_second[2] = { homo, second_id };
+    expect_factor(ctx, OSPREY_RULE_CD05, OSPREY_GRAPH_SECONDARY,
+                  OSPREY_POTENTIAL_IMPLICATION, true, 0.2, 1,
+                  reverse_first, 2, "CD05 segment-to-first factor");
+    expect_factor(ctx, OSPREY_RULE_CD05, OSPREY_GRAPH_SECONDARY,
+                  OSPREY_POTENTIAL_IMPLICATION, true, 0.2, 1,
+                  reverse_second, 2, "CD05 segment-to-second factor");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    extent = chunk(global, 0, 32);
+    first = chunk(global, 4, 4);
+    second = chunk(global, 20, 4);
+    add_extent(ctx, &extent);
+    add_logical(ctx, 0x10, &first, 1, 1);
+    add_logical(ctx, 0x20, &second, 1, 1);
+    seed_homo(ctx, address(global, 0), address(global, 16), 16);
+    CHECK(build_secondary(ctx), "CD05 equal-width near miss");
+    CHECK(rule_count(ctx, OSPREY_RULE_CD05) == 0,
+          "CD05 rejects matching widths");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    extent = chunk(global, 0, 32);
+    first = chunk(global, 4, 4);
+    second = chunk(global, 24, 8);
+    add_extent(ctx, &extent);
+    add_logical(ctx, 0x10, &first, 1, 1);
+    add_logical(ctx, 0x20, &second, 1, 1);
+    seed_homo(ctx, address(global, 0), address(global, 16), 16);
+    CHECK(build_secondary(ctx), "CD05 offset near miss");
+    CHECK(rule_count(ctx, OSPREY_RULE_CD05) == 0,
+          "CD05 rejects mismatched corresponding offsets");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    extent = chunk(global, 0, 32);
+    first = chunk(global, 0, 4);
+    second = chunk(global, 16, 8);
+    add_extent(ctx, &extent);
+    add_logical(ctx, 0x10, &first, 1, 1);
+    add_logical(ctx, 0x20, &second, 1, 1);
+    seed_homo(ctx, address(global, 0), address(global, 16), 16);
+    CHECK(build_secondary(ctx), "CD05 segment-start near miss");
+    CHECK(rule_count(ctx, OSPREY_RULE_CD05) == 0,
+          "CD05 enforces the positive-offset precondition");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    extent = chunk(global, 0, 32);
+    first = chunk(global, 12, 4);
+    second = chunk(global, 28, 2);
+    add_extent(ctx, &extent);
+    CHECK(seed_primitive(ctx, second).inserted,
+          "CD05 reverse-ID right primitive seed");
+    CHECK(seed_primitive(ctx, first).inserted,
+          "CD05 reverse-ID left primitive seed");
+    CHECK(seed_homo(ctx, address(global, 0), address(global, 16), 16).inserted,
+          "CD05 boundary segment seed");
+    CHECK(build_secondary(ctx), "CD05 exact-end semantic-order case");
+    CHECK(rule_count(ctx, OSPREY_RULE_CD05) == 3,
+          "CD05 permits a fully contained end-boundary field");
+    first_id = chunk_variable_id(ctx, OSPREY_PRED_PRIMITIVE_VAR, &first);
+    second_id = chunk_variable_id(ctx, OSPREY_PRED_PRIMITIVE_VAR, &second);
+    homo = homo_variable_id(ctx, address(global, 0),
+                            address(global, 16), 16);
+    uint32_t ordered_pair[3] = { first_id, second_id, homo };
+    CHECK(first_id > second_id,
+          "CD05 fixture reverses allocation IDs relative to endpoint roles");
+    expect_factor(ctx, OSPREY_RULE_CD05, OSPREY_GRAPH_SECONDARY,
+                  OSPREY_POTENTIAL_IMPLICATION, true, 0.2, 2,
+                  ordered_pair, 3, "CD05 preserves endpoint semantic order");
+    osprey_free(ctx);
+}
+
+static void populate_cd06(OspreyContext *ctx, bool reverse,
+                          bool target_access, bool cross_region)
+{
+    OspreyRegionId global = region(OSPREY_REGION_GLOBAL, 0);
+    OspreyRegionId stack = region(OSPREY_REGION_STACK_FUNCTION, 3);
+    OspreyChunk source = chunk(global, 8, 4);
+    OspreyChunk target = chunk(cross_region ? stack : global, 0, 4);
+    if (!reverse) {
+        add_logical(ctx, 0x10, &source, 1, 1);
+        if (target_access) add_logical(ctx, 0x20, &target, 1, 1);
+        add_base_fact(ctx, source, target.address);
+    } else {
+        add_base_fact(ctx, source, target.address);
+        if (target_access) add_logical(ctx, 0x20, &target, 1, 1);
+        add_logical(ctx, 0x10, &source, 1, 1);
+    }
+}
+
+static void test_cd06(void)
+{
+    OspreyContext *ctx = new_context();
+    populate_cd06(ctx, false, true, false);
+    CHECK(build_secondary(ctx), "CD06 positive");
+    CHECK(rule_count(ctx, OSPREY_RULE_CD06) == 1,
+          "CD06 emits a source-target FieldOf implication");
+    OspreyRegionId global = region(OSPREY_REGION_GLOBAL, 0);
+    OspreyChunk source = chunk(global, 8, 4);
+    OspreyChunk target = chunk(global, 0, 4);
+    uint32_t source_id = chunk_variable_id(ctx, OSPREY_PRED_PRIMITIVE_VAR,
+                                           &source);
+    uint32_t target_var_id = chunk_variable_id(ctx, OSPREY_PRED_PRIMITIVE_VAR,
+                                               &target);
+    uint32_t field_id = field_variable_id(ctx, &source, &target.address);
+    uint32_t ids[3] = { source_id, target_var_id, field_id };
+    expect_factor(ctx, OSPREY_RULE_CD06, OSPREY_GRAPH_SECONDARY,
+                  OSPREY_POTENTIAL_IMPLICATION, false, 0.8, 2,
+                  ids, 3, "CD06 exact source and target roles");
+    CHECK(field_id != UINT32_MAX, "CD06 interns the FieldOf head");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    OspreyChunk wide_source = chunk(global, 8, 8);
+    OspreyChunk narrow_target = chunk(global, 0, 4);
+    OspreyChunk wide_target = chunk(global, 0, 8);
+    OspreyChunk cd06_extent = chunk(global, 0, 16);
+    add_extent(ctx, &cd06_extent);
+    add_logical(ctx, 0x10, &wide_source, 1, 1);
+    add_logical(ctx, 0x20, &narrow_target, 1, 1);
+    add_logical(ctx, 0x30, &wide_target, 1, 1);
+    add_base_fact(ctx, wide_source, narrow_target.address);
+    CHECK(build_secondary(ctx), "CD06 multiple target widths");
+    CHECK(rule_count(ctx, OSPREY_RULE_CD06) == 2,
+          "CD06 retains each accessed target width witness");
+    uint32_t multi_source_id = chunk_variable_id(
+        ctx, OSPREY_PRED_PRIMITIVE_VAR, &wide_source);
+    uint32_t narrow_id = chunk_variable_id(ctx, OSPREY_PRED_PRIMITIVE_VAR,
+                                           &narrow_target);
+    uint32_t wide_id = chunk_variable_id(ctx, OSPREY_PRED_PRIMITIVE_VAR,
+                                         &wide_target);
+    uint32_t multi_field = field_variable_id(ctx, &wide_source,
+                                              &narrow_target.address);
+    uint32_t narrow_roles[3] = {
+        multi_source_id, narrow_id, multi_field,
+    };
+    uint32_t wide_roles[3] = {
+        multi_source_id, wide_id, multi_field,
+    };
+    expect_factor(ctx, OSPREY_RULE_CD06, OSPREY_GRAPH_SECONDARY,
+                  OSPREY_POTENTIAL_IMPLICATION, false, 0.8, 2,
+                  narrow_roles, 3, "CD06 narrow target role");
+    expect_factor(ctx, OSPREY_RULE_CD06, OSPREY_GRAPH_SECONDARY,
+                  OSPREY_POTENTIAL_IMPLICATION, false, 0.8, 2,
+                  wide_roles, 3, "CD06 wide target role");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    populate_cd06(ctx, true, true, false);
+    CHECK(build_secondary(ctx), "CD06 permuted input");
+    CHECK(rule_count(ctx, OSPREY_RULE_CD06) == 1,
+          "CD06 remains deterministic under permutation");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    populate_cd06(ctx, false, false, false);
+    CHECK(build_secondary(ctx), "CD06 target-access near miss");
+    CHECK(rule_count(ctx, OSPREY_RULE_CD06) == 0,
+          "CD06 requires target access");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    populate_cd06(ctx, false, true, true);
+    CHECK(build_secondary(ctx), "CD06 cross-region near miss");
+    CHECK(rule_count(ctx, OSPREY_RULE_CD06) == 0,
+          "CD06 excludes cross-region FieldOf");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    OspreyChunk zero_field = chunk(global, 0, 4);
+    add_logical(ctx, 0x10, &zero_field, 1, 1);
+    add_base_fact(ctx, zero_field, zero_field.address);
+    CHECK(build_secondary(ctx), "CD06 zero-offset self-base case");
+    CHECK(rule_count(ctx, OSPREY_RULE_CD06) == 1,
+          "CD06 retains a field whose base chunk is itself");
+    uint32_t zero_primitive = chunk_variable_id(
+        ctx, OSPREY_PRED_PRIMITIVE_VAR, &zero_field);
+    uint32_t zero_field_id = field_variable_id(
+        ctx, &zero_field, &zero_field.address);
+    uint32_t zero_roles[2] = { zero_primitive, zero_field_id };
+    expect_factor(ctx, OSPREY_RULE_CD06, OSPREY_GRAPH_SECONDARY,
+                  OSPREY_POTENTIAL_IMPLICATION, false, 0.8, 1,
+                  zero_roles, 2, "CD06 simplifies duplicate antecedents");
+    osprey_free(ctx);
+}
+
+static void test_cd07(void)
+{
+    OspreyContext *ctx = new_context();
+    OspreyRegionId heap = region(OSPREY_REGION_HEAP_SITE, 0x701);
+    OspreyChunk value = chunk(heap, 4, 4);
+    add_allocation(ctx, heap.site_offset, 16);
+    add_logical(ctx, 0x10, &value, 1, 1);
+    CHECK(build_secondary(ctx), "CD07 positive");
+    CHECK(rule_count(ctx, OSPREY_RULE_CD07) == 1,
+          "CD07 emits the heap-base FieldOf implication");
+    OspreyAddress heap_base = address(heap, 0);
+    uint32_t primitive = chunk_variable_id(ctx, OSPREY_PRED_PRIMITIVE_VAR,
+                                           &value);
+    uint32_t field = field_variable_id(ctx, &value, &heap_base);
+    uint32_t ids[2] = { primitive, field };
+    expect_factor(ctx, OSPREY_RULE_CD07, OSPREY_GRAPH_SECONDARY,
+                  OSPREY_POTENTIAL_IMPLICATION, false, 0.8, 1,
+                  ids, 2, "CD07 exact heap base factor");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    OspreyRegionId global = region(OSPREY_REGION_GLOBAL, 0);
+    value = chunk(global, 4, 4);
+    OspreyChunk extent = chunk(global, 0, 16);
+    add_extent(ctx, &extent);
+    add_logical(ctx, 0x10, &value, 1, 1);
+    CHECK(build_secondary(ctx), "CD07 global near miss");
+    CHECK(rule_count(ctx, OSPREY_RULE_CD07) == 0,
+          "CD07 excludes global regions");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    OspreyRegionId stack = region(OSPREY_REGION_STACK_FUNCTION, 0x702);
+    value = chunk(stack, -8, 4);
+    add_logical(ctx, 0x10, &value, 1, 1);
+    CHECK(build_secondary(ctx), "CD07 stack near miss");
+    CHECK(rule_count(ctx, OSPREY_RULE_CD07) == 0,
+          "CD07 excludes stack regions");
+    osprey_free(ctx);
+}
+
+static void test_cd08(void)
+{
+    OspreyContext *ctx = new_context();
+    OspreyRegionId global = region(OSPREY_REGION_GLOBAL, 0);
+    OspreyChunk extent = chunk(global, 0, 64);
+    OspreyChunk source = chunk(global, 0, 4);
+    OspreyChunk target = chunk(global, 16, 4);
+    add_extent(ctx, &extent);
+    add_logical(ctx, 0x10, &source, 1, 1);
+    add_logical(ctx, 0x20, &target, 1, 1);
+    seed_field(ctx, source, source.address);
+    seed_homo(ctx, address(global, 0), address(global, 16), 16);
+    CHECK(build_secondary(ctx), "CD08 offset-zero translation");
+    CHECK(rule_count(ctx, OSPREY_RULE_CD08) == 2,
+          "CD08 translates a complete field in both directions");
+    uint32_t source_field = field_variable_id(ctx, &source, &source.address);
+    uint32_t target_field = field_variable_id(ctx, &target, &target.address);
+    uint32_t homo = homo_variable_id(ctx, address(global, 0),
+                                     address(global, 16), 16);
+    uint32_t ids[3] = { source_field, homo, target_field };
+    expect_factor(ctx, OSPREY_RULE_CD08, OSPREY_GRAPH_SECONDARY,
+                  OSPREY_POTENTIAL_IMPLICATION, false, 0.8, 2,
+                  ids, 3, "CD08 exact translated-field factor");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    extent = chunk(global, 0, 64);
+    source = chunk(global, 16, 4);
+    target = chunk(global, 0, 4);
+    add_extent(ctx, &extent);
+    add_logical(ctx, 0x10, &source, 1, 1);
+    add_logical(ctx, 0x20, &target, 1, 1);
+    seed_field(ctx, source, source.address);
+    seed_homo(ctx, address(global, 0), address(global, 16), 16);
+    CHECK(build_secondary(ctx), "CD08 reverse translation");
+    CHECK(rule_count(ctx, OSPREY_RULE_CD08) == 2,
+          "CD08 repeats in the reverse endpoint direction");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    extent = chunk(global, 0, 64);
+    source = chunk(global, 15, 4);
+    target = chunk(global, 31, 4);
+    add_extent(ctx, &extent);
+    add_logical(ctx, 0x10, &source, 1, 1);
+    add_logical(ctx, 0x20, &target, 1, 1);
+    seed_field(ctx, source, address(global, 0));
+    seed_homo(ctx, address(global, 0), address(global, 16), 16);
+    CHECK(build_secondary(ctx), "CD08 span near miss");
+    CHECK(rule_count(ctx, OSPREY_RULE_CD08) == 0,
+          "CD08 rejects fields extending beyond a segment");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    extent = chunk(global, 0, 64);
+    source = chunk(global, 0, 4);
+    target = chunk(global, 16, 8);
+    add_extent(ctx, &extent);
+    add_logical(ctx, 0x10, &source, 1, 1);
+    add_logical(ctx, 0x20, &target, 1, 1);
+    seed_field(ctx, source, source.address);
+    seed_homo(ctx, address(global, 0), address(global, 16), 16);
+    CHECK(build_secondary(ctx), "CD08 unequal-width near miss");
+    CHECK(rule_count(ctx, OSPREY_RULE_CD08) == 0,
+          "CD08 requires equal field widths");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    extent = chunk(global, 0, 64);
+    source = chunk(global, 12, 4);
+    target = chunk(global, 28, 4);
+    add_extent(ctx, &extent);
+    add_logical(ctx, 0x10, &source, 1, 1);
+    add_logical(ctx, 0x20, &target, 1, 1);
+    seed_field(ctx, source, address(global, 0));
+    seed_homo(ctx, address(global, 0), address(global, 16), 16);
+    CHECK(build_secondary(ctx), "CD08 exact-end translation");
+    CHECK(rule_count(ctx, OSPREY_RULE_CD08) == 2,
+          "CD08 permits a field ending at the segment boundary");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    extent = chunk(global, 0, 64);
+    source = chunk(global, 0, 4);
+    target = chunk(global, 16, 4);
+    OspreyChunk second_target = chunk(global, 32, 4);
+    add_extent(ctx, &extent);
+    add_logical(ctx, 0x10, &source, 1, 1);
+    add_logical(ctx, 0x20, &target, 1, 1);
+    add_logical(ctx, 0x30, &second_target, 1, 1);
+    seed_field(ctx, source, source.address);
+    seed_homo(ctx, address(global, 0), address(global, 16), 16);
+    seed_homo(ctx, address(global, 16), address(global, 32), 16);
+    CHECK(build_secondary(ctx), "CD08 multi-round closure");
+    CHECK(field_variable_id(ctx, &second_target, &second_target.address) !=
+              UINT32_MAX && rule_count(ctx, OSPREY_RULE_CD08) >= 2,
+          "CD08 propagates a field through successive segments");
+    osprey_free(ctx);
+}
+
+static void test_cd10(void)
+{
+    OspreyContext *ctx = new_context();
+    OspreyRegionId global = region(OSPREY_REGION_GLOBAL, 0);
+    OspreyChunk value = chunk(global, 8, 4);
+    OspreyChunk extent = chunk(global, 0, 32);
+    add_extent(ctx, &extent);
+    add_logical(ctx, 0x10, &value, 1, 1);
+    OspreyAddress first_base = address(global, 0);
+    OspreyAddress second_base = address(global, 4);
+    seed_field(ctx, value, first_base);
+    seed_field(ctx, value, second_base);
+    CHECK(build_secondary(ctx), "CD10 positive");
+    CHECK(rule_count(ctx, OSPREY_RULE_CD10) == 2,
+          "CD10 emits exactly two reverse factors for two bases");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    add_extent(ctx, &extent);
+    add_logical(ctx, 0x10, &value, 1, 1);
+    seed_field(ctx, value, first_base);
+    seed_field(ctx, value, first_base);
+    CHECK(build_secondary(ctx), "CD10 same-base near miss");
+    CHECK(rule_count(ctx, OSPREY_RULE_CD10) == 0,
+          "CD10 omits equal-base self-factors");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    add_extent(ctx, &extent);
+    add_logical(ctx, 0x10, &value, 1, 1);
+    seed_field(ctx, value, address(global, 0));
+    seed_field(ctx, value, address(global, 4));
+    seed_field(ctx, value, address(global, 8));
+    CHECK(build_secondary(ctx), "CD10 three-base coverage");
+    CHECK(rule_count(ctx, OSPREY_RULE_CD10) == 6,
+          "CD10 emits both directions for every base pair");
+    osprey_free(ctx);
+}
+
+static void test_cd11(void)
+{
+    OspreyContext *ctx = new_context();
+    OspreyRegionId global = region(OSPREY_REGION_GLOBAL, 0);
+    OspreyChunk pointer = chunk(global, 0, 8);
+    OspreyChunk target = chunk(global, 16, 8);
+    add_logical(ctx, 0x10, &pointer, 1, 1);
+    add_logical(ctx, 0x20, &target, 1, 1);
+    add_points_fact(ctx, pointer, target.address);
+    CHECK(build_secondary(ctx), "CD11 positive");
+    CHECK(rule_count(ctx, OSPREY_RULE_CD11) == 1,
+          "CD11 emits the pointer-target implication");
+    uint32_t pointer_primitive = chunk_variable_id(
+        ctx, OSPREY_PRED_PRIMITIVE_VAR, &pointer);
+    uint32_t target_primitive = chunk_variable_id(
+        ctx, OSPREY_PRED_PRIMITIVE_VAR, &target);
+    uint32_t pointer_var = variable_id(ctx, OSPREY_PRED_POINTER,
+                                       &(OspreyVarPayload){
+                                           .attached = {
+                                               .chunk = pointer,
+                                               .base = target.address,
+                                           },
+                                       });
+    uint32_t ids[3] = { pointer_primitive, target_primitive, pointer_var };
+    expect_factor(ctx, OSPREY_RULE_CD11, OSPREY_GRAPH_SECONDARY,
+                  OSPREY_POTENTIAL_IMPLICATION, false, 0.8, 2,
+                  ids, 3, "CD11 exact pointer and target roles");
+    CHECK(pointer_var != UINT32_MAX, "CD11 interns the pointer head");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    OspreyChunk narrow_target = chunk(global, 16, 4);
+    OspreyChunk wide_target = chunk(global, 16, 8);
+    OspreyChunk pointer_extent = chunk(global, 0, 24);
+    add_extent(ctx, &pointer_extent);
+    add_logical(ctx, 0x10, &pointer, 1, 1);
+    add_logical(ctx, 0x20, &narrow_target, 1, 1);
+    add_logical(ctx, 0x30, &wide_target, 1, 1);
+    add_points_fact(ctx, pointer, narrow_target.address);
+    CHECK(build_secondary(ctx), "CD11 multiple target widths");
+    CHECK(rule_count(ctx, OSPREY_RULE_CD11) == 2,
+          "CD11 retains each accessed target width witness");
+    uint32_t pointer_id = chunk_variable_id(ctx, OSPREY_PRED_PRIMITIVE_VAR,
+                                            &pointer);
+    uint32_t narrow_target_id = chunk_variable_id(
+        ctx, OSPREY_PRED_PRIMITIVE_VAR, &narrow_target);
+    uint32_t wide_target_id = chunk_variable_id(
+        ctx, OSPREY_PRED_PRIMITIVE_VAR, &wide_target);
+    uint32_t narrow_pointer_id = variable_id(
+        ctx, OSPREY_PRED_POINTER,
+        &(OspreyVarPayload){ .attached = {
+            .chunk = pointer, .base = narrow_target.address,
+        }});
+    uint32_t narrow_roles[3] = {
+        pointer_id, narrow_target_id, narrow_pointer_id,
+    };
+    uint32_t wide_roles[3] = {
+        pointer_id, wide_target_id, narrow_pointer_id,
+    };
+    expect_factor(ctx, OSPREY_RULE_CD11, OSPREY_GRAPH_SECONDARY,
+                  OSPREY_POTENTIAL_IMPLICATION, false, 0.8, 2,
+                  narrow_roles, 3, "CD11 narrow target role");
+    expect_factor(ctx, OSPREY_RULE_CD11, OSPREY_GRAPH_SECONDARY,
+                  OSPREY_POTENTIAL_IMPLICATION, false, 0.8, 2,
+                  wide_roles, 3, "CD11 wide target role");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    OspreyRegionId stack = region(OSPREY_REGION_STACK_FUNCTION, 7);
+    OspreyChunk stack_target = chunk(stack, target.address.offset, target.size);
+    add_logical(ctx, 0x10, &pointer, 1, 1);
+    add_logical(ctx, 0x20, &stack_target, 1, 1);
+    add_points_fact(ctx, pointer, target.address);
+    CHECK(build_secondary(ctx), "CD11 target-region mismatch");
+    CHECK(rule_count(ctx, OSPREY_RULE_CD11) == 0,
+          "CD11 requires the pointed-to target region");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    add_logical(ctx, 0x10, &pointer, 1, 1);
+    add_points_fact(ctx, pointer, target.address);
+    CHECK(build_secondary(ctx), "CD11 missing-target-access near miss");
+    CHECK(rule_count(ctx, OSPREY_RULE_CD11) == 0,
+          "CD11 requires target access");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    add_logical(ctx, 0x10, &pointer, 1, 1);
+    add_points_fact(ctx, pointer, address(global, 0x1234));
+    CHECK(build_secondary(ctx), "CD11 numeric-target near miss");
+    CHECK(rule_count(ctx, OSPREY_RULE_CD11) == 0,
+          "CD11 excludes untagged numeric targets");
+    osprey_free(ctx);
+
+    ctx = new_context();
+    OspreyChunk self_pointer = chunk(global, 0, 8);
+    add_logical(ctx, 0x10, &self_pointer, 1, 1);
+    add_points_fact(ctx, self_pointer, self_pointer.address);
+    CHECK(build_secondary(ctx), "CD11 self-target case");
+    CHECK(rule_count(ctx, OSPREY_RULE_CD11) == 1,
+          "CD11 retains a pointer whose target chunk is itself");
+    uint32_t self_primitive = chunk_variable_id(
+        ctx, OSPREY_PRED_PRIMITIVE_VAR, &self_pointer);
+    uint32_t self_pointer_id = variable_id(
+        ctx, OSPREY_PRED_POINTER,
+        &(OspreyVarPayload){ .attached = {
+            .chunk = self_pointer, .base = self_pointer.address,
+        }});
+    uint32_t self_roles[2] = { self_primitive, self_pointer_id };
+    expect_factor(ctx, OSPREY_RULE_CD11, OSPREY_GRAPH_SECONDARY,
+                  OSPREY_POTENTIAL_IMPLICATION, false, 0.8, 1,
+                  self_roles, 2, "CD11 simplifies duplicate antecedents");
     osprey_free(ctx);
 }
 
@@ -2399,6 +3673,195 @@ static OspreyContext *permutation_context(uint16_t rule, bool reverse)
         status = build_secondary(ctx) ? OSPREY_OK : ctx->last_status;
         break;
     }
+    case OSPREY_RULE_CC01: {
+        OspreyRegionId heap = region(OSPREY_REGION_HEAP_SITE, 0x801);
+        add_allocation(ctx, heap.site_offset, 0);
+        status = build_secondary(ctx) ? OSPREY_OK : ctx->last_status;
+        break;
+    }
+    case OSPREY_RULE_CC02: {
+        OspreyRegionId heap = region(OSPREY_REGION_HEAP_SITE, 0x802);
+        if (reverse) {
+            add_allocation(ctx, heap.site_offset, 48);
+            add_allocation(ctx, heap.site_offset, 16);
+            add_allocation(ctx, heap.site_offset, 0);
+        } else {
+            add_allocation(ctx, heap.site_offset, 0);
+            add_allocation(ctx, heap.site_offset, 16);
+            add_allocation(ctx, heap.site_offset, 48);
+        }
+        status = build_secondary(ctx) ? OSPREY_OK : ctx->last_status;
+        break;
+    }
+    case OSPREY_RULE_CC03: {
+        OspreyRegionId heap = region(OSPREY_REGION_HEAP_SITE, 0x803);
+        OspreyChunk value = chunk(heap, 8, 8);
+        add_allocation(ctx, heap.site_offset, 32);
+        add_logical(ctx, 0x10, &value, 1, 1);
+        status = build_secondary(ctx) ? OSPREY_OK : ctx->last_status;
+        break;
+    }
+    case OSPREY_RULE_CC04:
+    case OSPREY_RULE_CC05: {
+        OspreyRegionId heap = region(OSPREY_REGION_HEAP_SITE, 0x804);
+        if (reverse) {
+            seed_heap_unfoldable(ctx, heap, 24);
+            seed_heap_unfoldable(ctx, heap, 8);
+            seed_heap_unfoldable(ctx, heap, 16);
+        } else {
+            seed_heap_unfoldable(ctx, heap, 8);
+            seed_heap_unfoldable(ctx, heap, 16);
+            seed_heap_unfoldable(ctx, heap, 24);
+        }
+        status = build_secondary(ctx) ? OSPREY_OK : ctx->last_status;
+        break;
+    }
+    case OSPREY_RULE_CC06: {
+        OspreyRegionId heap = region(OSPREY_REGION_HEAP_SITE, 0x805);
+        add_allocation(ctx, heap.site_offset, 32);
+        seed_array(ctx, heap, 0, 32, 8);
+        status = build_secondary(ctx) ? OSPREY_OK : ctx->last_status;
+        break;
+    }
+    case OSPREY_RULE_CC07: {
+        OspreyRegionId heap = region(OSPREY_REGION_HEAP_SITE, 0x806);
+        OspreyChunk value = chunk(heap, 12, 4);
+        OspreyChunk folded = chunk(heap, 8, 4);
+        add_allocation(ctx, heap.site_offset, 16);
+        CHECK(osprey_candidate_select(ctx, NULL, 0) == OSPREY_OK,
+              "CC07 permutation extent catalog");
+        seed_primitive(ctx, value);
+        seed_heap_unfoldable(ctx, heap, 8);
+        seed_heap_foldable(ctx, heap, 4);
+        seed_primitive(ctx, folded);
+        status = osprey_relations_build(ctx);
+        if (status == OSPREY_OK) {
+            uint32_t primitive = chunk_variable_id(ctx,
+                OSPREY_PRED_PRIMITIVE_VAR, &value);
+            uint32_t folded_id = chunk_variable_id(ctx,
+                OSPREY_PRED_PRIMITIVE_VAR, &folded);
+            uint32_t unfoldable = heap_fold_variable_id(
+                ctx, OSPREY_PRED_UNFOLDABLE_HEAP, heap, 8);
+            uint32_t foldable = heap_fold_variable_id(
+                ctx, OSPREY_PRED_FOLDABLE_HEAP, heap, 4);
+            status = osprey_compile_cc07(ctx, primitive, unfoldable,
+                                         foldable, folded_id);
+        }
+        break;
+    }
+    case OSPREY_RULE_CD01: {
+        if (reverse) {
+            add_copy_fact(ctx, chunk(global, 16, 8), chunk(global, 116, 8));
+            add_copy_fact(ctx, chunk(global, 0, 8), chunk(global, 100, 8));
+        } else {
+            add_copy_fact(ctx, chunk(global, 0, 8), chunk(global, 100, 8));
+            add_copy_fact(ctx, chunk(global, 16, 8), chunk(global, 116, 8));
+        }
+        status = build_secondary(ctx) ? OSPREY_OK : ctx->last_status;
+        break;
+    }
+    case OSPREY_RULE_CD02:
+        populate_cd02(ctx, reverse);
+        status = build_secondary(ctx) ? OSPREY_OK : ctx->last_status;
+        break;
+    case OSPREY_RULE_CD03:
+        populate_cd03(ctx, reverse, 16);
+        status = build_secondary(ctx) ? OSPREY_OK : ctx->last_status;
+        break;
+    case OSPREY_RULE_CD04: {
+        OspreyChunk extent = chunk(global, 0, 48);
+        OspreyChunk starts[4] = {
+            chunk(global, 0, 1), chunk(global, 4, 1),
+            chunk(global, 32, 1), chunk(global, 36, 1)
+        };
+        add_extent(ctx, &extent);
+        for (guint i = 0; i < G_N_ELEMENTS(starts); i++) {
+            add_logical(ctx, 0x10 + i, &starts[i], 1, 1);
+        }
+        if (reverse) {
+            seed_homo(ctx, address(global, 4), address(global, 36), 8);
+            seed_homo(ctx, address(global, 0), address(global, 32), 16);
+        } else {
+            seed_homo(ctx, address(global, 0), address(global, 32), 16);
+            seed_homo(ctx, address(global, 4), address(global, 36), 8);
+        }
+        status = build_secondary(ctx) ? OSPREY_OK : ctx->last_status;
+        break;
+    }
+    case OSPREY_RULE_CD05: {
+        OspreyChunk extent = chunk(global, 0, 32);
+        OspreyChunk first = chunk(global, 4, 4);
+        OspreyChunk second = chunk(global, 20, 8);
+        add_extent(ctx, &extent);
+        if (reverse) {
+            add_logical(ctx, 0x20, &second, 1, 1);
+            add_logical(ctx, 0x10, &first, 1, 1);
+        } else {
+            add_logical(ctx, 0x10, &first, 1, 1);
+            add_logical(ctx, 0x20, &second, 1, 1);
+        }
+        seed_homo(ctx, address(global, 0), address(global, 16), 16);
+        status = build_secondary(ctx) ? OSPREY_OK : ctx->last_status;
+        break;
+    }
+    case OSPREY_RULE_CD06:
+        populate_cd06(ctx, reverse, true, false);
+        status = build_secondary(ctx) ? OSPREY_OK : ctx->last_status;
+        break;
+    case OSPREY_RULE_CD07: {
+        OspreyRegionId heap = region(OSPREY_REGION_HEAP_SITE, 0x807);
+        OspreyChunk value = chunk(heap, 4, 4);
+        add_allocation(ctx, heap.site_offset, 16);
+        add_logical(ctx, 0x10, &value, 1, 1);
+        status = build_secondary(ctx) ? OSPREY_OK : ctx->last_status;
+        break;
+    }
+    case OSPREY_RULE_CD08: {
+        OspreyChunk extent = chunk(global, 0, 64);
+        OspreyChunk source = chunk(global, 0, 4);
+        OspreyChunk target = chunk(global, 16, 4);
+        add_extent(ctx, &extent);
+        if (reverse) {
+            add_logical(ctx, 0x20, &target, 1, 1);
+            add_logical(ctx, 0x10, &source, 1, 1);
+        } else {
+            add_logical(ctx, 0x10, &source, 1, 1);
+            add_logical(ctx, 0x20, &target, 1, 1);
+        }
+        seed_field(ctx, source, source.address);
+        seed_homo(ctx, address(global, 0), address(global, 16), 16);
+        status = build_secondary(ctx) ? OSPREY_OK : ctx->last_status;
+        break;
+    }
+    case OSPREY_RULE_CD10: {
+        OspreyChunk extent = chunk(global, 0, 32);
+        OspreyChunk value = chunk(global, 8, 4);
+        add_extent(ctx, &extent);
+        add_logical(ctx, 0x10, &value, 1, 1);
+        if (reverse) {
+            seed_field(ctx, value, address(global, 4));
+            seed_field(ctx, value, address(global, 0));
+        } else {
+            seed_field(ctx, value, address(global, 0));
+            seed_field(ctx, value, address(global, 4));
+        }
+        status = build_secondary(ctx) ? OSPREY_OK : ctx->last_status;
+        break;
+    }
+    case OSPREY_RULE_CD11: {
+        OspreyChunk pointer = chunk(global, 0, 8);
+        OspreyChunk target = chunk(global, 16, 8);
+        if (reverse) {
+            add_logical(ctx, 0x20, &target, 1, 1);
+            add_logical(ctx, 0x10, &pointer, 1, 1);
+        } else {
+            add_logical(ctx, 0x10, &pointer, 1, 1);
+            add_logical(ctx, 0x20, &target, 1, 1);
+        }
+        add_points_fact(ctx, pointer, target.address);
+        status = build_secondary(ctx) ? OSPREY_OK : ctx->last_status;
+        break;
+    }
     default:
         status = OSPREY_INVALID_GRAPH;
         break;
@@ -2542,6 +4005,136 @@ static OspreyContext *permutation_near_miss_context(uint16_t rule,
         }
         status = build_secondary(ctx) ? OSPREY_OK : ctx->last_status;
         break;
+    case OSPREY_RULE_CC01: {
+        OspreyRegionId heap = region(OSPREY_REGION_HEAP_SITE, 0x901);
+        add_allocation(ctx, heap.site_offset, 0);
+        add_allocation(ctx, heap.site_offset, 16);
+        status = build_secondary(ctx) ? OSPREY_OK : ctx->last_status;
+        break;
+    }
+    case OSPREY_RULE_CC02: {
+        OspreyRegionId heap = region(OSPREY_REGION_HEAP_SITE, 0x902);
+        add_allocation(ctx, heap.site_offset, 16);
+        status = build_secondary(ctx) ? OSPREY_OK : ctx->last_status;
+        break;
+    }
+    case OSPREY_RULE_CC03: {
+        OspreyChunk value = chunk(global, 0, 8);
+        add_logical(ctx, 0x10, &value, 1, 1);
+        status = osprey_stage3_base(ctx);
+        break;
+    }
+    case OSPREY_RULE_CC04:
+    case OSPREY_RULE_CC05: {
+        OspreyRegionId heap = region(OSPREY_REGION_HEAP_SITE, 0x904);
+        seed_heap_unfoldable(ctx, heap, 8);
+        status = build_secondary(ctx) ? OSPREY_OK : ctx->last_status;
+        break;
+    }
+    case OSPREY_RULE_CC06: {
+        OspreyRegionId global = region(OSPREY_REGION_GLOBAL, 0);
+        OspreyChunk extent = chunk(global, 0, 32);
+        add_extent(ctx, &extent);
+        seed_array(ctx, global, 0, 32, 8);
+        status = build_secondary(ctx) ? OSPREY_OK : ctx->last_status;
+        break;
+    }
+    case OSPREY_RULE_CC07: {
+        OspreyRegionId heap = region(OSPREY_REGION_HEAP_SITE, 0x906);
+        OspreyChunk value = chunk(heap, 11, 4);
+        OspreyChunk folded = chunk(heap, 11, 4);
+        seed_primitive(ctx, value);
+        seed_heap_unfoldable(ctx, heap, 8);
+        seed_heap_foldable(ctx, heap, 4);
+        seed_primitive(ctx, folded);
+        status = osprey_stage3_base(ctx);
+        break;
+    }
+    case OSPREY_RULE_CD01:
+        add_copy_fact(ctx, chunk(global, 0, 8), chunk(global, 100, 8));
+        add_copy_fact(ctx, chunk(global, 16, 8), chunk(global, 117, 8));
+        status = build_secondary(ctx) ? OSPREY_OK : ctx->last_status;
+        break;
+    case OSPREY_RULE_CD02:
+        populate_cd02(ctx, reverse);
+        /* Replace the second target with a non-corresponding pointer only by
+         * omitting the second point witness. */
+        if (ctx->points_facts->len > 1) {
+            g_array_set_size(ctx->points_facts, 1);
+        }
+        status = build_secondary(ctx) ? OSPREY_OK : ctx->last_status;
+        break;
+    case OSPREY_RULE_CD03:
+        populate_cd03(ctx, reverse, 17);
+        status = build_secondary(ctx) ? OSPREY_OK : ctx->last_status;
+        break;
+    case OSPREY_RULE_CD04: {
+        OspreyChunk extent = chunk(global, 0, 48);
+        OspreyChunk starts[4] = {
+            chunk(global, 0, 1), chunk(global, 4, 1),
+            chunk(global, 32, 1), chunk(global, 37, 1)
+        };
+        add_extent(ctx, &extent);
+        for (guint i = 0; i < G_N_ELEMENTS(starts); i++) {
+            add_logical(ctx, 0x10 + i, &starts[i], 1, 1);
+        }
+        seed_homo(ctx, address(global, 0), address(global, 32), 16);
+        seed_homo(ctx, address(global, 4), address(global, 37), 8);
+        status = build_secondary(ctx) ? OSPREY_OK : ctx->last_status;
+        break;
+    }
+    case OSPREY_RULE_CD05: {
+        OspreyChunk extent = chunk(global, 0, 32);
+        OspreyChunk first = chunk(global, 4, 4);
+        OspreyChunk second = chunk(global, 20, 4);
+        add_extent(ctx, &extent);
+        add_logical(ctx, 0x10, &first, 1, 1);
+        add_logical(ctx, 0x20, &second, 1, 1);
+        seed_homo(ctx, address(global, 0), address(global, 16), 16);
+        status = build_secondary(ctx) ? OSPREY_OK : ctx->last_status;
+        break;
+    }
+    case OSPREY_RULE_CD06:
+        populate_cd06(ctx, reverse, false, false);
+        status = build_secondary(ctx) ? OSPREY_OK : ctx->last_status;
+        break;
+    case OSPREY_RULE_CD07: {
+        OspreyChunk extent = chunk(global, 0, 16);
+        OspreyChunk value = chunk(global, 4, 4);
+        add_extent(ctx, &extent);
+        add_logical(ctx, 0x10, &value, 1, 1);
+        status = build_secondary(ctx) ? OSPREY_OK : ctx->last_status;
+        break;
+    }
+    case OSPREY_RULE_CD08: {
+        OspreyChunk extent = chunk(global, 0, 64);
+        OspreyChunk source = chunk(global, 15, 4);
+        OspreyChunk target = chunk(global, 31, 4);
+        add_extent(ctx, &extent);
+        add_logical(ctx, 0x10, &source, 1, 1);
+        add_logical(ctx, 0x20, &target, 1, 1);
+        seed_field(ctx, source, address(global, 0));
+        seed_homo(ctx, address(global, 0), address(global, 16), 16);
+        status = build_secondary(ctx) ? OSPREY_OK : ctx->last_status;
+        break;
+    }
+    case OSPREY_RULE_CD10: {
+        OspreyChunk extent = chunk(global, 0, 32);
+        OspreyChunk value = chunk(global, 8, 4);
+        add_extent(ctx, &extent);
+        add_logical(ctx, 0x10, &value, 1, 1);
+        seed_field(ctx, value, address(global, 0));
+        status = build_secondary(ctx) ? OSPREY_OK : ctx->last_status;
+        break;
+    }
+    case OSPREY_RULE_CD11: {
+        OspreyChunk pointer = chunk(global, 0, 8);
+        OspreyChunk target = chunk(global, 16, 8);
+        add_logical(ctx, 0x10, &pointer, 1, 1);
+        add_points_fact(ctx, pointer, target.address);
+        status = build_secondary(ctx) ? OSPREY_OK : ctx->last_status;
+        break;
+    }
     default:
         status = OSPREY_INVALID_GRAPH;
         break;
@@ -2585,6 +4178,23 @@ static const Stage3RuleCase stage3_rule_cases[] = {
     { OSPREY_RULE_CB07, "CB07", test_cb07 },
     { OSPREY_RULE_CB08, "CB08", test_cb08 },
     { OSPREY_RULE_CB09, "CB09", test_cb09 },
+    { OSPREY_RULE_CC01, "CC01", test_cc01 },
+    { OSPREY_RULE_CC02, "CC02", test_cc02 },
+    { OSPREY_RULE_CC03, "CC03", test_cc03 },
+    { OSPREY_RULE_CC04, "CC04", test_cc04 },
+    { OSPREY_RULE_CC05, "CC05", test_cc05 },
+    { OSPREY_RULE_CC06, "CC06", test_cc06 },
+    { OSPREY_RULE_CC07, "CC07", test_cc07 },
+    { OSPREY_RULE_CD01, "CD01", test_cd01 },
+    { OSPREY_RULE_CD02, "CD02", test_cd02 },
+    { OSPREY_RULE_CD03, "CD03", test_cd03 },
+    { OSPREY_RULE_CD04, "CD04", test_cd04 },
+    { OSPREY_RULE_CD05, "CD05", test_cd05 },
+    { OSPREY_RULE_CD06, "CD06", test_cd06 },
+    { OSPREY_RULE_CD07, "CD07", test_cd07 },
+    { OSPREY_RULE_CD08, "CD08", test_cd08 },
+    { OSPREY_RULE_CD10, "CD10", test_cd10 },
+    { OSPREY_RULE_CD11, "CD11", test_cd11 },
 };
 
 static void test_near_miss_permutations(void)
@@ -2610,18 +4220,18 @@ static void validate_rule_registry(void)
 {
     bool seen[OSPREY_RULE_COUNT];
     memset(seen, 0, sizeof(seen));
-    CHECK(G_N_ELEMENTS(stage3_rule_cases) == 17,
-          "exactly seventeen CA/CB cases are registered");
+    CHECK(G_N_ELEMENTS(stage3_rule_cases) == 34,
+          "exactly 34 CA/CB/CC/CD cases are registered");
     for (guint i = 0; i < G_N_ELEMENTS(stage3_rule_cases); i++) {
         uint16_t rule = stage3_rule_cases[i].rule;
-        CHECK(rule >= OSPREY_RULE_CA01 && rule <= OSPREY_RULE_CB09,
-              "registered CA/CB code is in range");
-        CHECK(!seen[rule], "registered CA/CB codes are unique");
+        CHECK(rule >= OSPREY_RULE_CA01 && rule <= OSPREY_RULE_CD11,
+              "registered CA/CD code is in range");
+        CHECK(!seen[rule], "registered CA/CD codes are unique");
         seen[rule] = true;
     }
     for (uint16_t rule = OSPREY_RULE_CA01;
-         rule <= OSPREY_RULE_CB09; rule++) {
-        CHECK(seen[rule], "every CA/CB code is registered");
+         rule <= OSPREY_RULE_CD11; rule++) {
+        CHECK(seen[rule], "every CA/CD code is registered");
     }
 }
 
@@ -2636,7 +4246,7 @@ int main(void)
     test_rule_permutations(stage3_rule_cases,
                            G_N_ELEMENTS(stage3_rule_cases));
     test_near_miss_permutations();
-    CHECK(registered == executed, "every CA/CB rule row executed");
+    CHECK(registered == executed, "every CA/CB/CC/CD rule row executed");
     if (failures != 0 || registered != executed) {
         fprintf(stderr, "FAIL stage3_rules (%u failures, %u/%u)\n",
                 failures, executed, registered);

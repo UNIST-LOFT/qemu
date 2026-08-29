@@ -851,6 +851,61 @@ TESTS = [
         },
         timeout=60,
     ),
+    dict(
+        name="t13_rule_graph",
+        mode="dump_compare",
+        memcheck=0,
+        env={"BINRADAR_OSPREY_MAX_EXACT_CLIQUE_VARS": "1"},
+        dump_stem="t13_dump",
+        expected="t13_rule_graph.expected",
+        graph_dump_stem="t13_graph_dump",
+        graph_expected="t13_rule_graph.graph.expected",
+        rc=(2,),
+        expect_rows=[
+            ("graph", "[stage base]"),
+            ("graph", "[stage secondary]"),
+            ("infer", "[large "),
+            ("reject", "[stage infer]"),
+        ],
+        expect_inferred=0,
+        expect_inferred_max=0,
+        expect_queue_min=1,
+        graph_assert={
+            "relations_min": {"R10": 1, "R11": 1, "R12": 1},
+            "predicate_kinds_min": {1: 1, 5: 1, 6: 1, 7: 1, 8: 1,
+                                     9: 1, 10: 1},
+            "factors_min": 1,
+        },
+        timeout=60,
+    ),
+    dict(
+        name="t13_rule_graph_combined",
+        guest="t13_rule_graph",
+        mode="dump_compare",
+        memcheck=1,
+        env={"BINRADAR_OSPREY_MAX_EXACT_CLIQUE_VARS": "1"},
+        dump_stem="t13_combined_dump",
+        expected="t13_rule_graph.expected",
+        graph_dump_stem="t13_combined_graph_dump",
+        graph_expected="t13_rule_graph.graph.expected",
+        rc=(2,),
+        expect_rows=[
+            ("graph", "[stage base]"),
+            ("graph", "[stage secondary]"),
+            ("infer", "[large "),
+            ("reject", "[stage infer]"),
+        ],
+        expect_inferred=0,
+        expect_inferred_max=0,
+        expect_queue_min=1,
+        graph_assert={
+            "relations_min": {"R10": 1, "R11": 1, "R12": 1},
+            "predicate_kinds_min": {1: 1, 5: 1, 6: 1, 7: 1, 8: 1,
+                                     9: 1, 10: 1},
+            "factors_min": 1,
+        },
+        timeout=60,
+    ),
 ]
 
 
@@ -1115,21 +1170,39 @@ def run_dump_compare(test, workdir, qemu, solver):
             return (None, f"expected dump missing: {expected_path}")
         with open(expected_path, "r", errors="replace") as f:
             expected = f.read()
+    graph_expected = None
+    graph_expected_name = test.get("graph_expected")
+    if graph_expected_name is not None:
+        graph_expected_path = os.path.join(os.path.dirname(__file__),
+                                           graph_expected_name)
+        if not os.path.isfile(graph_expected_path):
+            return (None, f"expected graph dump missing: "
+                        f"{graph_expected_path}")
+        with open(graph_expected_path, "r", errors="replace") as f:
+            graph_expected = f.read()
     biases = test.get("biases", [None, "0x4100000000", "0x4200000000"])
     dump_stem = test.get("dump_stem", "t01_dump")
+    graph_dump_stem = test.get("graph_dump_stem", "t01_graph_dump")
     dumps = []
+    graph_dumps = []
     outs = []
     rcs = []
     observed_biases = []
     for i, bias in enumerate(biases):
         dump_path = os.path.join(workdir, f"{dump_stem}_{i}.txt")
-        try:
-            os.unlink(dump_path)
-        except OSError:
-            pass
+        graph_dump_path = os.path.join(workdir,
+                                       f"{graph_dump_stem}_{i}.txt")
+        for path in (dump_path, graph_dump_path):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
         spec = dict(test)
         spec["env"] = dict(test.get("env", {}))
         spec["env"]["BINRADAR_OSPREY_DUMP_FILE"] = dump_path
+        if graph_expected is not None:
+            spec["env"]["BINRADAR_OSPREY_GRAPH_DUMP_FILE"] = \
+                graph_dump_path
         if bias is not None:
             spec["env"]["BINRADAR_MMAP_START"] = bias
         rc, out = run_binradar(spec, guest, qemu, solver, workdir)
@@ -1147,19 +1220,37 @@ def run_dump_compare(test, workdir, qemu, solver):
             return (None, out + f"\nmissing dump file: {dump_path}")
         with open(dump_path, "r", errors="replace") as f:
             dumps.append(f.read())
+        if graph_expected is not None:
+            if not os.path.isfile(graph_dump_path):
+                return (None, out +
+                        f"\nmissing graph dump file: {graph_dump_path}")
+            with open(graph_dump_path, "r", errors="replace") as f:
+                graph_dumps.append(f.read())
     if test.get("compare_biases", True):
         for i in range(1, len(dumps)):
             if dumps[i] != dumps[0]:
                 return (None, outs[0] +
                         f"\nDUMP MISMATCH between bias runs {0} and {i}")
+        for i in range(1, len(graph_dumps)):
+            if graph_dumps[i] != graph_dumps[0]:
+                return (None, outs[0] +
+                        f"\nGRAPH DUMP MISMATCH between bias runs "
+                        f"{0} and {i}")
         if len(set(observed_biases)) != len(observed_biases):
             return (None, outs[0] +
                     f"\nPIE load biases were not distinct: {observed_biases}")
     if expected is not None and dumps[0] != expected:
         return (None, outs[0] + "\nDUMP MISMATCH vs checked-in expected")
+    if graph_expected is not None and graph_dumps[0] != graph_expected:
+        return (None, outs[0] +
+                "\nGRAPH DUMP MISMATCH vs checked-in expected")
     problems = check_dump(test, dumps[0], guest)
     if problems:
         return (None, outs[0] + "\n" + "\n".join(problems))
+    if graph_expected is not None:
+        graph_problems = check_graph_dump(test, graph_dumps[0])
+        if graph_problems:
+            return (None, outs[0] + "\n" + "\n".join(graph_problems))
     if len(set(rcs)) != 1:
         return (rcs[-1], outs[0] +
                 f"\ntracer return codes differ: {rcs}")
@@ -1776,6 +1867,185 @@ def check_dump(test, dump, guest):
         if present:
             problems.append(
                 f"points {cell_sym} -> {target_sym} unexpectedly present")
+    return problems
+
+
+def parse_graph_dump(dump):
+    """Parse every field of the canonical Stage-3 graph dump schema."""
+    lines = dump.splitlines()
+    problems = []
+    if not lines or lines[0] != "OSPREY_GRAPH 1":
+        return {}, ["missing OSPREY_GRAPH 1 header"]
+    if len(lines) < 3 or lines[1] != "RELATIONS":
+        return {}, ["missing RELATIONS section"]
+    region = r"r[0-9]+:[0-9a-f]{16}:[0-9a-f]{16}"
+    address = region + r":[0-9a-f]{16}"
+    chunk = r"\{" + address + r":[0-9]+\}"
+    relation_re = {
+        "R01": re.compile(r"^R01 pc=[0-9a-f]{16} chunk=" + chunk + r"$"),
+        "R02": re.compile(r"^R02 chunk=" + chunk + r"$"),
+        "R03": re.compile(r"^R03 pc=[0-9a-f]{16} region=" + region + r"$"),
+        "R04": re.compile(r"^R04 pc=[0-9a-f]{16} region=" + region + r"$"),
+        "R05": re.compile(r"^R05 pc=[0-9a-f]{16} region=" + region +
+                           r" address=" + address + r" count=[0-9]+$"),
+        "R06": re.compile(r"^R06 pc=[0-9a-f]{16} region=" + region +
+                           r" address=" + address + r" count=[0-9]+$"),
+        "R07": re.compile(r"^R07 pc=[0-9a-f]{16} region=" + region +
+                           r" address=" + address + r" count=[0-9]+$"),
+        "R08": re.compile(r"^R08 site=[0-9a-f]{16} size=[0-9]+$"),
+        "R09": re.compile(r"^R09 site=[0-9a-f]{16} size=[0-9]+$"),
+        "R10": re.compile(r"^R10 a1=" + address + r" a2=" + address +
+                           r" size=-?[0-9]+ witnesses=[0-9]+$"),
+        "R11": re.compile(r"^R11 a1=" + address + r" a2=" + address +
+                           r" size=-?[0-9]+ witnesses=[0-9]+$"),
+        "R12": re.compile(r"^R12 a1=" + address + r" a2=" + address +
+                           r" size=-?[0-9]+ witnesses=[0-9]+$"),
+    }
+    relation_counts = Counter()
+    i = 2
+    while i < len(lines) and not lines[i].startswith("PREDICATES "):
+        prefix = lines[i].split(" ", 1)[0] if lines[i] else ""
+        matcher = relation_re.get(prefix)
+        if matcher is None or not matcher.fullmatch(lines[i]):
+            problems.append(f"malformed relation row: {lines[i]}")
+        else:
+            relation_counts[prefix] += 1
+        i += 1
+    if i >= len(lines):
+        return {"relations": relation_counts}, problems + [
+            "missing PREDICATES section"]
+    predicate_match = re.fullmatch(r"PREDICATES ([0-9]+)", lines[i])
+    if predicate_match is None:
+        problems.append(f"malformed predicate header: {lines[i]}")
+        return {"relations": relation_counts}, problems
+    predicate_count = int(predicate_match.group(1))
+    predicate_kinds = Counter()
+    predicate_re = re.compile(
+        r"^P ([0-9]+) kind=([0-9]+) hard_false=([01]) "
+        r"support=([0-9]+) priorbits=([0-9a-f]{16}) "
+        r"sources=([0-9a-f]{16}) (.+)$")
+    payload_res = {
+        1: re.compile(r"^chunk=" + chunk + r"$"),
+        2: re.compile(r"^pc=[0-9a-f]{16} chunk=" + chunk + r"$"),
+        3: re.compile(r"^region=" + region + r" size=[0-9]+$"),
+        4: re.compile(r"^region=" + region + r" size=[0-9]+$"),
+        5: re.compile(r"^a1=" + address + r" a2=" + address +
+                      r" size=-?[0-9]+$"),
+        6: re.compile(r"^address=" + address + r"$"),
+        7: re.compile(r"^chunk=" + chunk + r"$"),
+        8: re.compile(r"^a1=" + address + r" a2=" + address +
+                      r" size=-?[0-9]+$"),
+        9: re.compile(r"^chunk=" + chunk + r" base=" + address + r"$"),
+        10: re.compile(r"^chunk=" + chunk + r" base=" + address + r"$"),
+    }
+    predicate_rows = []
+    i += 1
+    while i < len(lines) and not lines[i].startswith("FACTORS "):
+        match = predicate_re.fullmatch(lines[i])
+        if match is None:
+            problems.append(f"malformed predicate row: {lines[i]}")
+        else:
+            ordinal, kind, hard_false, support, priorbits, sources, payload = match.groups()
+            ordinal = int(ordinal)
+            kind = int(kind)
+            if ordinal != len(predicate_rows):
+                problems.append(f"predicate ordinal {ordinal} != {len(predicate_rows)}")
+            if kind not in payload_res or not payload_res[kind].fullmatch(payload):
+                problems.append(f"malformed predicate payload: {lines[i]}")
+            predicate_kinds[kind] += 1
+            predicate_rows.append((ordinal, kind, int(hard_false),
+                                   int(support), priorbits, sources))
+        i += 1
+    if len(predicate_rows) != predicate_count:
+        problems.append(f"predicate count {len(predicate_rows)} != {predicate_count}")
+    if i >= len(lines):
+        return {"relations": relation_counts, "predicate_kinds": predicate_kinds}, problems + [
+            "missing FACTORS section"]
+    factor_match = re.fullmatch(r"FACTORS ([0-9]+)", lines[i])
+    if factor_match is None:
+        problems.append(f"malformed factor header: {lines[i]}")
+        return {"relations": relation_counts, "predicate_kinds": predicate_kinds}, problems
+    factor_count = int(factor_match.group(1))
+    factor_re = re.compile(
+        r"^F ([0-9]+) stage=([0-9]+) rule=([0-9]+) potential=([0-9]+) "
+        r"negative=([01]) pbits=([0-9a-f]{16}) head=(none|[0-9]+) "
+        r"arity=([0-9]+) vars=([0-9]+(?:,[0-9]+)*)$")
+    factor_rows = []
+    i += 1
+    while i < len(lines) and lines[i] != "CANDIDATE_BUCKETS":
+        match = factor_re.fullmatch(lines[i])
+        if match is None:
+            problems.append(f"malformed factor row: {lines[i]}")
+        else:
+            ordinal, stage, rule, potential, negative, pbits, head, arity, vars_text = match.groups()
+            ordinal = int(ordinal)
+            arity = int(arity)
+            vars_list = [int(value) for value in vars_text.split(",")]
+            if ordinal != len(factor_rows):
+                problems.append(f"factor ordinal {ordinal} != {len(factor_rows)}")
+            if len(vars_list) != arity:
+                problems.append(f"factor arity does not match vars: {lines[i]}")
+            if any(value >= predicate_count for value in vars_list):
+                problems.append(f"factor variable ordinal out of range: {lines[i]}")
+            factor_rows.append((ordinal, int(stage), int(rule), int(potential),
+                                int(negative), pbits, head, arity, vars_list))
+        i += 1
+    if len(factor_rows) != factor_count:
+        problems.append(f"factor count {len(factor_rows)} != {factor_count}")
+    if i >= len(lines) or lines[i] != "CANDIDATE_BUCKETS":
+        return {"relations": relation_counts, "predicate_kinds": predicate_kinds,
+                "factors": factor_rows}, problems + [
+            "missing CANDIDATE_BUCKETS section"]
+    bucket_re = re.compile(
+        r"^B kind=([0-9]+) region=" + region +
+        r" kept=([0-9]+) dropped=([0-9]+)$")
+    buckets = []
+    i += 1
+    while i < len(lines) and not lines[i].startswith("TOTALS "):
+        match = bucket_re.fullmatch(lines[i])
+        if match is None:
+            problems.append(f"malformed candidate bucket: {lines[i]}")
+        else:
+            kind, kept, dropped = match.groups()
+            buckets.append((int(kind), int(kept), int(dropped)))
+        i += 1
+    if i >= len(lines):
+        return {"relations": relation_counts, "predicate_kinds": predicate_kinds,
+                "factors": factor_rows, "buckets": buckets}, problems + [
+            "missing TOTALS row"]
+    totals_re = re.compile(
+        r"^TOTALS vars=([0-9]+) factors=([0-9]+) hints=([0-9]+) "
+        r"limit_rows=([0-9]+) candidate_kept=([0-9]+) "
+        r"candidate_dropped=([0-9]+)$")
+    match = totals_re.fullmatch(lines[i])
+    totals = None
+    if match is None:
+        problems.append(f"malformed totals row: {lines[i]}")
+    else:
+        totals = tuple(int(value) for value in match.groups())
+        if totals[0] != predicate_count or totals[1] != factor_count:
+            problems.append(f"TOTALS counts disagree with section headers: {lines[i]}")
+    if i + 1 != len(lines):
+        problems.append("trailing graph dump rows")
+    return {"relations": relation_counts, "predicate_kinds": predicate_kinds,
+            "factors": factor_rows, "buckets": buckets, "totals": totals}, problems
+
+
+def check_graph_dump(test, dump):
+    parsed, problems = parse_graph_dump(dump)
+    if problems:
+        return problems
+    want = test.get("graph_assert", {})
+    relation_counts = parsed["relations"]
+    for name, minimum in want.get("relations_min", {}).items():
+        if relation_counts[name] < minimum:
+            problems.append(f"graph relation {name}: {relation_counts[name]} < {minimum}")
+    predicate_kinds = parsed["predicate_kinds"]
+    for kind, minimum in want.get("predicate_kinds_min", {}).items():
+        if predicate_kinds[int(kind)] < minimum:
+            problems.append(f"graph predicate kind {kind}: {predicate_kinds[int(kind)]} < {minimum}")
+    if "factors_min" in want and len(parsed["factors"]) < want["factors_min"]:
+        problems.append(f"graph factors {len(parsed['factors'])} < {want['factors_min']}")
     return problems
 
 

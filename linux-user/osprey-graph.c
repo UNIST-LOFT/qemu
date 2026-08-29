@@ -485,8 +485,7 @@ gboolean osprey_factor_key_equal(gconstpointer a, gconstpointer b)
 
 static bool rule_code_valid(uint16_t rule)
 {
-    return rule > OSPREY_RULE_NONE && rule < OSPREY_RULE_COUNT &&
-           rule != OSPREY_RULE_CD09;
+    return rule > OSPREY_RULE_NONE && rule < OSPREY_RULE_COUNT;
 }
 
 static OspreyFactorResult factor_error(OspreyContext *ctx, OspreyStatus status)
@@ -1242,14 +1241,17 @@ static bool proposal_bounds_valid(OspreyContext *ctx, uint8_t kind,
     case OSPREY_PRED_ARRAY_START:
         return extent_contains_start(graph, &payload->addr);
     case OSPREY_PRED_FIELD_OF: {
+        int64_t base_end;
         if (region_compare(&payload->attached.chunk.address.region,
                            &payload->attached.base.region) != 0 ||
             !signed_size_end(payload->attached.chunk.address.offset,
                              payload->attached.chunk.size, &end) ||
+            !signed_size_end(payload->attached.base.offset,
+                             payload->attached.chunk.size, &base_end) ||
             !extent_contains(graph, &payload->attached.chunk.address.region,
                              payload->attached.chunk.address.offset, end) ||
             !extent_contains(graph, &payload->attached.base.region,
-                             payload->attached.base.offset, end)) {
+                             payload->attached.base.offset, base_end)) {
             return false;
         }
         int64_t relative;

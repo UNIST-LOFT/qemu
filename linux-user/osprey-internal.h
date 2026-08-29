@@ -886,7 +886,7 @@ typedef enum OspreyRuleCode {
     OSPREY_RULE_CC04, OSPREY_RULE_CC05, OSPREY_RULE_CC06, OSPREY_RULE_CC07,
     OSPREY_RULE_CD01, OSPREY_RULE_CD02, OSPREY_RULE_CD03, OSPREY_RULE_CD04,
     OSPREY_RULE_CD05, OSPREY_RULE_CD06, OSPREY_RULE_CD07, OSPREY_RULE_CD08,
-    OSPREY_RULE_CD09, OSPREY_RULE_CD10, OSPREY_RULE_CD11,
+    OSPREY_RULE_CD10, OSPREY_RULE_CD11,
     OSPREY_RULE_COUNT,
 } OspreyRuleCode;
 
@@ -957,16 +957,29 @@ struct OspreyGraph {
  * the deterministic relation result.  It does not solve anything. */
 OspreyStatus osprey_stage3_base(OspreyContext *ctx);
 
+/* Complete deterministic Stage 3 construction.  This builds the accepted
+ * relations, direct candidates, CC/CD factors, and static closure without
+ * invoking inference or decoding. */
+OspreyStatus osprey_stage3_build(OspreyContext *ctx);
+
+/* Pure CC07 compiler used by the later belief-dependent closure.  All
+ * candidate IDs are explicit, selected, and valid in the immutable extent
+ * catalog; this function never consults beliefs. */
+OspreyStatus osprey_compile_cc07(OspreyContext *ctx,
+                                 uint32_t primitive_id,
+                                 uint32_t unfoldable_id,
+                                 uint32_t foldable_id,
+                                 uint32_t folded_primitive_id);
+
 /* Ownership: free a factor graph or decoded model (osprey-rules.c /
  * osprey-decode.c). */
 OspreyGraph *osprey_graph_new(void);
 void osprey_graph_free(OspreyGraph *g);
 void osprey_model_free(OspreyModel *m);
 
-/* Stage 3 secondary construction: deterministic rules (CB02-CB09,
- * CC04/CC05, CD07, CD08) whose preconditions are fact- or candidate-driven.
- * Belief-dependent folding (CC07) is deferred to the Stage 5 dynamic
- * closure. */
+/* Stage 3 secondary construction: all fact- and candidate-driven CC/CD
+ * rules plus the static CB02-CB09 closure.  Belief-dependent folding (CC07)
+ * is deferred to the Stage 5 dynamic closure. */
 OspreyStatus osprey_stage3_secondary(OspreyContext *ctx);
 
 /* Stages 4/5 inference (osprey-infer.c): exact base inference followed
