@@ -1,9 +1,11 @@
-/* Stage 4.1 projection and Stage 4.2 clique-topology tests. */
+/* Stage 4.1 projection, Stage 4.2 clique topology, and Stage 4.3
+ * exact-inference tests. */
 
 #include "osprey.h"
 #include "osprey-internal.h"
 #include "stage4_exact_reference.h"
 
+#include <float.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -128,22 +130,38 @@ static uint32_t add_primitive_access(OspreyContext *ctx,
     return result.id;
 }
 
+static bool add_prior_probability(OspreyContext *ctx, uint16_t rule,
+                                  uint8_t stage, double probability,
+                                  uint32_t id)
+{
+    OspreyFactorResult result = osprey_factor_add_prior(
+        ctx, rule, stage, false, probability, id);
+    CHECK(result.status == OSPREY_OK, "prior factor inserted");
+    return result.status == OSPREY_OK;
+}
+
 static bool add_prior(OspreyContext *ctx, uint16_t rule, uint8_t stage,
                       uint32_t id)
 {
-    OspreyFactorResult result = osprey_factor_add_prior(
-        ctx, rule, stage, false, 0.8, id);
-    CHECK(result.status == OSPREY_OK, "prior factor inserted");
+    return add_prior_probability(ctx, rule, stage, 0.8, id);
+}
+
+static bool add_implication_probability(
+    OspreyContext *ctx, uint16_t rule, uint8_t stage, bool negative,
+    double probability, const uint32_t *antecedents, uint32_t count,
+    uint32_t target)
+{
+    OspreyFactorResult result = osprey_factor_add_implication(
+        ctx, rule, stage, negative, probability, antecedents, count, target);
+    CHECK(result.status == OSPREY_OK, "implication factor inserted");
     return result.status == OSPREY_OK;
 }
 
 static bool add_implication(OspreyContext *ctx, uint16_t rule, uint8_t stage,
                             uint32_t source, uint32_t target)
 {
-    OspreyFactorResult result = osprey_factor_add_implication(
-        ctx, rule, stage, false, 0.8, &source, 1, target);
-    CHECK(result.status == OSPREY_OK, "implication factor inserted");
-    return result.status == OSPREY_OK;
+    return add_implication_probability(ctx, rule, stage, false, 0.8,
+                                       &source, 1, target);
 }
 
 static OspreyExactComponent *component_for_local(const OspreyExactBase *base,
@@ -476,9 +494,17 @@ static char *build_permutation_dump(const unsigned variable_order[3],
     char *projection = base == NULL ? g_strdup("") : projection_dump(ctx, base);
     char *topology_text = topology == NULL ? g_strdup("") :
         topology_dump(topology);
-    char *dump = g_strconcat(projection, topology_text, NULL);
+    CHECK(osprey_stage4_exact(ctx) == OSPREY_OK,
+          "permutation exact inference succeeds");
+    char *beliefs = g_strdup_printf(
+        "BELIEFS %a %a %a\n",
+        g_array_index(ctx->graph->vars, OspreyVar, ids[0]).belief,
+        g_array_index(ctx->graph->vars, OspreyVar, ids[1]).belief,
+        g_array_index(ctx->graph->vars, OspreyVar, ids[2]).belief);
+    char *dump = g_strconcat(projection, topology_text, beliefs, NULL);
     g_free(projection);
     g_free(topology_text);
+    g_free(beliefs);
     osprey_exact_topology_free(topology);
     osprey_exact_base_free(base);
     osprey_free(ctx);
@@ -1286,6 +1312,296 @@ static void test_workspace_budget(void)
     osprey_free(ctx);
 }
 
+static void test_exact_log_arithmetic(void)
+{
+    double out = 0.0;
+    double log_norm = 0.0;
+    double table[3] = { log(0.2), log(0.3), -INFINITY };
+    double impossible[2] = { -INFINITY, -INFINITY };
+    double normalized_sum = -INFINITY;
+
+    CHECK(osprey_exact_logaddexp(-INFINITY, -INFINITY, &out) &&
+              out == -INFINITY,
+          "logaddexp preserves two exact zero weights");
+    CHECK(osprey_exact_logaddexp(log(0.2), -INFINITY, &out) &&
+              fabs(out - log(0.2)) < 1e-15,
+          "logaddexp handles one exact zero weight");
+    CHECK(!osprey_exact_logaddexp(NAN, 0.0, &out) &&
+              !osprey_exact_logaddexp(INFINITY, 0.0, &out),
+          "logaddexp rejects NaN and positive infinity");
+    CHECK(osprey_exact_log_normalize(table, G_N_ELEMENTS(table), &log_norm) &&
+              fabs(log_norm - log(0.5)) < 1e-15,
+          "log normalization returns the stable log partition");
+    for (unsigned i = 0; i < G_N_ELEMENTS(table); i++) {
+        CHECK(table[i] == -INFINITY ||
+                  (isfinite(table[i]) && table[i] <= 0.0),
+              "normalized log table retains finite nonpositive entries");
+        CHECK(osprey_exact_logaddexp(normalized_sum, table[i],
+                                     &normalized_sum),
+              "normalized entries have valid log support");
+    }
+    CHECK(fabs(normalized_sum) < 1e-15,
+          "normalized log table sums to one");
+    CHECK(!osprey_exact_log_normalize(impossible,
+                                      G_N_ELEMENTS(impossible), &log_norm),
+          "all-zero table rejects during normalization");
+}
+
+static void test_exact_numeric_marginals(void)
+{
+    OspreyContext *ctx = new_graph_context();
+    OspreyRegionId region = make_region(OSPREY_REGION_GLOBAL, 0);
+    uint32_t a = add_primitive(ctx, region, 0);
+    uint32_t b = add_primitive(ctx, region, 8);
+    uint32_t secondary = add_primitive(ctx, region, 16);
+    double p_a = 0.6;
+    double p_b = 0.4;
+    double p_edge = 0.8;
+    uint32_t antecedent = a;
+    double w00 = (1.0 - p_a) * (1.0 - p_b) * p_edge;
+    double w01 = (1.0 - p_a) * p_b * p_edge;
+    double w10 = p_a * (1.0 - p_b) * (1.0 - p_edge);
+    double w11 = p_a * p_b * p_edge;
+    double partition = w00 + w01 + w10 + w11;
+    double expected_a = (w10 + w11) / partition;
+    double expected_b = (w01 + w11) / partition;
+
+    add_prior_probability(ctx, OSPREY_RULE_CA01, OSPREY_GRAPH_BASE_CA,
+                          p_a, a);
+    add_prior_probability(ctx, OSPREY_RULE_CA01, OSPREY_GRAPH_BASE_CA,
+                          p_b, b);
+    add_implication_probability(ctx, OSPREY_RULE_CA02,
+                                OSPREY_GRAPH_BASE_CA, false, p_edge,
+                                &antecedent, 1, b);
+    add_implication_probability(ctx, OSPREY_RULE_CB02,
+                                OSPREY_GRAPH_SECONDARY, false, p_edge,
+                                &antecedent, 1, secondary);
+    g_array_index(ctx->graph->vars, OspreyVar, secondary).belief = 0.37;
+
+    CHECK(osprey_stage4_exact(ctx) == OSPREY_OK,
+          "exact sum-product computes a connected base component");
+    CHECK(fabs(g_array_index(ctx->graph->vars, OspreyVar, a).belief -
+               expected_a) < 1e-12,
+          "exact marginal matches the two-variable joint distribution");
+    CHECK(fabs(g_array_index(ctx->graph->vars, OspreyVar, b).belief -
+               expected_b) < 1e-12,
+          "exact marginal matches the implication target distribution");
+    CHECK(fabs(g_array_index(ctx->graph->vars, OspreyVar, secondary).belief -
+               0.37) < 1e-12,
+          "secondary-only beliefs are not initialized by Stage 4");
+    osprey_free(ctx);
+}
+
+static void test_exact_extreme_support(void)
+{
+    OspreyContext *ctx = new_graph_context();
+    OspreyRegionId region = make_region(OSPREY_REGION_GLOBAL, 0);
+    uint32_t ids[5];
+    const double probabilities[5] = {
+        0.0, 1.0, 0.5, DBL_MIN, nextafter(1.0, 0.0)
+    };
+
+    for (unsigned i = 0; i < G_N_ELEMENTS(ids); i++) {
+        ids[i] = add_primitive(ctx, region, (int64_t)i * 8);
+        add_prior_probability(ctx, OSPREY_RULE_CA01,
+                              OSPREY_GRAPH_BASE_CA, probabilities[i], ids[i]);
+    }
+    CHECK(osprey_stage4_exact(ctx) == OSPREY_OK,
+          "exact inference retains finite and hard-zero priors");
+    CHECK(g_array_index(ctx->graph->vars, OspreyVar, ids[0]).belief == 0.0,
+          "p=0 prior produces an exact zero marginal");
+    CHECK(g_array_index(ctx->graph->vars, OspreyVar, ids[1]).belief == 1.0,
+          "p=1 prior produces an exact one marginal");
+    CHECK(fabs(g_array_index(ctx->graph->vars, OspreyVar, ids[2]).belief -
+               0.5) < 1e-15,
+          "p=0.5 prior remains symmetric");
+    CHECK(g_array_index(ctx->graph->vars, OspreyVar, ids[3]).belief > 0.0 &&
+          fabs(g_array_index(ctx->graph->vars, OspreyVar, ids[3]).belief /
+               DBL_MIN - 1.0) < 1e-12,
+          "DBL_MIN prior remains representable in log space");
+    CHECK(g_array_index(ctx->graph->vars, OspreyVar, ids[4]).belief ==
+              probabilities[4],
+          "prior adjacent to one remains distinguishable from hard support");
+    osprey_free(ctx);
+}
+
+static void test_exact_log_domain_chain(void)
+{
+    OspreyConfig config = graph_config();
+    OspreyContext *ctx;
+    OspreyRegionId region = make_region(OSPREY_REGION_GLOBAL, 0);
+    uint32_t ids[64];
+
+    config.max_exact_clique_vars = 2;
+    ctx = new_graph_context_with_config(&config);
+    for (unsigned i = 0; i < G_N_ELEMENTS(ids); i++) {
+        ids[i] = add_primitive(ctx, region, (int64_t)i * 8);
+        add_prior_probability(ctx, OSPREY_RULE_CA01,
+                              OSPREY_GRAPH_BASE_CA, 0.5, ids[i]);
+        if (i != 0) {
+            add_implication_probability(ctx, OSPREY_RULE_CA02,
+                                        OSPREY_GRAPH_BASE_CA, false, DBL_MIN,
+                                        &ids[i - 1], 1, ids[i]);
+        }
+    }
+    CHECK(osprey_stage4_exact(ctx) == OSPREY_OK,
+          "log-domain chain avoids ordinary-domain joint underflow");
+    for (unsigned i = 0; i < G_N_ELEMENTS(ids); i++) {
+        double belief = g_array_index(ctx->graph->vars, OspreyVar,
+                                      ids[i]).belief;
+        CHECK(isfinite(belief) && belief >= 0.0 && belief <= 1.0,
+              "underflow-resistant chain publishes finite marginals");
+    }
+    osprey_free(ctx);
+}
+
+static void test_exact_separator_marginals(void)
+{
+    typedef struct TestEdge {
+        unsigned source;
+        unsigned target;
+        double probability;
+        uint16_t rule;
+        bool negative;
+    } TestEdge;
+    OspreyConfig config = graph_config();
+    OspreyContext *ctx;
+    OspreyRegionId region = make_region(OSPREY_REGION_GLOBAL, 0);
+    uint32_t ids[4];
+    const double priors[4] = { 0.2, 0.3, 0.4, 0.6 };
+    const TestEdge edges[] = {
+        { 0, 1, 0.7, OSPREY_RULE_CA02, false },
+        { 0, 2, 0.2, OSPREY_RULE_CA03, true },
+        { 1, 2, 0.6, OSPREY_RULE_CA02, false },
+        { 0, 3, 0.5, OSPREY_RULE_CA02, false },
+        { 1, 3, 0.9, OSPREY_RULE_CA02, false },
+    };
+    double weights[1u << G_N_ELEMENTS(ids)] = { 0.0 };
+    double expected[4] = { 0.0 };
+    double partition = 0.0;
+
+    config.max_exact_clique_vars = 3;
+    ctx = new_graph_context_with_config(&config);
+    for (unsigned i = 0; i < G_N_ELEMENTS(ids); i++) {
+        ids[i] = add_primitive(ctx, region, (int64_t)i * 8);
+        add_prior_probability(ctx, OSPREY_RULE_CA01,
+                              OSPREY_GRAPH_BASE_CA, priors[i], ids[i]);
+    }
+    for (unsigned i = 0; i < G_N_ELEMENTS(edges); i++) {
+        const TestEdge *edge = &edges[i];
+        add_implication_probability(ctx, edge->rule,
+                                    OSPREY_GRAPH_BASE_CA, edge->negative,
+                                    edge->probability, &ids[edge->source], 1,
+                                    ids[edge->target]);
+    }
+    for (unsigned assignment = 0; assignment < G_N_ELEMENTS(weights);
+         assignment++) {
+        double weight = 1.0;
+        for (unsigned i = 0; i < G_N_ELEMENTS(ids); i++) {
+            weight *= ((assignment >> i) & 1u) != 0 ? priors[i] :
+                                                      1.0 - priors[i];
+        }
+        for (unsigned i = 0; i < G_N_ELEMENTS(edges); i++) {
+            const TestEdge *edge = &edges[i];
+            bool source = ((assignment >> edge->source) & 1u) != 0;
+            bool target = ((assignment >> edge->target) & 1u) != 0;
+            if (source) {
+                weight *= target ? edge->probability :
+                                    1.0 - edge->probability;
+            } else {
+                weight *= fmax(edge->probability,
+                               1.0 - edge->probability);
+            }
+        }
+        weights[assignment] = weight;
+        partition += weight;
+        for (unsigned i = 0; i < G_N_ELEMENTS(ids); i++) {
+            if (((assignment >> i) & 1u) != 0) expected[i] += weight;
+        }
+    }
+    for (unsigned i = 0; i < G_N_ELEMENTS(ids); i++) expected[i] /= partition;
+
+    CHECK(osprey_stage4_exact(ctx) == OSPREY_OK,
+          "exact inference handles a two-variable separator");
+    for (unsigned i = 0; i < G_N_ELEMENTS(ids); i++) {
+        CHECK(fabs(g_array_index(ctx->graph->vars, OspreyVar, ids[i]).belief -
+                   expected[i]) < 1e-12,
+              "multi-clique marginal matches brute-force enumeration");
+    }
+    osprey_free(ctx);
+}
+
+static void test_exact_bidirectional(void)
+{
+    OspreyContext *ctx = new_graph_context();
+    OspreyRegionId region = make_region(OSPREY_REGION_GLOBAL, 0);
+    uint32_t a = add_primitive(ctx, region, 0);
+    uint32_t b = add_primitive(ctx, region, 8);
+    const double p_a = 0.35;
+    const double p_b = 0.65;
+    const double p_edge = 0.2;
+    const double neutral = 1.0 - p_edge;
+    double weights[4];
+    double partition;
+    double expected_a;
+    double expected_b;
+
+    add_prior_probability(ctx, OSPREY_RULE_CA01, OSPREY_GRAPH_BASE_CA,
+                          p_a, a);
+    add_prior_probability(ctx, OSPREY_RULE_CA01, OSPREY_GRAPH_BASE_CA,
+                          p_b, b);
+    OspreyFactorBatchResult batch = osprey_factor_add_bidirectional(
+        ctx, OSPREY_RULE_CA03, OSPREY_GRAPH_BASE_CA, true, p_edge, a, b);
+    CHECK(batch.status == OSPREY_OK && batch.inserted == 2,
+          "bidirectional negative factors inserted");
+
+    weights[0] = (1.0 - p_a) * (1.0 - p_b) * neutral * neutral;
+    weights[1] = p_a * (1.0 - p_b) * neutral * neutral;
+    weights[2] = (1.0 - p_a) * p_b * neutral * neutral;
+    weights[3] = p_a * p_b * p_edge * p_edge;
+    partition = weights[0] + weights[1] + weights[2] + weights[3];
+    expected_a = (weights[1] + weights[3]) / partition;
+    expected_b = (weights[2] + weights[3]) / partition;
+
+    CHECK(osprey_stage4_exact(ctx) == OSPREY_OK,
+          "bidirectional exact inference succeeds");
+    CHECK(fabs(g_array_index(ctx->graph->vars, OspreyVar, a).belief -
+               expected_a) < 1e-12 &&
+          fabs(g_array_index(ctx->graph->vars, OspreyVar, b).belief -
+               expected_b) < 1e-12,
+          "both directions match the exact joint distribution");
+    osprey_free(ctx);
+}
+
+static void test_exact_atomic_failure(void)
+{
+    OspreyContext *ctx = new_graph_context();
+    OspreyRegionId region = make_region(OSPREY_REGION_GLOBAL, 0);
+    uint32_t first = add_primitive(ctx, region, 0);
+    uint32_t contradictory = add_primitive(ctx, region, 8);
+    double first_before = 0.31;
+    double contradictory_before = 0.62;
+
+    add_prior_probability(ctx, OSPREY_RULE_CA01, OSPREY_GRAPH_BASE_CA,
+                          0.8, first);
+    add_prior_probability(ctx, OSPREY_RULE_CA01, OSPREY_GRAPH_BASE_CA,
+                          0.0, contradictory);
+    add_prior_probability(ctx, OSPREY_RULE_CA01, OSPREY_GRAPH_BASE_CA,
+                          1.0, contradictory);
+    g_array_index(ctx->graph->vars, OspreyVar, first).belief = first_before;
+    g_array_index(ctx->graph->vars, OspreyVar,
+                  contradictory).belief = contradictory_before;
+
+    CHECK(osprey_stage4_exact(ctx) == OSPREY_INVALID_MODEL,
+          "contradictory exact component rejects as an invalid model");
+    CHECK(g_array_index(ctx->graph->vars, OspreyVar, first).belief ==
+              first_before &&
+          g_array_index(ctx->graph->vars, OspreyVar,
+                        contradictory).belief == contradictory_before,
+          "failed exact inference publishes no partial marginals");
+    osprey_free(ctx);
+}
+
 int main(void)
 {
     RUN(test_stage_selection);
@@ -1308,7 +1624,14 @@ int main(void)
     RUN(test_topology_determinism_and_validator);
     RUN(test_exact_configuration);
     RUN(test_workspace_budget);
-    CHECK(registered == executed, "every Stage 4 topology case executed");
+    RUN(test_exact_log_arithmetic);
+    RUN(test_exact_numeric_marginals);
+    RUN(test_exact_extreme_support);
+    RUN(test_exact_separator_marginals);
+    RUN(test_exact_log_domain_chain);
+    RUN(test_exact_bidirectional);
+    RUN(test_exact_atomic_failure);
+    CHECK(registered == executed, "every Stage 4 exact case executed");
     if (failures != 0 || registered != executed) {
         fprintf(stderr, "FAIL stage4_exact (%u failures, %u/%u)\n",
                 failures, executed, registered);

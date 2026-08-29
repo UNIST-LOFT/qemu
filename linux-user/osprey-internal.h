@@ -1065,9 +1065,16 @@ bool osprey_exact_topology_validate(
     const OspreyContext *ctx, const OspreyExactBase *base,
     const OspreyExactTopology *topology);
 
-/* Stage 4.2 entrypoint.  It validates and reports the exact topology but
- * performs no numerical inference or belief publication. */
+/* Stage 4.3 entrypoint.  It builds and validates the bounded topology,
+ * computes exact base marginals in temporary workspaces, and publishes
+ * beliefs only after every component succeeds. */
 OspreyStatus osprey_stage4_exact(OspreyContext *ctx);
+
+/* Stage 4.3 numerical primitives.  These accept finite values or exact
+ * -INFINITY only and preserve hard zero support. */
+bool osprey_exact_logaddexp(double left, double right, double *out);
+bool osprey_exact_log_normalize(double *table, size_t count,
+                                double *log_norm);
 
 /* Stages 4/5 inference (osprey-infer.c): Stage 4 topology followed by the
  * still-untrusted secondary BP path. */

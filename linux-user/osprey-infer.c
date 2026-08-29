@@ -3,10 +3,10 @@
  *
  * Stages 4.1-4.2 accept the immutable CA-only projection, canonical local
  * maps, retained factor validation, deterministic bounded clique topology,
- * exact factor ownership, and running-intersection validation. Numerical
- * junction-tree inference, loopy BP, and CC07 scheduling below that boundary
- * remain non-conformant and must not provide trusted marginals. See
- * agent-docs/info/OSPREY_TYPE_INFERENCE/STAGE4.md.
+ * exact factor ownership, and running-intersection validation. Stage 4.3
+ * adds the atomic exact numerical pass; loopy BP and CC07 scheduling below
+ * that boundary remain non-conformant and must not provide trusted marginals.
+ * See agent-docs/info/OSPREY_TYPE_INFERENCE/STAGE4.md.
  *
  * Generic factor potentials are owned by osprey-graph.c.
  */
@@ -2494,6 +2494,763 @@ out:
     return valid;
 }
 
+/* ------------------------------------------------------------------ */
+/* Stage 4.3: exact log-domain junction-tree inference                 */
+
+#define OSPREY_EXACT_MARGINAL_TOL 1e-10
+
+typedef struct OspreyExactNumericMessage {
+    double *parent_to_child;
+    double *child_to_parent;
+    uint64_t cells;
+    double parent_to_child_log_norm;
+    double child_to_parent_log_norm;
+    bool parent_to_child_ready;
+    bool child_to_parent_ready;
+} OspreyExactNumericMessage;
+
+typedef struct OspreyExactNumericEdgeMap {
+    uint32_t count;
+    uint32_t *parent_positions;
+    uint32_t *child_positions;
+} OspreyExactNumericEdgeMap;
+
+typedef struct OspreyExactNumericWorkspace {
+    uint32_t clique_count;
+    uint32_t edge_count;
+    double **clique_potentials;
+    OspreyExactNumericMessage *messages;
+    OspreyExactNumericEdgeMap *edge_maps;
+    uint32_t *parent_edge;
+    uint32_t *preorder;
+} OspreyExactNumericWorkspace;
+
+/* A log-domain value is either finite or the exact representation of zero.
+ * Positive infinity and NaN are never valid intermediate values. */
+static bool exact_log_value_valid(double value)
+{
+    return isfinite(value) || value == -INFINITY;
+}
+
+bool osprey_exact_logaddexp(double left, double right, double *out)
+{
+    double high;
+    double low;
+    double value;
+
+    if (out == NULL || !exact_log_value_valid(left) ||
+        !exact_log_value_valid(right)) return false;
+    if (left == -INFINITY) {
+        *out = right;
+        return true;
+    }
+    if (right == -INFINITY) {
+        *out = left;
+        return true;
+    }
+    high = left > right ? left : right;
+    low = left > right ? right : left;
+    value = high + log1p(exp(low - high));
+    if (!exact_log_value_valid(value)) return false;
+    *out = value;
+    return true;
+}
+
+/* Add two log weights belonging to one assignment.  This is ordinary
+ * addition, not logaddexp: a -INFINITY term makes the product exactly zero. */
+static bool exact_log_product_add(double left, double right, double *out)
+{
+    double value;
+
+    if (out == NULL || !exact_log_value_valid(left) ||
+        !exact_log_value_valid(right)) return false;
+    if (left == -INFINITY || right == -INFINITY) {
+        *out = -INFINITY;
+        return true;
+    }
+    value = left + right;
+    if (!exact_log_value_valid(value)) return false;
+    *out = value;
+    return true;
+}
+
+bool osprey_exact_log_normalize(double *table, size_t count,
+                                double *log_norm)
+{
+    double norm = -INFINITY;
+
+    if (table == NULL || count == 0 || log_norm == NULL) return false;
+    for (size_t i = 0; i < count; i++) {
+        if (!exact_log_value_valid(table[i]) ||
+            !osprey_exact_logaddexp(norm, table[i], &norm)) return false;
+    }
+    if (norm == -INFINITY || !isfinite(norm)) return false;
+    for (size_t i = 0; i < count; i++) {
+        if (table[i] == -INFINITY) continue;
+        table[i] -= norm;
+        if (!exact_log_value_valid(table[i]) || table[i] > 0.0) {
+            return false;
+        }
+    }
+    *log_norm = norm;
+    return true;
+}
+
+static bool exact_array_size(uint64_t count, size_t element_size,
+                             size_t *bytes)
+{
+    if (bytes == NULL || element_size == 0 ||
+        count > SIZE_MAX / element_size) return false;
+    *bytes = (size_t)count * element_size;
+    return true;
+}
+
+static bool exact_double_table_size(uint64_t cells, size_t *bytes)
+{
+    if (cells == 0 || !exact_array_size(cells, sizeof(double), bytes)) {
+        return false;
+    }
+    return true;
+}
+
+static bool exact_message_index(const uint32_t *positions, uint32_t count,
+                               uint64_t assignment, uint64_t cells,
+                               uint64_t *out)
+{
+    uint64_t index = 0;
+
+    if (positions == NULL || out == NULL || count >= sizeof(uint64_t) * 8u ||
+        cells == 0) return false;
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t position = positions[i];
+        if (position >= sizeof(uint64_t) * 8u) return false;
+        if (((assignment >> position) & 1u) != 0) {
+            index |= UINT64_C(1) << i;
+        }
+    }
+    if (index >= cells) return false;
+    *out = index;
+    return true;
+}
+
+static void exact_numeric_workspace_free(OspreyExactNumericWorkspace *work)
+{
+    if (work == NULL) return;
+    if (work->clique_potentials != NULL) {
+        for (uint32_t i = 0; i < work->clique_count; i++) {
+            g_free(work->clique_potentials[i]);
+        }
+    }
+    if (work->messages != NULL) {
+        for (uint32_t i = 0; i < work->edge_count; i++) {
+            g_free(work->messages[i].parent_to_child);
+            g_free(work->messages[i].child_to_parent);
+        }
+    }
+    if (work->edge_maps != NULL) {
+        for (uint32_t i = 0; i < work->edge_count; i++) {
+            g_free(work->edge_maps[i].parent_positions);
+            g_free(work->edge_maps[i].child_positions);
+        }
+    }
+    g_free(work->clique_potentials);
+    g_free(work->messages);
+    g_free(work->edge_maps);
+    g_free(work->parent_edge);
+    g_free(work->preorder);
+    memset(work, 0, sizeof(*work));
+}
+
+static bool exact_numeric_edge_map_build(
+    const OspreyExactTopologyComponent *component,
+    const OspreyExactTreeEdge *edge, OspreyExactNumericEdgeMap *map)
+{
+    OspreyExactClique *parent;
+    OspreyExactClique *child;
+    uint32_t count;
+    size_t bytes;
+
+    if (component == NULL || edge == NULL || map == NULL ||
+        edge->parent >= component->cliques->len ||
+        edge->child >= component->cliques->len ||
+        edge->separator == NULL || edge->separator->len == 0) return false;
+    parent = g_ptr_array_index(component->cliques, edge->parent);
+    child = g_ptr_array_index(component->cliques, edge->child);
+    count = edge->separator->len;
+    if (!exact_array_size(count, sizeof(uint32_t), &bytes)) return false;
+    map->count = count;
+    map->parent_positions = g_try_malloc(bytes);
+    map->child_positions = g_try_malloc(bytes);
+    if (map->parent_positions == NULL || map->child_positions == NULL) {
+        g_free(map->parent_positions);
+        g_free(map->child_positions);
+        map->parent_positions = NULL;
+        map->child_positions = NULL;
+        return false;
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        map->parent_positions[i] = UINT32_MAX;
+        map->child_positions[i] = UINT32_MAX;
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t local = g_array_index(edge->separator, uint32_t, i);
+        uint32_t parent_position;
+        uint32_t child_position;
+        if (!exact_local_position(parent->local_vars, local,
+                                  &parent_position) ||
+            !exact_local_position(child->local_vars, local,
+                                  &child_position)) return false;
+        for (uint32_t j = 0; j < i; j++) {
+            if (map->parent_positions[j] == parent_position ||
+                map->child_positions[j] == child_position) return false;
+        }
+        map->parent_positions[i] = parent_position;
+        map->child_positions[i] = child_position;
+    }
+    return true;
+}
+
+static bool exact_numeric_edge_before(
+    const OspreyExactTopologyComponent *component, uint32_t left,
+    uint32_t right)
+{
+    const OspreyExactTreeEdge *a;
+    const OspreyExactTreeEdge *b;
+
+    a = &g_array_index(component->tree_edges, OspreyExactTreeEdge, left);
+    b = &g_array_index(component->tree_edges, OspreyExactTreeEdge, right);
+    if (a->parent != b->parent) return a->parent < b->parent;
+    if (a->child != b->child) return a->child < b->child;
+    return left < right;
+}
+
+static bool exact_numeric_order_build(
+    const OspreyExactTopologyComponent *component,
+    OspreyExactNumericWorkspace *work)
+{
+    uint8_t *seen = NULL;
+    size_t seen_bytes;
+    uint32_t order_count = 0;
+
+    if (component == NULL || work == NULL || component->cliques == NULL ||
+        component->tree_edges == NULL || component->root_clique != 0 ||
+        work->clique_count == 0 ||
+        component->tree_edges->len + 1 != work->clique_count) return false;
+    for (uint32_t i = 0; i < work->clique_count; i++) {
+        work->parent_edge[i] = UINT32_MAX;
+    }
+    for (uint32_t i = 0; i < work->edge_count; i++) {
+        const OspreyExactTreeEdge *edge = &g_array_index(
+            component->tree_edges, OspreyExactTreeEdge, i);
+        if (edge->parent >= work->clique_count ||
+            edge->child >= work->clique_count || edge->parent == edge->child ||
+            edge->child == 0 || work->parent_edge[edge->child] != UINT32_MAX) {
+            return false;
+        }
+        work->parent_edge[edge->child] = i;
+        work->preorder[i] = i;
+    }
+    for (uint32_t i = 1; i < work->edge_count; i++) {
+        uint32_t value = work->preorder[i];
+        uint32_t j = i;
+        while (j != 0 && exact_numeric_edge_before(component, value,
+                                                   work->preorder[j - 1])) {
+            work->preorder[j] = work->preorder[j - 1];
+            j--;
+        }
+        work->preorder[j] = value;
+    }
+    for (uint32_t i = 1; i < work->clique_count; i++) {
+        if (work->parent_edge[i] == UINT32_MAX) return false;
+    }
+
+    if (!exact_array_size(work->clique_count, sizeof(*seen), &seen_bytes)) {
+        return false;
+    }
+    seen = g_try_malloc0(seen_bytes);
+    if (seen == NULL) return false;
+    work->preorder[0] = 0;
+    seen[0] = 1;
+    order_count = 1;
+    for (uint32_t i = 0; i < order_count; i++) {
+        uint32_t current = work->preorder[i];
+        for (uint32_t j = 0; j < work->edge_count; j++) {
+            const OspreyExactTreeEdge *edge = &g_array_index(
+                component->tree_edges, OspreyExactTreeEdge, j);
+            if (edge->parent != current || seen[edge->child]) continue;
+            if (order_count >= work->clique_count) {
+                g_free(seen);
+                return false;
+            }
+            seen[edge->child] = 1;
+            work->preorder[order_count++] = edge->child;
+        }
+    }
+    g_free(seen);
+    return order_count == work->clique_count;
+}
+
+static bool exact_numeric_workspace_init(
+    const OspreyExactTopologyComponent *component,
+    OspreyExactNumericWorkspace *work)
+{
+    if (component == NULL || work == NULL || component->cliques == NULL ||
+        component->tree_edges == NULL || component->cliques->len == 0) {
+        return false;
+    }
+    memset(work, 0, sizeof(*work));
+    work->clique_count = component->cliques->len;
+    work->edge_count = component->tree_edges->len;
+    size_t clique_bytes;
+    size_t parent_edge_bytes;
+    size_t preorder_bytes;
+    if (!exact_array_size(work->clique_count,
+                          sizeof(*work->clique_potentials), &clique_bytes) ||
+        !exact_array_size(work->clique_count, sizeof(*work->parent_edge),
+                          &parent_edge_bytes) ||
+        !exact_array_size(work->clique_count, sizeof(*work->preorder),
+                          &preorder_bytes)) return false;
+    work->clique_potentials = g_try_malloc0(clique_bytes);
+    work->parent_edge = g_try_malloc(parent_edge_bytes);
+    work->preorder = g_try_malloc(preorder_bytes);
+    if (work->clique_potentials == NULL || work->parent_edge == NULL ||
+        work->preorder == NULL) return false;
+    if (work->edge_count != 0) {
+        size_t edge_bytes;
+        if (!exact_array_size(work->edge_count, sizeof(*work->messages),
+                              &edge_bytes)) return false;
+        work->messages = g_try_malloc0(edge_bytes);
+        if (!exact_array_size(work->edge_count, sizeof(*work->edge_maps),
+                              &edge_bytes)) return false;
+        work->edge_maps = g_try_malloc0(edge_bytes);
+        if (work->messages == NULL || work->edge_maps == NULL) return false;
+    }
+
+    for (uint32_t i = 0; i < work->clique_count; i++) {
+        const OspreyExactClique *clique = g_ptr_array_index(
+            component->cliques, i);
+        size_t bytes;
+        if (clique == NULL ||
+            !exact_double_table_size(clique->assignment_cells, &bytes)) {
+            return false;
+        }
+        work->clique_potentials[i] = g_try_malloc(bytes);
+        if (work->clique_potentials[i] == NULL) return false;
+        for (uint64_t j = 0; j < clique->assignment_cells; j++) {
+            work->clique_potentials[i][(size_t)j] = 0.0;
+        }
+    }
+    for (uint32_t i = 0; i < work->edge_count; i++) {
+        const OspreyExactTreeEdge *edge = &g_array_index(
+            component->tree_edges, OspreyExactTreeEdge, i);
+        size_t bytes;
+        if (!exact_double_table_size(edge->separator_cells, &bytes) ||
+            !exact_numeric_edge_map_build(component, edge,
+                                          &work->edge_maps[i])) return false;
+        work->messages[i].cells = edge->separator_cells;
+        work->messages[i].parent_to_child_log_norm = NAN;
+        work->messages[i].child_to_parent_log_norm = NAN;
+        work->messages[i].parent_to_child = g_try_malloc(bytes);
+        work->messages[i].child_to_parent = g_try_malloc(bytes);
+        if (work->messages[i].parent_to_child == NULL ||
+            work->messages[i].child_to_parent == NULL) return false;
+        for (uint64_t j = 0; j < edge->separator_cells; j++) {
+            work->messages[i].parent_to_child[(size_t)j] = -INFINITY;
+            work->messages[i].child_to_parent[(size_t)j] = -INFINITY;
+        }
+    }
+    return exact_numeric_order_build(component, work);
+}
+
+/* Dense assignment convention: bit j is the Boolean state of the
+ * sorted clique local_vars[j].  Separator bit j is separator[j], with
+ * edge maps translating that canonical order at each endpoint. */
+static bool exact_numeric_build_clique_potential(
+    const OspreyGraph *graph, const OspreyExactBase *base,
+    const OspreyExactTopologyComponent *component,
+    const OspreyExactClique *clique, double *potential)
+{
+    if (graph == NULL || base == NULL || component == NULL || clique == NULL ||
+        potential == NULL || clique->assignment_cells == 0) return false;
+    for (guint i = 0; i < clique->factor_refs->len; i++) {
+        uint32_t ref_id = g_array_index(clique->factor_refs, uint32_t, i);
+        const OspreyExactFactorRef *ref;
+        const OspreyFactor *factor;
+        uint32_t positions[OSPREY_FACTOR_MAX_ARITY];
+        if (ref_id >= base->factor_refs->len) return false;
+        ref = &g_array_index(base->factor_refs, OspreyExactFactorRef,
+                             ref_id);
+        if (ref->graph_factor_id >= graph->factors->len ||
+            ref->num_vars == 0 || ref->num_vars > OSPREY_FACTOR_MAX_ARITY) {
+            return false;
+        }
+        factor = g_array_index(graph->factors, OspreyFactor *,
+                               ref->graph_factor_id);
+        if (factor == NULL || factor->num_vars != ref->num_vars) return false;
+        for (uint32_t j = 0; j < ref->num_vars; j++) {
+            positions[j] = UINT32_MAX;
+            if (!exact_local_position(clique->local_vars,
+                                      ref->local_vars[j], &positions[j]) ||
+                positions[j] == UINT32_MAX) return false;
+            for (uint32_t k = 0; k < j; k++) {
+                if (positions[k] == positions[j]) return false;
+            }
+        }
+        for (uint64_t assignment = 0;
+             assignment < clique->assignment_cells; assignment++) {
+            uint8_t factor_assignment[OSPREY_FACTOR_MAX_ARITY];
+            double term;
+            for (uint32_t j = 0; j < ref->num_vars; j++) {
+                if (positions[j] >= sizeof(uint64_t) * 8u) return false;
+                factor_assignment[j] = (uint8_t)((assignment >> positions[j]) &
+                                                1u);
+            }
+            if (!osprey_factor_log_weight(factor, factor_assignment, &term) ||
+                !exact_log_value_valid(term) ||
+                !exact_log_product_add(potential[(size_t)assignment], term,
+                                       &potential[(size_t)assignment])) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static bool exact_numeric_add_incoming(
+    const OspreyExactTopologyComponent *component,
+    const OspreyExactNumericWorkspace *work, uint32_t source,
+    uint32_t excluded_edge, uint64_t assignment, double *value)
+{
+    for (uint32_t i = 0; i < work->edge_count; i++) {
+        const OspreyExactTreeEdge *edge = &g_array_index(
+            component->tree_edges, OspreyExactTreeEdge, i);
+        const OspreyExactNumericEdgeMap *map = &work->edge_maps[i];
+        const double *message;
+        const uint32_t *positions;
+        uint64_t index;
+
+        if (i == excluded_edge ||
+            (edge->parent != source && edge->child != source)) continue;
+        if (edge->parent == source) {
+            message = work->messages[i].child_to_parent;
+            positions = map->parent_positions;
+            if (!work->messages[i].child_to_parent_ready) return false;
+        } else {
+            message = work->messages[i].parent_to_child;
+            positions = map->child_positions;
+            if (!work->messages[i].parent_to_child_ready) return false;
+        }
+        if (message == NULL || !exact_message_index(
+                positions, map->count, assignment, work->messages[i].cells,
+                &index) ||
+            !exact_log_product_add(*value, message[(size_t)index], value)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static OspreyStatus exact_numeric_compute_message(
+    const OspreyExactTopologyComponent *component,
+    OspreyExactNumericWorkspace *work, uint32_t edge_id,
+    bool parent_to_child)
+{
+    const OspreyExactTreeEdge *edge;
+    const OspreyExactNumericEdgeMap *map;
+    OspreyExactNumericMessage *message;
+    const OspreyExactClique *source_clique;
+    const uint32_t *source_positions;
+    double *output;
+    bool *ready;
+    double *published_log_norm;
+    uint32_t source;
+    uint32_t destination;
+    uint64_t cells;
+    double log_norm;
+
+    if (component == NULL || work == NULL || edge_id >= work->edge_count) {
+        return OSPREY_INVALID_GRAPH;
+    }
+    edge = &g_array_index(component->tree_edges, OspreyExactTreeEdge, edge_id);
+    map = &work->edge_maps[edge_id];
+    message = &work->messages[edge_id];
+    source = parent_to_child ? edge->parent : edge->child;
+    destination = parent_to_child ? edge->child : edge->parent;
+    if (source >= work->clique_count || destination >= work->clique_count) {
+        return OSPREY_INVALID_GRAPH;
+    }
+    source_clique = g_ptr_array_index(component->cliques, source);
+    source_positions = parent_to_child ? map->parent_positions :
+                                         map->child_positions;
+    output = parent_to_child ? message->parent_to_child :
+                               message->child_to_parent;
+    ready = parent_to_child ? &message->parent_to_child_ready :
+                              &message->child_to_parent_ready;
+    published_log_norm = parent_to_child
+        ? &message->parent_to_child_log_norm
+        : &message->child_to_parent_log_norm;
+    cells = message->cells;
+    if (source_clique == NULL || source_positions == NULL || output == NULL ||
+        *ready || cells == 0) return OSPREY_INVALID_GRAPH;
+    for (uint64_t i = 0; i < cells; i++) output[(size_t)i] = -INFINITY;
+
+    for (uint64_t assignment = 0;
+         assignment < source_clique->assignment_cells; assignment++) {
+        uint64_t index;
+        double value = work->clique_potentials[source][(size_t)assignment];
+        if (!exact_log_value_valid(value) ||
+            !exact_numeric_add_incoming(component, work, source, edge_id,
+                                        assignment, &value) ||
+            !exact_message_index(source_positions, map->count, assignment,
+                                 cells, &index) ||
+            !osprey_exact_logaddexp(output[(size_t)index], value,
+                                    &output[(size_t)index])) {
+            return OSPREY_INVALID_GRAPH;
+        }
+    }
+    if (!osprey_exact_log_normalize(output, (size_t)cells, &log_norm)) {
+        return OSPREY_INVALID_MODEL;
+    }
+    *published_log_norm = log_norm;
+    *ready = true;
+    return OSPREY_OK;
+}
+
+static OspreyStatus exact_numeric_build_clique_belief(
+    const OspreyExactTopologyComponent *component,
+    const OspreyExactNumericWorkspace *work, uint32_t clique_id,
+    double *belief, double *log_norm)
+{
+    const OspreyExactClique *clique;
+
+    if (component == NULL || work == NULL || belief == NULL || log_norm == NULL ||
+        clique_id >= work->clique_count) return OSPREY_INVALID_GRAPH;
+    clique = g_ptr_array_index(component->cliques, clique_id);
+    if (clique == NULL) return OSPREY_INVALID_GRAPH;
+    for (uint64_t assignment = 0;
+         assignment < clique->assignment_cells; assignment++) {
+        double value = belief[(size_t)assignment];
+        if (!exact_log_value_valid(value) ||
+            !exact_numeric_add_incoming(component, work, clique_id,
+                                        UINT32_MAX, assignment, &value)) {
+            return OSPREY_INVALID_GRAPH;
+        }
+        belief[(size_t)assignment] = value;
+    }
+    return osprey_exact_log_normalize(belief,
+                                      (size_t)clique->assignment_cells,
+                                      log_norm)
+        ? OSPREY_OK
+        : OSPREY_INVALID_MODEL;
+}
+
+static bool exact_numeric_binary_marginal(const double *belief, uint64_t cells,
+                                          uint32_t position, double *out)
+{
+    double zero = -INFINITY;
+    double one = -INFINITY;
+    double norm;
+    double probability;
+
+    if (belief == NULL || out == NULL || cells == 0 ||
+        position >= sizeof(uint64_t) * 8u) return false;
+    for (uint64_t assignment = 0; assignment < cells; assignment++) {
+        double *accumulator = ((assignment >> position) & 1u) != 0
+            ? &one : &zero;
+        if (!osprey_exact_logaddexp(*accumulator,
+                                     belief[(size_t)assignment],
+                                     accumulator)) return false;
+    }
+    if (zero == -INFINITY && one == -INFINITY) return false;
+    if (zero == -INFINITY) {
+        *out = 1.0;
+        return true;
+    }
+    if (one == -INFINITY) {
+        *out = 0.0;
+        return true;
+    }
+    if (!osprey_exact_logaddexp(zero, one, &norm) || !isfinite(norm)) {
+        return false;
+    }
+    probability = exp(one - norm);
+    if (!isfinite(probability) || probability < 0.0 || probability > 1.0) {
+        return false;
+    }
+    *out = probability;
+    return true;
+}
+
+static OspreyStatus exact_numeric_component(
+    const OspreyGraph *graph, const OspreyExactBase *base,
+    const OspreyExactTopologyComponent *component, double *marginals,
+    double *logz_out)
+{
+    OspreyExactNumericWorkspace work;
+    OspreyStatus status = OSPREY_INVALID_GRAPH;
+    double root_log_norm = NAN;
+    double logz;
+
+    if (graph == NULL || base == NULL || component == NULL ||
+        marginals == NULL || logz_out == NULL) return status;
+    memset(&work, 0, sizeof(work));
+    if (!exact_numeric_workspace_init(component, &work)) goto out;
+    for (uint32_t i = 0; i < work.clique_count; i++) {
+        const OspreyExactClique *clique = g_ptr_array_index(
+            component->cliques, i);
+        if (!exact_numeric_build_clique_potential(
+                graph, base, component, clique, work.clique_potentials[i])) {
+            goto out;
+        }
+    }
+
+    /* The preorder is rooted at clique zero.  Reverse preorder is a
+     * deterministic postorder for the child-to-parent pass. */
+    for (uint32_t i = work.clique_count; i > 1; i--) {
+        uint32_t clique = work.preorder[i - 1];
+        uint32_t edge = work.parent_edge[clique];
+        if (edge == UINT32_MAX) goto out;
+        OspreyStatus message_status = exact_numeric_compute_message(
+            component, &work, edge, false);
+        if (message_status != OSPREY_OK) {
+            status = message_status;
+            goto out;
+        }
+    }
+    for (uint32_t i = 1; i < work.clique_count; i++) {
+        uint32_t clique = work.preorder[i];
+        uint32_t edge = work.parent_edge[clique];
+        if (edge == UINT32_MAX) goto out;
+        OspreyStatus message_status = exact_numeric_compute_message(
+            component, &work, edge, true);
+        if (message_status != OSPREY_OK) {
+            status = message_status;
+            goto out;
+        }
+    }
+    for (uint32_t i = 0; i < work.edge_count; i++) {
+        if (!work.messages[i].parent_to_child_ready ||
+            !work.messages[i].child_to_parent_ready ||
+            !isfinite(work.messages[i].parent_to_child_log_norm) ||
+            !isfinite(work.messages[i].child_to_parent_log_norm)) goto out;
+    }
+
+    /* Both message passes are complete, so no later operation needs the
+     * uncalibrated clique potentials.  Reuse each planned dense table for its
+     * normalized belief instead of allocating an unbudgeted duplicate. */
+    for (uint32_t clique_id = 0; clique_id < work.clique_count; clique_id++) {
+        const OspreyExactClique *clique = g_ptr_array_index(
+            component->cliques, clique_id);
+        double *belief = work.clique_potentials[clique_id];
+        double clique_log_norm;
+        OspreyStatus belief_status;
+        if (clique == NULL || belief == NULL) goto out;
+        belief_status = exact_numeric_build_clique_belief(
+            component, &work, clique_id, belief, &clique_log_norm);
+        if (belief_status != OSPREY_OK) {
+            status = belief_status;
+            goto out;
+        }
+        if (clique_id == 0) root_log_norm = clique_log_norm;
+        for (guint position = 0; position < clique->local_vars->len;
+             position++) {
+            uint32_t local = g_array_index(clique->local_vars, uint32_t,
+                                           position);
+            double marginal;
+            if (local >= base->graph_var_ids->len ||
+                !exact_numeric_binary_marginal(belief,
+                                               clique->assignment_cells,
+                                               position, &marginal)) {
+                status = OSPREY_INVALID_GRAPH;
+                goto out;
+            }
+            if (isnan(marginals[local])) {
+                marginals[local] = marginal;
+            } else if (!isfinite(marginals[local]) ||
+                       fabs(marginals[local] - marginal) >
+                           OSPREY_EXACT_MARGINAL_TOL) {
+                status = OSPREY_INVALID_GRAPH;
+                goto out;
+            }
+        }
+    }
+    if (!isfinite(root_log_norm)) goto out;
+    logz = root_log_norm;
+    for (uint32_t i = 0; i < work.edge_count; i++) {
+        if (!exact_log_product_add(logz,
+                                   work.messages[i].child_to_parent_log_norm,
+                                   &logz)) goto out;
+    }
+    if (!isfinite(logz)) goto out;
+    *logz_out = logz;
+    status = OSPREY_OK;
+out:
+    exact_numeric_workspace_free(&work);
+    return status;
+}
+
+static OspreyStatus exact_numeric_infer(OspreyContext *ctx,
+                                         const OspreyExactBase *base,
+                                         const OspreyExactTopology *topology)
+{
+    uint32_t local_count;
+    size_t marginal_bytes;
+    double *marginals = NULL;
+    OspreyStatus status = OSPREY_INVALID_GRAPH;
+
+    if (ctx == NULL || ctx->graph == NULL || base == NULL || topology == NULL ||
+        topology->components == NULL ||
+        topology->components->len != base->components->len ||
+        base->graph_var_ids == NULL || base->local_by_graph == NULL) {
+        return exact_projection_failure(ctx, status);
+    }
+    local_count = base->graph_var_ids->len;
+    if (!exact_double_table_size(local_count, &marginal_bytes)) {
+        return exact_projection_failure(ctx, status);
+    }
+    marginals = g_try_malloc(marginal_bytes);
+    if (marginals == NULL) goto out;
+    for (uint32_t i = 0; i < local_count; i++) marginals[i] = NAN;
+
+    for (guint i = 0; i < topology->components->len; i++) {
+        const OspreyExactTopologyComponent *component = g_ptr_array_index(
+            topology->components, i);
+        double component_logz;
+        OspreyStatus component_status = exact_numeric_component(
+            ctx->graph, base, component, marginals, &component_logz);
+        if (component_status != OSPREY_OK || !isfinite(component_logz)) {
+            status = component_status == OSPREY_OK
+                ? OSPREY_INVALID_GRAPH
+                : component_status;
+            goto out;
+        }
+    }
+    for (uint32_t local = 0; local < local_count; local++) {
+        if (!isfinite(marginals[local]) || marginals[local] < 0.0 ||
+            marginals[local] > 1.0) goto out;
+    }
+    for (uint32_t graph_id = 0; graph_id < base->graph_var_count;
+         graph_id++) {
+        uint32_t local = base->local_by_graph[graph_id];
+        if (local == UINT32_MAX) continue; /* secondary-only variable */
+        if (local >= local_count ||
+            g_array_index(ctx->graph->vars, OspreyVar, graph_id).id !=
+                graph_id) goto out;
+    }
+
+    /* This is the only graph mutation in Stage 4.3.  All component tables,
+     * messages, marginals, and log-partition values have succeeded above. */
+    for (uint32_t local = 0; local < local_count; local++) {
+        uint32_t graph_id = g_array_index(base->graph_var_ids, uint32_t, local);
+        g_array_index(ctx->graph->vars, OspreyVar, graph_id).belief =
+            marginals[local];
+    }
+    status = OSPREY_OK;
+out:
+    g_free(marginals);
+    return exact_projection_failure(ctx, status);
+}
+
 OspreyStatus osprey_stage4_exact(OspreyContext *ctx)
 {
     OspreyExactBase *base = NULL;
@@ -2508,17 +3265,20 @@ OspreyStatus osprey_stage4_exact(OspreyContext *ctx)
         osprey_exact_base_free(base);
         return status;
     }
-    log_msg("[osprey] [infer] [exact] [components %u] [vars %u] "
-            "[factors %u] [cliques %llu] [max-clique %llu] "
-            "[table-bytes %llu]\n",
-            topology->components->len, topology->variable_count,
-            topology->factor_count,
-            (unsigned long long)topology->clique_count,
-            (unsigned long long)topology->max_clique_vars,
-            (unsigned long long)topology->table_bytes);
+    status = exact_numeric_infer(ctx, base, topology);
+    if (status == OSPREY_OK) {
+        log_msg("[osprey] [infer] [exact] [components %u] [vars %u] "
+                "[factors %u] [cliques %llu] [max-clique %llu] "
+                "[table-bytes %llu]\n",
+                topology->components->len, topology->variable_count,
+                topology->factor_count,
+                (unsigned long long)topology->clique_count,
+                (unsigned long long)topology->max_clique_vars,
+                (unsigned long long)topology->table_bytes);
+    }
     osprey_exact_topology_free(topology);
     osprey_exact_base_free(base);
-    return OSPREY_OK;
+    return status;
 }
 
 /* ------------------------------------------------------------------ */
@@ -2795,10 +3555,9 @@ OspreyStatus osprey_infer(OspreyContext *ctx) {
     }
     OspreyGraph *g = ctx->graph;
 
-    /* Stage 4.2 validates bounded exact topology.  Numerical exact
-     * inference is the next package; the legacy secondary BP path below
-     * remains explicitly untrusted and is retained only for existing
-     * fail-closed integration behavior. */
+    /* Stage 4.3 computes exact base marginals.  The legacy secondary BP
+     * path below remains explicitly untrusted and is retained only for
+     * existing fail-closed integration behavior. */
     OspreyStatus exact_status = osprey_stage4_exact(ctx);
     if (exact_status != OSPREY_OK) return exact_status;
 
