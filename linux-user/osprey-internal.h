@@ -119,6 +119,16 @@ typedef struct OspreyFactorKey {
 guint osprey_factor_key_hash(gconstpointer p);
 gboolean osprey_factor_key_equal(gconstpointer a, gconstpointer b);
 
+/* Stage 5.1 semantic edge identity.  The factor key uses canonical local
+ * variable IDs; the variable key preserves the complete predicate identity.
+ * Neither graph insertion ID participates in equality. */
+typedef struct OspreyBpEdgeKey {
+    OspreyFactorKey factor;
+    OspreyKey variable;
+    uint32_t factor_position;
+    uint32_t reserved;
+} OspreyBpEdgeKey;
+
 /* ------------------------------------------------------------------ */
 /* Fact records (child-written)                                        */
 /* ------------------------------------------------------------------ */
@@ -849,7 +859,7 @@ typedef struct OspreyVar {
     uint8_t kind;                  /* OspreyPredicateKind */
     uint8_t hard_false;            /* CB06-style hard constraint */
     uint8_t region_limit_hit;      /* per-region candidate cap exceeded */
-    uint8_t reserved;
+    uint8_t belief_valid;           /* Stage-4 exact seed is present */
     uint64_t direct_support;       /* saturated merged proposal evidence */
     uint64_t source_rule_bits;     /* OspreyRuleCode bitset, Stage 3 */
     double prior;                  /* maximum exact proposal prior */
@@ -944,7 +954,7 @@ struct OspreyGraph {
     GHashTable *var_index;         /* OspreyKey* → (var_id+1) */
     GArray *hints;                 /* OspreyHint (deduped) */
     GArray *factors;               /* OspreyFactor* */
-    GHashTable *factor_index;      /* OspreyKey* → (factor_id+1) */
+    GHashTable *factor_index;      /* OspreyFactorKey* → (factor_id+1) */
     /* per (kind, region-key) candidate accounting */
     GHashTable *kind_region;       /* OspreyKey* → OspreyKindRegionCount* */
     GArray *extents;               /* sorted immutable candidate bounds */
@@ -960,6 +970,78 @@ struct OspreyGraph {
      * used for deterministic acceptance diagnostics. */
     uint64_t candidate_proposals[OSPREY_RULE_COUNT];
 };
+
+/* ------------------------------------------------------------------ */
+/* Stage 5.1 canonical complete-graph projection                       */
+
+/* All records below own indices and values, never pointers into the
+ * growable production graph arrays.  Local IDs are canonical and are only
+ * used inside one OspreyBpGraph. */
+typedef struct OspreyBpVarRef {
+    uint32_t graph_var_id;
+    uint32_t var_edge_begin;
+    uint32_t var_edge_count;
+    uint8_t base_seed_valid;
+    uint8_t reserved[3];
+    double base_seed[2];          /* normalized P(false), P(true) */
+} OspreyBpVarRef;
+
+typedef struct OspreyBpFactorRef {
+    uint32_t graph_factor_id;
+    uint32_t factor_edge_begin;
+    uint32_t factor_edge_count;
+} OspreyBpFactorRef;
+
+typedef struct OspreyBpEdge {
+    uint32_t id;
+    uint32_t local_var;
+    uint32_t local_factor;
+    uint32_t factor_position;
+    uint32_t graph_var_id;
+    uint32_t graph_factor_id;
+    OspreyBpEdgeKey key;
+} OspreyBpEdge;
+
+typedef struct OspreyBpComponent {
+    uint32_t id;
+    GArray *local_vars;           /* uint32_t, canonical local IDs */
+    GArray *local_factors;        /* uint32_t, canonical local IDs */
+    GArray *edges;                /* uint32_t, canonical edge IDs */
+} OspreyBpComponent;
+
+typedef struct OspreyBpGraph {
+    GArray *vars;                 /* OspreyBpVarRef, canonical */
+    GArray *factors;              /* OspreyBpFactorRef, canonical */
+    GArray *edges;                /* OspreyBpEdge, factor ranges */
+    GArray *var_edges;             /* uint32_t edge IDs, variable ranges */
+    uint32_t *local_by_graph_var;
+    uint32_t *local_by_graph_factor;
+    GPtrArray *components;         /* OspreyBpComponent*, canonical */
+
+    /* Four normalized binary message families reserved for Stage 5.2+. */
+    double *msg_vf_current;
+    double *msg_vf_next;
+    double *msg_fv_current;
+    double *msg_fv_next;
+    /* Reserved temporary normalized-message and binary-belief storage. */
+    double *scratch_message;
+    double *beliefs;
+    uint64_t message_values;
+    uint64_t workspace_bytes;
+    uint64_t workspace_limit;
+} OspreyBpGraph;
+
+/* Stage 5.1 projection and ownership boundary. */
+OspreyStatus osprey_bp_graph_build(OspreyContext *ctx,
+                                   OspreyBpGraph **out);
+void osprey_bp_graph_free(OspreyBpGraph *graph);
+bool osprey_bp_graph_validate(const OspreyContext *ctx,
+                              const OspreyBpGraph *graph);
+void osprey_bp_test_set_alloc_fail_after(int64_t allocations);
+
+/* Deterministic projection dump used by focused tests. */
+bool osprey_bp_graph_dump_file(const OspreyContext *ctx,
+                               const OspreyBpGraph *graph, FILE *out);
 
 /* Stage 3 base graph entry: current candidate/factor construction over
  * the deterministic relation result.  It does not solve anything. */

@@ -72,6 +72,7 @@ typedef struct OspreyConfig {
     uint64_t max_factors;
     uint64_t max_exact_clique_vars;
     uint64_t max_exact_table_bytes; /* BINRADAR_OSPREY_MAX_EXACT_TABLE_MB * 1 MiB */
+    uint64_t max_bp_table_bytes;    /* BINRADAR_OSPREY_MAX_BP_TABLE_MB * 1 MiB */
     double report_threshold;
     char dump_file[512];        /* BINRADAR_OSPREY_DUMP_FILE: canonical
                                  * fact dump written after each

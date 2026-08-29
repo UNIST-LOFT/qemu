@@ -57,6 +57,8 @@ static const char *g_pre_sample_reason;
 #define OSPREY_DEFAULT_MAX_EXACT_CLIQUE_VARS 20u
 #define OSPREY_DEFAULT_MAX_EXACT_TABLE_MB 256u
 #define OSPREY_MAX_EXACT_TABLE_MB 4096u
+#define OSPREY_DEFAULT_MAX_BP_TABLE_MB 256u
+#define OSPREY_MAX_BP_TABLE_MB 4096u
 #define OSPREY_DEFAULT_REPORT_THRESHOLD 0.6
 
 static bool osprey_parse_u64(const char *name, uint64_t *out) {
@@ -93,6 +95,8 @@ bool osprey_config_from_env(OspreyConfig *config) {
     config->max_exact_clique_vars = OSPREY_DEFAULT_MAX_EXACT_CLIQUE_VARS;
     config->max_exact_table_bytes =
         (uint64_t)OSPREY_DEFAULT_MAX_EXACT_TABLE_MB * 1024u * 1024u;
+    config->max_bp_table_bytes =
+        (uint64_t)OSPREY_DEFAULT_MAX_BP_TABLE_MB * 1024u * 1024u;
     config->report_threshold = OSPREY_DEFAULT_REPORT_THRESHOLD;
 
     const char *v = getenv("BINRADAR_OSPREY_ENABLE");
@@ -149,6 +153,23 @@ bool osprey_config_from_env(OspreyConfig *config) {
         }
         config->max_exact_table_bytes =
             (uint64_t)mb * 1024u * 1024u;
+    }
+
+    v = getenv("BINRADAR_OSPREY_MAX_BP_TABLE_MB");
+    if (v != NULL && v[0] != '\0') {
+        char *end = NULL;
+        errno = 0;
+        unsigned long long mb = strtoull(v, &end, 10);
+        if (v[0] < '0' || v[0] > '9' || errno == ERANGE ||
+            end == v || *end != '\0' || mb == 0 ||
+            mb > OSPREY_MAX_BP_TABLE_MB ||
+            mb > SIZE_MAX / (1024u * 1024u)) {
+            fprintf(stderr,
+                    "[osprey] [config] [invalid] [var BINRADAR_OSPREY_MAX_BP_TABLE_MB] [value %s]\n",
+                    v);
+            return false;
+        }
+        config->max_bp_table_bytes = (uint64_t)mb * 1024u * 1024u;
     }
 
     v = getenv("BINRADAR_OSPREY_REPORT_THRESHOLD");

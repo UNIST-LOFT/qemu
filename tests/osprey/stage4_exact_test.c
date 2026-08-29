@@ -1389,8 +1389,12 @@ static void test_exact_numeric_marginals(void)
                expected_b) < 1e-12,
           "exact marginal matches the implication target distribution");
     CHECK(fabs(g_array_index(ctx->graph->vars, OspreyVar, secondary).belief -
-               0.37) < 1e-12,
+               0.37) < 1e-12 &&
+              g_array_index(ctx->graph->vars, OspreyVar, secondary).belief_valid == 0,
           "secondary-only beliefs are not initialized by Stage 4");
+    CHECK(g_array_index(ctx->graph->vars, OspreyVar, a).belief_valid == 1 &&
+              g_array_index(ctx->graph->vars, OspreyVar, b).belief_valid == 1,
+          "Stage 4 publishes validity for every exact variable");
     osprey_free(ctx);
 }
 
@@ -1424,6 +1428,10 @@ static void test_exact_extreme_support(void)
     CHECK(g_array_index(ctx->graph->vars, OspreyVar, ids[4]).belief ==
               probabilities[4],
           "prior adjacent to one remains distinguishable from hard support");
+    for (unsigned i = 0; i < G_N_ELEMENTS(ids); i++) {
+        CHECK(g_array_index(ctx->graph->vars, OspreyVar, ids[i]).belief_valid == 1,
+              "exact endpoint and finite marginals retain validity");
+    }
     osprey_free(ctx);
 }
 

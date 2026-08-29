@@ -369,6 +369,10 @@ OspreyInternResult osprey_intern_var(OspreyContext *ctx, uint8_t kind,
     memset(&variable, 0, sizeof(variable));
     variable.id = graph->vars->len;
     variable.kind = kind;
+    /* belief_valid is authoritative; keep the numeric payload ignored until
+     * Stage 4 publishes an exact seed. */
+    variable.belief = 0.0;
+    variable.belief_valid = 0;
     variable.payload = canonical;
     g_array_append_val(graph->vars, variable);
 
