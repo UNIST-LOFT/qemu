@@ -17,6 +17,8 @@ static unsigned executed;
  * fixed 2,000-case corpus measured a maximum error of 0x1.0cd00168p-24;
  * retain a decimal bound with margin while keeping the required stop rule. */
 #define OSPREY_BP_FOREST_ORACLE_TOL 1e-7
+#define OSPREY_BP_LOOPY_CORPUS_CASES 256u
+#define OSPREY_BP_LOOPY_TRACE_ROUNDS 16u
 
 #define CHECK(condition, message) do {                                      \
     if (!(condition)) {                                                      \
@@ -1404,6 +1406,27 @@ static void dump_generated_round_failure(unsigned sample,
     }
 }
 
+static void dump_generated_initial_state(unsigned sample,
+                                         OspreyContext *ctx,
+                                         const char *label)
+{
+    OspreyBpGraph *initial = NULL;
+    OspreyStatus status;
+
+    fprintf(stderr, "INITIAL %s\n", label == NULL ? "GRAPH" : label);
+    status = ctx == NULL ? OSPREY_INVALID_GRAPH
+        : osprey_bp_graph_build(ctx, &initial);
+    if (status == OSPREY_OK && initial != NULL) {
+        dump_generated_round_failure(sample, ctx, initial);
+    } else {
+        fprintf(stderr, "initial BP build failed with status %d\n", status);
+        if (ctx != NULL && ctx->graph != NULL) {
+            osprey_graph_dump_file(ctx, stderr);
+        }
+    }
+    osprey_bp_graph_free(initial);
+}
+
 static bool brute_force_beliefs(const OspreyContext *ctx,
                                 const OspreyBpGraph *graph, double *out)
 {
@@ -1581,6 +1604,68 @@ fail:
     return NULL;
 }
 
+static double generated_loopy_probability(uint32_t value)
+{
+    static const double probabilities[] = {
+        0.07, 0.13, 0.23, 0.31, 0.43,
+        0.57, 0.69, 0.77, 0.87, 0.93
+    };
+    return probabilities[value % G_N_ELEMENTS(probabilities)];
+}
+
+static OspreyContext *generated_loopy_context(unsigned sample)
+{
+    OspreyContext *ctx = new_context();
+    OspreyRegionId region = make_region(OSPREY_REGION_GLOBAL,
+                                        0x300u + sample);
+    uint32_t state = 0x31415927u ^ (sample * 0x9e3779b9u);
+    uint32_t ids[9];
+    uint32_t order[9];
+    uint32_t count;
+
+    if (ctx == NULL) return NULL;
+    count = 3u + next_random(&state) % 7u;
+    for (uint32_t i = 0; i < count; i++) order[i] = i;
+    for (uint32_t i = count; i > 1; i--) {
+        uint32_t selected = next_random(&state) % i;
+        uint32_t swap = order[i - 1u];
+        order[i - 1u] = order[selected];
+        order[selected] = swap;
+    }
+    for (uint32_t position = 0; position < count; position++) {
+        uint32_t semantic_id = order[position];
+        double probability = generated_loopy_probability(
+            next_random(&state));
+        ids[semantic_id] = add_primitive(ctx, region,
+                                         (int64_t)semantic_id * 16);
+        set_seed(ctx, ids[semantic_id], probability);
+        if (!add_prior(ctx, ids[semantic_id], probability)) goto fail;
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t antecedent = ids[i];
+        uint16_t rule = (uint16_t)(OSPREY_RULE_CB01 + i);
+        if (!add_implication_probability(
+                ctx, rule, OSPREY_GRAPH_SECONDARY, false,
+                generated_loopy_probability(next_random(&state)),
+                &antecedent, 1, ids[(i + 1u) % count])) goto fail;
+    }
+    if (count >= 5u) {
+        for (uint32_t i = 0; i < 2u; i++) {
+            uint32_t antecedents[2] = { ids[i], ids[i + 1u] };
+            if (!add_implication_probability(
+                    ctx, (uint16_t)(OSPREY_RULE_CC01 + i),
+                    OSPREY_GRAPH_SECONDARY, false,
+                    generated_loopy_probability(next_random(&state)),
+                    antecedents, 2, ids[(i + 3u) % count])) goto fail;
+        }
+    }
+    return ctx;
+
+fail:
+    osprey_free(ctx);
+    return NULL;
+}
+
 static bool fixed_result_metadata_equal(const OspreyBpResult *left,
                                         const OspreyBpResult *right)
 {
@@ -1603,12 +1688,12 @@ static bool fixed_result_metadata_equal(const OspreyBpResult *left,
 }
 
 static void dump_fixed_solver_failure(unsigned sample,
-                                      const OspreyContext *ctx,
+                                      OspreyContext *ctx,
                                       const OspreyBpGraph *graph,
                                       const OspreyBpResult *result)
 {
     fprintf(stderr, "fixed forest failure seed %u\n", sample);
-    if (ctx != NULL && ctx->graph != NULL) osprey_graph_dump_file(ctx, stderr);
+    dump_generated_initial_state(sample, ctx, "FIXED");
     if (graph != NULL) dump_generated_round_failure(sample, ctx, graph);
     if (result != NULL) {
         fprintf(stderr, "result status %d iters %u stable %u component %u "
@@ -1653,6 +1738,388 @@ static void test_fixed_damping(void)
               message_pair_close(damped,
                                  (double[2]){ -log(2.0), -log(2.0) }),
           "damping mixes complementary hard-zero support without epsilon");
+}
+
+static bool explicit_logaddexp(double left, double right, double *out)
+{
+    double high;
+    double low;
+    double value;
+
+    if (out == NULL ||
+        ((!isfinite(left)) && left != -INFINITY) ||
+        ((!isfinite(right)) && right != -INFINITY)) return false;
+    if (left == -INFINITY) {
+        *out = right;
+        return true;
+    }
+    if (right == -INFINITY) {
+        *out = left;
+        return true;
+    }
+    high = left > right ? left : right;
+    low = left > right ? right : left;
+    value = high + log1p(exp(low - high));
+    if (!isfinite(value)) return false;
+    *out = value;
+    return true;
+}
+
+static bool explicit_damped_pair(const double current[2],
+                                 const double raw[2], double out[2])
+{
+    double mixed[2];
+    double norm;
+
+    if (current == NULL || raw == NULL || out == NULL) return false;
+    for (unsigned state = 0; state < 2; state++) {
+        double current_term = log(0.5) + current[state];
+        double raw_term = log1p(-0.5) + raw[state];
+        if (!explicit_logaddexp(current_term, raw_term, &mixed[state])) {
+            return false;
+        }
+    }
+    if ((mixed[0] == -INFINITY && mixed[1] == -INFINITY) ||
+        !explicit_logaddexp(mixed[0], mixed[1], &norm) ||
+        !isfinite(norm)) return false;
+    for (unsigned state = 0; state < 2; state++) {
+        out[state] = mixed[state] == -INFINITY
+            ? -INFINITY : mixed[state] - norm;
+        if (out[state] != -INFINITY &&
+            (!isfinite(out[state]) || out[state] > 0.0)) return false;
+    }
+    return true;
+}
+
+static void test_swap_damped_buffers(OspreyBpGraph *graph)
+{
+    double *swap;
+
+    swap = graph->msg_vf_current;
+    graph->msg_vf_current = graph->msg_vf_next;
+    graph->msg_vf_next = swap;
+    swap = graph->msg_fv_current;
+    graph->msg_fv_current = graph->msg_fv_next;
+    graph->msg_fv_next = swap;
+    for (uint64_t i = 0; i < graph->message_values; i++) {
+        graph->msg_vf_next[i] = NAN;
+        graph->msg_fv_next[i] = NAN;
+    }
+}
+
+static OspreyStatus reference_raw_round_copy(
+    const OspreyContext *ctx, const OspreyBpGraph *graph,
+    const double *vf_current, const double *fv_current, double *vf_next,
+    double *fv_next)
+{
+    OspreyBpMessages messages;
+
+    if (ctx == NULL || graph == NULL || vf_current == NULL ||
+        fv_current == NULL || vf_next == NULL || fv_next == NULL) {
+        return OSPREY_INVALID_GRAPH;
+    }
+    messages.vf_current = (double *)vf_current;
+    messages.vf_next = vf_next;
+    messages.fv_current = (double *)fv_current;
+    messages.fv_next = fv_next;
+    messages.value_count = graph->message_values;
+    return stage5_bp_reference_compute_round(ctx, graph, &messages);
+}
+
+static bool message_pair_bits_equal(const double left[2],
+                                    const double right[2])
+{
+    return double_bits(left[0]) == double_bits(right[0]) &&
+           double_bits(left[1]) == double_bits(right[1]);
+}
+
+static bool message_families_normalized(const OspreyBpGraph *graph,
+                                        bool next)
+{
+    const double *vf;
+    const double *fv;
+
+    if (graph == NULL) return false;
+    vf = next ? graph->msg_vf_next : graph->msg_vf_current;
+    fv = next ? graph->msg_fv_next : graph->msg_fv_current;
+    if (vf == NULL || fv == NULL || graph->edges == NULL) return false;
+    for (guint edge_id = 0; edge_id < graph->edges->len; edge_id++) {
+        size_t index = (size_t)edge_id * 2u;
+        const double *vf_pair = &vf[index];
+        const double *fv_pair = &fv[index];
+        double vf_max = vf_pair[0] > vf_pair[1] ? vf_pair[0] : vf_pair[1];
+        double fv_max = fv_pair[0] > fv_pair[1] ? fv_pair[0] : fv_pair[1];
+        double vf_norm;
+        double fv_norm;
+
+        if ((vf_pair[0] == -INFINITY && vf_pair[1] == -INFINITY) ||
+            (fv_pair[0] == -INFINITY && fv_pair[1] == -INFINITY) ||
+            ((!isfinite(vf_pair[0])) && vf_pair[0] != -INFINITY) ||
+            ((!isfinite(vf_pair[1])) && vf_pair[1] != -INFINITY) ||
+            ((!isfinite(fv_pair[0])) && fv_pair[0] != -INFINITY) ||
+            ((!isfinite(fv_pair[1])) && fv_pair[1] != -INFINITY)) {
+            return false;
+        }
+        vf_norm = exp(vf_pair[0] - vf_max) + exp(vf_pair[1] - vf_max);
+        fv_norm = exp(fv_pair[0] - fv_max) + exp(fv_pair[1] - fv_max);
+        if (!isfinite(vf_norm) || !isfinite(fv_norm) ||
+            fabs(vf_max + log(vf_norm)) > 1e-12 ||
+            fabs(fv_max + log(fv_norm)) > 1e-12) return false;
+    }
+    return true;
+}
+
+static bool find_exact_tolerance_boundary(double tolerance,
+                                          double *probability_out,
+                                          double *candidate_out)
+{
+    double center = 3.0 * tolerance;
+
+    if (probability_out == NULL || candidate_out == NULL) return false;
+    for (unsigned direction = 0; direction < 2; direction++) {
+        double probability = center;
+        for (unsigned step = 0; step < 4096; step++) {
+            double current_pair[2] = { 0.0, -INFINITY };
+            double raw_pair[2];
+            double candidate_pair[2];
+            double candidate;
+            double baseline;
+
+            set_log_probability_pair(raw_pair, probability);
+            if (explicit_damped_pair(current_pair, raw_pair,
+                                     candidate_pair)) {
+                candidate = exp(candidate_pair[1]);
+                baseline = candidate - tolerance;
+                if (baseline >= 0.0 && candidate > tolerance &&
+                    candidate - baseline == tolerance) {
+                    *probability_out = probability;
+                    *candidate_out = candidate;
+                    return true;
+                }
+            }
+            probability = nextafter(
+                probability, direction == 0 ? 0.0 : INFINITY);
+        }
+    }
+    return false;
+}
+
+static uint64_t message_families_digest(const OspreyBpGraph *graph,
+                                        bool next)
+{
+    const double *vf;
+    const double *fv;
+    uint64_t digest = UINT64_C(1469598103934665603);
+
+    if (graph == NULL) return 0;
+    vf = next ? graph->msg_vf_next : graph->msg_vf_current;
+    fv = next ? graph->msg_fv_next : graph->msg_fv_current;
+    if (vf == NULL || fv == NULL) return 0;
+    for (unsigned family = 0; family < 2u; family++) {
+        const double *values = family == 0u ? vf : fv;
+        for (uint64_t i = 0; i < graph->message_values; i++) {
+            uint64_t bits = double_bits(values[i]);
+            digest ^= bits;
+            digest *= UINT64_C(1099511628211);
+        }
+    }
+    return digest;
+}
+
+static bool next_message_families_empty(const OspreyBpGraph *graph)
+{
+    if (graph == NULL || graph->msg_vf_next == NULL ||
+        graph->msg_fv_next == NULL) return false;
+    for (uint64_t i = 0; i < graph->message_values; i++) {
+        if (!isnan(graph->msg_vf_next[i]) ||
+            !isnan(graph->msg_fv_next[i])) return false;
+    }
+    return true;
+}
+
+static bool run_damped_trace_pair(
+    const OspreyContext *ctx, OspreyBpGraph *graph,
+    const OspreyContext *permuted_ctx, OspreyBpGraph *permuted_graph,
+    bool *changed_out, uint64_t *trace_digests,
+    uint64_t *permuted_trace_digests, unsigned *failed_round_out)
+{
+    bool changed = false;
+
+    if (changed_out != NULL) *changed_out = false;
+    if (failed_round_out != NULL) *failed_round_out = UINT32_MAX;
+    if (ctx == NULL || graph == NULL || permuted_ctx == NULL ||
+        permuted_graph == NULL || changed_out == NULL ||
+        trace_digests == NULL || permuted_trace_digests == NULL ||
+        failed_round_out == NULL ||
+        graph->message_values != permuted_graph->message_values) return false;
+    for (unsigned round = 0; round < OSPREY_BP_LOOPY_TRACE_ROUNDS;
+         round++) {
+        OspreyBpMessages messages = graph_messages(graph);
+        OspreyBpMessages permuted_messages = graph_messages(permuted_graph);
+        OspreyStatus status = osprey_bp_compute_round_damped(
+            ctx, graph, &messages, NULL, 0.5);
+        OspreyStatus permuted_status = osprey_bp_compute_round_damped(
+            permuted_ctx, permuted_graph, &permuted_messages, NULL, 0.5);
+
+        trace_digests[round] = message_families_digest(graph, true);
+        permuted_trace_digests[round] = message_families_digest(
+            permuted_graph, true);
+        if (status != OSPREY_OK || permuted_status != OSPREY_OK ||
+            !message_families_normalized(graph, true) ||
+            !message_families_normalized(permuted_graph, true) ||
+            trace_digests[round] != permuted_trace_digests[round] ||
+            memcmp(graph->msg_vf_next, permuted_graph->msg_vf_next,
+                   (size_t)graph->message_values * sizeof(double)) != 0 ||
+            memcmp(graph->msg_fv_next, permuted_graph->msg_fv_next,
+                   (size_t)graph->message_values * sizeof(double)) != 0) {
+            *failed_round_out = round + 1u;
+            return false;
+        }
+        if (memcmp(graph->msg_vf_current, graph->msg_vf_next,
+                   (size_t)graph->message_values * sizeof(double)) != 0 ||
+            memcmp(graph->msg_fv_current, graph->msg_fv_next,
+                   (size_t)graph->message_values * sizeof(double)) != 0) {
+            changed = true;
+        }
+        test_swap_damped_buffers(graph);
+        test_swap_damped_buffers(permuted_graph);
+        if (!message_families_normalized(graph, false) ||
+            !message_families_normalized(permuted_graph, false) ||
+            !next_message_families_empty(graph) ||
+            !next_message_families_empty(permuted_graph)) {
+            *failed_round_out = round + 1u;
+            return false;
+        }
+    }
+    *changed_out = changed;
+    return true;
+}
+
+static void test_fixed_round_damping(void)
+{
+    OspreyContext *ctx = new_context();
+    OspreyRegionId region = make_region(OSPREY_REGION_GLOBAL, 0x1a1);
+    uint32_t a = add_primitive(ctx, region, 0);
+    uint32_t b = add_primitive(ctx, region, 8);
+    uint32_t antecedent = a;
+    OspreyBpGraph *graph = NULL;
+    double *raw_vf = NULL;
+    double *raw_fv = NULL;
+    double *first_vf = NULL;
+    double *first_fv = NULL;
+
+    set_seed(ctx, a, 0.25);
+    set_seed(ctx, b, 0.75);
+    add_prior(ctx, a, 0.25);
+    add_prior(ctx, b, 0.75);
+    add_implication_probability(ctx, OSPREY_RULE_CB01,
+                                OSPREY_GRAPH_SECONDARY, false, 0.9,
+                                &antecedent, 1, b);
+    CHECK(osprey_bp_graph_build(ctx, &graph) == OSPREY_OK && graph != NULL,
+          "graph-level damping fixture builds");
+    if (graph != NULL) {
+        uint32_t local_a = local_for_offset(ctx, graph, 0);
+        uint32_t prior_edge = edge_for_local_rule(
+            ctx, graph, local_a, OSPREY_RULE_CA01);
+        OspreyBpMessages messages = graph_messages(graph);
+        double raw_second[2];
+        bool allocated = graph->message_values <= SIZE_MAX / sizeof(double);
+        bool oracle_ok = true;
+        size_t message_bytes = allocated
+            ? (size_t)graph->message_values * sizeof(double) : 0;
+
+        CHECK(local_a != UINT32_MAX && prior_edge != UINT32_MAX,
+              "graph-level damping fixture resolves a unary edge");
+        if (allocated) {
+            raw_vf = g_new(double, (size_t)graph->message_values);
+            raw_fv = g_new(double, (size_t)graph->message_values);
+            first_vf = g_new(double, (size_t)graph->message_values);
+            first_fv = g_new(double, (size_t)graph->message_values);
+        }
+        CHECK(allocated && raw_vf != NULL && raw_fv != NULL &&
+                  first_vf != NULL && first_fv != NULL,
+              "graph-level damping fixture allocates trace storage");
+        if (allocated && raw_vf != NULL && raw_fv != NULL &&
+            first_vf != NULL && first_fv != NULL &&
+            local_a != UINT32_MAX && prior_edge != UINT32_MAX) {
+            CHECK(reference_raw_round_copy(
+                      ctx, graph, graph->msg_vf_current,
+                      graph->msg_fv_current, raw_vf, raw_fv) == OSPREY_OK,
+                  "graph-level damping obtains an independent raw first half-step");
+            for (guint edge = 0; edge < graph->edges->len; edge++) {
+                size_t index = (size_t)edge * 2u;
+                oracle_ok = explicit_damped_pair(
+                    &graph->msg_vf_current[index], &raw_vf[index],
+                    &first_vf[index]) && oracle_ok;
+            }
+            oracle_ok = stage5_bp_reference_compute_factor_half(
+                ctx, graph, first_vf, raw_fv) == OSPREY_OK && oracle_ok;
+            for (guint edge = 0; edge < graph->edges->len; edge++) {
+                size_t index = (size_t)edge * 2u;
+                oracle_ok = explicit_damped_pair(
+                    &graph->msg_fv_current[index], &raw_fv[index],
+                    &first_fv[index]) && oracle_ok;
+            }
+            CHECK(oracle_ok,
+                  "independent first staged-round oracle evaluates");
+            CHECK(osprey_bp_compute_round_damped(
+                      ctx, graph, &messages, NULL, 0.5) == OSPREY_OK,
+                  "graph-level damping executes the first staged round");
+            CHECK(memcmp(graph->msg_vf_next, first_vf, message_bytes) == 0 &&
+                      memcmp(graph->msg_fv_next, first_fv,
+                             message_bytes) == 0,
+                  "first graph round matches both independently staged families");
+            CHECK(message_families_normalized(graph, true),
+                  "first staged round leaves every next pair normalized");
+            test_swap_damped_buffers(graph);
+            messages = graph_messages(graph);
+            CHECK(reference_raw_round_copy(
+                      ctx, graph, graph->msg_vf_current,
+                      graph->msg_fv_current, raw_vf, raw_fv) == OSPREY_OK,
+                  "graph-level damping obtains an independent raw second half-step");
+            memcpy(raw_second, &raw_vf[(size_t)prior_edge * 2u],
+                   sizeof(raw_second));
+            oracle_ok = true;
+            for (guint edge = 0; edge < graph->edges->len; edge++) {
+                size_t index = (size_t)edge * 2u;
+                oracle_ok = explicit_damped_pair(
+                    &graph->msg_vf_current[index], &raw_vf[index],
+                    &first_vf[index]) && oracle_ok;
+            }
+            oracle_ok = stage5_bp_reference_compute_factor_half(
+                ctx, graph, first_vf, raw_fv) == OSPREY_OK && oracle_ok;
+            for (guint edge = 0; edge < graph->edges->len; edge++) {
+                size_t index = (size_t)edge * 2u;
+                oracle_ok = explicit_damped_pair(
+                    &graph->msg_fv_current[index], &raw_fv[index],
+                    &first_fv[index]) && oracle_ok;
+            }
+            CHECK(oracle_ok,
+                  "independent second staged-round oracle evaluates");
+            CHECK(osprey_bp_compute_round_damped(
+                      ctx, graph, &messages, NULL, 0.5) == OSPREY_OK,
+                  "graph-level damping executes the second staged round");
+            CHECK(memcmp(graph->msg_vf_next, first_vf, message_bytes) == 0 &&
+                      memcmp(graph->msg_fv_next, first_fv,
+                             message_bytes) == 0,
+                  "second graph round matches both independently staged families");
+            CHECK(!message_pair_bits_equal(
+                      raw_second,
+                      &graph->msg_vf_current[(size_t)prior_edge * 2u]) &&
+                      !message_pair_bits_equal(
+                          raw_second,
+                          &graph->msg_vf_next[(size_t)prior_edge * 2u]),
+                  "raw second iterate differs from first and its mixture");
+            CHECK(message_families_normalized(graph, true),
+                  "second staged round leaves every next pair normalized");
+        }
+    }
+    g_free(raw_vf);
+    g_free(raw_fv);
+    g_free(first_vf);
+    g_free(first_fv);
+    osprey_bp_graph_free(graph);
+    osprey_free(ctx);
 }
 
 static void test_fixed_graph_solver(void)
@@ -2069,6 +2536,97 @@ static void test_fixed_message_failure_matrix(void)
     osprey_free(ctx);
 }
 
+static void test_fixed_convergence_boundaries(void)
+{
+    const double tolerance = 1e-6;
+    OspreyRegionId region = make_region(OSPREY_REGION_GLOBAL, 0x1c1);
+    OspreyContext *ctx = new_context();
+    OspreyBpGraph *graph = NULL;
+    OspreyBpResult *result = NULL;
+    uint32_t id = add_primitive(ctx, region, 0);
+    double boundary_probability = 0.0;
+    double boundary_pair[2];
+    double boundary_candidate = 0.0;
+    bool boundary_found = find_exact_tolerance_boundary(
+        tolerance, &boundary_probability, &boundary_candidate);
+
+    CHECK(boundary_found,
+          "strict-tolerance fixture has an exactly representable delta");
+    if (!boundary_found) {
+        osprey_free(ctx);
+        return;
+    }
+    add_prior(ctx, id, boundary_probability);
+    CHECK(osprey_bp_graph_build(ctx, &graph) == OSPREY_OK && graph != NULL,
+          "strict-tolerance boundary graph builds");
+    if (graph != NULL) {
+        uint32_t prior_edge = edge_for_local_rule(
+            ctx, graph, local_for_offset(ctx, graph, 0), OSPREY_RULE_CA01);
+        CHECK(prior_edge != UINT32_MAX,
+              "strict-tolerance boundary resolves its unary edge");
+        if (prior_edge != UINT32_MAX) {
+            set_log_probability_pair(boundary_pair, 0.0);
+            graph->msg_fv_current[(size_t)prior_edge * 2u] =
+                boundary_pair[0];
+            graph->msg_fv_current[(size_t)prior_edge * 2u + 1u] =
+                boundary_pair[1];
+            CHECK(boundary_candidate > tolerance &&
+                      boundary_candidate - (boundary_candidate - tolerance) ==
+                          tolerance,
+                  "strict-tolerance fixture retains the exact delta");
+            graph->beliefs[0] = boundary_candidate - tolerance;
+            graph->beliefs[1] = boundary_candidate;
+            graph->message_state = OSPREY_BP_MESSAGES_ITERATED;
+            CHECK(osprey_bp_graph_validate(ctx, graph),
+                  "strict-tolerance boundary state validates");
+            CHECK(osprey_bp_solve_fixed(ctx, graph, &result) == OSPREY_OK &&
+                      result != NULL && result->status == OSPREY_OK,
+                  "delta equal to tolerance remains solvable");
+            if (result != NULL) {
+                CHECK(result->iterations == 11u &&
+                          result->stable_rounds == 10u,
+                      "delta equal to tolerance is not counted stable");
+            }
+        }
+    }
+    osprey_bp_result_free(result);
+    osprey_bp_graph_free(graph);
+    osprey_free(ctx);
+
+    ctx = new_context();
+    id = add_primitive(ctx, region, 8);
+    add_prior(ctx, id, 1.0);
+    graph = NULL;
+    CHECK(osprey_bp_graph_build(ctx, &graph) == OSPREY_OK && graph != NULL,
+          "stable-count reset graph builds");
+    if (graph != NULL) {
+        uint32_t prior_edge = edge_for_local_rule(
+            ctx, graph, local_for_offset(ctx, graph, 8), OSPREY_RULE_CA01);
+        CHECK(prior_edge != UINT32_MAX,
+              "stable-count reset resolves its unary edge");
+        if (prior_edge != UINT32_MAX) {
+            set_log_probability_pair(
+                &graph->msg_fv_current[(size_t)prior_edge * 2u], 0.0);
+            graph->beliefs[0] = 0.5;
+            graph->beliefs[1] = 0.5;
+            graph->message_state = OSPREY_BP_MESSAGES_ITERATED;
+            CHECK(osprey_bp_graph_validate(ctx, graph),
+                  "stable-count reset state validates");
+            CHECK(osprey_bp_solve_fixed(ctx, graph, &result) == OSPREY_OK &&
+                      result != NULL && result->status == OSPREY_OK,
+                  "stable-count reset graph converges");
+            if (result != NULL) {
+                CHECK(result->iterations == 29u &&
+                          result->stable_rounds == 10u,
+                      "an unstable round resets the ten-round stability count");
+            }
+        }
+    }
+    osprey_bp_result_free(result);
+    osprey_bp_graph_free(graph);
+    osprey_free(ctx);
+}
+
 static void test_fixed_convergence_policy(void)
 {
     OspreyContext *ctx = new_context();
@@ -2086,7 +2644,8 @@ static void test_fixed_convergence_policy(void)
               "one-prior graph converges");
         if (result != NULL) {
             double belief = g_array_index(result->beliefs, double, 0);
-            CHECK(result->iterations == 28u && result->stable_rounds == 10u &&
+            CHECK(result->iterations == 28u && result->iterations < 500u &&
+                      result->stable_rounds == 10u &&
                       result->final_max_delta < 1e-6,
                   "solver stops at the exact ten-round policy boundary");
             CHECK(double_bits(result->final_max_delta) ==
@@ -2218,14 +2777,16 @@ static void test_fixed_real_nonconvergence(void)
                   fixed_result_metadata_equal(result, permuted_result),
               "nonconvergence is bit-identical after insertion reversal");
         if (result != NULL) {
-            CHECK(result->iterations == 500u && result->stable_rounds < 10u &&
+            CHECK(result->iterations == 500u,
+                  "nonconvergence executes round 500 rather than stopping at 499");
+            CHECK(result->stable_rounds < 10u &&
                       result->nonconverged_component == 0u &&
                       isfinite(result->final_max_delta) &&
                       result->final_max_delta >= 1e-6 &&
                       isfinite(result->best_max_delta) &&
                       result->best_iteration > 0u &&
                       result->best_iteration <= 500u,
-                  "nonconverged result retains deterministic diagnostics");
+                  "nonconverged result retains deterministic diagnostics at cap");
             CHECK(double_bits(result->final_max_delta) ==
                       UINT64_C(0x3fa82f45d31d7484) &&
                       double_bits(result->best_max_delta) ==
@@ -2405,6 +2966,134 @@ static void test_generated_fixed_forests(void)
           "generated fixed-forest beliefs meet the policy-bounded oracle");
 }
 
+static void test_generated_loopy_corpus(void)
+{
+    unsigned generated = 0;
+    unsigned changed = 0;
+    unsigned converged = 0;
+    unsigned nonconverged = 0;
+    unsigned max_iterations = 0;
+
+    for (unsigned sample = 0; sample < OSPREY_BP_LOOPY_CORPUS_CASES;
+         sample++) {
+        OspreyContext *ctx = generated_loopy_context(sample);
+        OspreyContext *permuted_ctx = NULL;
+        OspreyBpGraph *graph = NULL;
+        OspreyBpGraph *permuted_graph = NULL;
+        OspreyBpResult *result = NULL;
+        OspreyBpResult *permuted_result = NULL;
+        char *graph_dump = NULL;
+        char *permuted_dump = NULL;
+        OspreyStatus status = OSPREY_INVALID_GRAPH;
+        OspreyStatus permuted_status = OSPREY_INVALID_GRAPH;
+        unsigned failed_round = UINT32_MAX;
+        bool ok = true;
+
+        if (ctx == NULL) {
+            ok = false;
+        } else {
+            permuted_ctx = reverse_clone_context(ctx);
+            status = osprey_bp_graph_build(ctx, &graph);
+            permuted_status = permuted_ctx == NULL
+                ? OSPREY_INVALID_GRAPH
+                : osprey_bp_graph_build(permuted_ctx, &permuted_graph);
+            if (status != OSPREY_OK || permuted_status != OSPREY_OK ||
+                graph == NULL || permuted_graph == NULL ||
+                !osprey_bp_graph_validate(ctx, graph) ||
+                !osprey_bp_graph_validate(permuted_ctx, permuted_graph) ||
+                graph->components->len != 1u ||
+                permuted_graph->components->len != 1u) {
+                ok = false;
+            }
+        }
+        if (ok) {
+            bool trace_changed = false;
+            uint64_t trace_digests[OSPREY_BP_LOOPY_TRACE_ROUNDS];
+            uint64_t permuted_trace_digests[
+                OSPREY_BP_LOOPY_TRACE_ROUNDS];
+            bool trace_ok = run_damped_trace_pair(
+                ctx, graph, permuted_ctx, permuted_graph, &trace_changed,
+                trace_digests, permuted_trace_digests, &failed_round);
+            if (!trace_ok || memcmp(trace_digests, permuted_trace_digests,
+                                    sizeof(trace_digests)) != 0) ok = false;
+            if (trace_changed) changed++;
+        }
+        osprey_bp_graph_free(graph);
+        osprey_bp_graph_free(permuted_graph);
+        graph = NULL;
+        permuted_graph = NULL;
+        if (ok) {
+            status = osprey_bp_graph_build(ctx, &graph);
+            permuted_status = osprey_bp_graph_build(
+                permuted_ctx, &permuted_graph);
+            if (status != OSPREY_OK || permuted_status != OSPREY_OK ||
+                graph == NULL || permuted_graph == NULL) {
+                ok = false;
+            }
+        }
+        if (ok) {
+            status = osprey_bp_solve_fixed(ctx, graph, &result);
+            permuted_status = osprey_bp_solve_fixed(
+                permuted_ctx, permuted_graph, &permuted_result);
+            if (status != permuted_status ||
+                (status != OSPREY_OK && status != OSPREY_NON_CONVERGED) ||
+                result == NULL || permuted_result == NULL ||
+                !fixed_result_metadata_equal(result, permuted_result) ||
+                (status == OSPREY_OK &&
+                 graph->message_state != OSPREY_BP_MESSAGES_ITERATED) ||
+                (status == OSPREY_NON_CONVERGED &&
+                 graph->message_state != OSPREY_BP_MESSAGES_INITIAL) ||
+                !message_families_normalized(graph, false) ||
+                !message_families_normalized(permuted_graph, false) ||
+                !next_message_families_empty(graph) ||
+                !next_message_families_empty(permuted_graph)) {
+                ok = false;
+            }
+        }
+        if (ok) {
+            graph_dump = dump_graph(ctx, graph);
+            permuted_dump = dump_graph(permuted_ctx, permuted_graph);
+            if (graph_dump == NULL || permuted_dump == NULL ||
+                strcmp(graph_dump, permuted_dump) != 0) ok = false;
+        }
+        if (ok) {
+            if (status == OSPREY_OK) converged++;
+            else nonconverged++;
+            if (result->iterations > max_iterations) {
+                max_iterations = result->iterations;
+            }
+            generated++;
+        } else {
+            unsigned diagnostic_round = failed_round != UINT32_MAX
+                ? failed_round : result == NULL ? 0u : result->iterations;
+            uint32_t component = result != NULL &&
+                result->nonconverged_component != UINT32_MAX
+                ? result->nonconverged_component : 0u;
+            fprintf(stderr, "generated loopy mismatch at seed %u round %u "
+                    "component %u status %d/%d\n", sample,
+                    diagnostic_round, component, status, permuted_status);
+            dump_generated_initial_state(sample, ctx, "CANONICAL");
+            dump_generated_initial_state(sample, permuted_ctx, "PERMUTED");
+        }
+        free(graph_dump);
+        free(permuted_dump);
+        osprey_bp_result_free(result);
+        osprey_bp_result_free(permuted_result);
+        osprey_bp_graph_free(graph);
+        osprey_bp_graph_free(permuted_graph);
+        osprey_free(ctx);
+        osprey_free(permuted_ctx);
+    }
+    fprintf(stderr, "loopy corpus: generated %u/%u changed %u converged %u "
+            "nonconverged %u max-iterations %u\n", generated,
+            OSPREY_BP_LOOPY_CORPUS_CASES, changed, converged, nonconverged,
+            max_iterations);
+    CHECK(generated == OSPREY_BP_LOOPY_CORPUS_CASES,
+          "all generated loopy traces are deterministic and valid");
+    CHECK(changed > 0,
+          "generated loopy trace corpus exercises changing iterations");
+}
+
 static void test_generated_projections(void)
 {
     uint32_t state = 0x5eeda11u;
@@ -2578,14 +3267,17 @@ int main(void)
     RUN(test_allocation_failures);
     RUN(test_rebuild_after_failure);
     RUN(test_fixed_damping);
+    RUN(test_fixed_round_damping);
     RUN(test_fixed_graph_solver);
     RUN(test_fixed_solver_failures);
     RUN(test_fixed_workspace_failure);
     RUN(test_fixed_message_failure_matrix);
+    RUN(test_fixed_convergence_boundaries);
     RUN(test_fixed_convergence_policy);
     RUN(test_fixed_horn_support);
     RUN(test_fixed_real_nonconvergence);
     RUN(test_generated_fixed_forests);
+    RUN(test_generated_loopy_corpus);
     RUN(test_generated_projections);
 
     if (failures != 0 || executed != registered) {
@@ -2594,6 +3286,7 @@ int main(void)
         return 1;
     }
     printf("PASS stage5_bp (%u/%u; fixed forests 2000/2000; "
-           "projections 2000/2000)\n", executed, registered);
+           "loopy %u/%u; projections 2000/2000)\n", executed, registered,
+           OSPREY_BP_LOOPY_CORPUS_CASES, OSPREY_BP_LOOPY_CORPUS_CASES);
     return 0;
 }

@@ -955,6 +955,103 @@ static bool ref_round_graph_valid(const OspreyContext *ctx,
     return true;
 }
 
+OspreyStatus stage5_bp_reference_compute_factor_half(
+    const OspreyContext *ctx, const OspreyBpGraph *graph,
+    const double *vf_messages, double *fv_messages)
+{
+    uint32_t edge_count;
+    uint64_t value_count;
+    OspreyStatus status;
+
+    if (!ref_round_graph_valid(ctx, graph, &edge_count) ||
+        vf_messages == NULL || fv_messages == NULL) {
+        return OSPREY_INVALID_GRAPH;
+    }
+    value_count = (uint64_t)edge_count * 2u;
+    if (graph->message_values != value_count || value_count > SIZE_MAX) {
+        return OSPREY_INVALID_GRAPH;
+    }
+    for (uint32_t edge_id = 0; edge_id < edge_count; edge_id++) {
+        if (!ref_round_pair_valid(&vf_messages[(size_t)edge_id * 2u])) {
+            return OSPREY_INVALID_GRAPH;
+        }
+    }
+    for (uint64_t i = 0; i < value_count; i++) {
+        fv_messages[(size_t)i] = NAN;
+    }
+
+    for (uint32_t edge_id = 0; edge_id < edge_count; edge_id++) {
+        const OspreyBpEdge *edge = &g_array_index(graph->edges,
+                                                  OspreyBpEdge, edge_id);
+        const OspreyBpFactorRef *factor_ref = &g_array_index(
+            graph->factors, OspreyBpFactorRef, edge->local_factor);
+        const OspreyFactor *factor = g_array_index(
+            ctx->graph->factors, OspreyFactor *,
+            factor_ref->graph_factor_id);
+        uint32_t arity = factor->num_vars;
+        uint32_t alternatives = 1u << (arity - 1u);
+        double output[2] = { -INFINITY, -INFINITY };
+
+        for (uint32_t recipient_state = 0; recipient_state < 2;
+             recipient_state++) {
+            double raw = -INFINITY;
+            for (uint32_t compact = 0; compact < alternatives; compact++) {
+                uint8_t assignment[OSPREY_FACTOR_MAX_ARITY];
+                uint32_t compact_bit = 0;
+                double term;
+
+                for (uint32_t position = 0; position < arity; position++) {
+                    if (position == edge->factor_position) {
+                        assignment[position] = recipient_state;
+                    } else {
+                        assignment[position] = (uint8_t)((compact >>
+                                                          compact_bit++) & 1u);
+                    }
+                }
+                if (!osprey_factor_log_weight(factor, assignment, &term)) {
+                    status = OSPREY_INVALID_GRAPH;
+                    goto fail;
+                }
+                for (uint32_t position = 0; position < arity; position++) {
+                    uint32_t incoming_id;
+                    const double *incoming;
+                    if (position == edge->factor_position) continue;
+                    if (!ref_round_find_factor_edge(graph, edge->local_factor,
+                                                    position, &incoming_id)) {
+                        status = OSPREY_INVALID_GRAPH;
+                        goto fail;
+                    }
+                    incoming = &vf_messages[(size_t)incoming_id * 2u];
+                    if (!ref_round_log_product_add(
+                            term, incoming[assignment[position]], &term)) {
+                        status = OSPREY_INVALID_GRAPH;
+                        goto fail;
+                    }
+                }
+                if (!ref_round_logaddexp(raw, term, &raw)) {
+                    status = OSPREY_INVALID_GRAPH;
+                    goto fail;
+                }
+            }
+            output[recipient_state] = raw;
+        }
+        if (!ref_round_log_normalize(output)) {
+            status = (output[0] == -INFINITY && output[1] == -INFINITY)
+                ? OSPREY_INVALID_MODEL : OSPREY_INVALID_GRAPH;
+            goto fail;
+        }
+        fv_messages[(size_t)edge_id * 2u] = output[0];
+        fv_messages[(size_t)edge_id * 2u + 1u] = output[1];
+    }
+    return OSPREY_OK;
+
+fail:
+    for (uint64_t i = 0; i < value_count; i++) {
+        fv_messages[(size_t)i] = NAN;
+    }
+    return status;
+}
+
 OspreyStatus stage5_bp_reference_compute_round(
     const OspreyContext *ctx, const OspreyBpGraph *graph,
     OspreyBpMessages *messages)
@@ -1011,69 +1108,9 @@ OspreyStatus stage5_bp_reference_compute_round(
         messages->vf_next[(size_t)edge_id * 2u + 1u] = output[1];
     }
 
-    for (uint32_t edge_id = 0; edge_id < edge_count; edge_id++) {
-        const OspreyBpEdge *edge = &g_array_index(graph->edges,
-                                                  OspreyBpEdge, edge_id);
-        const OspreyBpFactorRef *factor_ref = &g_array_index(
-            graph->factors, OspreyBpFactorRef, edge->local_factor);
-        const OspreyFactor *factor = g_array_index(
-            ctx->graph->factors, OspreyFactor *,
-            factor_ref->graph_factor_id);
-        uint32_t arity = factor->num_vars;
-        uint32_t alternatives = 1u << (arity - 1u);
-        double output[2] = { -INFINITY, -INFINITY };
-
-        for (uint32_t recipient_state = 0; recipient_state < 2;
-             recipient_state++) {
-            double raw = -INFINITY;
-            for (uint32_t compact = 0; compact < alternatives; compact++) {
-                uint8_t assignment[OSPREY_FACTOR_MAX_ARITY];
-                uint32_t compact_bit = 0;
-                double term;
-
-                for (uint32_t position = 0; position < arity; position++) {
-                    if (position == edge->factor_position) {
-                        assignment[position] = recipient_state;
-                    } else {
-                        assignment[position] = (uint8_t)((compact >>
-                                                          compact_bit++) & 1u);
-                    }
-                }
-                if (!osprey_factor_log_weight(factor, assignment, &term)) {
-                    status = OSPREY_INVALID_GRAPH;
-                    goto fail;
-                }
-                for (uint32_t position = 0; position < arity; position++) {
-                    uint32_t incoming_id;
-                    const double *incoming;
-                    if (position == edge->factor_position) continue;
-                    if (!ref_round_find_factor_edge(graph, edge->local_factor,
-                                                    position, &incoming_id)) {
-                        status = OSPREY_INVALID_GRAPH;
-                        goto fail;
-                    }
-                    incoming = &messages->vf_next[(size_t)incoming_id * 2u];
-                    if (!ref_round_log_product_add(
-                            term, incoming[assignment[position]], &term)) {
-                        status = OSPREY_INVALID_GRAPH;
-                        goto fail;
-                    }
-                }
-                if (!ref_round_logaddexp(raw, term, &raw)) {
-                    status = OSPREY_INVALID_GRAPH;
-                    goto fail;
-                }
-            }
-            output[recipient_state] = raw;
-        }
-        if (!ref_round_log_normalize(output)) {
-            status = (output[0] == -INFINITY && output[1] == -INFINITY)
-                ? OSPREY_INVALID_MODEL : OSPREY_INVALID_GRAPH;
-            goto fail;
-        }
-        messages->fv_next[(size_t)edge_id * 2u] = output[0];
-        messages->fv_next[(size_t)edge_id * 2u + 1u] = output[1];
-    }
+    status = stage5_bp_reference_compute_factor_half(
+        ctx, graph, messages->vf_next, messages->fv_next);
+    if (status != OSPREY_OK) goto fail;
     return OSPREY_OK;
 
 fail:

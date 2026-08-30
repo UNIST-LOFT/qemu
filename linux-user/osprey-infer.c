@@ -5155,6 +5155,15 @@ OspreyStatus osprey_bp_compute_round(const OspreyContext *ctx,
     return bp_compute_round_internal(ctx, graph, messages, stats, false, 0.0);
 }
 
+OspreyStatus osprey_bp_compute_round_damped(
+    const OspreyContext *ctx, const OspreyBpGraph *graph,
+    OspreyBpMessages *messages, OspreyBpRoundStats *stats,
+    double coefficient)
+{
+    return bp_compute_round_internal(ctx, graph, messages, stats, true,
+                                     coefficient);
+}
+
 /* ------------------------------------------------------------------ */
 /* Stage 5.3: fixed-graph damping, convergence, and publication        */
 /* ------------------------------------------------------------------ */
@@ -5774,8 +5783,8 @@ OspreyStatus osprey_bp_solve_fixed(OspreyContext *ctx,
         uint32_t unstable_component;
         bool all_stable;
 
-        status = bp_compute_round_internal(ctx, graph, &messages, NULL, true,
-                                            OSPREY_BP_DAMPING);
+        status = osprey_bp_compute_round_damped(
+            ctx, graph, &messages, NULL, OSPREY_BP_DAMPING);
         if (status != OSPREY_OK) goto solve_fail;
         status = bp_compute_next_beliefs(
             graph, (double *)result->beliefs->data, &max_delta,

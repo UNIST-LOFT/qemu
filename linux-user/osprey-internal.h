@@ -1075,6 +1075,14 @@ OspreyStatus osprey_bp_compute_round(const OspreyContext *ctx,
                                      const OspreyBpGraph *graph,
                                      OspreyBpMessages *messages,
                                      OspreyBpRoundStats *stats);
+/* Stage 5.3 staged round: damp the complete variable-to-factor family,
+ * compute factor-to-variable messages from that family, then damp the
+ * complete factor-to-variable family.  The coefficient weights current
+ * messages; the fixed solver passes exactly 0.5. */
+OspreyStatus osprey_bp_compute_round_damped(
+    const OspreyContext *ctx, const OspreyBpGraph *graph,
+    OspreyBpMessages *messages, OspreyBpRoundStats *stats,
+    double coefficient);
 /* Probability-space damping of two normalized log-probability pairs.  The
  * coefficient weights the current pair; production passes 0.5. */
 bool osprey_bp_damp_pair(const double current[2], const double raw[2],
