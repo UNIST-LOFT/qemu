@@ -1399,6 +1399,463 @@ static void dump_generated_round_failure(unsigned sample,
     }
 }
 
+static bool brute_force_beliefs(const OspreyContext *ctx,
+                                const OspreyBpGraph *graph, double *out)
+{
+    uint32_t variable_count;
+    uint64_t assignment_count;
+    long double total = 0.0L;
+    long double *true_weights;
+
+    if (ctx == NULL || graph == NULL || out == NULL || ctx->graph == NULL ||
+        ctx->graph->vars == NULL || ctx->graph->factors == NULL ||
+        ctx->graph->vars->len == 0 || ctx->graph->vars->len >= 63 ||
+        graph->local_by_graph_var == NULL) return false;
+    variable_count = ctx->graph->vars->len;
+    assignment_count = UINT64_C(1) << variable_count;
+    true_weights = g_new0(long double, variable_count);
+    for (uint64_t mask = 0; mask < assignment_count; mask++) {
+        long double log_weight = 0.0L;
+        bool supported = true;
+
+        for (guint factor_index = 0;
+             factor_index < ctx->graph->factors->len; factor_index++) {
+            const OspreyFactor *factor = g_array_index(
+                ctx->graph->factors, OspreyFactor *, factor_index);
+            uint8_t assignment[OSPREY_FACTOR_MAX_ARITY];
+            double factor_log_weight;
+
+            if (factor == NULL || factor->num_vars == 0 ||
+                factor->num_vars > OSPREY_FACTOR_MAX_ARITY) {
+                g_free(true_weights);
+                return false;
+            }
+            for (uint32_t position = 0; position < factor->num_vars;
+                 position++) {
+                uint32_t graph_var = factor->var_ids[position];
+                if (graph_var >= variable_count) {
+                    g_free(true_weights);
+                    return false;
+                }
+                assignment[position] = (uint8_t)((mask >> graph_var) & 1u);
+            }
+            if (!osprey_factor_log_weight(factor, assignment,
+                                           &factor_log_weight)) {
+                g_free(true_weights);
+                return false;
+            }
+            if (factor_log_weight == -INFINITY) {
+                supported = false;
+                break;
+            }
+            if (!isfinite(factor_log_weight)) {
+                g_free(true_weights);
+                return false;
+            }
+            log_weight += (long double)factor_log_weight;
+        }
+        if (!supported) continue;
+        long double weight = expl(log_weight);
+        if (!(weight >= 0.0L) || !isfinite((double)weight)) {
+            g_free(true_weights);
+            return false;
+        }
+        total += weight;
+        for (uint32_t graph_var = 0; graph_var < variable_count;
+             graph_var++) {
+            if ((mask >> graph_var) & 1u) true_weights[graph_var] += weight;
+        }
+    }
+    if (!(total > 0.0L) || !isfinite((double)total)) {
+        g_free(true_weights);
+        return false;
+    }
+    for (uint32_t local = 0; local < variable_count; local++) {
+        uint32_t graph_var = graph->vars == NULL || local >= graph->vars->len
+            ? UINT32_MAX
+            : g_array_index(graph->vars, OspreyBpVarRef, local).graph_var_id;
+        if (graph_var >= variable_count) {
+            g_free(true_weights);
+            return false;
+        }
+        out[local] = (double)(true_weights[graph_var] / total);
+        if (!isfinite(out[local]) || out[local] < 0.0 || out[local] > 1.0) {
+            g_free(true_weights);
+            return false;
+        }
+    }
+    g_free(true_weights);
+    return true;
+}
+
+static void test_fixed_damping(void)
+{
+    double current[2];
+    double raw[2];
+    double damped[2];
+    double expected[2];
+    double geometric_true;
+
+    set_log_probability_pair(current, 0.2);
+    set_log_probability_pair(raw, 0.6);
+    CHECK(osprey_bp_damp_pair(current, raw, 0.5, damped),
+          "probability-space damping accepts normalized pairs");
+    set_log_probability_pair(expected, 0.4);
+    CHECK(message_pair_close(damped, expected),
+          "damping matches the arithmetic probability mixture");
+    geometric_true = sqrt(0.2 * 0.6);
+    CHECK(fabs(exp(damped[1]) - geometric_true) > 1e-3,
+          "damping is not geometric interpolation of log values");
+    CHECK(osprey_bp_damp_pair(current, raw, 1.0, damped) &&
+              damped[0] == current[0] && damped[1] == current[1],
+          "damping coefficient one retains the current message");
+    CHECK(osprey_bp_damp_pair(current, raw, 0.0, damped) &&
+              damped[0] == raw[0] && damped[1] == raw[1],
+          "damping coefficient zero retains the raw message");
+    current[0] = 0.0;
+    current[1] = -INFINITY;
+    raw[0] = -INFINITY;
+    raw[1] = 0.0;
+    CHECK(osprey_bp_damp_pair(current, raw, 0.5, damped) &&
+              message_pair_close(damped,
+                                 (double[2]){ -log(2.0), -log(2.0) }),
+          "damping mixes complementary hard-zero support without epsilon");
+}
+
+static void test_fixed_graph_solver(void)
+{
+    OspreyContext *ctx = new_context();
+    OspreyRegionId region = make_region(OSPREY_REGION_GLOBAL, 0x1a0);
+    uint32_t ids[3];
+    uint32_t antecedent;
+    OspreyBpGraph *graph = NULL;
+    OspreyBpResult *result = NULL;
+    OspreyBpResult *repeat = NULL;
+    double expected[3];
+    OspreyStatus status;
+
+    ids[0] = add_primitive(ctx, region, 0);
+    ids[1] = add_primitive(ctx, region, 8);
+    ids[2] = add_primitive(ctx, region, 16);
+    add_prior(ctx, ids[0], 0.25);
+    add_prior(ctx, ids[1], 0.75);
+    add_prior(ctx, ids[2], 0.4);
+    antecedent = ids[0];
+    add_implication_probability(ctx, OSPREY_RULE_CB01,
+                                OSPREY_GRAPH_SECONDARY, false, 0.8,
+                                &antecedent, 1, ids[1]);
+    antecedent = ids[1];
+    add_implication_probability(ctx, OSPREY_RULE_CB02,
+                                OSPREY_GRAPH_SECONDARY, false, 0.65,
+                                &antecedent, 1, ids[2]);
+    CHECK(osprey_bp_graph_build(ctx, &graph) == OSPREY_OK && graph != NULL,
+          "fixed-graph solver fixture builds");
+    if (graph == NULL) {
+        osprey_free(ctx);
+        return;
+    }
+    CHECK(brute_force_beliefs(ctx, graph, expected),
+          "independent tree marginal oracle evaluates the fixture");
+    status = osprey_bp_solve_fixed(ctx, graph, &result);
+    CHECK(status == OSPREY_OK && result != NULL &&
+              result->status == OSPREY_OK,
+          "fixed graph converges with the real stability policy");
+    if (result != NULL) {
+        CHECK(result->iterations >= 10u && result->iterations <= 500u &&
+                  result->stable_rounds == 10u &&
+                  result->best_iteration > 0 &&
+                  isfinite(result->best_max_delta),
+              "fixed result carries deterministic convergence metadata");
+        CHECK(result->beliefs != NULL && result->beliefs->len == 3,
+              "fixed result owns canonical beliefs");
+        if (result->beliefs != NULL && result->beliefs->len == 3) {
+            for (guint local = 0; local < result->beliefs->len; local++) {
+                double actual = g_array_index(result->beliefs, double, local);
+                CHECK(fabs(actual - expected[local]) <= 2e-8,
+                      "tree BP belief matches the policy-bounded oracle");
+            }
+        }
+    }
+    CHECK(g_array_index(ctx->graph->vars, OspreyVar, ids[0]).belief == 0.0 &&
+              g_array_index(ctx->graph->vars, OspreyVar, ids[1]).belief == 0.0 &&
+              g_array_index(ctx->graph->vars, OspreyVar, ids[2]).belief == 0.0 &&
+              g_array_index(ctx->graph->vars, OspreyVar, ids[0]).belief_valid == 0,
+          "fixed solver does not publish production beliefs");
+    CHECK(osprey_bp_graph_validate(ctx, graph),
+          "completed fixed graph remains internally valid");
+    CHECK(result != NULL && osprey_bp_commit_result(ctx, graph, result) ==
+              OSPREY_OK,
+          "successful fixed result commits atomically");
+    for (guint local = 0; local < graph->vars->len; local++) {
+        uint32_t graph_id = g_array_index(graph->vars, OspreyBpVarRef,
+                                          local).graph_var_id;
+        OspreyVar *variable = &g_array_index(ctx->graph->vars, OspreyVar,
+                                             graph_id);
+        CHECK(variable->belief_valid == 1 &&
+                  variable->belief == g_array_index(result->beliefs, double,
+                                                    local),
+              "commit publishes every canonical belief exactly once");
+    }
+    CHECK(osprey_bp_graph_validate(ctx, graph),
+          "committed fixed graph validates after source beliefs change");
+    osprey_bp_result_free(result);
+    result = NULL;
+    status = osprey_bp_solve_fixed(ctx, graph, &repeat);
+    CHECK(status == OSPREY_OK && repeat != NULL,
+          "repeated solve accepts the iterated message state");
+    if (repeat != NULL) {
+        for (guint local = 0; local < repeat->beliefs->len; local++) {
+            CHECK(fabs(g_array_index(repeat->beliefs, double, local) -
+                       expected[local]) <= 1e-10,
+                  "repeated fixed solve retains tree marginals");
+        }
+    }
+    osprey_bp_result_free(repeat);
+    osprey_bp_graph_free(graph);
+    osprey_free(ctx);
+}
+
+static void test_fixed_solver_failures(void)
+{
+    OspreyRegionId region = make_region(OSPREY_REGION_GLOBAL, 0x1b0);
+    OspreyContext *ctx = new_context();
+    uint32_t id = add_primitive(ctx, region, 0);
+    OspreyBpGraph *graph = NULL;
+    OspreyBpResult *result = NULL;
+    double before = 0.37;
+
+    set_seed(ctx, id, before);
+    add_prior(ctx, id, 0.0);
+    add_prior(ctx, id, 1.0);
+    CHECK(osprey_bp_graph_build(ctx, &graph) == OSPREY_OK && graph != NULL,
+          "impossible fixed graph builds");
+    if (graph != NULL) {
+        CHECK(osprey_bp_solve_fixed(ctx, graph, &result) ==
+                  OSPREY_INVALID_MODEL && result != NULL &&
+                  result->status == OSPREY_INVALID_MODEL,
+              "impossible fixed component rejects as an invalid model");
+        CHECK(g_array_index(ctx->graph->vars, OspreyVar, id).belief == before &&
+                  g_array_index(ctx->graph->vars, OspreyVar, id).belief_valid == 1,
+              "impossible fixed solve leaves source belief unchanged");
+        if (result != NULL) {
+            bool all_nan = true;
+            for (guint i = 0; i < result->beliefs->len; i++) {
+                if (!isnan(g_array_index(result->beliefs, double, i))) {
+                    all_nan = false;
+                }
+            }
+            CHECK(all_nan, "impossible result publishes no temporary belief");
+        }
+        CHECK(osprey_bp_graph_validate(ctx, graph),
+              "impossible fixed solve restores the initial graph state");
+    }
+    osprey_bp_result_free(result);
+    osprey_bp_graph_free(graph);
+    osprey_free(ctx);
+
+    ctx = new_context();
+    id = add_primitive(ctx, region, 8);
+    add_prior(ctx, id, 0.5);
+    graph = NULL;
+    CHECK(osprey_bp_graph_build(ctx, &graph) == OSPREY_OK && graph != NULL,
+          "allocation-failure fixed graph builds");
+    if (graph != NULL) {
+        char *before_dump = dump_graph(ctx, graph);
+        osprey_bp_test_set_alloc_fail_after(0);
+        CHECK(osprey_bp_solve_fixed(ctx, graph, &result) ==
+                  OSPREY_INVALID_GRAPH && result == NULL,
+              "fixed result allocation failure rejects cleanly");
+        osprey_bp_test_set_alloc_fail_after(3);
+        CHECK(osprey_bp_solve_fixed(ctx, graph, &result) ==
+                  OSPREY_INVALID_GRAPH && result == NULL,
+              "fixed snapshot allocation failure rejects cleanly");
+        osprey_bp_test_set_alloc_fail_after(-1);
+        char *after_dump = dump_graph(ctx, graph);
+        CHECK(before_dump != NULL && after_dump != NULL &&
+                  strcmp(before_dump, after_dump) == 0,
+              "fixed snapshot allocation failure preserves exact graph state");
+        free(before_dump);
+        free(after_dump);
+        CHECK(osprey_bp_graph_validate(ctx, graph),
+              "fixed result allocation failure preserves graph ownership");
+    }
+    osprey_bp_graph_free(graph);
+    osprey_free(ctx);
+
+    ctx = new_context();
+    id = add_primitive(ctx, region, 16);
+    add_prior(ctx, id, 0.5);
+    graph = NULL;
+    CHECK(osprey_bp_graph_build(ctx, &graph) == OSPREY_OK && graph != NULL,
+          "non-finite fixed graph builds");
+    if (graph != NULL) {
+        graph->msg_fv_current[0] = NAN;
+        CHECK(osprey_bp_solve_fixed(ctx, graph, &result) ==
+                  OSPREY_INVALID_GRAPH && result == NULL,
+              "non-finite current state rejects before publication");
+    }
+    osprey_bp_result_free(result);
+    osprey_bp_graph_free(graph);
+    osprey_free(ctx);
+}
+
+static void test_fixed_convergence_policy(void)
+{
+    OspreyContext *ctx = new_context();
+    OspreyRegionId region = make_region(OSPREY_REGION_GLOBAL, 0x1c0);
+    uint32_t id = add_primitive(ctx, region, 0);
+    OspreyBpGraph *graph = NULL;
+    OspreyBpResult *result = NULL;
+
+    add_prior(ctx, id, 0.8);
+    CHECK(osprey_bp_graph_build(ctx, &graph) == OSPREY_OK && graph != NULL,
+          "one-prior convergence-policy graph builds");
+    if (graph != NULL) {
+        CHECK(osprey_bp_solve_fixed(ctx, graph, &result) == OSPREY_OK &&
+                  result != NULL && result->status == OSPREY_OK,
+              "one-prior graph converges");
+        if (result != NULL) {
+            double belief = g_array_index(result->beliefs, double, 0);
+            CHECK(result->iterations == 28u && result->stable_rounds == 10u &&
+                      result->final_max_delta < 1e-6,
+                  "solver stops at the exact ten-round policy boundary");
+            CHECK(fabs(belief - 0.8) <= 2e-9,
+                  "policy-bound one-prior belief remains numerically bounded");
+        }
+    }
+    osprey_bp_result_free(result);
+    osprey_bp_graph_free(graph);
+    osprey_free(ctx);
+}
+
+static void test_fixed_horn_support(void)
+{
+    OspreyContext *ctx = new_context();
+    OspreyRegionId region = make_region(OSPREY_REGION_GLOBAL, 0x1d0);
+    uint32_t ids[3];
+    uint32_t antecedent;
+    OspreyBpGraph *graph = NULL;
+    OspreyBpResult *result = NULL;
+    char *before = NULL;
+    char *after = NULL;
+
+    for (uint32_t i = 0; i < G_N_ELEMENTS(ids); i++) {
+        ids[i] = add_primitive(ctx, region, (int64_t)i * 8);
+    }
+    add_prior(ctx, ids[0], 1.0);
+    antecedent = ids[0];
+    add_implication_probability(ctx, OSPREY_RULE_CB01,
+                                OSPREY_GRAPH_SECONDARY, false, 1.0,
+                                &antecedent, 1, ids[1]);
+    antecedent = ids[1];
+    add_implication_probability(ctx, OSPREY_RULE_CB02,
+                                OSPREY_GRAPH_SECONDARY, false, 1.0,
+                                &antecedent, 1, ids[2]);
+    antecedent = ids[0];
+    add_implication_probability(ctx, OSPREY_RULE_CB03,
+                                OSPREY_GRAPH_SECONDARY, false, 0.0,
+                                &antecedent, 1, ids[2]);
+    CHECK(osprey_bp_graph_build(ctx, &graph) == OSPREY_OK && graph != NULL,
+          "Horn-support contradiction graph builds");
+    if (graph != NULL) {
+        before = dump_graph(ctx, graph);
+        CHECK(osprey_bp_solve_fixed(ctx, graph, &result) ==
+                  OSPREY_INVALID_MODEL && result != NULL &&
+                  result->status == OSPREY_INVALID_MODEL &&
+                  result->iterations == 0,
+              "linear Horn propagation rejects global hard conflict pre-round");
+        after = dump_graph(ctx, graph);
+        CHECK(before != NULL && after != NULL && strcmp(before, after) == 0,
+              "hard-support rejection restores every BP buffer");
+    }
+    free(before);
+    free(after);
+    osprey_bp_result_free(result);
+    osprey_bp_graph_free(graph);
+    osprey_free(ctx);
+}
+
+static void test_fixed_real_nonconvergence(void)
+{
+    OspreyContext *ctx = new_context();
+    OspreyRegionId region = make_region(OSPREY_REGION_GLOBAL, 0x1e0);
+    uint32_t ids[7];
+    OspreyBpGraph *graph = NULL;
+    OspreyBpResult *result = NULL;
+    char *before = NULL;
+    char *after = NULL;
+
+    for (uint32_t i = 0; i < G_N_ELEMENTS(ids); i++) {
+        ids[i] = add_primitive(ctx, region, (int64_t)i * 8);
+    }
+    add_prior(ctx, ids[0], 0.9);
+    add_prior(ctx, ids[2], 0.01);
+    add_prior(ctx, ids[3], 0.1);
+    add_prior(ctx, ids[4], 0.9);
+    add_prior(ctx, ids[5], 0.99);
+    add_prior(ctx, ids[6], 0.1);
+
+#define ADD_FIXTURE_IMPLICATION(_p, _head, ...) do {                       \
+    uint32_t fixture_antecedents[] = { __VA_ARGS__ };                      \
+    add_implication_probability(                                           \
+        ctx, OSPREY_RULE_CB01, OSPREY_GRAPH_SECONDARY, false, (_p),       \
+        fixture_antecedents, G_N_ELEMENTS(fixture_antecedents), (_head));  \
+} while (0)
+    ADD_FIXTURE_IMPLICATION(0.01, ids[4], ids[1], ids[0]);
+    ADD_FIXTURE_IMPLICATION(0.2, ids[3], ids[0]);
+    ADD_FIXTURE_IMPLICATION(0.999, ids[2], ids[0]);
+    ADD_FIXTURE_IMPLICATION(0.999, ids[2], ids[0], ids[1]);
+    ADD_FIXTURE_IMPLICATION(0.2, ids[5], ids[0]);
+    ADD_FIXTURE_IMPLICATION(0.999, ids[2], ids[3], ids[1]);
+    ADD_FIXTURE_IMPLICATION(0.99, ids[3], ids[6], ids[4], ids[2]);
+    ADD_FIXTURE_IMPLICATION(0.1, ids[0], ids[5]);
+    ADD_FIXTURE_IMPLICATION(0.9, ids[0], ids[2], ids[1]);
+    ADD_FIXTURE_IMPLICATION(0.99, ids[2], ids[4]);
+    ADD_FIXTURE_IMPLICATION(0.2, ids[5], ids[0], ids[1]);
+    ADD_FIXTURE_IMPLICATION(0.9, ids[0], ids[2]);
+    ADD_FIXTURE_IMPLICATION(0.001, ids[5], ids[0]);
+    ADD_FIXTURE_IMPLICATION(0.01, ids[2], ids[3], ids[5]);
+    ADD_FIXTURE_IMPLICATION(0.99, ids[2], ids[5]);
+#undef ADD_FIXTURE_IMPLICATION
+
+    CHECK(osprey_bp_graph_build(ctx, &graph) == OSPREY_OK && graph != NULL,
+          "real-policy nonconvergence fixture builds");
+    if (graph != NULL) {
+        before = dump_graph(ctx, graph);
+        CHECK(osprey_bp_solve_fixed(ctx, graph, &result) ==
+                  OSPREY_NON_CONVERGED && result != NULL &&
+                  result->status == OSPREY_NON_CONVERGED,
+              "frustrated loopy graph misses the actual 500-round policy");
+        if (result != NULL) {
+            CHECK(result->iterations == 500u && result->stable_rounds < 10u &&
+                      result->nonconverged_component == 0u &&
+                      isfinite(result->final_max_delta) &&
+                      result->final_max_delta >= 1e-6 &&
+                      isfinite(result->best_max_delta) &&
+                      result->best_iteration > 0u &&
+                      result->best_iteration <= 500u,
+                  "nonconverged result retains deterministic diagnostics");
+            CHECK(osprey_bp_commit_result(ctx, graph, result) ==
+                      OSPREY_NON_CONVERGED,
+                  "nonconverged result cannot publish beliefs");
+        }
+        after = dump_graph(ctx, graph);
+        CHECK(before != NULL && after != NULL && strcmp(before, after) == 0,
+              "nonconvergence restores initial messages and beliefs");
+    }
+    for (uint32_t i = 0; i < G_N_ELEMENTS(ids); i++) {
+        const OspreyVar *variable = &g_array_index(ctx->graph->vars,
+                                                   OspreyVar, ids[i]);
+        CHECK(variable->belief_valid == 0 && variable->belief == 0.0,
+              "nonconvergence leaves every production belief unpublished");
+    }
+    free(before);
+    free(after);
+    osprey_bp_result_free(result);
+    osprey_bp_graph_free(graph);
+    osprey_free(ctx);
+}
+
 static void test_generated_projections(void)
 {
     uint32_t state = 0x5eeda11u;
@@ -1571,6 +2028,12 @@ int main(void)
     RUN(test_workspace_boundaries);
     RUN(test_allocation_failures);
     RUN(test_rebuild_after_failure);
+    RUN(test_fixed_damping);
+    RUN(test_fixed_graph_solver);
+    RUN(test_fixed_solver_failures);
+    RUN(test_fixed_convergence_policy);
+    RUN(test_fixed_horn_support);
+    RUN(test_fixed_real_nonconvergence);
     RUN(test_generated_projections);
 
     if (failures != 0 || executed != registered) {

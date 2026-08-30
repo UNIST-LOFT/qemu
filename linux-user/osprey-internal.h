@@ -1009,6 +1009,11 @@ typedef struct OspreyBpComponent {
     GArray *edges;                /* uint32_t, canonical edge IDs */
 } OspreyBpComponent;
 
+typedef enum OspreyBpMessageState {
+    OSPREY_BP_MESSAGES_INITIAL = 0,
+    OSPREY_BP_MESSAGES_ITERATED = 1,
+} OspreyBpMessageState;
+
 typedef struct OspreyBpGraph {
     GArray *vars;                 /* OspreyBpVarRef, canonical */
     GArray *factors;              /* OspreyBpFactorRef, canonical */
@@ -1029,13 +1034,14 @@ typedef struct OspreyBpGraph {
     uint64_t message_values;
     uint64_t workspace_bytes;
     uint64_t workspace_limit;
+    uint8_t message_state;          /* OspreyBpMessageState */
+    uint8_t reserved_state[7];
 } OspreyBpGraph;
 
 /* Stage 5.2 message buffers.  The four non-overlapping arrays contain two
  * normalized log-probabilities per canonical edge, in state order
  * {false, true}.  The graph owns the storage; this view permits the round
- * kernel to keep its input/output contract explicit and test independent
- * buffers. */
+ * kernel to keep its input/output contract explicit and test independent. */
 typedef struct OspreyBpMessages {
     double *vf_current;
     double *vf_next;
@@ -1049,11 +1055,40 @@ typedef struct OspreyBpRoundStats {
     uint32_t factor_messages;
 } OspreyBpRoundStats;
 
+/* Stage 5.3 fixed-graph result.  Beliefs are in the canonical local-variable
+ * order of the owning BP graph.  The solver never publishes these values to
+ * OspreyVar; the commit helper performs that mutation only after validation. */
+typedef struct OspreyBpResult {
+    OspreyStatus status;
+    GArray *beliefs;              /* double, canonical local variable order */
+    uint32_t iterations;
+    uint32_t stable_rounds;
+    uint32_t nonconverged_component;
+    double final_max_delta;
+    double best_max_delta;
+    uint32_t best_iteration;
+    const OspreyBpGraph *owner;   /* non-owning graph identity */
+} OspreyBpResult;
+
 /* Stage 5.1 projection and ownership boundary. */
 OspreyStatus osprey_bp_compute_round(const OspreyContext *ctx,
                                      const OspreyBpGraph *graph,
                                      OspreyBpMessages *messages,
                                      OspreyBpRoundStats *stats);
+/* Probability-space damping of two normalized log-probability pairs.  The
+ * coefficient weights the current pair; production passes 0.5. */
+bool osprey_bp_damp_pair(const double current[2], const double raw[2],
+                         double coefficient, double out[2]);
+/* Solve one immutable complete graph with the fixed 500/10/1e-6 policy.
+ * The result is temporary and must be freed by osprey_bp_result_free(). */
+OspreyStatus osprey_bp_solve_fixed(OspreyContext *ctx,
+                                   OspreyBpGraph *graph,
+                                   OspreyBpResult **out);
+void osprey_bp_result_free(OspreyBpResult *result);
+/* Publish a successful temporary result atomically to every graph variable. */
+OspreyStatus osprey_bp_commit_result(OspreyContext *ctx,
+                                     const OspreyBpGraph *graph,
+                                     const OspreyBpResult *result);
 OspreyStatus osprey_bp_graph_build(OspreyContext *ctx,
                                    OspreyBpGraph **out);
 void osprey_bp_graph_free(OspreyBpGraph *graph);
