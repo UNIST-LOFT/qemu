@@ -5666,6 +5666,7 @@ OspreyStatus osprey_bp_solve_fixed(OspreyContext *ctx,
     uint64_t workspace_required;
     uint64_t belief_bytes_u64;
     uint64_t message_bytes_u64;
+    uint64_t saved_belief_values;
     uint64_t saved_belief_bytes_u64;
     size_t belief_bytes;
     size_t message_bytes;
@@ -5720,7 +5721,9 @@ OspreyStatus osprey_bp_solve_fixed(OspreyContext *ctx,
     if (!bp_bytes_for(graph->message_values, sizeof(double),
                       &message_bytes_u64) ||
         message_bytes_u64 > SIZE_MAX ||
-        !bp_bytes_for((uint64_t)variable_count * 2u, sizeof(double),
+        !bp_u64_mul((uint64_t)variable_count, 2u,
+                    &saved_belief_values) ||
+        !bp_bytes_for(saved_belief_values, sizeof(double),
                       &saved_belief_bytes_u64) ||
         saved_belief_bytes_u64 > SIZE_MAX) {
         osprey_bp_result_free(result);
@@ -5862,8 +5865,9 @@ OspreyStatus osprey_bp_commit_result(OspreyContext *ctx,
                                      const OspreyBpResult *result)
 {
     if (ctx == NULL || graph == NULL || result == NULL ||
-        result->owner != graph || result->status != OSPREY_OK ||
-        result->beliefs == NULL || result->beliefs->data == NULL ||
+        graph->vars == NULL || result->owner != graph ||
+        result->status != OSPREY_OK || result->beliefs == NULL ||
+        result->beliefs->data == NULL ||
         result->beliefs->len != graph->vars->len ||
         g_array_get_element_size(result->beliefs) != sizeof(double) ||
         !osprey_bp_graph_validate(ctx, graph)) {

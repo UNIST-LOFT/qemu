@@ -13,6 +13,11 @@ static unsigned failures;
 static unsigned registered;
 static unsigned executed;
 
+/* Ten policy-stable rounds stop before exact tree arithmetic converges.  The
+ * fixed 2,000-case corpus measured a maximum error of 0x1.0cd00168p-24;
+ * retain a decimal bound with margin while keeping the required stop rule. */
+#define OSPREY_BP_FOREST_ORACLE_TOL 1e-7
+
 #define CHECK(condition, message) do {                                      \
     if (!(condition)) {                                                      \
         fprintf(stderr, "FAIL: %s (line %d)\n", (message), __LINE__);      \
@@ -1488,6 +1493,134 @@ static bool brute_force_beliefs(const OspreyContext *ctx,
     return true;
 }
 
+static uint64_t double_bits(double value)
+{
+    uint64_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+static double generated_forest_probability(uint32_t value)
+{
+    static const double probabilities[] = {
+        0.015, 0.05, 0.12, 0.25, 0.4, 0.6, 0.75, 0.88, 0.95, 0.985
+    };
+    return probabilities[value % G_N_ELEMENTS(probabilities)];
+}
+
+static OspreyContext *generated_forest_context(unsigned sample)
+{
+    OspreyContext *ctx = new_context();
+    OspreyRegionId region = make_region(OSPREY_REGION_GLOBAL,
+                                        0x200u + sample);
+    uint32_t state = 0x6d2b79f5u ^ (sample * 0x9e3779b9u);
+    uint32_t ids[12];
+    uint32_t order[12];
+    uint32_t count;
+    uint32_t cursor = 0;
+    uint16_t rule = OSPREY_RULE_CB01;
+
+    if (ctx == NULL) return NULL;
+    count = 1u + next_random(&state) % 12u;
+    for (uint32_t i = 0; i < count; i++) order[i] = i;
+    for (uint32_t i = count; i > 1; i--) {
+        uint32_t selected = next_random(&state) % i;
+        uint32_t swap = order[i - 1u];
+        order[i - 1u] = order[selected];
+        order[selected] = swap;
+    }
+    for (uint32_t position = 0; position < count; position++) {
+        uint32_t semantic_id = order[position];
+        double probability = generated_forest_probability(
+            next_random(&state));
+        ids[semantic_id] = add_primitive(ctx, region,
+                                         (int64_t)semantic_id * 16);
+        set_seed(ctx, ids[semantic_id], probability);
+        if (!add_prior(ctx, ids[semantic_id], probability)) goto fail;
+    }
+    while (cursor < count) {
+        uint32_t remaining = count - cursor;
+        uint32_t group_size = 1u + next_random(&state) %
+            (remaining < 5u ? remaining : 5u);
+        uint32_t parent = ids[cursor];
+        uint32_t group_cursor = cursor + 1u;
+        uint32_t group_end = cursor + group_size;
+
+        while (group_cursor < group_end) {
+            uint32_t available = group_end - group_cursor;
+            uint32_t fanout = 1u;
+            uint32_t selector = next_random(&state);
+            uint32_t antecedents[3];
+
+            if (available >= 3u && selector % 3u == 0u) {
+                fanout = 3u;
+            } else if (available >= 2u && selector % 2u == 0u) {
+                fanout = 2u;
+            }
+            antecedents[0] = parent;
+            for (uint32_t i = 1; i < fanout; i++) {
+                antecedents[i] = ids[group_cursor + i - 1u];
+            }
+            if (!add_implication_probability(
+                    ctx, rule, OSPREY_GRAPH_SECONDARY, false,
+                    generated_forest_probability(next_random(&state)),
+                    antecedents, fanout, ids[group_cursor + fanout - 1u])) {
+                goto fail;
+            }
+            parent = ids[group_cursor + fanout - 1u];
+            group_cursor += fanout;
+            rule = (uint16_t)(OSPREY_RULE_CB01 +
+                              (rule - OSPREY_RULE_CB01 + 1u) % 9u);
+        }
+        cursor = group_end;
+    }
+    return ctx;
+
+fail:
+    osprey_free(ctx);
+    return NULL;
+}
+
+static bool fixed_result_metadata_equal(const OspreyBpResult *left,
+                                        const OspreyBpResult *right)
+{
+    if (left == NULL || right == NULL || left->status != right->status ||
+        left->iterations != right->iterations ||
+        left->stable_rounds != right->stable_rounds ||
+        left->nonconverged_component != right->nonconverged_component ||
+        left->best_iteration != right->best_iteration ||
+        double_bits(left->final_max_delta) !=
+            double_bits(right->final_max_delta) ||
+        double_bits(left->best_max_delta) !=
+            double_bits(right->best_max_delta) ||
+        left->beliefs == NULL || right->beliefs == NULL ||
+        left->beliefs->len != right->beliefs->len) return false;
+    for (guint i = 0; i < left->beliefs->len; i++) {
+        if (double_bits(g_array_index(left->beliefs, double, i)) !=
+            double_bits(g_array_index(right->beliefs, double, i))) return false;
+    }
+    return true;
+}
+
+static void dump_fixed_solver_failure(unsigned sample,
+                                      const OspreyContext *ctx,
+                                      const OspreyBpGraph *graph,
+                                      const OspreyBpResult *result)
+{
+    fprintf(stderr, "fixed forest failure seed %u\n", sample);
+    if (ctx != NULL && ctx->graph != NULL) osprey_graph_dump_file(ctx, stderr);
+    if (graph != NULL) dump_generated_round_failure(sample, ctx, graph);
+    if (result != NULL) {
+        fprintf(stderr, "result status %d iters %u stable %u component %u "
+                "final %016llx best %016llx best-iteration %u\n",
+                result->status, result->iterations, result->stable_rounds,
+                result->nonconverged_component,
+                (unsigned long long)double_bits(result->final_max_delta),
+                (unsigned long long)double_bits(result->best_max_delta),
+                result->best_iteration);
+    }
+}
+
 static void test_fixed_damping(void)
 {
     double current[2];
@@ -1598,6 +1731,38 @@ static void test_fixed_graph_solver(void)
     }
     CHECK(osprey_bp_graph_validate(ctx, graph),
           "committed fixed graph validates after source beliefs change");
+    if (result != NULL) {
+        double committed[3];
+        uint8_t committed_valid[3];
+        GArray *saved_vars = graph->vars;
+        for (guint local = 0; local < graph->vars->len; local++) {
+            uint32_t graph_id = g_array_index(graph->vars, OspreyBpVarRef,
+                                              local).graph_var_id;
+            const OspreyVar *variable = &g_array_index(
+                ctx->graph->vars, OspreyVar, graph_id);
+            committed[local] = variable->belief;
+            committed_valid[local] = variable->belief_valid;
+        }
+        g_array_index(result->beliefs, double, 0) = NAN;
+        CHECK(osprey_bp_commit_result(ctx, graph, result) ==
+                  OSPREY_INVALID_GRAPH,
+              "invalid temporary belief rejects before publication");
+        graph->vars = NULL;
+        CHECK(osprey_bp_commit_result(ctx, graph, result) ==
+                  OSPREY_INVALID_GRAPH,
+              "malformed commit graph rejects without dereference");
+        graph->vars = saved_vars;
+        for (guint local = 0; local < graph->vars->len; local++) {
+            uint32_t graph_id = g_array_index(graph->vars, OspreyBpVarRef,
+                                              local).graph_var_id;
+            const OspreyVar *variable = &g_array_index(
+                ctx->graph->vars, OspreyVar, graph_id);
+            CHECK(variable->belief == committed[local] &&
+                      variable->belief_valid == committed_valid[local],
+                  "commit rejection preserves every published belief");
+        }
+        g_array_index(result->beliefs, double, 0) = committed[0];
+    }
     osprey_bp_result_free(result);
     result = NULL;
     status = osprey_bp_solve_fixed(ctx, graph, &repeat);
@@ -1622,6 +1787,7 @@ static void test_fixed_solver_failures(void)
     uint32_t id = add_primitive(ctx, region, 0);
     OspreyBpGraph *graph = NULL;
     OspreyBpResult *result = NULL;
+    OspreyStatus status;
     double before = 0.37;
 
     set_seed(ctx, id, before);
@@ -1654,30 +1820,89 @@ static void test_fixed_solver_failures(void)
     osprey_free(ctx);
 
     ctx = new_context();
+    uint32_t valid_id = add_primitive(ctx, region, 8);
+    uint32_t impossible_id = add_primitive(ctx, region, 16);
+    double valid_before = 0.73;
+    double impossible_before = 0.41;
+    set_seed(ctx, valid_id, valid_before);
+    set_seed(ctx, impossible_id, impossible_before);
+    add_prior(ctx, valid_id, valid_before);
+    add_prior(ctx, impossible_id, 0.0);
+    add_prior(ctx, impossible_id, 1.0);
+    graph = NULL;
+    CHECK(osprey_bp_graph_build(ctx, &graph) == OSPREY_OK && graph != NULL &&
+              graph->components->len == 2,
+          "later impossible component graph builds separately");
+    if (graph != NULL) {
+        char *before_dump = dump_graph(ctx, graph);
+        status = osprey_bp_solve_fixed(ctx, graph, &result);
+        CHECK(status == OSPREY_INVALID_MODEL && result != NULL &&
+                  result->status == OSPREY_INVALID_MODEL,
+              "later impossible component rejects the whole solve");
+        CHECK(g_array_index(ctx->graph->vars, OspreyVar, valid_id).belief ==
+                  valid_before &&
+                  g_array_index(ctx->graph->vars, OspreyVar,
+                                impossible_id).belief == impossible_before &&
+                  g_array_index(ctx->graph->vars, OspreyVar,
+                                valid_id).belief_valid == 1 &&
+                  g_array_index(ctx->graph->vars, OspreyVar,
+                                impossible_id).belief_valid == 1,
+              "later impossible component leaves earlier beliefs unchanged");
+        osprey_bp_result_free(result);
+        result = NULL;
+        CHECK(osprey_bp_solve_fixed(ctx, graph, &result) ==
+                  OSPREY_INVALID_MODEL && result != NULL &&
+                  result->status == OSPREY_INVALID_MODEL,
+              "repeated impossible solve remains rejected");
+        char *after_dump = dump_graph(ctx, graph);
+        CHECK(before_dump != NULL && after_dump != NULL &&
+                  strcmp(before_dump, after_dump) == 0,
+              "repeated impossible rejection preserves graph state");
+        free(before_dump);
+        free(after_dump);
+    }
+    osprey_bp_result_free(result);
+    osprey_bp_graph_free(graph);
+    osprey_free(ctx);
+
+    ctx = new_context();
     id = add_primitive(ctx, region, 8);
     add_prior(ctx, id, 0.5);
     graph = NULL;
     CHECK(osprey_bp_graph_build(ctx, &graph) == OSPREY_OK && graph != NULL,
           "allocation-failure fixed graph builds");
     if (graph != NULL) {
-        char *before_dump = dump_graph(ctx, graph);
-        osprey_bp_test_set_alloc_fail_after(0);
-        CHECK(osprey_bp_solve_fixed(ctx, graph, &result) ==
-                  OSPREY_INVALID_GRAPH && result == NULL,
-              "fixed result allocation failure rejects cleanly");
-        osprey_bp_test_set_alloc_fail_after(3);
-        CHECK(osprey_bp_solve_fixed(ctx, graph, &result) ==
-                  OSPREY_INVALID_GRAPH && result == NULL,
-              "fixed snapshot allocation failure rejects cleanly");
-        osprey_bp_test_set_alloc_fail_after(-1);
-        char *after_dump = dump_graph(ctx, graph);
-        CHECK(before_dump != NULL && after_dump != NULL &&
-                  strcmp(before_dump, after_dump) == 0,
-              "fixed snapshot allocation failure preserves exact graph state");
-        free(before_dump);
-        free(after_dump);
+        static const char *const allocation_stages[] = {
+            "result ownership", "result belief-array ownership",
+            "saved variable-message ownership",
+            "saved factor-message ownership", "saved-belief ownership"
+        };
+        for (int64_t fail_after = 0;
+             fail_after < (int64_t)G_N_ELEMENTS(allocation_stages);
+             fail_after++) {
+            char *before_dump = dump_graph(ctx, graph);
+            char *after_dump;
+            result = NULL;
+            osprey_bp_test_set_alloc_fail_after(fail_after);
+            OspreyStatus allocation_status = osprey_bp_solve_fixed(
+                ctx, graph, &result);
+            osprey_bp_test_set_alloc_fail_after(-1);
+            after_dump = dump_graph(ctx, graph);
+            CHECK(allocation_status == OSPREY_INVALID_GRAPH && result == NULL,
+                  allocation_stages[fail_after]);
+            CHECK(before_dump != NULL && after_dump != NULL &&
+                      strcmp(before_dump, after_dump) == 0,
+                  "fixed allocation failure preserves exact graph state");
+            free(before_dump);
+            free(after_dump);
+        }
         CHECK(osprey_bp_graph_validate(ctx, graph),
-              "fixed result allocation failure preserves graph ownership");
+              "fixed allocation failures preserve graph ownership");
+        CHECK(osprey_bp_solve_fixed(ctx, graph, &result) == OSPREY_OK &&
+                  result != NULL,
+              "fixed solver recovers after every ownership failure");
+        osprey_bp_result_free(result);
+        result = NULL;
     }
     osprey_bp_graph_free(graph);
     osprey_free(ctx);
@@ -1693,6 +1918,151 @@ static void test_fixed_solver_failures(void)
         CHECK(osprey_bp_solve_fixed(ctx, graph, &result) ==
                   OSPREY_INVALID_GRAPH && result == NULL,
               "non-finite current state rejects before publication");
+    }
+    osprey_bp_result_free(result);
+    osprey_bp_graph_free(graph);
+    osprey_free(ctx);
+}
+
+static void test_fixed_workspace_failure(void)
+{
+    OspreyConfig config = bp_config();
+    OspreyRegionId region = make_region(OSPREY_REGION_GLOBAL, 0x1b2);
+    OspreyContext *probe = new_context_with_config(&config);
+    OspreyContext *ctx = NULL;
+    OspreyBpGraph *probe_graph = NULL;
+    OspreyBpGraph *graph = NULL;
+    OspreyBpResult *result = NULL;
+    uint64_t graph_workspace = 0;
+    char *before = NULL;
+    char *after = NULL;
+
+    uint32_t probe_id = add_primitive(probe, region, 0);
+    add_prior(probe, probe_id, 0.5);
+    CHECK(osprey_bp_graph_build(probe, &probe_graph) == OSPREY_OK &&
+              probe_graph != NULL,
+          "fixed workspace probe builds");
+    if (probe_graph != NULL) graph_workspace = probe_graph->workspace_bytes;
+    osprey_bp_graph_free(probe_graph);
+    osprey_free(probe);
+    if (graph_workspace == 0) return;
+
+    config.max_bp_table_bytes = graph_workspace;
+    ctx = new_context_with_config(&config);
+    uint32_t id = add_primitive(ctx, region, 0);
+    add_prior(ctx, id, 0.5);
+    CHECK(osprey_bp_graph_build(ctx, &graph) == OSPREY_OK && graph != NULL &&
+              osprey_bp_graph_validate(ctx, graph),
+          "fixed workspace-limit graph validates at its graph-only bound");
+    if (graph != NULL) {
+        before = dump_graph(ctx, graph);
+        CHECK(osprey_bp_solve_fixed(ctx, graph, &result) ==
+                  OSPREY_LIMIT_EXCEEDED && result == NULL,
+              "fixed result workspace rejects below its solver bound");
+        after = dump_graph(ctx, graph);
+        CHECK(before != NULL && after != NULL && strcmp(before, after) == 0,
+              "workspace rejection preserves exact fixed graph state");
+    }
+    free(before);
+    free(after);
+    osprey_bp_result_free(result);
+    osprey_bp_graph_free(graph);
+    osprey_free(ctx);
+}
+
+static void test_fixed_message_failure_matrix(void)
+{
+    static const char *const family_names[] = {
+        "variable-to-factor current corruption",
+        "factor-to-variable current corruption",
+        "variable-to-factor next corruption",
+        "factor-to-variable next corruption"
+    };
+    OspreyContext *ctx = new_context();
+    OspreyRegionId region = make_region(OSPREY_REGION_GLOBAL, 0x1b1);
+    uint32_t id = add_primitive(ctx, region, 0);
+    OspreyBpGraph *graph = NULL;
+    OspreyBpResult *result = NULL;
+    OspreyStatus status;
+
+    add_prior(ctx, id, 0.5);
+    CHECK(osprey_bp_graph_build(ctx, &graph) == OSPREY_OK && graph != NULL,
+          "message-family failure graph builds");
+    if (graph != NULL) {
+        double saved_vf[2];
+        double saved_fv[2];
+        double saved_next_vf[2];
+        double saved_next_fv[2];
+        double saved_beliefs[2];
+        double *families[] = {
+            graph->msg_vf_current, graph->msg_fv_current,
+            graph->msg_vf_next, graph->msg_fv_next
+        };
+        double *saved_pointers[] = {
+            graph->msg_vf_current, graph->msg_fv_current,
+            graph->msg_vf_next, graph->msg_fv_next
+        };
+        memcpy(saved_vf, graph->msg_vf_current, sizeof(saved_vf));
+        memcpy(saved_fv, graph->msg_fv_current, sizeof(saved_fv));
+        memcpy(saved_next_vf, graph->msg_vf_next, sizeof(saved_next_vf));
+        memcpy(saved_next_fv, graph->msg_fv_next, sizeof(saved_next_fv));
+        memcpy(saved_beliefs, graph->beliefs, sizeof(saved_beliefs));
+        for (unsigned family = 0; family < G_N_ELEMENTS(families);
+             family++) {
+            unsigned corruption_count = family < 2u ? 2u : 1u;
+            for (unsigned corruption = 0; corruption < corruption_count;
+                 corruption++) {
+                double corrupt_value = family < 2u && corruption == 0u
+                    ? NAN : INFINITY;
+                memcpy(graph->msg_vf_current, saved_vf,
+                       sizeof(saved_vf));
+                memcpy(graph->msg_fv_current, saved_fv,
+                       sizeof(saved_fv));
+                memcpy(graph->msg_vf_next, saved_next_vf,
+                       sizeof(saved_next_vf));
+                memcpy(graph->msg_fv_next, saved_next_fv,
+                       sizeof(saved_next_fv));
+                memcpy(graph->beliefs, saved_beliefs,
+                       sizeof(saved_beliefs));
+                families[family][0] = corrupt_value;
+                result = NULL;
+                status = osprey_bp_solve_fixed(ctx, graph, &result);
+                CHECK(status == OSPREY_INVALID_GRAPH && result == NULL,
+                      family_names[family]);
+                bool preserved =
+                    graph->msg_vf_current == saved_pointers[0] &&
+                    graph->msg_fv_current == saved_pointers[1] &&
+                    graph->msg_vf_next == saved_pointers[2] &&
+                    graph->msg_fv_next == saved_pointers[3] &&
+                    graph->message_state == OSPREY_BP_MESSAGES_INITIAL &&
+                    memcmp(graph->beliefs, saved_beliefs,
+                           sizeof(saved_beliefs)) == 0;
+                for (unsigned other = 0; other < G_N_ELEMENTS(families);
+                     other++) {
+                    if (other == family) continue;
+                    const double *saved = other == 0u ? saved_vf :
+                        other == 1u ? saved_fv :
+                        other == 2u ? saved_next_vf : saved_next_fv;
+                    preserved = preserved &&
+                        memcmp(families[other], saved, sizeof(saved_vf)) == 0;
+                }
+                CHECK(preserved, "message-family rejection is atomic");
+                /* The selected corruption is deliberately still present:
+                 * pre-validation must not silently repair caller state. */
+                CHECK((isnan(corrupt_value) &&
+                       isnan(families[family][0])) ||
+                          (isinf(corrupt_value) &&
+                           isinf(families[family][0])),
+                      "message-family rejection does not rewrite input");
+            }
+        }
+        memcpy(graph->msg_vf_current, saved_vf, sizeof(saved_vf));
+        memcpy(graph->msg_fv_current, saved_fv, sizeof(saved_fv));
+        memcpy(graph->msg_vf_next, saved_next_vf, sizeof(saved_next_vf));
+        memcpy(graph->msg_fv_next, saved_next_fv, sizeof(saved_next_fv));
+        memcpy(graph->beliefs, saved_beliefs, sizeof(saved_beliefs));
+        CHECK(osprey_bp_graph_validate(ctx, graph),
+              "message-family failure matrix restores valid state");
     }
     osprey_bp_result_free(result);
     osprey_bp_graph_free(graph);
@@ -1719,6 +2089,12 @@ static void test_fixed_convergence_policy(void)
             CHECK(result->iterations == 28u && result->stable_rounds == 10u &&
                       result->final_max_delta < 1e-6,
                   "solver stops at the exact ten-round policy boundary");
+            CHECK(double_bits(result->final_max_delta) ==
+                      UINT64_C(0x3e13333320000000) &&
+                      double_bits(result->best_max_delta) ==
+                      UINT64_C(0x3e13333320000000) &&
+                      result->best_iteration == 28u,
+                  "policy-bound diagnostics retain exact delta bits");
             CHECK(fabs(belief - 0.8) <= 2e-9,
                   "policy-bound one-prior belief remains numerically bounded");
         }
@@ -1778,12 +2154,17 @@ static void test_fixed_horn_support(void)
 static void test_fixed_real_nonconvergence(void)
 {
     OspreyContext *ctx = new_context();
+    OspreyContext *permuted_ctx = NULL;
     OspreyRegionId region = make_region(OSPREY_REGION_GLOBAL, 0x1e0);
     uint32_t ids[7];
     OspreyBpGraph *graph = NULL;
+    OspreyBpGraph *permuted_graph = NULL;
     OspreyBpResult *result = NULL;
+    OspreyBpResult *permuted_result = NULL;
     char *before = NULL;
     char *after = NULL;
+    char *permuted_before = NULL;
+    char *permuted_after = NULL;
 
     for (uint32_t i = 0; i < G_N_ELEMENTS(ids); i++) {
         ids[i] = add_primitive(ctx, region, (int64_t)i * 8);
@@ -1818,14 +2199,24 @@ static void test_fixed_real_nonconvergence(void)
     ADD_FIXTURE_IMPLICATION(0.99, ids[2], ids[5]);
 #undef ADD_FIXTURE_IMPLICATION
 
-    CHECK(osprey_bp_graph_build(ctx, &graph) == OSPREY_OK && graph != NULL,
-          "real-policy nonconvergence fixture builds");
-    if (graph != NULL) {
+    permuted_ctx = reverse_clone_context(ctx);
+    CHECK(osprey_bp_graph_build(ctx, &graph) == OSPREY_OK && graph != NULL &&
+              permuted_ctx != NULL &&
+              osprey_bp_graph_build(permuted_ctx, &permuted_graph) ==
+                  OSPREY_OK && permuted_graph != NULL,
+          "both real-policy nonconvergence permutations build");
+    if (graph != NULL && permuted_graph != NULL) {
         before = dump_graph(ctx, graph);
+        permuted_before = dump_graph(permuted_ctx, permuted_graph);
         CHECK(osprey_bp_solve_fixed(ctx, graph, &result) ==
                   OSPREY_NON_CONVERGED && result != NULL &&
                   result->status == OSPREY_NON_CONVERGED,
               "frustrated loopy graph misses the actual 500-round policy");
+        CHECK(osprey_bp_solve_fixed(permuted_ctx, permuted_graph,
+                                    &permuted_result) ==
+                  OSPREY_NON_CONVERGED && permuted_result != NULL &&
+                  fixed_result_metadata_equal(result, permuted_result),
+              "nonconvergence is bit-identical after insertion reversal");
         if (result != NULL) {
             CHECK(result->iterations == 500u && result->stable_rounds < 10u &&
                       result->nonconverged_component == 0u &&
@@ -1835,13 +2226,22 @@ static void test_fixed_real_nonconvergence(void)
                       result->best_iteration > 0u &&
                       result->best_iteration <= 500u,
                   "nonconverged result retains deterministic diagnostics");
+            CHECK(double_bits(result->final_max_delta) ==
+                      UINT64_C(0x3fa82f45d31d7484) &&
+                      double_bits(result->best_max_delta) ==
+                      UINT64_C(0x3f839ec166b01b20) &&
+                      result->best_iteration == 467u,
+                  "frustrated-loop diagnostics retain exact delta bits");
             CHECK(osprey_bp_commit_result(ctx, graph, result) ==
                       OSPREY_NON_CONVERGED,
                   "nonconverged result cannot publish beliefs");
         }
         after = dump_graph(ctx, graph);
-        CHECK(before != NULL && after != NULL && strcmp(before, after) == 0,
-              "nonconvergence restores initial messages and beliefs");
+        permuted_after = dump_graph(permuted_ctx, permuted_graph);
+        CHECK(before != NULL && after != NULL && strcmp(before, after) == 0 &&
+                  permuted_before != NULL && permuted_after != NULL &&
+                  strcmp(permuted_before, permuted_after) == 0,
+              "nonconvergence restores both initial graph permutations");
     }
     for (uint32_t i = 0; i < G_N_ELEMENTS(ids); i++) {
         const OspreyVar *variable = &g_array_index(ctx->graph->vars,
@@ -1851,9 +2251,158 @@ static void test_fixed_real_nonconvergence(void)
     }
     free(before);
     free(after);
+    free(permuted_before);
+    free(permuted_after);
     osprey_bp_result_free(result);
+    osprey_bp_result_free(permuted_result);
     osprey_bp_graph_free(graph);
+    osprey_bp_graph_free(permuted_graph);
     osprey_free(ctx);
+    osprey_free(permuted_ctx);
+}
+
+static void test_generated_fixed_forests(void)
+{
+    unsigned generated = 0;
+    double max_error = 0.0;
+    unsigned max_error_sample = 0;
+
+    for (unsigned sample = 0; sample < 2000; sample++) {
+        OspreyContext *ctx = generated_forest_context(sample);
+        OspreyContext *permuted_ctx = NULL;
+        OspreyBpGraph *graph = NULL;
+        OspreyBpGraph *permuted_graph = NULL;
+        OspreyBpResult *result = NULL;
+        OspreyBpResult *permuted_result = NULL;
+        double *expected = NULL;
+        char *graph_dump = NULL;
+        char *permuted_dump = NULL;
+        OspreyStatus status = OSPREY_INVALID_GRAPH;
+        OspreyStatus permuted_status = OSPREY_INVALID_GRAPH;
+        bool ok = true;
+
+        if (ctx == NULL) {
+            ok = false;
+        } else {
+            permuted_ctx = reverse_clone_context(ctx);
+            status = osprey_bp_graph_build(ctx, &graph);
+            permuted_status = permuted_ctx == NULL
+                ? OSPREY_INVALID_GRAPH
+                : osprey_bp_graph_build(permuted_ctx, &permuted_graph);
+            if (status != OSPREY_OK || permuted_status != OSPREY_OK ||
+                graph == NULL || permuted_graph == NULL ||
+                !osprey_bp_graph_validate(ctx, graph) ||
+                !osprey_bp_graph_validate(permuted_ctx, permuted_graph) ||
+                graph->vars->len != permuted_graph->vars->len) {
+                ok = false;
+            }
+        }
+        if (ok) {
+            expected = g_new(double, graph->vars->len);
+            ok = brute_force_beliefs(ctx, graph, expected);
+        }
+        if (ok) {
+            status = osprey_bp_solve_fixed(ctx, graph, &result);
+            permuted_status = osprey_bp_solve_fixed(
+                permuted_ctx, permuted_graph, &permuted_result);
+            if (status != OSPREY_OK || permuted_status != OSPREY_OK ||
+                result == NULL || permuted_result == NULL ||
+                result->status != OSPREY_OK ||
+                permuted_result->status != OSPREY_OK ||
+                !fixed_result_metadata_equal(result, permuted_result) ||
+                result->beliefs->len != graph->vars->len ||
+                result->stable_rounds != 10u ||
+                result->nonconverged_component != UINT32_MAX) {
+                ok = false;
+            }
+        }
+        if (ok) {
+            graph_dump = dump_graph(ctx, graph);
+            permuted_dump = dump_graph(permuted_ctx, permuted_graph);
+            if (graph_dump == NULL || permuted_dump == NULL ||
+                strcmp(graph_dump, permuted_dump) != 0) {
+                size_t mismatch = 0;
+                if (graph_dump != NULL && permuted_dump != NULL) {
+                    while (graph_dump[mismatch] == permuted_dump[mismatch] &&
+                           graph_dump[mismatch] != '\0' &&
+                           permuted_dump[mismatch] != '\0') mismatch++;
+                }
+                fprintf(stderr, "fixed forest dump mismatch seed %u at %zu "
+                        "chars %02x/%02x\n", sample, mismatch,
+                        graph_dump == NULL ? 0 :
+                            (unsigned char)graph_dump[mismatch],
+                        permuted_dump == NULL ? 0 :
+                            (unsigned char)permuted_dump[mismatch]);
+                ok = false;
+            }
+        }
+        if (ok) {
+            for (guint local = 0; local < result->beliefs->len; local++) {
+                double actual = g_array_index(result->beliefs, double, local);
+                double error = fabs(actual - expected[local]);
+                if (!isfinite(actual) || actual < 0.0 || actual > 1.0 ||
+                    !isfinite(error) ||
+                    error > OSPREY_BP_FOREST_ORACLE_TOL) {
+                    fprintf(stderr, "oracle mismatch local %u actual %a "
+                            "expected %a error %a\n", local, actual,
+                            expected[local], error);
+                    ok = false;
+                    break;
+                }
+                if (error > max_error) {
+                    max_error = error;
+                    max_error_sample = sample;
+                }
+            }
+        }
+        if (!ok) {
+            fprintf(stderr, "fixed forest checks seed %u status %d/%d "
+                    "result %p/%p metadata %d\n", sample, status,
+                    permuted_status, (void *)result, (void *)permuted_result,
+                    fixed_result_metadata_equal(result, permuted_result) ? 1 : 0);
+            if (result != NULL && permuted_result != NULL &&
+                result->beliefs != NULL && permuted_result->beliefs != NULL) {
+                for (guint i = 0; i < result->beliefs->len &&
+                                  i < permuted_result->beliefs->len; i++) {
+                    if (double_bits(g_array_index(result->beliefs, double, i)) !=
+                        double_bits(g_array_index(permuted_result->beliefs,
+                                                  double, i))) {
+                        fprintf(stderr, "belief mismatch local %u %016llx/%016llx\n",
+                                i,
+                                (unsigned long long)double_bits(
+                                    g_array_index(result->beliefs, double, i)),
+                                (unsigned long long)double_bits(
+                                    g_array_index(permuted_result->beliefs,
+                                                  double, i)));
+                        break;
+                    }
+                }
+            }
+            dump_fixed_solver_failure(sample, ctx, graph, result);
+            if (permuted_ctx != NULL && permuted_graph != NULL) {
+                dump_fixed_solver_failure(sample, permuted_ctx,
+                                          permuted_graph, permuted_result);
+            }
+        } else {
+            generated++;
+        }
+        free(graph_dump);
+        free(permuted_dump);
+        g_free(expected);
+        osprey_bp_result_free(result);
+        osprey_bp_result_free(permuted_result);
+        osprey_bp_graph_free(graph);
+        osprey_bp_graph_free(permuted_graph);
+        osprey_free(ctx);
+        osprey_free(permuted_ctx);
+    }
+    fprintf(stderr, "fixed forest corpus: generated %u/2000 max-error %a "
+            "sample %u bits %016llx\n", generated, max_error,
+            max_error_sample, (unsigned long long)double_bits(max_error));
+    CHECK(generated == 2000,
+          "all 2000 generated fixed forests converge in both permutations");
+    CHECK(max_error <= OSPREY_BP_FOREST_ORACLE_TOL,
+          "generated fixed-forest beliefs meet the policy-bounded oracle");
 }
 
 static void test_generated_projections(void)
@@ -2031,9 +2580,12 @@ int main(void)
     RUN(test_fixed_damping);
     RUN(test_fixed_graph_solver);
     RUN(test_fixed_solver_failures);
+    RUN(test_fixed_workspace_failure);
+    RUN(test_fixed_message_failure_matrix);
     RUN(test_fixed_convergence_policy);
     RUN(test_fixed_horn_support);
     RUN(test_fixed_real_nonconvergence);
+    RUN(test_generated_fixed_forests);
     RUN(test_generated_projections);
 
     if (failures != 0 || executed != registered) {
@@ -2041,7 +2593,7 @@ int main(void)
                 failures, executed, registered);
         return 1;
     }
-    printf("PASS stage5_bp (%u/%u; generated 2000/2000)\n",
-           executed, registered);
+    printf("PASS stage5_bp (%u/%u; fixed forests 2000/2000; "
+           "projections 2000/2000)\n", executed, registered);
     return 0;
 }
