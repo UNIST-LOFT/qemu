@@ -229,6 +229,35 @@ static void candidate_append(GArray *proposals, uint8_t kind,
     g_array_append_val(proposals, proposal);
 }
 
+/* Replay must not add the same deterministic evidence to an already
+ * interned candidate.  Keep all proposals for a candidate that is new at the
+ * start of this batch so candidate_select can merge independent witnesses;
+ * discard only proposals whose semantic key is already resident. */
+static OspreyStatus select_new_candidates(OspreyContext *ctx,
+                                          const GArray *proposals)
+{
+    GArray *fresh;
+    OspreyStatus status;
+
+    if (ctx == NULL || ctx->graph == NULL || proposals == NULL) {
+        return rules_error(ctx, OSPREY_INVALID_GRAPH);
+    }
+    fresh = g_array_new(FALSE, FALSE, sizeof(OspreyCandidateProposal));
+    for (guint i = 0; i < proposals->len; i++) {
+        const OspreyCandidateProposal *proposal = &g_array_index(
+            proposals, OspreyCandidateProposal, i);
+        OspreyKey key = osprey_var_key(proposal->predicate_kind,
+                                       &proposal->payload);
+        if (g_hash_table_lookup(ctx->graph->var_index, &key) == NULL) {
+            g_array_append_val(fresh, *proposal);
+        }
+    }
+    status = fresh->len == 0 ? OSPREY_OK : osprey_candidate_select(
+        ctx, (const OspreyCandidateProposal *)fresh->data, fresh->len);
+    g_array_free(fresh, TRUE);
+    return status;
+}
+
 static bool array_payload_make(const OspreyAddress *lo,
                                const OspreyAddress *hi, int64_t stride,
                                OspreyVarPayload *payload)
@@ -1473,6 +1502,8 @@ typedef struct Cd04UnionKey {
 typedef struct Cd04UnionWork {
     uint32_t first;
     uint32_t second;
+    uint8_t candidate_new;
+    uint8_t reserved[3];
     OspreyVarPayload payload;
 } Cd04UnionWork;
 
@@ -1608,9 +1639,14 @@ static OspreyStatus cd04_try_pair(OspreyContext *ctx,
     union_key.second = work.first < work.second ? work.second : work.first;
     union_key.payload = work.payload;
     if (rule_witness_mark(union_seen, &union_key, sizeof(union_key))) {
+        OspreyVarPayload canonical = work.payload;
+        work.candidate_new = rule_var_id(
+            ctx, OSPREY_PRED_HOMO_SEGMENT, &canonical) == UINT32_MAX;
         g_array_append_val(unions, work);
-        candidate_append(proposals, OSPREY_PRED_HOMO_SEGMENT,
-                         &work.payload, 1, P_UP, OSPREY_RULE_CD04);
+        if (work.candidate_new) {
+            candidate_append(proposals, OSPREY_PRED_HOMO_SEGMENT,
+                             &work.payload, 1, P_UP, OSPREY_RULE_CD04);
+        }
     }
     return OSPREY_OK;
 }
@@ -1660,9 +1696,7 @@ static OspreyStatus cd04_round(OspreyContext *ctx, GHashTable *pair_seen,
         }
     }
     if (status == OSPREY_OK && proposals->len != 0) {
-        status = osprey_candidate_select(
-            ctx, (const OspreyCandidateProposal *)proposals->data,
-            proposals->len);
+        status = select_new_candidates(ctx, proposals);
     }
     for (guint i = 0; i < pairs->len && status == OSPREY_OK; i++) {
         const Cd04PairKey *pair = &g_array_index(pairs, Cd04PairKey, i);
@@ -1687,7 +1721,17 @@ static OspreyStatus cd04_round(OspreyContext *ctx, GHashTable *pair_seen,
         if (result.status != OSPREY_OK) status = result.status;
     }
     if (status == OSPREY_OK) {
-        graph->cd04_extensions += unions->len;
+        for (guint i = 0; i < unions->len; i++) {
+            const Cd04UnionWork *work = &g_array_index(
+                unions, Cd04UnionWork, i);
+            if (work->candidate_new) {
+                if (graph->cd04_extensions == UINT64_MAX) {
+                    status = rules_error(ctx, OSPREY_GRAPH_ARITHMETIC);
+                    break;
+                }
+                graph->cd04_extensions++;
+            }
+        }
     }
     *changed = graph->vars->len != vars_before ||
                graph->factors->len != factors_before;
@@ -2201,9 +2245,7 @@ static OspreyStatus secondary_array_round(OspreyContext *ctx,
     }
 
     if (status == OSPREY_OK && proposals->len != 0) {
-        status = osprey_candidate_select(
-            ctx, (const OspreyCandidateProposal *)proposals->data,
-            proposals->len);
+        status = select_new_candidates(ctx, proposals);
     }
     if (status == OSPREY_OK) {
         status = compile_array_pair_works(ctx, pairs);
@@ -2648,9 +2690,7 @@ static OspreyStatus cd08_round(OspreyContext *ctx, GHashTable *seen,
         }
     }
     if (status == OSPREY_OK && proposals->len != 0) {
-        status = osprey_candidate_select(
-            ctx, (const OspreyCandidateProposal *)proposals->data,
-            proposals->len);
+        status = select_new_candidates(ctx, proposals);
     }
     for (guint i = 0; i < works->len && status == OSPREY_OK; i++) {
         const Cd08Work *work = &g_array_index(works, Cd08Work, i);
@@ -2818,14 +2858,24 @@ static OspreyStatus compile_stage34_direct(OspreyContext *ctx)
     return compile_cd07(ctx);
 }
 
-/* Stage-3 secondary entry.  All fact/candidate-driven CC/CD rules run here;
- * CC07 is deliberately left to the later belief-dependent stage. */
-OspreyStatus osprey_stage3_secondary(OspreyContext *ctx)
+/* One idempotent replay of every fact/candidate-driven secondary
+ * consequence.  CC07 remains deliberately outside this package. */
+OspreyStatus osprey_secondary_static_closure(OspreyContext *ctx,
+                                             OspreyGraphDelta *delta,
+                                             bool emit_stage3_summary)
 {
+    uint64_t vars_before;
+    uint64_t factors_before;
+    uint64_t limit_rows_before;
+
+    if (delta != NULL) memset(delta, 0, sizeof(*delta));
     if (ctx == NULL || !ctx->config.enabled) return OSPREY_DISABLED;
     if (ctx->graph == NULL || ctx->relations == NULL) {
         return OSPREY_INCOMPLETE_FACTS;
     }
+    vars_before = ctx->graph->vars->len;
+    factors_before = ctx->graph->factors->len;
+    limit_rows_before = ctx->graph->limit_rows;
     osprey_graph_set_stage(ctx->graph, OSPREY_GRAPH_SECONDARY);
 
     GHashTable *array_processed = g_hash_table_new_full(
@@ -2852,9 +2902,7 @@ OspreyStatus osprey_stage3_secondary(OspreyContext *ctx)
         status = collect_stage34_direct(ctx, secondary_proposals);
     }
     if (status == OSPREY_OK && secondary_proposals->len != 0) {
-        status = osprey_candidate_select(
-            ctx, (const OspreyCandidateProposal *)secondary_proposals->data,
-            secondary_proposals->len);
+        status = select_new_candidates(ctx, secondary_proposals);
     }
     g_array_free(secondary_proposals, TRUE);
     if (status != OSPREY_OK) return status;
@@ -2903,9 +2951,57 @@ OspreyStatus osprey_stage3_secondary(OspreyContext *ctx)
         return ctx->last_status;
     }
     OspreyGraph *graph = ctx->graph;
-    log_msg("[osprey] [graph] [stage secondary] [vars %u] [factors %u]\n",
-            graph->vars->len, graph->factors->len);
+    uint64_t vars_after = graph->vars->len;
+    uint64_t factors_after = graph->factors->len;
+    uint64_t limit_rows_after = graph->limit_rows;
+    if (vars_after < vars_before || factors_after < factors_before ||
+        limit_rows_after < limit_rows_before ||
+        vars_after - vars_before > UINT32_MAX ||
+        factors_after - factors_before > UINT32_MAX ||
+        limit_rows_after - limit_rows_before > UINT32_MAX) {
+        return rules_error(ctx, OSPREY_GRAPH_ARITHMETIC);
+    }
+    if (delta != NULL) {
+        delta->variables_added = (uint32_t)(vars_after - vars_before);
+        delta->factors_added = (uint32_t)(factors_after - factors_before);
+        delta->limit_rows_added =
+            (uint32_t)(limit_rows_after - limit_rows_before);
+        for (uint64_t i = factors_before; i < factors_after; i++) {
+            const OspreyFactor *factor = g_array_index(
+                graph->factors, OspreyFactor *, (guint)i);
+            if (factor == NULL) {
+                if (delta != NULL) memset(delta, 0, sizeof(*delta));
+                return rules_error(ctx, OSPREY_INVALID_GRAPH);
+            }
+            if (factor->rule >= OSPREY_RULE_CA01 &&
+                factor->rule <= OSPREY_RULE_CA08) {
+                if (delta->base_factors_added == UINT32_MAX) {
+                    if (delta != NULL) memset(delta, 0, sizeof(*delta));
+                    return rules_error(ctx, OSPREY_GRAPH_ARITHMETIC);
+                }
+                delta->base_factors_added++;
+            } else {
+                if (delta->secondary_factors_added == UINT32_MAX) {
+                    if (delta != NULL) memset(delta, 0, sizeof(*delta));
+                    return rules_error(ctx, OSPREY_GRAPH_ARITHMETIC);
+                }
+                delta->secondary_factors_added++;
+            }
+        }
+    }
+    if (emit_stage3_summary) {
+        log_msg("[osprey] [graph] [stage secondary] [vars %u] [factors %u]\n",
+                graph->vars->len, graph->factors->len);
+    }
     return OSPREY_OK;
+}
+
+/* Stage-3 secondary entry.  Stage 5 reuses the same compiler without the
+ * summary row or a second rule implementation. */
+OspreyStatus osprey_stage3_secondary(OspreyContext *ctx)
+{
+    OspreyGraphDelta delta;
+    return osprey_secondary_static_closure(ctx, &delta, true);
 }
 
 /* ------------------------------------------------------------------ */

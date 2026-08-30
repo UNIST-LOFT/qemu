@@ -672,6 +672,17 @@ void osprey_census_rebuild_from_prefix(OspreySharedRun *run);
 
 typedef struct OspreyGraph OspreyGraph; /* Stage 3 factor graph */
 
+/* Exact semantic growth reported by one idempotent Stage-3 consequence
+ * replay.  Counts are committed graph deltas; duplicate proposals/factors
+ * are not progress. */
+typedef struct OspreyGraphDelta {
+    uint32_t variables_added;
+    uint32_t base_factors_added;
+    uint32_t secondary_factors_added;
+    uint32_t factors_added;
+    uint32_t limit_rows_added;
+} OspreyGraphDelta;
+
 struct OspreyContext {
     OspreyConfig config;
     OspreySharedRun *shared;   /* attached in child; NULL in parent */
@@ -1032,6 +1043,7 @@ typedef struct OspreyBpGraph {
     double *scratch_message;
     double *beliefs;
     uint64_t message_values;
+    uint64_t version;             /* canonical graph version, starts at 0 */
     uint64_t workspace_bytes;
     uint64_t workspace_limit;
     uint8_t message_state;          /* OspreyBpMessageState */
@@ -1100,6 +1112,24 @@ OspreyStatus osprey_bp_commit_result(OspreyContext *ctx,
 OspreyStatus osprey_bp_graph_build(OspreyContext *ctx,
                                    OspreyBpGraph **out);
 void osprey_bp_graph_free(OspreyBpGraph *graph);
+/* Stage 5.4: build a replacement projection and preserve current messages
+ * by complete semantic edge identity, leaving old_graph untouched on every
+ * failure. */
+OspreyStatus osprey_bp_graph_migrate(OspreyContext *ctx,
+                                     const OspreyBpGraph *old_graph,
+                                     OspreyBpGraph **out);
+/* Stage 5.4 coordinator: a new CA factor forces an atomic Stage-4 exact
+ * re-solve before replacement projection/migration. */
+OspreyStatus osprey_bp_migrate_after_delta(OspreyContext *ctx,
+                                           const OspreyBpGraph *old_graph,
+                                           const OspreyGraphDelta *delta,
+                                           OspreyBpGraph **out);
+/* Stage 5.4 package coordinator only; production inference continues to use
+ * the legacy Stage-5 loop until the Stage 5.5 cutover. */
+OspreyStatus osprey_stage5_static_replay(OspreyContext *ctx,
+                                         const OspreyBpGraph *old_graph,
+                                         OspreyGraphDelta *delta,
+                                         OspreyBpGraph **out);
 bool osprey_bp_graph_validate(const OspreyContext *ctx,
                               const OspreyBpGraph *graph);
 void osprey_bp_test_set_alloc_fail_after(int64_t allocations);
@@ -1136,6 +1166,12 @@ void osprey_model_free(OspreyModel *m);
  * rules plus the static CB02-CB09 closure.  Belief-dependent folding (CC07)
  * is deferred to the Stage 5 dynamic closure. */
 OspreyStatus osprey_stage3_secondary(OspreyContext *ctx);
+
+/* Idempotent Stage 3 consequence replay used by Stage 3 and Stage 5 graph
+ * growth.  It never schedules CC07 from beliefs. */
+OspreyStatus osprey_secondary_static_closure(OspreyContext *ctx,
+                                             OspreyGraphDelta *delta,
+                                             bool emit_stage3_summary);
 
 /* Stage 4.1 exact-base projection.  The projection owns local IDs,
  * factor references, and CA-only connectivity; it never aliases graph

@@ -3244,8 +3244,559 @@ static void test_generated_projections(void)
           "all 2000 generated projection and round cases execute");
 }
 
+static void test_stage54_static_closure_idempotence(void)
+{
+    OspreyContext *ctx = new_context();
+    OspreyRegionId heap = make_region(OSPREY_REGION_HEAP_SITE, 0x54);
+    OspreyGraphDelta first;
+    OspreyGraphDelta second;
+    OspreyBpGraph *first_bp = NULL;
+    OspreyBpGraph *second_bp = NULL;
+    char *first_dump = NULL;
+    char *second_dump = NULL;
+    uint32_t primitive;
+
+    primitive = add_primitive(ctx, heap, 32);
+    set_seed(ctx, primitive, 0.6);
+    OspreyMallocFact allocation;
+    memset(&allocation, 0, sizeof(allocation));
+    allocation.site_pc = heap.site_offset;
+    allocation.requested_size = 64;
+    g_array_append_val(ctx->alloc_facts, allocation);
+    OspreyBaseFact base;
+    memset(&base, 0, sizeof(base));
+    base.chunk = make_chunk(heap, 32, 8);
+    base.base = (OspreyAddress){ .region = heap, .offset = 0 };
+    g_array_append_val(ctx->base_facts, base);
+    CHECK(osprey_factor_add_prior(ctx, OSPREY_RULE_CA01,
+                                  OSPREY_GRAPH_BASE_CA, false, 0.6,
+                                  primitive).status == OSPREY_OK,
+          "Stage 5.4 closure fixture prior inserted");
+    CHECK(osprey_relations_build(ctx) == OSPREY_OK,
+          "Stage 5.4 closure relations built");
+    CHECK(osprey_secondary_static_closure(ctx, &first, false) == OSPREY_OK,
+          "Stage 5.4 first static closure succeeds");
+    CHECK(first.variables_added == 4 && first.base_factors_added == 0 &&
+              first.secondary_factors_added == 7 && first.factors_added == 7 &&
+              first.limit_rows_added == 0,
+          "Stage 5.4 first closure reports exact graph growth");
+    CHECK(osprey_bp_graph_build(ctx, &first_bp) == OSPREY_OK &&
+              first_bp != NULL,
+          "Stage 5.4 first closure projects");
+    first_dump = dump_graph(ctx, first_bp);
+    CHECK(osprey_secondary_static_closure(ctx, &second, false) == OSPREY_OK,
+          "Stage 5.4 repeated static closure succeeds");
+    CHECK(second.variables_added == 0 && second.base_factors_added == 0 &&
+              second.secondary_factors_added == 0 && second.factors_added == 0 &&
+              second.limit_rows_added == 0,
+          "Stage 5.4 repeated closure has zero delta");
+    CHECK(osprey_bp_graph_build(ctx, &second_bp) == OSPREY_OK &&
+              second_bp != NULL,
+          "Stage 5.4 repeated closure projects");
+    second_dump = dump_graph(ctx, second_bp);
+    CHECK(first_dump != NULL && second_dump != NULL &&
+              strcmp(first_dump, second_dump) == 0,
+          "Stage 5.4 repeated closure preserves canonical projection");
+    free(first_dump);
+    free(second_dump);
+    osprey_bp_graph_free(first_bp);
+    osprey_bp_graph_free(second_bp);
+    osprey_free(ctx);
+}
+
+static void test_stage54_exact_resolve_coordinator(void)
+{
+    OspreyContext *ctx = new_context();
+    OspreyRegionId heap = make_region(OSPREY_REGION_HEAP_SITE, 0x541);
+    OspreyChunk value = make_chunk(heap, 32, 8);
+    OspreyVarPayload scalar_payload;
+    OspreyInternResult scalar_result;
+    OspreyVarPayload access_payload;
+    OspreyInternResult access_result;
+    OspreyMallocFact allocation;
+    OspreyBaseFact base;
+    OspreyBpGraph *old_graph = NULL;
+    OspreyBpGraph *new_graph = NULL;
+    OspreyGraphDelta delta;
+    uint32_t primitive;
+    OspreyStatus status;
+
+    primitive = add_primitive(ctx, heap, 32);
+    memset(&scalar_payload, 0, sizeof(scalar_payload));
+    scalar_payload.chunk = value;
+    scalar_result = osprey_intern_var(ctx, OSPREY_PRED_SCALAR,
+                                      &scalar_payload);
+    CHECK(scalar_result.id != UINT32_MAX,
+          "Stage 5.4 exact fixture scalar inserted");
+    memset(&access_payload, 0, sizeof(access_payload));
+    access_payload.prim_access.chunk = value;
+    access_payload.prim_access.insn_pc = 0x5410;
+    access_result = osprey_intern_var(ctx, OSPREY_PRED_PRIMITIVE_ACCESS,
+                                      &access_payload);
+    CHECK(access_result.id != UINT32_MAX,
+          "Stage 5.4 exact fixture access inserted");
+    set_seed(ctx, primitive, 0.3);
+    set_seed(ctx, scalar_result.id, 0.7);
+    CHECK(add_prior(ctx, primitive, 0.3) &&
+              osprey_factor_add_implication(
+                  ctx, OSPREY_RULE_CA06, OSPREY_GRAPH_BASE_CA, false, 0.8,
+                  &access_result.id, 1, scalar_result.id).status == OSPREY_OK,
+          "Stage 5.4 exact fixture base factors inserted");
+    memset(&allocation, 0, sizeof(allocation));
+    allocation.site_pc = heap.site_offset;
+    allocation.requested_size = 64;
+    g_array_append_val(ctx->alloc_facts, allocation);
+    memset(&base, 0, sizeof(base));
+    base.chunk = value;
+    base.base = (OspreyAddress){ .region = heap, .offset = 0 };
+    g_array_append_val(ctx->base_facts, base);
+    CHECK(osprey_relations_build(ctx) == OSPREY_OK,
+          "Stage 5.4 exact fixture relations built");
+    status = osprey_bp_graph_build(ctx, &old_graph);
+    CHECK(status == OSPREY_OK && old_graph != NULL,
+          "Stage 5.4 exact old graph builds");
+    if (old_graph != NULL) {
+        status = osprey_stage5_static_replay(ctx, old_graph, &delta,
+                                             &new_graph);
+        CHECK(status == OSPREY_OK && new_graph != NULL,
+              "Stage 5.4 coordinator performs static replay");
+        CHECK(delta.base_factors_added != 0,
+              "Stage 5.4 coordinator reports CA08 base growth");
+        CHECK(new_graph != NULL && osprey_bp_graph_validate(ctx, new_graph),
+              "Stage 5.4 exact replacement validates");
+        if (new_graph != NULL) {
+            bool exact_field = false;
+            for (guint i = 0; i < ctx->graph->vars->len; i++) {
+                const OspreyVar *variable = &g_array_index(
+                    ctx->graph->vars, OspreyVar, i);
+                if (variable->kind == OSPREY_PRED_FIELD_OF) {
+                    exact_field = variable->belief_valid != 0;
+                    break;
+                }
+            }
+            CHECK(exact_field,
+                  "Stage 5.4 CA08 growth reruns exact base inference");
+        }
+    }
+    osprey_bp_graph_free(new_graph);
+    osprey_bp_graph_free(old_graph);
+    osprey_free(ctx);
+}
+
+static void test_stage54_semantic_migration(void)
+{
+    OspreyContext *ctx = new_context();
+    OspreyRegionId region = make_region(OSPREY_REGION_GLOBAL, 0x540);
+    OspreyBpGraph *old_graph = NULL;
+    OspreyBpGraph *new_graph = NULL;
+    uint32_t first;
+    uint32_t second;
+    uint32_t added;
+    uint64_t old_values;
+    double *old_vf = NULL;
+    double *old_fv = NULL;
+    OspreyStatus status;
+
+    first = add_primitive(ctx, region, 0);
+    second = add_primitive(ctx, region, 8);
+    set_seed(ctx, first, 0.25);
+    set_seed(ctx, second, 0.75);
+    CHECK(add_prior(ctx, first, 0.25) && add_prior(ctx, second, 0.75),
+          "Stage 5.4 migration fixture factors inserted");
+    status = osprey_bp_graph_build(ctx, &old_graph);
+    CHECK(status == OSPREY_OK && old_graph != NULL,
+          "Stage 5.4 old graph builds");
+    if (old_graph == NULL) {
+        osprey_free(ctx);
+        return;
+    }
+    old_values = old_graph->message_values;
+    old_vf = g_new(double, old_values);
+    old_fv = g_new(double, old_values);
+    for (uint64_t i = 0; i < old_values; i += 2) {
+        double vf = ((double)i / 2.0 + 2.0) / 10.0;
+        double fv = ((double)i / 2.0 + 3.0) / 11.0;
+        set_log_probability_pair(&old_graph->msg_vf_current[i], vf);
+        set_log_probability_pair(&old_graph->msg_fv_current[i], fv);
+    }
+    memcpy(old_vf, old_graph->msg_vf_current,
+           old_values * sizeof(double));
+    memcpy(old_fv, old_graph->msg_fv_current,
+           old_values * sizeof(double));
+    old_graph->message_state = OSPREY_BP_MESSAGES_ITERATED;
+    for (guint local = 0; local < old_graph->vars->len; local++) {
+        old_graph->beliefs[local] = 0.5;
+        old_graph->beliefs[old_graph->vars->len + local] = 0.5;
+    }
+
+    added = add_primitive(ctx, region, 16);
+    set_seed(ctx, added, 0.8);
+    CHECK(add_prior(ctx, added, 0.8),
+          "Stage 5.4 new factor inserted");
+    status = osprey_bp_graph_migrate(ctx, old_graph, &new_graph);
+    CHECK(status == OSPREY_OK && new_graph != NULL,
+          "Stage 5.4 semantic migration succeeds");
+    CHECK(new_graph != NULL && new_graph->version == old_graph->version + 1,
+          "Stage 5.4 migration increments graph version");
+    if (new_graph != NULL) {
+        CHECK(osprey_bp_graph_validate(ctx, new_graph),
+              "Stage 5.4 migrated graph validates");
+        for (guint new_edge_id = 0;
+             new_edge_id < new_graph->edges->len; new_edge_id++) {
+            const OspreyBpEdge *new_edge = &g_array_index(
+                new_graph->edges, OspreyBpEdge, new_edge_id);
+            if (new_edge->graph_var_id == added) {
+                const double *vf = &new_graph->msg_vf_current[
+                    (size_t)new_edge_id * 2u];
+                const double *fv = &new_graph->msg_fv_current[
+                    (size_t)new_edge_id * 2u];
+                CHECK(vf[0] == log(1.0 - 0.8) && vf[1] == log(0.8),
+                      "Stage 5.4 new variable message uses base seed");
+                CHECK(fv[0] == -log(2.0) && fv[1] == -log(2.0),
+                      "Stage 5.4 new factor message is uniform");
+            }
+        }
+        for (guint old_edge_id = 0;
+             old_edge_id < old_graph->edges->len; old_edge_id++) {
+            const OspreyBpEdge *old_edge = &g_array_index(
+                old_graph->edges, OspreyBpEdge, old_edge_id);
+            bool found = false;
+            for (guint new_edge_id = 0;
+                 new_edge_id < new_graph->edges->len; new_edge_id++) {
+                const OspreyBpEdge *new_edge = &g_array_index(
+                    new_graph->edges, OspreyBpEdge, new_edge_id);
+                if (new_edge->graph_factor_id == old_edge->graph_factor_id &&
+                    new_edge->graph_var_id == old_edge->graph_var_id &&
+                    new_edge->factor_position == old_edge->factor_position) {
+                    found = memcmp(&new_graph->msg_vf_current[
+                                        (size_t)new_edge_id * 2u],
+                                   &old_vf[(size_t)old_edge_id * 2u],
+                                   2u * sizeof(double)) == 0 &&
+                            memcmp(&new_graph->msg_fv_current[
+                                        (size_t)new_edge_id * 2u],
+                                   &old_fv[(size_t)old_edge_id * 2u],
+                                   2u * sizeof(double)) == 0;
+                    break;
+                }
+            }
+            CHECK(found, "Stage 5.4 retained edge messages copied bitwise");
+        }
+    }
+    CHECK(memcmp(old_graph->msg_vf_current, old_vf,
+                 old_values * sizeof(double)) == 0 &&
+              memcmp(old_graph->msg_fv_current, old_fv,
+                     old_values * sizeof(double)) == 0,
+          "Stage 5.4 migration leaves old ownership untouched");
+    free(old_vf);
+    free(old_fv);
+    osprey_bp_graph_free(new_graph);
+    osprey_bp_graph_free(old_graph);
+    osprey_free(ctx);
+}
+
+static void test_stage54_migration_ignores_storage_ids(void)
+{
+    OspreyContext *source = new_context();
+    OspreyContext *reordered = NULL;
+    OspreyRegionId region = make_region(OSPREY_REGION_GLOBAL, 0x546);
+    OspreyBpGraph *old_graph = NULL;
+    OspreyBpGraph *new_graph = NULL;
+    uint32_t first = add_primitive(source, region, 0);
+    uint32_t second = add_primitive(source, region, 8);
+
+    set_seed(source, first, 0.2);
+    set_seed(source, second, 0.8);
+    CHECK(add_prior(source, first, 0.2) && add_prior(source, second, 0.8),
+          "Stage 5.4 storage-ID fixture factors inserted");
+    CHECK(osprey_bp_graph_build(source, &old_graph) == OSPREY_OK &&
+              old_graph != NULL,
+          "Stage 5.4 storage-ID old graph builds");
+    reordered = reverse_clone_context(source);
+    CHECK(reordered != NULL,
+          "Stage 5.4 storage-ID reordered source builds");
+    if (old_graph != NULL && reordered != NULL) {
+        for (guint edge_id = 0; edge_id < old_graph->edges->len; edge_id++) {
+            size_t index = (size_t)edge_id * 2u;
+            set_log_probability_pair(&old_graph->msg_vf_current[index],
+                                     0.3 + 0.1 * edge_id);
+            set_log_probability_pair(&old_graph->msg_fv_current[index],
+                                     0.4 + 0.1 * edge_id);
+        }
+        old_graph->message_state = OSPREY_BP_MESSAGES_ITERATED;
+        for (guint local = 0; local < old_graph->vars->len; local++) {
+            old_graph->beliefs[local] = 0.5;
+            old_graph->beliefs[old_graph->vars->len + local] = 0.5;
+        }
+        uint32_t added = add_primitive(reordered, region, 16);
+        set_seed(reordered, added, 0.6);
+        CHECK(add_prior(reordered, added, 0.6),
+              "Stage 5.4 storage-ID growth inserted");
+        CHECK(osprey_bp_graph_migrate(reordered, old_graph, &new_graph) ==
+                  OSPREY_OK && new_graph != NULL,
+              "Stage 5.4 migration accepts reordered storage IDs");
+        if (new_graph != NULL) {
+            for (guint old_id = 0; old_id < old_graph->edges->len; old_id++) {
+                const OspreyBpEdge *old_edge = &g_array_index(
+                    old_graph->edges, OspreyBpEdge, old_id);
+                bool found = false;
+                for (guint new_id = 0; new_id < new_graph->edges->len;
+                     new_id++) {
+                    const OspreyBpEdge *new_edge = &g_array_index(
+                        new_graph->edges, OspreyBpEdge, new_id);
+                    if (old_edge->factor_position ==
+                            new_edge->factor_position &&
+                        osprey_factor_key_equal(&old_edge->key.factor,
+                                                &new_edge->key.factor) &&
+                        osprey_key_equal(&old_edge->key.variable,
+                                         &new_edge->key.variable)) {
+                        found = memcmp(&old_graph->msg_vf_current[
+                                           (size_t)old_id * 2u],
+                                       &new_graph->msg_vf_current[
+                                           (size_t)new_id * 2u],
+                                       2u * sizeof(double)) == 0 &&
+                                memcmp(&old_graph->msg_fv_current[
+                                           (size_t)old_id * 2u],
+                                       &new_graph->msg_fv_current[
+                                           (size_t)new_id * 2u],
+                                       2u * sizeof(double)) == 0;
+                        break;
+                    }
+                }
+                CHECK(found,
+                      "Stage 5.4 storage-ID migration preserves semantic edge");
+            }
+        }
+    }
+    osprey_bp_graph_free(new_graph);
+    osprey_bp_graph_free(old_graph);
+    osprey_free(reordered);
+    osprey_free(source);
+}
+
+static void test_stage54_explicit_growth_coordinator(void)
+{
+    OspreyContext *ctx = new_context();
+    OspreyRegionId region = make_region(OSPREY_REGION_GLOBAL, 0x543);
+    OspreyBpGraph *old_graph = NULL;
+    OspreyBpGraph *new_graph = NULL;
+    OspreyGraphDelta delta;
+    uint32_t first;
+    uint32_t second;
+
+    first = add_primitive(ctx, region, 0);
+    set_seed(ctx, first, 0.3);
+    CHECK(add_prior(ctx, first, 0.3),
+          "Stage 5.4 explicit-growth old factor inserted");
+    CHECK(osprey_bp_graph_build(ctx, &old_graph) == OSPREY_OK &&
+              old_graph != NULL,
+          "Stage 5.4 explicit-growth old graph builds");
+    if (old_graph != NULL) {
+        second = add_primitive(ctx, region, 8);
+        set_seed(ctx, second, 0.7);
+        CHECK(add_secondary(ctx, OSPREY_RULE_CB02, &first, 1, second),
+              "Stage 5.4 explicit-growth new factor inserted");
+        CHECK(osprey_relations_build(ctx) == OSPREY_OK,
+              "Stage 5.4 explicit-growth relations built");
+        CHECK(osprey_stage5_static_replay(ctx, old_graph, &delta,
+                                          &new_graph) == OSPREY_OK &&
+                  new_graph != NULL,
+              "Stage 5.4 coordinator migrates explicit growth");
+        CHECK(delta.variables_added == 1 && delta.factors_added == 1 &&
+                  delta.base_factors_added == 0 &&
+                  delta.secondary_factors_added == 1,
+              "Stage 5.4 coordinator counts explicit secondary growth");
+    }
+    osprey_bp_graph_free(new_graph);
+    osprey_bp_graph_free(old_graph);
+    osprey_free(ctx);
+}
+
+static void test_stage54_initial_growth_preserves_seed_beliefs(void)
+{
+    OspreyContext *ctx = new_context();
+    OspreyRegionId region = make_region(OSPREY_REGION_GLOBAL, 0x544);
+    OspreyBpGraph *old_graph = NULL;
+    OspreyBpGraph *new_graph = NULL;
+    uint32_t first = add_primitive(ctx, region, 0);
+    uint32_t second = add_primitive(ctx, region, 8);
+    uint32_t added;
+
+    set_seed(ctx, first, 0.25);
+    set_seed(ctx, second, 0.75);
+    CHECK(add_prior(ctx, first, 0.25) && add_prior(ctx, second, 0.75),
+          "Stage 5.4 initial-belief fixture factors inserted");
+    CHECK(osprey_bp_graph_build(ctx, &old_graph) == OSPREY_OK &&
+              old_graph != NULL,
+          "Stage 5.4 initial-belief old graph builds");
+    if (old_graph != NULL) {
+        added = add_primitive(ctx, region, 16);
+        CHECK(add_secondary(ctx, OSPREY_RULE_CB02, &first, 1, added),
+              "Stage 5.4 initial-belief growth inserted");
+        CHECK(osprey_bp_graph_migrate(ctx, old_graph, &new_graph) ==
+                  OSPREY_OK && new_graph != NULL,
+              "Stage 5.4 initial-belief migration succeeds");
+        if (new_graph != NULL) {
+            uint32_t first_local = local_for_offset(ctx, new_graph, 0);
+            uint32_t second_local = local_for_offset(ctx, new_graph, 8);
+            uint32_t added_local = local_for_offset(ctx, new_graph, 16);
+            CHECK(new_graph->message_state == OSPREY_BP_MESSAGES_ITERATED &&
+                      first_local != UINT32_MAX &&
+                      second_local != UINT32_MAX &&
+                      added_local != UINT32_MAX,
+                  "Stage 5.4 grown initial graph has complete belief state");
+            if (first_local != UINT32_MAX && second_local != UINT32_MAX &&
+                added_local != UINT32_MAX) {
+                CHECK(new_graph->beliefs[first_local] == 0.25 &&
+                          new_graph->beliefs[new_graph->vars->len +
+                                             first_local] == 0.25 &&
+                          new_graph->beliefs[second_local] == 0.75 &&
+                          new_graph->beliefs[new_graph->vars->len +
+                                             second_local] == 0.75 &&
+                          new_graph->beliefs[added_local] == 0.5 &&
+                          new_graph->beliefs[new_graph->vars->len +
+                                             added_local] == 0.5,
+                      "Stage 5.4 growth preserves exact initial beliefs");
+            }
+        }
+    }
+    osprey_bp_graph_free(new_graph);
+    osprey_bp_graph_free(old_graph);
+    osprey_free(ctx);
+}
+
+static void test_stage54_rejects_inconsistent_delta(void)
+{
+    OspreyContext *ctx = new_context();
+    OspreyRegionId region = make_region(OSPREY_REGION_GLOBAL, 0x545);
+    OspreyBpGraph *old_graph = NULL;
+    OspreyBpGraph *new_graph = NULL;
+    OspreyGraphDelta delta;
+    uint32_t first = add_primitive(ctx, region, 0);
+
+    set_seed(ctx, first, 0.4);
+    CHECK(add_prior(ctx, first, 0.4),
+          "Stage 5.4 delta fixture old factor inserted");
+    CHECK(osprey_bp_graph_build(ctx, &old_graph) == OSPREY_OK &&
+              old_graph != NULL,
+          "Stage 5.4 delta fixture old graph builds");
+    if (old_graph != NULL) {
+        uint32_t added = add_primitive(ctx, region, 8);
+        double old_vf[2];
+        double old_fv[2];
+        set_seed(ctx, added, 0.6);
+        CHECK(add_prior(ctx, added, 0.6),
+              "Stage 5.4 delta fixture new base factor inserted");
+        memcpy(old_vf, old_graph->msg_vf_current, sizeof(old_vf));
+        memcpy(old_fv, old_graph->msg_fv_current, sizeof(old_fv));
+        memset(&delta, 0, sizeof(delta));
+        delta.variables_added = 1;
+        delta.factors_added = 1;
+        delta.secondary_factors_added = 1;
+        CHECK(osprey_bp_migrate_after_delta(ctx, old_graph, &delta,
+                                             &new_graph) ==
+                  OSPREY_INVALID_GRAPH && new_graph == NULL,
+              "Stage 5.4 rejects a misclassified base-factor delta");
+        CHECK(memcmp(old_graph->msg_vf_current, old_vf, sizeof(old_vf)) == 0 &&
+                  memcmp(old_graph->msg_fv_current, old_fv,
+                         sizeof(old_fv)) == 0,
+              "Stage 5.4 delta rejection preserves old messages");
+    }
+    osprey_bp_graph_free(new_graph);
+    osprey_bp_graph_free(old_graph);
+    osprey_free(ctx);
+}
+
+static void test_stage54_workspace_rejects_before_allocation(void)
+{
+    OspreyContext *ctx = new_context();
+    OspreyRegionId region = make_region(OSPREY_REGION_GLOBAL, 0x547);
+    OspreyBpGraph *old_graph = NULL;
+    OspreyBpGraph *sized_graph = NULL;
+    OspreyBpGraph *new_graph = NULL;
+    uint32_t first = add_primitive(ctx, region, 0);
+
+    set_seed(ctx, first, 0.4);
+    CHECK(add_prior(ctx, first, 0.4),
+          "Stage 5.4 workspace fixture old factor inserted");
+    CHECK(osprey_bp_graph_build(ctx, &old_graph) == OSPREY_OK &&
+              old_graph != NULL,
+          "Stage 5.4 workspace old graph builds");
+    if (old_graph != NULL) {
+        uint32_t added = add_primitive(ctx, region, 8);
+        set_seed(ctx, added, 0.6);
+        CHECK(add_prior(ctx, added, 0.6),
+              "Stage 5.4 workspace fixture growth inserted");
+        CHECK(osprey_bp_graph_build(ctx, &sized_graph) == OSPREY_OK &&
+                  sized_graph != NULL,
+              "Stage 5.4 workspace replacement size is known");
+        if (sized_graph != NULL) {
+            uint64_t limit = old_graph->workspace_bytes +
+                             sized_graph->workspace_bytes - 1u;
+            CHECK(limit > old_graph->workspace_bytes &&
+                      limit > sized_graph->workspace_bytes,
+                  "Stage 5.4 workspace limit fits each graph separately");
+            ctx->config.max_bp_table_bytes = limit;
+            old_graph->workspace_limit = limit;
+            osprey_bp_test_set_alloc_fail_after(0);
+            CHECK(osprey_bp_graph_migrate(ctx, old_graph, &new_graph) ==
+                      OSPREY_LIMIT_EXCEEDED && new_graph == NULL,
+                  "Stage 5.4 peak limit rejects before fingerprint allocation");
+            osprey_bp_test_set_alloc_fail_after(-1);
+        }
+    }
+    osprey_bp_test_set_alloc_fail_after(-1);
+    osprey_bp_graph_free(new_graph);
+    osprey_bp_graph_free(sized_graph);
+    osprey_bp_graph_free(old_graph);
+    osprey_free(ctx);
+}
+
+static void test_stage54_changed_factor_is_new_edge(void)
+{
+    OspreyContext *ctx = new_context();
+    OspreyRegionId region = make_region(OSPREY_REGION_GLOBAL, 0x542);
+    OspreyBpGraph *old_graph = NULL;
+    OspreyBpGraph *new_graph = NULL;
+    uint32_t id = add_primitive(ctx, region, 0);
+    OspreyStatus status;
+
+    set_seed(ctx, id, 0.4);
+    CHECK(add_prior(ctx, id, 0.4),
+          "Stage 5.4 changed-factor fixture inserted");
+    status = osprey_bp_graph_build(ctx, &old_graph);
+    CHECK(status == OSPREY_OK && old_graph != NULL,
+          "Stage 5.4 changed-factor old graph builds");
+    if (old_graph != NULL) {
+        old_graph->message_state = OSPREY_BP_MESSAGES_ITERATED;
+        old_graph->beliefs[0] = 0.4;
+        old_graph->beliefs[1] = 0.4;
+        g_array_index(ctx->graph->factors, OspreyFactor *, 0)->p = 0.6;
+        status = osprey_bp_graph_migrate(ctx, old_graph, &new_graph);
+        CHECK(status == OSPREY_OK && new_graph != NULL,
+              "Stage 5.4 changed factor migrates");
+        if (new_graph != NULL) {
+            CHECK(new_graph->version == 1 &&
+                      new_graph->msg_vf_current[0] == -log(2.0) &&
+                      new_graph->msg_vf_current[1] == -log(2.0),
+                  "Stage 5.4 changed factor initializes a new edge");
+        }
+    }
+    osprey_bp_graph_free(new_graph);
+    osprey_bp_graph_free(old_graph);
+    osprey_free(ctx);
+}
+
 int main(void)
 {
+    RUN(test_stage54_static_closure_idempotence);
+    RUN(test_stage54_explicit_growth_coordinator);
+    RUN(test_stage54_initial_growth_preserves_seed_beliefs);
+    RUN(test_stage54_rejects_inconsistent_delta);
+    RUN(test_stage54_workspace_rejects_before_allocation);
+    RUN(test_stage54_changed_factor_is_new_edge);
+    RUN(test_stage54_exact_resolve_coordinator);
+    RUN(test_stage54_semantic_migration);
+    RUN(test_stage54_migration_ignores_storage_ids);
     RUN(test_bp_configuration);
     RUN(test_basic_projection);
     RUN(test_arity_and_components);
