@@ -1047,6 +1047,10 @@ typedef struct OspreyBpGraph {
     uint64_t version;             /* canonical graph version, starts at 0 */
     uint64_t workspace_bytes;
     uint64_t workspace_limit;
+    /* Live Stage 5.5 ownership outside this graph (the saved production
+     * belief snapshot).  Charged once by solve, snapshot, and migration
+     * peak checks; the coordinator owns and frees the allocation. */
+    uint64_t external_workspace_bytes;
     uint8_t message_state;          /* OspreyBpMessageState */
     uint8_t reserved_state[7];
 } OspreyBpGraph;
@@ -1125,8 +1129,8 @@ OspreyStatus osprey_bp_migrate_after_delta(OspreyContext *ctx,
                                            const OspreyBpGraph *old_graph,
                                            const OspreyGraphDelta *delta,
                                            OspreyBpGraph **out);
-/* Stage 5.4 package coordinator only; production inference continues to use
- * the legacy Stage-5 loop until the Stage 5.5 cutover. */
+/* Stage 5.4 package coordinator for explicit static growth; production
+ * Stage 5.5 uses the same migration boundary after belief-driven closure. */
 OspreyStatus osprey_stage5_static_replay(OspreyContext *ctx,
                                          const OspreyBpGraph *old_graph,
                                          OspreyGraphDelta *delta,
@@ -1135,7 +1139,11 @@ bool osprey_bp_graph_validate(const OspreyContext *ctx,
                               const OspreyBpGraph *graph);
 void osprey_bp_test_set_alloc_fail_after(int64_t allocations);
 typedef void (*OspreyBpMigrationTestHook)(OspreyContext *ctx);
+typedef void (*OspreyBpClosureTestHook)(OspreyContext *ctx);
 void osprey_bp_test_set_migration_hook(OspreyBpMigrationTestHook hook);
+void osprey_bp_test_set_closure_hook(OspreyBpClosureTestHook hook);
+void osprey_bp_test_set_closure_round_bound(uint64_t rounds);
+void osprey_bp_test_set_reverse_cc07_tuples(bool reverse);
 
 /* Deterministic projection dump used by focused tests. */
 bool osprey_bp_graph_dump_file(const OspreyContext *ctx,
@@ -1150,6 +1158,16 @@ OspreyStatus osprey_stage3_base(OspreyContext *ctx);
  * invoking inference or decoding. */
 OspreyStatus osprey_stage3_build(OspreyContext *ctx);
 
+/* Compute one checked CC07 folded P01 payload.  Ordinary ineligible
+ * tuples return OSPREY_OK with *eligible false; malformed identities and
+ * checked-arithmetic failures return a rejection status. */
+OspreyStatus osprey_cc07_folded_payload(OspreyContext *ctx,
+                                        uint32_t primitive_id,
+                                        uint32_t unfoldable_id,
+                                        uint32_t foldable_id,
+                                        OspreyVarPayload *folded_payload,
+                                        bool *eligible);
+
 /* Pure CC07 compiler used by the later belief-dependent closure.  All
  * candidate IDs are explicit, selected, and valid in the immutable extent
  * catalog; this function never consults beliefs. */
@@ -1158,6 +1176,9 @@ OspreyStatus osprey_compile_cc07(OspreyContext *ctx,
                                  uint32_t unfoldable_id,
                                  uint32_t foldable_id,
                                  uint32_t folded_primitive_id);
+
+/* Stage 5.5 complete-graph inference and belief-driven closure. */
+OspreyStatus osprey_stage5_secondary(OspreyContext *ctx);
 
 /* Ownership: free a factor graph or decoded model (osprey-rules.c /
  * osprey-decode.c). */

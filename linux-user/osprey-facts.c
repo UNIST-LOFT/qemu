@@ -3957,15 +3957,22 @@ OspreyStatus osprey_analyze(OspreyContext *ctx) {
         st = OSPREY_INVALID_GRAPH;
         goto fail;
     }
-    /* Stage 3b: exact component solving + loopy BP + CC07 folding. */
+    /* Stage 3b: exact base inference plus complete BP/CC07 closure. */
     st = osprey_infer(ctx);
     if (st != OSPREY_OK && st != OSPREY_DISABLED) {
-        osprey_tx_reject(ctx, st, "infer",
-                         st == OSPREY_NON_CONVERGED
-                             ? "belief propagation did not converge"
-                         : st == OSPREY_EXACT_COMPONENT_TOO_LARGE
-                             ? "exact component exceeds configured limit"
-                             : "inference failed");
+        const char *infer_reason = ctx->tx_reason;
+        if (infer_reason == NULL) {
+            infer_reason = st == OSPREY_NON_CONVERGED
+                ? "secondary non-convergence"
+                : st == OSPREY_LIMIT_EXCEEDED
+                ? "secondary workspace"
+                : st == OSPREY_INVALID_MODEL
+                ? "secondary invalid model"
+                : st == OSPREY_EXACT_COMPONENT_TOO_LARGE
+                ? "exact component exceeds configured limit"
+                : "secondary closure";
+        }
+        osprey_tx_reject(ctx, st, "infer", infer_reason);
         goto fail;
     }
     /* Stage 4: consistent decoding into the OspreyModel. */

@@ -21,4 +21,25 @@ OspreyStatus stage5_bp_reference_compute_factor_half(
     const OspreyContext *ctx, const OspreyBpGraph *graph,
     const double *vf_messages, double *fv_messages);
 
+/* Independent bounded Stage 5.5 closure description.  The oracle uses direct
+ * checked arithmetic and declarative semantic factor signatures; it does not
+ * call production closure, candidate, BP, migration, or log helpers. */
+typedef struct Stage5BpClosureCase {
+    OspreyRegionId region;
+    int64_t source_offset;
+    uint64_t width;
+    uint64_t prefix_size;
+    uint64_t fold_size;
+    uint64_t extent;
+    double primitive_probability;
+    double prefix_probability;
+    double fold_probability;
+    bool folded_preexisting;
+} Stage5BpClosureCase;
+
+bool stage5_bp_reference_closure_eligible(
+    const Stage5BpClosureCase *description, int64_t *folded_offset_out);
+bool stage5_bp_reference_closure_matches(
+    const OspreyContext *ctx, const Stage5BpClosureCase *description);
+
 #endif

@@ -2370,6 +2370,12 @@ static OspreyStatus compile_cc06(OspreyContext *ctx)
     return OSPREY_OK;
 }
 
+static bool cc07_region_valid(const OspreyRegionId *region)
+{
+    return region != NULL && region->kind >= OSPREY_REGION_GLOBAL &&
+           region->kind <= OSPREY_REGION_STACK_FUNCTION;
+}
+
 static bool rules_extent_contains(const OspreyGraph *graph,
                                   const OspreyRegionId *region,
                                   int64_t lo, int64_t hi)
@@ -2385,6 +2391,107 @@ static bool rules_extent_contains(const OspreyGraph *graph,
         }
     }
     return false;
+}
+
+/* Compute the checked folded P01 payload shared by the Stage-5 selector
+ * and the pure compiler.  Extent failures and ordinary near misses are
+ * ineligible tuples, not graph corruption; malformed identities and checked
+ * arithmetic failures remain fatal to the analysis transaction. */
+OspreyStatus osprey_cc07_folded_payload(OspreyContext *ctx,
+                                        uint32_t primitive_id,
+                                        uint32_t unfoldable_id,
+                                        uint32_t foldable_id,
+                                        OspreyVarPayload *folded_payload,
+                                        bool *eligible)
+{
+    OspreyGraph *graph;
+    const OspreyVar *primitive;
+    const OspreyVar *unfoldable;
+    const OspreyVar *foldable;
+    int64_t sh;
+    int64_t st;
+    int64_t threshold;
+    int64_t relative;
+    int64_t folded_offset;
+    int64_t primitive_end;
+    int64_t folded_end;
+
+    if (eligible != NULL) *eligible = false;
+    if (ctx == NULL || ctx->graph == NULL || folded_payload == NULL ||
+        eligible == NULL || primitive_id >= ctx->graph->vars->len ||
+        unfoldable_id >= ctx->graph->vars->len ||
+        foldable_id >= ctx->graph->vars->len) {
+        return rules_error(ctx, OSPREY_INVALID_GRAPH);
+    }
+    graph = ctx->graph;
+    primitive = &g_array_index(graph->vars, OspreyVar, primitive_id);
+    unfoldable = &g_array_index(graph->vars, OspreyVar, unfoldable_id);
+    foldable = &g_array_index(graph->vars, OspreyVar, foldable_id);
+    if (primitive->kind != OSPREY_PRED_PRIMITIVE_VAR ||
+        unfoldable->kind != OSPREY_PRED_UNFOLDABLE_HEAP ||
+        foldable->kind != OSPREY_PRED_FOLDABLE_HEAP ||
+        !cc07_region_valid(&primitive->payload.chunk.address.region) ||
+        !cc07_region_valid(&unfoldable->payload.heap_fold.region) ||
+        !cc07_region_valid(&foldable->payload.heap_fold.region)) {
+        return rules_error(ctx, OSPREY_INVALID_GRAPH);
+    }
+    if (primitive->payload.chunk.address.region.kind !=
+            OSPREY_REGION_HEAP_SITE ||
+        !same_region(&primitive->payload.chunk.address.region,
+                     &unfoldable->payload.heap_fold.region) ||
+        !same_region(&primitive->payload.chunk.address.region,
+                     &foldable->payload.heap_fold.region)) {
+        return OSPREY_OK;
+    }
+    if (primitive->payload.chunk.size == 0 ||
+        primitive->payload.chunk.size > (uint64_t)INT64_MAX ||
+        unfoldable->payload.heap_fold.size > (uint64_t)INT64_MAX ||
+        foldable->payload.heap_fold.size > (uint64_t)INT64_MAX) {
+        return rules_error(ctx, primitive->payload.chunk.size == 0
+                           ? OSPREY_INVALID_GRAPH
+                           : OSPREY_GRAPH_ARITHMETIC);
+    }
+    sh = (int64_t)unfoldable->payload.heap_fold.size;
+    st = (int64_t)foldable->payload.heap_fold.size;
+    if (st == 0) return OSPREY_OK;
+    if (!osprey_check_add(sh, st, &threshold) ||
+        !osprey_check_sub(primitive->payload.chunk.address.offset, sh,
+                          &relative)) {
+        return rules_error(ctx, OSPREY_GRAPH_ARITHMETIC);
+    }
+    if (primitive->payload.chunk.address.offset < threshold || relative < 0) {
+        return OSPREY_OK;
+    }
+    if (!osprey_check_add(sh, relative % st, &folded_offset) ||
+        !osprey_check_add(primitive->payload.chunk.address.offset,
+                          (int64_t)primitive->payload.chunk.size,
+                          &primitive_end) ||
+        !osprey_check_add(folded_offset,
+                          (int64_t)primitive->payload.chunk.size,
+                          &folded_end)) {
+        return rules_error(ctx, OSPREY_GRAPH_ARITHMETIC);
+    }
+    if (folded_offset == primitive->payload.chunk.address.offset ||
+        !rules_extent_contains(graph,
+                                &primitive->payload.chunk.address.region,
+                                primitive->payload.chunk.address.offset,
+                                primitive_end) ||
+        !rules_extent_contains(graph,
+                                &primitive->payload.chunk.address.region,
+                                folded_offset, folded_end) ||
+        !rules_extent_contains(graph,
+                                &primitive->payload.chunk.address.region,
+                                0, sh) ||
+        !rules_extent_contains(graph,
+                                &primitive->payload.chunk.address.region,
+                                sh, threshold)) {
+        return OSPREY_OK;
+    }
+    memset(folded_payload, 0, sizeof(*folded_payload));
+    folded_payload->chunk = primitive->payload.chunk;
+    folded_payload->chunk.address.offset = folded_offset;
+    *eligible = true;
+    return OSPREY_OK;
 }
 
 /* Pure CC07 compiler.  Stage 3 does not schedule this rule from beliefs;
@@ -2403,76 +2510,16 @@ OspreyStatus osprey_compile_cc07(OspreyContext *ctx,
         return rules_error(ctx, OSPREY_INVALID_GRAPH);
     }
     OspreyGraph *graph = ctx->graph;
-    const OspreyVar *primitive = &g_array_index(graph->vars, OspreyVar,
-                                                primitive_id);
-    const OspreyVar *unfoldable = &g_array_index(graph->vars, OspreyVar,
-                                                  unfoldable_id);
-    const OspreyVar *foldable = &g_array_index(graph->vars, OspreyVar,
-                                                foldable_id);
     const OspreyVar *folded = &g_array_index(graph->vars, OspreyVar,
                                              folded_primitive_id);
-    if (primitive->kind != OSPREY_PRED_PRIMITIVE_VAR ||
-        unfoldable->kind != OSPREY_PRED_UNFOLDABLE_HEAP ||
-        foldable->kind != OSPREY_PRED_FOLDABLE_HEAP ||
-        folded->kind != OSPREY_PRED_PRIMITIVE_VAR ||
-        primitive->payload.chunk.address.region.kind !=
-            OSPREY_REGION_HEAP_SITE ||
-        !same_region(&primitive->payload.chunk.address.region,
-                     &unfoldable->payload.heap_fold.region) ||
-        !same_region(&primitive->payload.chunk.address.region,
-                     &foldable->payload.heap_fold.region) ||
-        !same_region(&primitive->payload.chunk.address.region,
-                     &folded->payload.chunk.address.region)) {
-        return rules_error(ctx, OSPREY_INVALID_GRAPH);
-    }
-    if (primitive->payload.chunk.size > (uint64_t)INT64_MAX ||
-        unfoldable->payload.heap_fold.size > (uint64_t)INT64_MAX ||
-        foldable->payload.heap_fold.size > (uint64_t)INT64_MAX) {
-        return rules_error(ctx, OSPREY_GRAPH_ARITHMETIC);
-    }
-    if (foldable->payload.heap_fold.size == 0) {
-        return rules_error(ctx, OSPREY_INVALID_GRAPH);
-    }
-    int64_t sh = (int64_t)unfoldable->payload.heap_fold.size;
-    int64_t st = (int64_t)foldable->payload.heap_fold.size;
-    int64_t threshold;
-    if (!osprey_check_add(sh, st, &threshold)) {
-        return rules_error(ctx, OSPREY_GRAPH_ARITHMETIC);
-    }
-    int64_t relative;
-    if (!osprey_check_sub(primitive->payload.chunk.address.offset, sh,
-                          &relative)) {
-        return rules_error(ctx, OSPREY_GRAPH_ARITHMETIC);
-    }
-    if (primitive->payload.chunk.address.offset < threshold || relative < 0) {
-        return rules_error(ctx, OSPREY_INVALID_GRAPH);
-    }
-    int64_t folded_offset;
-    if (!osprey_check_add(sh, relative % st, &folded_offset)) {
-        return rules_error(ctx, OSPREY_GRAPH_ARITHMETIC);
-    }
-    int64_t primitive_end;
-    int64_t folded_end;
-    if (!osprey_check_add(primitive->payload.chunk.address.offset,
-                          (int64_t)primitive->payload.chunk.size,
-                          &primitive_end) ||
-        !osprey_check_add(folded_offset,
-                          (int64_t)primitive->payload.chunk.size,
-                          &folded_end)) {
-        return rules_error(ctx, OSPREY_GRAPH_ARITHMETIC);
-    }
-    const OspreyRegionId *heap = &primitive->payload.chunk.address.region;
-    if (!rules_extent_contains(graph, heap,
-                               primitive->payload.chunk.address.offset,
-                               primitive_end) ||
-        !rules_extent_contains(graph, heap, folded_offset, folded_end) ||
-        !rules_extent_contains(graph, heap, 0, sh) ||
-        !rules_extent_contains(graph, heap, 0, st)) {
-        return rules_error(ctx, OSPREY_INVALID_GRAPH);
-    }
-    OspreyChunk expected = primitive->payload.chunk;
-    expected.address.offset = folded_offset;
-    if (!chunk_equal(&expected, &folded->payload.chunk) ||
+    OspreyVarPayload expected_payload;
+    bool eligible;
+    OspreyStatus payload_status = osprey_cc07_folded_payload(
+        ctx, primitive_id, unfoldable_id, foldable_id, &expected_payload,
+        &eligible);
+    if (payload_status != OSPREY_OK) return payload_status;
+    if (!eligible || folded->kind != OSPREY_PRED_PRIMITIVE_VAR ||
+        !chunk_equal(&expected_payload.chunk, &folded->payload.chunk) ||
         folded_primitive_id == primitive_id) {
         return rules_error(ctx, OSPREY_INVALID_GRAPH);
     }

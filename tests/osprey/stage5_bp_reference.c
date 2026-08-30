@@ -1117,3 +1117,440 @@ fail:
     ref_round_clear_next(messages, value_count);
     return status;
 }
+
+/* ------------------------------------------------------------------ */
+/* Independent Stage 5.5 bounded closure oracle                        */
+/* ------------------------------------------------------------------ */
+
+typedef struct RefClosureVar {
+    OspreyKey key;
+    uint64_t direct_support;
+    uint64_t source_rule_bits;
+    uint64_t prior_bits;
+} RefClosureVar;
+
+typedef struct RefClosureFactor {
+    uint16_t rule;
+    uint16_t head_idx;
+    uint8_t stage;
+    uint8_t potential_kind;
+    uint8_t negative;
+    uint8_t reserved;
+    uint64_t probability_bits;
+    uint32_t num_vars;
+    OspreyKey vars[OSPREY_FACTOR_MAX_ARITY];
+} RefClosureFactor;
+
+static bool ref_closure_add_i64(int64_t left, int64_t right, int64_t *out)
+{
+    if (out == NULL || (right > 0 && left > INT64_MAX - right) ||
+        (right < 0 && left < INT64_MIN - right)) return false;
+    *out = left + right;
+    return true;
+}
+
+static bool ref_closure_interval(uint64_t extent, int64_t lo, int64_t hi)
+{
+    return lo >= 0 && lo <= hi && (uint64_t)hi <= extent;
+}
+
+bool stage5_bp_reference_closure_eligible(
+    const Stage5BpClosureCase *description, int64_t *folded_offset_out)
+{
+    int64_t prefix;
+    int64_t fold;
+    int64_t width;
+    int64_t threshold;
+    int64_t relative;
+    int64_t folded;
+    int64_t source_end;
+    int64_t folded_end;
+
+    if (folded_offset_out != NULL) *folded_offset_out = 0;
+    if (description == NULL || folded_offset_out == NULL ||
+        description->region.kind != OSPREY_REGION_HEAP_SITE ||
+        !isfinite(description->primitive_probability) ||
+        !isfinite(description->prefix_probability) ||
+        !isfinite(description->fold_probability) ||
+        description->primitive_probability <= 0.5 ||
+        description->prefix_probability <= 0.5 ||
+        description->fold_probability <= 0.5 ||
+        description->width == 0 || description->width > INT64_MAX ||
+        description->prefix_size > INT64_MAX ||
+        description->fold_size == 0 ||
+        description->fold_size > INT64_MAX) return false;
+    prefix = (int64_t)description->prefix_size;
+    fold = (int64_t)description->fold_size;
+    width = (int64_t)description->width;
+    if (!ref_closure_add_i64(prefix, fold, &threshold) ||
+        description->source_offset < threshold ||
+        !ref_closure_add_i64(description->source_offset, -prefix,
+                             &relative) ||
+        relative < 0 ||
+        !ref_closure_add_i64(prefix, relative % fold, &folded) ||
+        folded == description->source_offset ||
+        !ref_closure_add_i64(description->source_offset, width,
+                             &source_end) ||
+        !ref_closure_add_i64(folded, width, &folded_end) ||
+        !ref_closure_interval(description->extent, 0, prefix) ||
+        !ref_closure_interval(description->extent, prefix, threshold) ||
+        !ref_closure_interval(description->extent,
+                              description->source_offset, source_end) ||
+        !ref_closure_interval(description->extent, folded, folded_end)) {
+        return false;
+    }
+    *folded_offset_out = folded;
+    return true;
+}
+
+static int ref_closure_var_compare(const void *left_pointer,
+                                   const void *right_pointer)
+{
+    const RefClosureVar *left = left_pointer;
+    const RefClosureVar *right = right_pointer;
+    return ref_key_compare(&left->key, &right->key);
+}
+
+static int ref_closure_factor_compare(const void *left_pointer,
+                                      const void *right_pointer)
+{
+    const RefClosureFactor *left = left_pointer;
+    const RefClosureFactor *right = right_pointer;
+    int result = ref_cmp_u64(left->stage, right->stage);
+    if (result != 0) return result;
+    result = ref_cmp_u64(left->rule, right->rule);
+    if (result != 0) return result;
+    result = ref_cmp_u64(left->potential_kind, right->potential_kind);
+    if (result != 0) return result;
+    result = ref_cmp_u64(left->negative, right->negative);
+    if (result != 0) return result;
+    result = ref_cmp_u64(left->probability_bits, right->probability_bits);
+    if (result != 0) return result;
+    result = ref_cmp_u64(left->head_idx, right->head_idx);
+    if (result != 0) return result;
+    result = ref_cmp_u64(left->num_vars, right->num_vars);
+    if (result != 0) return result;
+    for (uint32_t i = 0; i < left->num_vars; i++) {
+        result = ref_key_compare(&left->vars[i], &right->vars[i]);
+        if (result != 0) return result;
+    }
+    return 0;
+}
+
+static OspreyKey ref_closure_payload_key(uint8_t kind,
+                                         const OspreyVarPayload *payload)
+{
+    return ref_var_key(kind, payload);
+}
+
+static void ref_closure_var_add(RefClosureVar *vars, uint32_t *count,
+                                uint8_t kind,
+                                const OspreyVarPayload *payload,
+                                uint64_t direct_support, double prior,
+                                uint16_t source_rule)
+{
+    RefClosureVar *entry = &vars[(*count)++];
+    memset(entry, 0, sizeof(*entry));
+    entry->key = ref_closure_payload_key(kind, payload);
+    entry->direct_support = direct_support;
+    if (source_rule != OSPREY_RULE_NONE) {
+        entry->source_rule_bits = UINT64_C(1) << source_rule;
+    }
+    memcpy(&entry->prior_bits, &prior, sizeof(entry->prior_bits));
+}
+
+static void ref_closure_factor_add(RefClosureFactor *factors,
+                                   uint32_t *count, uint16_t rule,
+                                   uint8_t stage, uint8_t potential_kind,
+                                   bool negative, double probability,
+                                   uint16_t head_idx,
+                                   const OspreyKey *vars,
+                                   uint32_t num_vars)
+{
+    RefClosureFactor *entry = &factors[(*count)++];
+    memset(entry, 0, sizeof(*entry));
+    entry->rule = rule;
+    entry->stage = stage;
+    entry->potential_kind = potential_kind;
+    entry->negative = negative;
+    entry->head_idx = head_idx;
+    entry->num_vars = num_vars;
+    memcpy(&entry->probability_bits, &probability,
+           sizeof(entry->probability_bits));
+    memcpy(entry->vars, vars, num_vars * sizeof(*vars));
+}
+
+static bool ref_closure_var_matches(const OspreyVar *actual,
+                                    const RefClosureVar *expected)
+{
+    OspreyKey key;
+    uint64_t prior_bits;
+
+    if (actual == NULL || expected == NULL || !actual->belief_valid ||
+        !isfinite(actual->belief) || actual->belief < 0.0 ||
+        actual->belief > 1.0 || actual->hard_false ||
+        actual->region_limit_hit) return false;
+    key = ref_var_key(actual->kind, &actual->payload);
+    memcpy(&prior_bits, &actual->prior, sizeof(prior_bits));
+    return ref_key_equal(&key, &expected->key) &&
+           actual->direct_support == expected->direct_support &&
+           actual->source_rule_bits == expected->source_rule_bits &&
+           prior_bits == expected->prior_bits;
+}
+
+static bool ref_closure_factor_from_actual(const OspreyContext *ctx,
+                                           const OspreyFactor *factor,
+                                           RefClosureFactor *out)
+{
+    if (ctx == NULL || ctx->graph == NULL || factor == NULL || out == NULL ||
+        factor->num_vars == 0 ||
+        factor->num_vars > OSPREY_FACTOR_MAX_ARITY ||
+        factor->var_ids == NULL) return false;
+    memset(out, 0, sizeof(*out));
+    out->rule = factor->rule;
+    out->stage = factor->stage;
+    out->potential_kind = factor->potential_kind;
+    out->negative = factor->negative;
+    out->head_idx = factor->head_idx;
+    out->num_vars = factor->num_vars;
+    memcpy(&out->probability_bits, &factor->p,
+           sizeof(out->probability_bits));
+    for (uint32_t i = 0; i < factor->num_vars; i++) {
+        const OspreyVar *variable;
+        if (factor->var_ids[i] >= ctx->graph->vars->len) return false;
+        variable = &g_array_index(ctx->graph->vars, OspreyVar,
+                                  factor->var_ids[i]);
+        out->vars[i] = ref_var_key(variable->kind, &variable->payload);
+    }
+    return true;
+}
+
+bool stage5_bp_reference_closure_matches(
+    const OspreyContext *ctx, const Stage5BpClosureCase *description)
+{
+    RefClosureVar expected_vars[8];
+    RefClosureFactor expected_factors[19];
+    RefClosureFactor actual_factors[19];
+    OspreyVarPayload source;
+    OspreyVarPayload prefix;
+    OspreyVarPayload fold;
+    OspreyVarPayload folded;
+    OspreyVarPayload source_prefix;
+    OspreyVarPayload folded_prefix;
+    OspreyVarPayload source_field;
+    OspreyVarPayload folded_field;
+    OspreyKey source_key;
+    OspreyKey prefix_key;
+    OspreyKey fold_key;
+    OspreyKey folded_key;
+    OspreyKey source_prefix_key;
+    OspreyKey folded_prefix_key;
+    OspreyKey source_field_key;
+    OspreyKey folded_field_key;
+    uint32_t expected_var_count = 0;
+    uint32_t expected_factor_count = 0;
+    int64_t folded_offset = 0;
+    bool eligible;
+
+    if (ctx == NULL || ctx->graph == NULL || description == NULL ||
+        ctx->graph->vars == NULL || ctx->graph->factors == NULL) return false;
+    eligible = stage5_bp_reference_closure_eligible(description,
+                                                    &folded_offset);
+    memset(&source, 0, sizeof(source));
+    source.chunk.address.region = description->region;
+    source.chunk.address.offset = description->source_offset;
+    source.chunk.size = description->width;
+    memset(&prefix, 0, sizeof(prefix));
+    prefix.heap_fold.region = description->region;
+    prefix.heap_fold.size = description->prefix_size;
+    memset(&fold, 0, sizeof(fold));
+    fold.heap_fold.region = description->region;
+    fold.heap_fold.size = description->fold_size;
+    source_key = ref_var_key(OSPREY_PRED_PRIMITIVE_VAR, &source);
+    prefix_key = ref_var_key(OSPREY_PRED_UNFOLDABLE_HEAP, &prefix);
+    fold_key = ref_var_key(OSPREY_PRED_FOLDABLE_HEAP, &fold);
+    ref_closure_var_add(expected_vars, &expected_var_count,
+                        OSPREY_PRED_PRIMITIVE_VAR, &source, 0, 0.0,
+                        OSPREY_RULE_NONE);
+    ref_closure_var_add(expected_vars, &expected_var_count,
+                        OSPREY_PRED_UNFOLDABLE_HEAP, &prefix, 0, 0.0,
+                        OSPREY_RULE_NONE);
+    ref_closure_var_add(expected_vars, &expected_var_count,
+                        OSPREY_PRED_FOLDABLE_HEAP, &fold, 0, 0.0,
+                        OSPREY_RULE_NONE);
+    ref_closure_factor_add(expected_factors, &expected_factor_count,
+                           OSPREY_RULE_CA01, OSPREY_GRAPH_BASE_CA,
+                           OSPREY_POTENTIAL_PRIOR, false,
+                           description->primitive_probability, 0,
+                           &source_key, 1);
+    ref_closure_factor_add(expected_factors, &expected_factor_count,
+                           OSPREY_RULE_CC01, OSPREY_GRAPH_SECONDARY,
+                           OSPREY_POTENTIAL_PRIOR, false,
+                           description->prefix_probability, 0,
+                           &prefix_key, 1);
+    ref_closure_factor_add(expected_factors, &expected_factor_count,
+                           OSPREY_RULE_CC02, OSPREY_GRAPH_SECONDARY,
+                           OSPREY_POTENTIAL_PRIOR, false,
+                           description->fold_probability, 0,
+                           &fold_key, 1);
+    if (eligible) {
+        int64_t source_end;
+        int64_t folded_end;
+        OspreyKey positive[4];
+        OspreyKey negative[3];
+        OspreyKey implication[2];
+        OspreyKey prefixes[3];
+
+        if (!ref_closure_add_i64(description->source_offset,
+                                 (int64_t)description->width, &source_end) ||
+            !ref_closure_add_i64(folded_offset,
+                                 (int64_t)description->width, &folded_end)) {
+            return false;
+        }
+        folded = source;
+        folded.chunk.address.offset = folded_offset;
+        memset(&source_prefix, 0, sizeof(source_prefix));
+        source_prefix.heap_fold.region = description->region;
+        source_prefix.heap_fold.size = (uint64_t)source_end;
+        memset(&folded_prefix, 0, sizeof(folded_prefix));
+        folded_prefix.heap_fold.region = description->region;
+        folded_prefix.heap_fold.size = (uint64_t)folded_end;
+        memset(&source_field, 0, sizeof(source_field));
+        source_field.attached.chunk = source.chunk;
+        source_field.attached.base.region = description->region;
+        memset(&folded_field, 0, sizeof(folded_field));
+        folded_field.attached.chunk = folded.chunk;
+        folded_field.attached.base.region = description->region;
+        folded_key = ref_var_key(OSPREY_PRED_PRIMITIVE_VAR, &folded);
+        source_prefix_key = ref_var_key(OSPREY_PRED_UNFOLDABLE_HEAP,
+                                        &source_prefix);
+        folded_prefix_key = ref_var_key(OSPREY_PRED_UNFOLDABLE_HEAP,
+                                        &folded_prefix);
+        source_field_key = ref_var_key(OSPREY_PRED_FIELD_OF, &source_field);
+        folded_field_key = ref_var_key(OSPREY_PRED_FIELD_OF, &folded_field);
+        if (description->folded_preexisting) {
+            ref_closure_factor_add(expected_factors, &expected_factor_count,
+                                   OSPREY_RULE_CB01,
+                                   OSPREY_GRAPH_SECONDARY,
+                                   OSPREY_POTENTIAL_PRIOR, false, 0.5, 0,
+                                   &folded_key, 1);
+        }
+        ref_closure_var_add(expected_vars, &expected_var_count,
+                            OSPREY_PRED_PRIMITIVE_VAR, &folded,
+                            description->folded_preexisting ? 0 : 1,
+                            description->folded_preexisting ? 0.0 : 0.8,
+                            description->folded_preexisting
+                                ? OSPREY_RULE_NONE : OSPREY_RULE_CC07);
+        ref_closure_var_add(expected_vars, &expected_var_count,
+                            OSPREY_PRED_UNFOLDABLE_HEAP, &source_prefix, 0,
+                            0.8, OSPREY_RULE_CC03);
+        ref_closure_var_add(expected_vars, &expected_var_count,
+                            OSPREY_PRED_UNFOLDABLE_HEAP, &folded_prefix,
+                            description->folded_preexisting ? 0 : 1,
+                            0.8, OSPREY_RULE_CC03);
+        ref_closure_var_add(expected_vars, &expected_var_count,
+                            OSPREY_PRED_FIELD_OF, &source_field, 0, 0.8,
+                            OSPREY_RULE_CD07);
+        ref_closure_var_add(expected_vars, &expected_var_count,
+                            OSPREY_PRED_FIELD_OF, &folded_field,
+                            description->folded_preexisting ? 0 : 1,
+                            0.8, OSPREY_RULE_CD07);
+        positive[0] = source_key;
+        positive[1] = prefix_key;
+        positive[2] = fold_key;
+        positive[3] = folded_key;
+        ref_closure_factor_add(expected_factors, &expected_factor_count,
+                               OSPREY_RULE_CC07, OSPREY_GRAPH_SECONDARY,
+                               OSPREY_POTENTIAL_IMPLICATION, false, 0.8, 3,
+                               positive, 4);
+        negative[0] = prefix_key;
+        negative[1] = fold_key;
+        negative[2] = source_key;
+        ref_closure_factor_add(expected_factors, &expected_factor_count,
+                               OSPREY_RULE_CC07, OSPREY_GRAPH_SECONDARY,
+                               OSPREY_POTENTIAL_IMPLICATION, true, 0.2, 2,
+                               negative, 3);
+        implication[0] = source_key;
+        implication[1] = source_prefix_key;
+        ref_closure_factor_add(expected_factors, &expected_factor_count,
+                               OSPREY_RULE_CC03, OSPREY_GRAPH_SECONDARY,
+                               OSPREY_POTENTIAL_IMPLICATION, false, 0.8, 1,
+                               implication, 2);
+        implication[0] = folded_key;
+        implication[1] = folded_prefix_key;
+        ref_closure_factor_add(expected_factors, &expected_factor_count,
+                               OSPREY_RULE_CC03, OSPREY_GRAPH_SECONDARY,
+                               OSPREY_POTENTIAL_IMPLICATION, false, 0.8, 1,
+                               implication, 2);
+        implication[0] = source_key;
+        implication[1] = source_field_key;
+        ref_closure_factor_add(expected_factors, &expected_factor_count,
+                               OSPREY_RULE_CD07, OSPREY_GRAPH_SECONDARY,
+                               OSPREY_POTENTIAL_IMPLICATION, false, 0.8, 1,
+                               implication, 2);
+        implication[0] = folded_key;
+        implication[1] = folded_field_key;
+        ref_closure_factor_add(expected_factors, &expected_factor_count,
+                               OSPREY_RULE_CD07, OSPREY_GRAPH_SECONDARY,
+                               OSPREY_POTENTIAL_IMPLICATION, false, 0.8, 1,
+                               implication, 2);
+        prefixes[0] = prefix_key;
+        prefixes[1] = folded_prefix_key;
+        prefixes[2] = source_prefix_key;
+        for (uint32_t i = 0; i < 3; i++) {
+            for (uint32_t j = i + 1; j < 3; j++) {
+                OspreyKey pair[2] = { prefixes[i], prefixes[j] };
+                ref_closure_factor_add(
+                    expected_factors, &expected_factor_count,
+                    OSPREY_RULE_CC04, OSPREY_GRAPH_SECONDARY,
+                    OSPREY_POTENTIAL_IMPLICATION, true, 0.2, 1, pair, 2);
+                pair[0] = prefixes[j];
+                pair[1] = prefixes[i];
+                ref_closure_factor_add(
+                    expected_factors, &expected_factor_count,
+                    OSPREY_RULE_CC04, OSPREY_GRAPH_SECONDARY,
+                    OSPREY_POTENTIAL_IMPLICATION, true, 0.2, 1, pair, 2);
+                pair[0] = prefixes[i];
+                pair[1] = prefixes[j];
+                ref_closure_factor_add(
+                    expected_factors, &expected_factor_count,
+                    OSPREY_RULE_CC05, OSPREY_GRAPH_SECONDARY,
+                    OSPREY_POTENTIAL_IMPLICATION, false, 0.8, 1, pair, 2);
+            }
+        }
+    }
+    if (ctx->graph->vars->len != expected_var_count ||
+        ctx->graph->factors->len != expected_factor_count) return false;
+    qsort(expected_vars, expected_var_count, sizeof(expected_vars[0]),
+          ref_closure_var_compare);
+    for (uint32_t i = 0; i < expected_var_count; i++) {
+        const OspreyVar *matched = NULL;
+        for (guint j = 0; j < ctx->graph->vars->len; j++) {
+            const OspreyVar *candidate = &g_array_index(
+                ctx->graph->vars, OspreyVar, j);
+            OspreyKey key = ref_var_key(candidate->kind,
+                                        &candidate->payload);
+            if (ref_key_equal(&key, &expected_vars[i].key)) {
+                matched = candidate;
+                break;
+            }
+        }
+        if (matched == NULL ||
+            !ref_closure_var_matches(matched, &expected_vars[i])) return false;
+    }
+    for (uint32_t i = 0; i < expected_factor_count; i++) {
+        const OspreyFactor *factor = g_array_index(
+            ctx->graph->factors, OspreyFactor *, i);
+        if (!ref_closure_factor_from_actual(ctx, factor,
+                                            &actual_factors[i])) return false;
+    }
+    qsort(expected_factors, expected_factor_count,
+          sizeof(expected_factors[0]), ref_closure_factor_compare);
+    qsort(actual_factors, expected_factor_count,
+          sizeof(actual_factors[0]), ref_closure_factor_compare);
+    for (uint32_t i = 0; i < expected_factor_count; i++) {
+        if (ref_closure_factor_compare(&expected_factors[i],
+                                       &actual_factors[i]) != 0) return false;
+    }
+    return true;
+}

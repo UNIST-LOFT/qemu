@@ -1,12 +1,12 @@
 /*
- * OSPREY exact-base projection and legacy inference.
+ * OSPREY exact-base projection and production secondary inference.
  *
  * Stages 4.1-4.2 accept the immutable CA-only projection, canonical local
  * maps, retained factor validation, deterministic bounded clique topology,
  * exact factor ownership, and running-intersection validation. Stage 4.3
- * adds the atomic exact numerical pass; loopy BP and CC07 scheduling below
- * that boundary remain non-conformant and must not provide trusted marginals.
- * See agent-docs/info/OSPREY_TYPE_INFERENCE/STAGE4.md.
+ * adds the atomic exact numerical pass; Stage 5 owns complete-graph BP,
+ * message migration, and belief-driven secondary closure.
+ * See agent-docs/info/OSPREY_TYPE_INFERENCE/STAGE5.5.md.
  *
  * Generic factor potentials are owned by osprey-graph.c.
  */
@@ -26,33 +26,6 @@ void log_msg(const char *fmt, ...);
 #define OSPREY_BP_TOL 1e-6
 #define OSPREY_BP_CONVERGED_ROUNDS 10u
 #define OSPREY_BP_DAMPING 0.5
-#define OSPREY_BP_MAX_FOLD_ROUNDS 8u
-#define OSPREY_P_UP 0.8
-#define OSPREY_P_DN 0.2
-
-/* ------------------------------------------------------------------ */
-/* Region helpers                                                      */
-/* ------------------------------------------------------------------ */
-
-static bool region_eq(const OspreyRegionId *a, const OspreyRegionId *b) {
-    return a->kind == b->kind && a->code_image_id == b->code_image_id &&
-           a->site_offset == b->site_offset;
-}
-
-/* ------------------------------------------------------------------ */
-/* Factor potential (§7.1)                                             */
-/* ------------------------------------------------------------------ */
-
-static double factor_value(const OspreyFactor *f, const uint32_t *bits) {
-    uint8_t assignment[OSPREY_FACTOR_MAX_ARITY];
-    double log_weight;
-    if (f == NULL || f->num_vars > OSPREY_FACTOR_MAX_ARITY) return 0.0;
-    for (uint32_t i = 0; i < f->num_vars; i++) {
-        assignment[i] = bits[i] != 0;
-    }
-    if (!osprey_factor_log_weight(f, assignment, &log_weight)) return 0.0;
-    return isinf(log_weight) && log_weight < 0.0 ? 0.0 : exp(log_weight);
-}
 
 /* ------------------------------------------------------------------ */
 /* Stage 4.1: immutable CA-only projection and components              */
@@ -3276,10 +3249,18 @@ static OspreyStatus exact_numeric_infer(OspreyContext *ctx,
     /* This is the only graph mutation in Stage 4.3.  All component tables,
      * messages, marginals, and log-partition values have succeeded above. */
     ctx->last_exact_logz = total_logz;
-    for (uint32_t local = 0; local < local_count; local++) {
-        uint32_t graph_id = g_array_index(base->graph_var_ids, uint32_t, local);
+    for (uint32_t graph_id = 0; graph_id < base->graph_var_count; graph_id++) {
+        uint32_t local = base->local_by_graph[graph_id];
         OspreyVar *variable = &g_array_index(ctx->graph->vars, OspreyVar,
-                                               graph_id);
+                                             graph_id);
+
+        /* A prior successful Stage 5 invocation marks every variable valid.
+         * Stage 4 seeds only its CA projection: clear stale secondary
+         * validity atomically with publishing the new exact marginals. */
+        if (local == UINT32_MAX) {
+            variable->belief_valid = 0;
+            continue;
+        }
         variable->belief = marginals[local];
         variable->belief_valid = 1;
     }
@@ -3325,8 +3306,13 @@ OspreyStatus osprey_stage4_exact(OspreyContext *ctx)
 
 #define OSPREY_BP_DEFAULT_TABLE_BYTES (256ULL * 1024ULL * 1024ULL)
 
+/* Focused-test fault/transition seams.  NULL/UINT64_MAX are the production
+ * defaults; no production caller installs or narrows them. */
 static int64_t bp_test_alloc_fail_after = -1;
 static OspreyBpMigrationTestHook bp_test_migration_hook;
+static OspreyBpClosureTestHook bp_test_closure_hook;
+static uint64_t bp_test_closure_round_bound = UINT64_MAX;
+static bool bp_test_reverse_cc07_tuples;
 
 void osprey_bp_test_set_alloc_fail_after(int64_t allocations)
 {
@@ -3336,6 +3322,21 @@ void osprey_bp_test_set_alloc_fail_after(int64_t allocations)
 void osprey_bp_test_set_migration_hook(OspreyBpMigrationTestHook hook)
 {
     bp_test_migration_hook = hook;
+}
+
+void osprey_bp_test_set_closure_hook(OspreyBpClosureTestHook hook)
+{
+    bp_test_closure_hook = hook;
+}
+
+void osprey_bp_test_set_closure_round_bound(uint64_t rounds)
+{
+    bp_test_closure_round_bound = rounds;
+}
+
+void osprey_bp_test_set_reverse_cc07_tuples(bool reverse)
+{
+    bp_test_reverse_cc07_tuples = reverse;
 }
 
 static bool bp_alloc_allowed(void)
@@ -4309,7 +4310,9 @@ bool osprey_bp_graph_validate(const OspreyContext *ctx,
         graph->workspace_limit != bp_workspace_limit(&ctx->config) ||
         !bp_graph_workspace_bytes(graph, &workspace) ||
         workspace != graph->workspace_bytes ||
-        workspace > graph->workspace_limit) return false;
+        workspace > graph->workspace_limit ||
+        graph->external_workspace_bytes >
+            graph->workspace_limit - workspace) return false;
 
     for (uint32_t local = 0; local < variable_count; local++) {
         const OspreyBpVarRef *ref = &g_array_index(graph->vars,
@@ -6009,7 +6012,8 @@ static bool bp_migration_peak_bytes(
         return false;
     }
     total = old_graph->workspace_bytes;
-    if (!bp_u64_add(&total, new_graph->workspace_bytes) ||
+    if (!bp_u64_add(&total, old_graph->external_workspace_bytes) ||
+        !bp_u64_add(&total, new_graph->workspace_bytes) ||
         !bp_workspace_add(&total, old_graph->edges->len,
                           sizeof(OspreyBpMigrationEntry)) ||
         !bp_workspace_add(&total, new_graph->edges->len,
@@ -6231,6 +6235,7 @@ static OspreyStatus bp_graph_migrate_internal(
         new_graph->message_state = OSPREY_BP_MESSAGES_INITIAL;
     }
     new_graph->version = old_graph->version + (graph_changed ? 1u : 0u);
+    new_graph->external_workspace_bytes = old_graph->external_workspace_bytes;
     if ((fingerprint != NULL && !bp_source_fingerprint_matches(ctx,
                                                                fingerprint)) ||
         !osprey_bp_graph_validate(ctx, new_graph)) {
@@ -6280,7 +6285,8 @@ static OspreyStatus bp_graph_migrate_build(
     uint64_t peak;
     uint32_t new_edge_count;
     peak = old_graph->workspace_bytes;
-    if (!bp_source_required_workspace(ctx, &new_required, &new_edge_count) ||
+    if (!bp_u64_add(&peak, old_graph->external_workspace_bytes) ||
+        !bp_source_required_workspace(ctx, &new_required, &new_edge_count) ||
         !bp_u64_add(&peak, new_required) ||
         !bp_workspace_add(&peak, old_graph->edges->len,
                           sizeof(OspreyBpMigrationEntry)) ||
@@ -6490,14 +6496,68 @@ OspreyStatus osprey_bp_migrate_after_delta(OspreyContext *ctx,
     return bp_graph_migrate_build(ctx, old_graph, out, true);
 }
 
+static OspreyStatus bp_graph_delta_from_prefix(
+    const OspreyContext *ctx, const OspreyBpGraph *old_graph,
+    OspreyGraphDelta *delta)
+{
+    const OspreyGraph *source;
+    uint64_t variable_delta;
+    uint64_t factor_delta;
+    uint64_t limit_delta;
+    uint32_t base_factors = 0;
+    uint32_t secondary_factors = 0;
+
+    if (ctx == NULL || ctx->graph == NULL || old_graph == NULL ||
+        delta == NULL || old_graph->vars == NULL ||
+        old_graph->factors == NULL || old_graph->source_limit_rows >
+            ctx->graph->limit_rows || ctx->graph->vars == NULL ||
+        ctx->graph->factors == NULL || ctx->graph->vars->len <
+            old_graph->vars->len || ctx->graph->factors->len <
+            old_graph->factors->len) {
+        return OSPREY_INVALID_GRAPH;
+    }
+    source = ctx->graph;
+    variable_delta = (uint64_t)source->vars->len - old_graph->vars->len;
+    factor_delta = (uint64_t)source->factors->len - old_graph->factors->len;
+    limit_delta = source->limit_rows - old_graph->source_limit_rows;
+    if (variable_delta > UINT32_MAX || factor_delta > UINT32_MAX ||
+        limit_delta > UINT32_MAX) return OSPREY_GRAPH_ARITHMETIC;
+
+    memset(delta, 0, sizeof(*delta));
+    delta->variables_added = (uint32_t)variable_delta;
+    delta->factors_added = (uint32_t)factor_delta;
+    delta->limit_rows_added = (uint32_t)limit_delta;
+    for (uint64_t i = old_graph->factors->len;
+         i < source->factors->len; i++) {
+        const OspreyFactor *factor = g_array_index(
+            source->factors, OspreyFactor *, (guint)i);
+        if (factor == NULL || factor->id != i) return OSPREY_INVALID_GRAPH;
+        if (factor->stage == OSPREY_GRAPH_BASE_CA) {
+            if (base_factors == UINT32_MAX) return OSPREY_GRAPH_ARITHMETIC;
+            base_factors++;
+        } else if (factor->stage == OSPREY_GRAPH_SECONDARY) {
+            if (secondary_factors == UINT32_MAX) {
+                return OSPREY_GRAPH_ARITHMETIC;
+            }
+            secondary_factors++;
+        } else {
+            return OSPREY_INVALID_GRAPH;
+        }
+    }
+    if ((uint64_t)base_factors + secondary_factors != factor_delta) {
+        return OSPREY_INVALID_GRAPH;
+    }
+    delta->base_factors_added = base_factors;
+    delta->secondary_factors_added = secondary_factors;
+    return OSPREY_OK;
+}
+
 OspreyStatus osprey_stage5_static_replay(OspreyContext *ctx,
                                          const OspreyBpGraph *old_graph,
                                          OspreyGraphDelta *delta,
                                          OspreyBpGraph **out)
 {
     OspreyStatus status;
-    uint64_t old_variable_count;
-    uint64_t old_factor_count;
 
     if (out != NULL) *out = NULL;
     if (delta != NULL) memset(delta, 0, sizeof(*delta));
@@ -6509,44 +6569,12 @@ OspreyStatus osprey_stage5_static_replay(OspreyContext *ctx,
         return bp_migration_failure(ctx, OSPREY_INVALID_GRAPH,
                                     "invalid old BP graph");
     }
-    old_variable_count = old_graph->vars->len;
-    old_factor_count = old_graph->factors->len;
     status = osprey_secondary_static_closure(ctx, delta, false);
     if (status != OSPREY_OK) return status;
-    if (ctx->graph->vars->len < old_variable_count ||
-        ctx->graph->factors->len < old_factor_count ||
-        ctx->graph->limit_rows < old_graph->source_limit_rows ||
-        ctx->graph->vars->len > UINT32_MAX ||
-        ctx->graph->factors->len > UINT32_MAX ||
-        ctx->graph->vars->len - old_variable_count > UINT32_MAX ||
-        ctx->graph->factors->len - old_factor_count > UINT32_MAX ||
-        ctx->graph->limit_rows - old_graph->source_limit_rows > UINT32_MAX) {
-        return bp_migration_failure(ctx, OSPREY_GRAPH_ARITHMETIC,
-                                    "Stage 5 graph delta overflow");
-    }
-    delta->variables_added = (uint32_t)(ctx->graph->vars->len -
-                                        old_variable_count);
-    delta->factors_added = (uint32_t)(ctx->graph->factors->len -
-                                      old_factor_count);
-    delta->limit_rows_added = (uint32_t)(ctx->graph->limit_rows -
-                                         old_graph->source_limit_rows);
-    delta->base_factors_added = 0;
-    delta->secondary_factors_added = 0;
-    for (uint64_t i = old_factor_count; i < ctx->graph->factors->len; i++) {
-        const OspreyFactor *factor = g_array_index(
-            ctx->graph->factors, OspreyFactor *, (guint)i);
-        if (factor == NULL) {
-            return bp_migration_failure(ctx, OSPREY_INVALID_GRAPH,
-                                        "missing Stage 5 delta factor");
-        }
-        if (factor->stage == OSPREY_GRAPH_BASE_CA) {
-            delta->base_factors_added++;
-        } else if (factor->stage == OSPREY_GRAPH_SECONDARY) {
-            delta->secondary_factors_added++;
-        } else {
-            return bp_migration_failure(ctx, OSPREY_INVALID_GRAPH,
-                                        "invalid Stage 5 delta factor stage");
-        }
+    status = bp_graph_delta_from_prefix(ctx, old_graph, delta);
+    if (status != OSPREY_OK) {
+        return bp_migration_failure(ctx, status,
+                                    "Stage 5 graph delta validation");
     }
     if (delta->variables_added == 0 && delta->factors_added == 0 &&
         delta->limit_rows_added == 0) {
@@ -6822,7 +6850,8 @@ static bool bp_result_workspace_bytes(const OspreyBpGraph *graph,
     if (!bp_u64_mul(graph->message_values, 2u, &saved_message_values) ||
         !bp_u64_mul(graph->vars->len, 2u, &saved_belief_values)) return false;
     total = graph->workspace_bytes;
-    if (!bp_u64_add(&total, sizeof(OspreyBpResult)) ||
+    if (!bp_u64_add(&total, graph->external_workspace_bytes) ||
+        !bp_u64_add(&total, sizeof(OspreyBpResult)) ||
         !bp_u64_add(&total, sizeof(GArray)) ||
         !bp_workspace_add(&total, graph->vars->len, sizeof(double)) ||
         !bp_workspace_add(&total, saved_message_values, sizeof(double)) ||
@@ -6923,11 +6952,12 @@ static void bp_log_fixed_result(const OspreyBpGraph *graph,
     uint64_t delta_bits;
 
     memcpy(&delta_bits, &result->final_max_delta, sizeof(delta_bits));
-    log_msg("[osprey] [infer] [bp] [version 0] [components %u] "
+    log_msg("[osprey] [infer] [bp] [version %llu] [components %u] "
             "[vars %u] [factors %u] [edges %u] [iters %u] "
             "[converged %u] [max-delta %016llx] [stable %u] "
             "[workspace %llu]\n",
-            graph->components->len, graph->vars->len, graph->factors->len,
+            (unsigned long long)graph->version, graph->components->len,
+            graph->vars->len, graph->factors->len,
             graph->edges->len, result->iterations,
             result->status == OSPREY_OK ? 1 : 0,
             (unsigned long long)delta_bits, result->stable_rounds,
@@ -7146,14 +7176,23 @@ OspreyStatus osprey_bp_commit_result(OspreyContext *ctx,
                                      const OspreyBpResult *result)
 {
     if (ctx == NULL || graph == NULL || result == NULL ||
-        graph->vars == NULL || result->owner != graph ||
+        graph->vars == NULL ||
+        (ctx->last_status != OSPREY_OK &&
+         ctx->last_status != OSPREY_DISABLED) ||
+        result->owner != graph ||
         result->status != OSPREY_OK || result->beliefs == NULL ||
         result->beliefs->data == NULL ||
         result->beliefs->len != graph->vars->len ||
         g_array_get_element_size(result->beliefs) != sizeof(double) ||
         !osprey_bp_graph_validate(ctx, graph)) {
-        return result != NULL && result->status != OSPREY_OK
-            ? result->status : OSPREY_INVALID_GRAPH;
+        if (result != NULL && result->status != OSPREY_OK) {
+            return result->status;
+        }
+        if (ctx != NULL && ctx->last_status != OSPREY_OK &&
+            ctx->last_status != OSPREY_DISABLED) {
+            return ctx->last_status;
+        }
+        return OSPREY_INVALID_GRAPH;
     }
     for (guint local = 0; local < result->beliefs->len; local++) {
         double belief = g_array_index(result->beliefs, double, local);
@@ -7173,316 +7212,766 @@ OspreyStatus osprey_bp_commit_result(OspreyContext *ctx,
 }
 
 /* ------------------------------------------------------------------ */
-/* Loopy BP (log domain, synchronous, damped)                          */
+/* Stage 5.5: belief-driven closure and fixed-point coordination        */
 /* ------------------------------------------------------------------ */
 
-typedef struct OspEdge {
-    uint32_t factor;      /* index into graph->factors */
-    uint32_t var;         /* var id */
-    uint32_t pos;         /* position of var within factor->var_ids */
-    uint32_t next;        /* next edge id in the same ring */
-} OspEdge;
+typedef struct OspreyCc07VarSnapshot {
+    OspreyKey key;
+    OspreyVarPayload payload;
+    uint8_t kind;
+    double belief;
+} OspreyCc07VarSnapshot;
 
-typedef struct OspBp {
-    OspreyGraph *g;
-    GArray *edges;        /* OspEdge */
-    uint32_t *var_ring;   /* var id -> head edge id (UINT32_MAX none) */
-    uint32_t *fac_ring;   /* factor idx -> head edge id */
-    double *msg_fv0, *msg_fv1;   /* factor -> variable log messages */
-    double *msg_vf0, *msg_vf1;   /* variable -> factor log messages */
-} OspBp;
+typedef struct OspreyCc07Tuple {
+    OspreyKey primitive_key;
+    OspreyKey unfoldable_key;
+    OspreyKey foldable_key;
+    uint32_t primitive_id;
+    uint32_t unfoldable_id;
+    uint32_t foldable_id;
+    OspreyVarPayload folded_payload;
+} OspreyCc07Tuple;
 
-static void bp_build(OspBp *bp, OspreyGraph *g) {
-    memset(bp, 0, sizeof(*bp));
-    bp->g = g;
-    bp->edges = g_array_new(FALSE, FALSE, sizeof(OspEdge));
-    bp->fac_ring = g_new(uint32_t, g->factors->len);
-    bp->var_ring = g_new(uint32_t, g->vars->len);
-    for (uint32_t f = 0; f < g->factors->len; f++) bp->fac_ring[f] = UINT32_MAX;
-    for (uint32_t v = 0; v < g->vars->len; v++) bp->var_ring[v] = UINT32_MAX;
-    for (guint fi = 0; fi < g->factors->len; fi++) {
-        OspreyFactor *F = g_array_index(g->factors, OspreyFactor *, fi);
-        for (uint32_t i = 0; i < F->num_vars; i++) {
-            OspEdge e;
-            e.factor = fi;
-            e.var = F->var_ids[i];
-            e.pos = i;
-            e.next = bp->fac_ring[fi];
-            g_array_append_val(bp->edges, e);
-            bp->fac_ring[fi] = bp->edges->len - 1;
+typedef struct OspreySourceBelief {
+    double belief;
+    uint8_t belief_valid;
+} OspreySourceBelief;
+
+static OspreyStatus bp_secondary_failure(OspreyContext *ctx,
+                                         OspreyStatus status,
+                                         const char *reason)
+{
+    const char *effective_reason = reason;
+
+    if (ctx != NULL && (ctx->last_status == OSPREY_OK ||
+                        ctx->last_status == OSPREY_DISABLED)) {
+        ctx->last_status = status;
+    }
+    if (ctx != NULL && ctx->tx_reason == NULL) {
+        ctx->tx_reason = reason;
+    }
+    if (ctx != NULL && ctx->tx_reason != NULL) {
+        effective_reason = ctx->tx_reason;
+    }
+    log_msg("[osprey] [infer] [secondary] [reject] [status %d] [reason %s]\n",
+            (int)status,
+            effective_reason == NULL ? "unknown" : effective_reason);
+    return status;
+}
+
+static void bp_secondary_note_failure(OspreyContext *ctx,
+                                      const char *reason)
+{
+    if (ctx != NULL && ctx->tx_reason == NULL) {
+        ctx->tx_reason = reason;
+    }
+}
+
+static OspreySourceBelief *bp_source_beliefs_save(
+    const OspreyContext *ctx, uint32_t *count_out)
+{
+    OspreySourceBelief *saved;
+    uint64_t bytes;
+
+    if (count_out != NULL) *count_out = 0;
+    if (ctx == NULL || ctx->graph == NULL || ctx->graph->vars == NULL ||
+        count_out == NULL || ctx->graph->vars->len > UINT32_MAX ||
+        !bp_bytes_for(ctx->graph->vars->len, sizeof(*saved), &bytes) ||
+        bytes > SIZE_MAX) return NULL;
+    saved = bp_try_alloc((size_t)bytes);
+    if (saved == NULL) return NULL;
+    for (guint i = 0; i < ctx->graph->vars->len; i++) {
+        const OspreyVar *variable = &g_array_index(
+            ctx->graph->vars, OspreyVar, i);
+        saved[i].belief = variable->belief;
+        saved[i].belief_valid = variable->belief_valid;
+    }
+    *count_out = ctx->graph->vars->len;
+    return saved;
+}
+
+static void bp_source_beliefs_restore(OspreyContext *ctx,
+                                      const OspreySourceBelief *saved,
+                                      uint32_t count)
+{
+    if (ctx == NULL || ctx->graph == NULL || ctx->graph->vars == NULL ||
+        saved == NULL) return;
+    if (count > ctx->graph->vars->len) count = ctx->graph->vars->len;
+    for (uint32_t i = 0; i < count; i++) {
+        OspreyVar *variable = &g_array_index(ctx->graph->vars, OspreyVar, i);
+        variable->belief = saved[i].belief;
+        variable->belief_valid = saved[i].belief_valid;
+    }
+}
+
+static bool bp_result_beliefs_valid(const OspreyBpGraph *graph,
+                                    const OspreyBpResult *result)
+{
+    if (graph == NULL || graph->vars == NULL || graph->vars->data == NULL ||
+        result == NULL || result->owner != graph || result->status != OSPREY_OK ||
+        result->beliefs == NULL || result->beliefs->data == NULL ||
+        result->beliefs->len != graph->vars->len ||
+        g_array_get_element_size(result->beliefs) != sizeof(double)) return false;
+    for (guint i = 0; i < result->beliefs->len; i++) {
+        double belief = g_array_index(result->beliefs, double, i);
+        if (!isfinite(belief) || belief < 0.0 || belief > 1.0) return false;
+    }
+    return true;
+}
+
+static uint32_t bp_graph_var_id_for_key(const OspreyContext *ctx,
+                                        const OspreyKey *key);
+
+static int bp_cc07_tuple_compare(gconstpointer ap, gconstpointer bp)
+{
+    const OspreyCc07Tuple *a = ap;
+    const OspreyCc07Tuple *b = bp;
+    int order = exact_key_compare(&a->primitive_key, &b->primitive_key);
+    if (order != 0) return order;
+    order = exact_key_compare(&a->unfoldable_key, &b->unfoldable_key);
+    return order != 0 ? order : exact_key_compare(&a->foldable_key,
+                                                   &b->foldable_key);
+}
+
+/* Enumerate only complete, belief-eligible same-region tuples.  A global
+ * P01×P03×P04 capacity would reject disjoint heaps based on combinations
+ * that can never satisfy CC07.  The count-only pass permits an exact bounded
+ * allocation; the fill pass copies semantic keys but no storage IDs. */
+static OspreyStatus bp_cc07_enumerate(const OspreyContext *ctx,
+                                      const GArray *candidates,
+                                      GArray *tuples,
+                                      uint64_t *count_out)
+{
+    uint64_t count = 0;
+
+    if (ctx == NULL || candidates == NULL || count_out == NULL) {
+        return OSPREY_INVALID_GRAPH;
+    }
+    for (guint i = 0; i < candidates->len; i++) {
+        const OspreyCc07VarSnapshot *primitive = &g_array_index(
+            candidates, OspreyCc07VarSnapshot, i);
+        uint32_t primitive_id;
+
+        if (primitive->kind != OSPREY_PRED_PRIMITIVE_VAR ||
+            primitive->belief <= 0.5 ||
+            primitive->payload.chunk.address.region.kind !=
+                OSPREY_REGION_HEAP_SITE) continue;
+        primitive_id = bp_graph_var_id_for_key(ctx, &primitive->key);
+        if (primitive_id == UINT32_MAX) return OSPREY_INVALID_GRAPH;
+        for (guint j = 0; j < candidates->len; j++) {
+            const OspreyCc07VarSnapshot *unfoldable = &g_array_index(
+                candidates, OspreyCc07VarSnapshot, j);
+            uint32_t unfoldable_id;
+
+            if (unfoldable->kind != OSPREY_PRED_UNFOLDABLE_HEAP ||
+                unfoldable->belief <= 0.5 ||
+                exact_region_compare(
+                    &primitive->payload.chunk.address.region,
+                    &unfoldable->payload.heap_fold.region) != 0) continue;
+            unfoldable_id = bp_graph_var_id_for_key(ctx, &unfoldable->key);
+            if (unfoldable_id == UINT32_MAX) return OSPREY_INVALID_GRAPH;
+            for (guint k = 0; k < candidates->len; k++) {
+                const OspreyCc07VarSnapshot *foldable = &g_array_index(
+                    candidates, OspreyCc07VarSnapshot, k);
+                OspreyVarPayload folded_payload;
+                OspreyStatus status;
+                uint32_t foldable_id;
+                bool eligible = false;
+
+                if (foldable->kind != OSPREY_PRED_FOLDABLE_HEAP ||
+                    foldable->belief <= 0.5 ||
+                    exact_region_compare(
+                        &primitive->payload.chunk.address.region,
+                        &foldable->payload.heap_fold.region) != 0) continue;
+                foldable_id = bp_graph_var_id_for_key(ctx, &foldable->key);
+                if (foldable_id == UINT32_MAX) return OSPREY_INVALID_GRAPH;
+                status = osprey_cc07_folded_payload(
+                    (OspreyContext *)ctx, primitive_id, unfoldable_id,
+                    foldable_id, &folded_payload, &eligible);
+                if (status != OSPREY_OK) return status;
+                if (!eligible) continue;
+                if (count == G_MAXUINT) return OSPREY_LIMIT_EXCEEDED;
+                count++;
+                if (tuples != NULL) {
+                    OspreyCc07Tuple tuple;
+                    memset(&tuple, 0, sizeof(tuple));
+                    tuple.primitive_key = primitive->key;
+                    tuple.unfoldable_key = unfoldable->key;
+                    tuple.foldable_key = foldable->key;
+                    g_array_append_val(tuples, tuple);
+                }
+            }
         }
     }
-    for (guint i = 0; i < bp->edges->len; i++) {
-        OspEdge *e = &g_array_index(bp->edges, OspEdge, i);
-        e->next = bp->var_ring[e->var];
-        bp->var_ring[e->var] = i;
-    }
-    uint32_t n = bp->edges->len;
-    bp->msg_fv0 = g_new0(double, n);
-    bp->msg_fv1 = g_new0(double, n);
-    bp->msg_vf0 = g_new(double, n);
-    bp->msg_vf1 = g_new(double, n);
-    /* seed variable->factor messages from exact beliefs */
-    for (uint32_t i = 0; i < n; i++) {
-        OspEdge *e = &g_array_index(bp->edges, OspEdge, i);
-        double b = g_array_index(g->vars, OspreyVar, e->var).belief;
-        if (!(b > 0.0)) b = 0.5;
-        if (b > 0.999999) b = 0.999999;
-        if (b < 0.000001) b = 0.000001;
-        bp->msg_vf0[i] = log(1.0 - b);
-        bp->msg_vf1[i] = log(b);
-    }
+    *count_out = count;
+    return OSPREY_OK;
 }
 
-static void bp_free(OspBp *bp) {
-    g_array_free(bp->edges, TRUE);
-    g_free(bp->fac_ring);
-    g_free(bp->var_ring);
-    g_free(bp->msg_fv0);
-    g_free(bp->msg_fv1);
-    g_free(bp->msg_vf0);
-    g_free(bp->msg_vf1);
-}
+static OspreyStatus bp_cc07_snapshot(const OspreyContext *ctx,
+                                     const OspreyBpGraph *graph,
+                                     const OspreyBpResult *result,
+                                     GArray **out,
+                                     uint32_t *capacity_out)
+{
+    GArray *candidates = NULL;
+    GArray *tuples = NULL;
+    uint64_t candidate_bytes;
+    uint64_t tuple_bytes;
+    uint64_t snapshot_workspace;
+    OspreyStatus status = OSPREY_OK;
 
-/* Variable -> factor: sum of incoming factor logs. */
-static void bp_var_to_factor(OspBp *bp, uint32_t edge) {
-    OspEdge *e = &g_array_index(bp->edges, OspEdge, edge);
-    double l0 = 0.0, l1 = 0.0;
-    uint32_t ring = bp->var_ring[e->var];
-    while (ring != UINT32_MAX) {
-        if (ring != edge) {
-            l0 += bp->msg_fv0[ring];
-            l1 += bp->msg_fv1[ring];
+    if (out != NULL) *out = NULL;
+    if (capacity_out != NULL) *capacity_out = 0;
+    if (ctx == NULL || ctx->graph == NULL || graph == NULL ||
+        result == NULL || out == NULL || capacity_out == NULL ||
+        !bp_result_beliefs_valid(graph, result))
+        return OSPREY_INVALID_GRAPH;
+    if (graph->vars->len > G_MAXUINT ||
+        !bp_bytes_for(graph->vars->len, sizeof(OspreyCc07VarSnapshot),
+                      &candidate_bytes)) {
+        return OSPREY_LIMIT_EXCEEDED;
+    }
+    snapshot_workspace = graph->workspace_bytes;
+    if (!bp_u64_add(&snapshot_workspace,
+                    graph->external_workspace_bytes) ||
+        !bp_u64_add(&snapshot_workspace, sizeof(OspreyBpResult)) ||
+        !bp_u64_add(&snapshot_workspace, sizeof(GArray)) ||
+        !bp_u64_add(&snapshot_workspace, candidate_bytes) ||
+        !bp_u64_add(&snapshot_workspace,
+                    (uint64_t)graph->vars->len * sizeof(double)) ||
+        snapshot_workspace > graph->workspace_limit) {
+        return OSPREY_LIMIT_EXCEEDED;
+    }
+    candidates = bp_array_new(sizeof(OspreyCc07VarSnapshot),
+                              graph->vars->len);
+    if (candidates == NULL) return OSPREY_LIMIT_EXCEEDED;
+    for (guint local = 0; local < graph->vars->len; local++) {
+        const OspreyBpVarRef *ref = &g_array_index(
+            graph->vars, OspreyBpVarRef, local);
+        const OspreyVar *variable;
+        OspreyCc07VarSnapshot snapshot;
+
+        if (ref->graph_var_id >= ctx->graph->vars->len) {
+            status = OSPREY_INVALID_GRAPH;
+            break;
         }
-        ring = g_array_index(bp->edges, OspEdge, ring).next;
+        variable = &g_array_index(ctx->graph->vars, OspreyVar,
+                                  ref->graph_var_id);
+        if (variable->id != ref->graph_var_id ||
+            (variable->kind != OSPREY_PRED_PRIMITIVE_VAR &&
+             variable->kind != OSPREY_PRED_UNFOLDABLE_HEAP &&
+             variable->kind != OSPREY_PRED_FOLDABLE_HEAP)) continue;
+        memset(&snapshot, 0, sizeof(snapshot));
+        snapshot.key = osprey_var_key(variable->kind, &variable->payload);
+        snapshot.payload = variable->payload;
+        snapshot.kind = variable->kind;
+        snapshot.belief = g_array_index(result->beliefs, double, local);
+        g_array_append_val(candidates, snapshot);
     }
-    bp->msg_vf0[edge] = l0;
-    bp->msg_vf1[edge] = l1;
+    if (status != OSPREY_OK) {
+        g_array_free(candidates, TRUE);
+        return status;
+    }
+    uint64_t tuple_capacity = 0;
+    uint64_t tuples_filled = 0;
+    status = bp_cc07_enumerate(ctx, candidates, NULL, &tuple_capacity);
+    if (status != OSPREY_OK ||
+        !bp_bytes_for(tuple_capacity, sizeof(OspreyCc07Tuple),
+                      &tuple_bytes) ||
+        !bp_u64_add(&snapshot_workspace, sizeof(GArray)) ||
+        !bp_u64_add(&snapshot_workspace, tuple_bytes) ||
+        snapshot_workspace > graph->workspace_limit) {
+        g_array_free(candidates, TRUE);
+        return status == OSPREY_OK ? OSPREY_LIMIT_EXCEEDED : status;
+    }
+    tuples = bp_array_new(sizeof(OspreyCc07Tuple),
+                          (guint)tuple_capacity);
+    if (tuples == NULL) {
+        g_array_free(candidates, TRUE);
+        return OSPREY_LIMIT_EXCEEDED;
+    }
+    status = bp_cc07_enumerate(ctx, candidates, tuples, &tuples_filled);
+    g_array_free(candidates, TRUE);
+    if (status != OSPREY_OK || tuples_filled != tuple_capacity ||
+        tuples->len != tuple_capacity) {
+        g_array_free(tuples, TRUE);
+        return status == OSPREY_OK ? OSPREY_INVALID_GRAPH : status;
+    }
+    g_array_sort(tuples, bp_cc07_tuple_compare);
+    guint unique = 0;
+    for (guint i = 0; i < tuples->len; i++) {
+        if (unique != 0 && bp_cc07_tuple_compare(
+                &g_array_index(tuples, OspreyCc07Tuple, unique - 1),
+                &g_array_index(tuples, OspreyCc07Tuple, i)) == 0) continue;
+        if (unique != i) {
+            g_array_index(tuples, OspreyCc07Tuple, unique) =
+                g_array_index(tuples, OspreyCc07Tuple, i);
+        }
+        unique++;
+    }
+    g_array_set_size(tuples, unique);
+    guint eligible_count = 0;
+    for (guint i = 0; i < tuples->len; i++) {
+        OspreyCc07Tuple *tuple = &g_array_index(tuples, OspreyCc07Tuple, i);
+        bool eligible = false;
+        tuple->primitive_id = bp_graph_var_id_for_key(
+            ctx, &tuple->primitive_key);
+        tuple->unfoldable_id = bp_graph_var_id_for_key(
+            ctx, &tuple->unfoldable_key);
+        tuple->foldable_id = bp_graph_var_id_for_key(
+            ctx, &tuple->foldable_key);
+        if (tuple->primitive_id == UINT32_MAX ||
+            tuple->unfoldable_id == UINT32_MAX ||
+            tuple->foldable_id == UINT32_MAX) {
+            g_array_free(tuples, TRUE);
+            return OSPREY_INVALID_GRAPH;
+        }
+        status = osprey_cc07_folded_payload(
+            (OspreyContext *)ctx, tuple->primitive_id,
+            tuple->unfoldable_id, tuple->foldable_id,
+            &tuple->folded_payload, &eligible);
+        if (status != OSPREY_OK) {
+            g_array_free(tuples, TRUE);
+            return status;
+        }
+        if (!eligible) continue;
+        if (eligible_count != i) {
+            g_array_index(tuples, OspreyCc07Tuple, eligible_count) = *tuple;
+        }
+        eligible_count++;
+    }
+    g_array_set_size(tuples, eligible_count);
+    if (bp_test_reverse_cc07_tuples) {
+        for (guint left = 0; left < tuples->len / 2u; left++) {
+            guint right = tuples->len - left - 1u;
+            OspreyCc07Tuple temporary = g_array_index(
+                tuples, OspreyCc07Tuple, left);
+            g_array_index(tuples, OspreyCc07Tuple, left) = g_array_index(
+                tuples, OspreyCc07Tuple, right);
+            g_array_index(tuples, OspreyCc07Tuple, right) = temporary;
+        }
+    }
+    *capacity_out = (uint32_t)tuple_capacity;
+    *out = tuples;
+    return OSPREY_OK;
 }
 
-/* Factor -> variable: eliminate the factor's other variables over its
- * table (k <= 8 by the factor-add cap). */
-static void bp_factor_to_var(OspBp *bp, uint32_t edge) {
-    OspEdge *e = &g_array_index(bp->edges, OspEdge, edge);
-    OspreyFactor *f = g_array_index(bp->g->factors, OspreyFactor *,
-                                    e->factor);
-    uint32_t k = f->num_vars;
-    uint32_t total = 1u << k;
-    double in0[8], in1[8];
-    for (uint32_t i = 0; i < k; i++) {
-        in0[i] = in1[i] = 0.0;
-        uint32_t ring = bp->fac_ring[e->factor];
-        while (ring != UINT32_MAX) {
-            OspEdge *o = &g_array_index(bp->edges, OspEdge, ring);
-            if (o->pos == i) {
-                in0[i] = bp->msg_vf0[ring];
-                in1[i] = bp->msg_vf1[ring];
+static uint32_t bp_graph_var_id_for_key(const OspreyContext *ctx,
+                                        const OspreyKey *key)
+{
+    gpointer value;
+    uint32_t id;
+    const OspreyVar *variable;
+    OspreyKey found_key;
+
+    if (ctx == NULL || ctx->graph == NULL || key == NULL ||
+        ctx->graph->var_index == NULL) return UINT32_MAX;
+    value = g_hash_table_lookup(ctx->graph->var_index, key);
+    if (value == NULL) return UINT32_MAX;
+    id = (uint32_t)(uintptr_t)value - 1u;
+    if (id >= ctx->graph->vars->len) return UINT32_MAX;
+    variable = &g_array_index(ctx->graph->vars, OspreyVar, id);
+    if (variable->id != id) return UINT32_MAX;
+    found_key = osprey_var_key(variable->kind, &variable->payload);
+    return exact_key_compare(key, &found_key) == 0 ? id : UINT32_MAX;
+}
+
+static bool bp_edge_preservation_counts(const OspreyContext *ctx,
+                                        const OspreyBpGraph *old_graph,
+                                        const OspreyBpGraph *new_graph,
+                                        uint32_t *preserved_out,
+                                        uint32_t *new_edges_out)
+{
+    uint64_t preserved = 0;
+
+    if (ctx == NULL || old_graph == NULL || new_graph == NULL ||
+        old_graph->edges == NULL || new_graph->edges == NULL ||
+        preserved_out == NULL || new_edges_out == NULL ||
+        old_graph->edges->len > UINT32_MAX || new_graph->edges->len > UINT32_MAX)
+        return false;
+    for (uint32_t new_id = 0; new_id < new_graph->edges->len; new_id++) {
+        OspreyBpSemanticEdgeKey new_key;
+        bool found = false;
+        if (!bp_semantic_edge_from_graph(ctx, new_graph, new_id, &new_key)) {
+            return false;
+        }
+        for (uint32_t old_id = 0; old_id < old_graph->edges->len; old_id++) {
+            OspreyBpSemanticEdgeKey old_key;
+            if (!bp_semantic_edge_from_old_graph(old_graph, old_id,
+                                                 &old_key)) return false;
+            if (bp_semantic_edge_compare(&new_key, &old_key) == 0) {
+                found = true;
                 break;
             }
-            ring = o->next;
+        }
+        if (found) {
+            if (preserved == UINT32_MAX) return false;
+            preserved++;
         }
     }
-    double m0 = -INFINITY, m1 = -INFINITY;
-    uint32_t bits[8];
-    for (uint32_t a = 0; a < total; a++) {
-        if (((a >> e->pos) & 1) != 0) continue;
-        for (uint32_t i = 0; i < k; i++) bits[i] = (a >> i) & 1;
-        double l = log(factor_value(f, bits));
-        for (uint32_t i = 0; i < k; i++) l += (bits[i] ? in1[i] : in0[i]);
-        if (l > m0) m0 = l;
-    }
-    for (uint32_t a = 0; a < total; a++) {
-        if (((a >> e->pos) & 1) == 0) continue;
-        for (uint32_t i = 0; i < k; i++) bits[i] = (a >> i) & 1;
-        double l = log(factor_value(f, bits));
-        for (uint32_t i = 0; i < k; i++) l += (bits[i] ? in1[i] : in0[i]);
-        if (l > m1) m1 = l;
-    }
-    bp->msg_fv0[edge] = m0;
-    bp->msg_fv1[edge] = m1;
+    *preserved_out = (uint32_t)preserved;
+    *new_edges_out = new_graph->edges->len - *preserved_out;
+    return true;
 }
 
-static void bp_round(OspBp *bp) {
-    for (guint i = 0; i < bp->edges->len; i++) bp_var_to_factor(bp, i);
-    for (guint i = 0; i < bp->edges->len; i++) bp_factor_to_var(bp, i);
+static bool bp_secondary_round_bound(const OspreyContext *ctx,
+                                     uint64_t *out)
+{
+    uint64_t variable_cap;
+    uint64_t factor_cap;
+    uint64_t total;
+
+    if (ctx == NULL || out == NULL) return false;
+    /* Graph arrays and IDs are uint32-bounded.  Zero means no configured
+     * cap at this coordinator boundary; use the representation bound rather
+     * than turning an unlimited setting into a one-round limit. */
+    variable_cap = ctx->config.max_variables == 0
+        ? UINT32_MAX : MIN(ctx->config.max_variables, (uint64_t)UINT32_MAX);
+    factor_cap = ctx->config.max_factors == 0
+        ? UINT32_MAX : MIN(ctx->config.max_factors, (uint64_t)UINT32_MAX);
+    if (variable_cap > UINT64_MAX - factor_cap) return false;
+    total = variable_cap + factor_cap;
+    if (total == UINT64_MAX) return false;
+    *out = bp_test_closure_round_bound == UINT64_MAX
+        ? total + 1u : bp_test_closure_round_bound;
+    return true;
 }
 
-static double bp_belief(OspBp *bp, uint32_t var) {
-    OspreyVar *v = &g_array_index(bp->g->vars, OspreyVar, var);
-    if (v->hard_false) return 0.0;
-    double l0 = 0.0, l1 = 0.0;
-    uint32_t ring = bp->var_ring[var];
-    while (ring != UINT32_MAX) {
-        l0 += bp->msg_fv0[ring];
-        l1 += bp->msg_fv1[ring];
-        ring = g_array_index(bp->edges, OspEdge, ring).next;
-    }
-    double mx = l0 > l1 ? l0 : l1;
-    double e0 = exp(l0 - mx), e1 = exp(l1 - mx);
-    double s = e0 + e1;
-    if (!(s > 0.0)) return 0.5;
-    return e1 / s;
+static void bp_secondary_log_fixed(const OspreyBpGraph *graph,
+                                   uint64_t closure_rounds)
+{
+    uint64_t versions;
+
+    if (graph == NULL || graph->version == UINT64_MAX) return;
+    versions = graph->version + 1u;
+    log_msg("[osprey] [infer] [secondary-fixed] [versions %llu] "
+            "[closure-rounds %llu] [vars %u] [factors %u] [edges %u]\n",
+            (unsigned long long)versions,
+            (unsigned long long)closure_rounds, graph->vars->len,
+            graph->factors->len, graph->edges->len);
 }
 
-/* Damped synchronous BP; writes beliefs; returns (iters, converged). */
-static bool bp_run(OspBp *bp, uint32_t max_iters, uint32_t *iters_out,
-                   double *best_delta_out) {
-    OspreyGraph *g = bp->g;
-    double *prev = g_new(double, g->vars->len);
-    for (uint32_t i = 0; i < g->vars->len; i++) {
-        prev[i] = g_array_index(g->vars, OspreyVar, i).belief;
-        if (!(prev[i] > 0.0)) prev[i] = 0.5;
+OspreyStatus osprey_stage5_secondary(OspreyContext *ctx)
+{
+    OspreyBpGraph *graph = NULL;
+    OspreyBpGraph *next_graph = NULL;
+    OspreyBpResult *result = NULL;
+    OspreySourceBelief *saved_beliefs = NULL;
+    GArray *tuples = NULL;
+    GArray *proposals = NULL;
+    GArray *snapshot_beliefs = NULL;
+    uint32_t saved_count = 0;
+    uint64_t saved_belief_bytes;
+    uint64_t initial_workspace;
+    uint64_t max_dynamic_rounds;
+    uint64_t closure_rounds = 0;
+    OspreyStatus status;
+
+    if (ctx == NULL || !ctx->config.enabled) return OSPREY_DISABLED;
+    if (ctx->graph == NULL || ctx->graph->vars == NULL ||
+        ctx->graph->vars->len == 0) return OSPREY_INCOMPLETE_FACTS;
+    if (!bp_secondary_round_bound(ctx, &max_dynamic_rounds)) {
+        return bp_secondary_failure(ctx, OSPREY_LIMIT_EXCEEDED,
+                                    "secondary closure round bound");
     }
-    double best_delta = INFINITY;
-    uint32_t stable = 0;
-    uint32_t iters = 0;
-    bool converged = false;
-    for (uint32_t it = 0; it < max_iters; it++) {
-        iters = it + 1;
-        bp_round(bp);
-        /* damping: blend new messages with the previous iterate */
-        double *old0 = g_new(double, bp->edges->len);
-        double *old1 = g_new(double, bp->edges->len);
-        memcpy(old0, bp->msg_fv0, bp->edges->len * sizeof(double));
-        memcpy(old1, bp->msg_fv1, bp->edges->len * sizeof(double));
-        for (guint i = 0; i < bp->edges->len; i++) {
-            bp->msg_fv0[i] = OSPREY_BP_DAMPING * old0[i] +
-                             (1.0 - OSPREY_BP_DAMPING) * bp->msg_fv0[i];
-            bp->msg_fv1[i] = OSPREY_BP_DAMPING * old1[i] +
-                             (1.0 - OSPREY_BP_DAMPING) * bp->msg_fv1[i];
+    /* The CC07 payload helper consumes the immutable extent catalog.  A
+     * zero-proposal selector call only builds that catalog; it cannot alter
+     * the candidate or factor graph. */
+    status = osprey_candidate_select(ctx, NULL, 0);
+    if (status != OSPREY_OK) {
+        return bp_secondary_failure(ctx, status, "secondary closure");
+    }
+    status = osprey_bp_graph_build(ctx, &graph);
+    if (status != OSPREY_OK || graph == NULL) {
+        return bp_secondary_failure(
+            ctx, status == OSPREY_OK ? OSPREY_INVALID_GRAPH : status,
+            status == OSPREY_LIMIT_EXCEEDED ? "secondary workspace"
+                                            : "secondary closure");
+    }
+    if (!bp_bytes_for(ctx->graph->vars->len, sizeof(*saved_beliefs),
+                      &saved_belief_bytes)) {
+        status = OSPREY_LIMIT_EXCEEDED;
+        bp_secondary_note_failure(ctx, "secondary workspace");
+        goto coordinator_fail;
+    }
+    initial_workspace = graph->workspace_bytes;
+    if (!bp_u64_add(&initial_workspace, saved_belief_bytes) ||
+        initial_workspace > graph->workspace_limit) {
+        status = OSPREY_LIMIT_EXCEEDED;
+        bp_secondary_note_failure(ctx, "secondary workspace");
+        goto coordinator_fail;
+    }
+    saved_beliefs = bp_source_beliefs_save(ctx, &saved_count);
+    if (saved_beliefs == NULL) {
+        status = OSPREY_LIMIT_EXCEEDED;
+        bp_secondary_note_failure(ctx, "secondary workspace");
+        goto coordinator_fail;
+    }
+    graph->external_workspace_bytes = saved_belief_bytes;
+    if (!osprey_bp_graph_validate(ctx, graph)) {
+        status = OSPREY_INVALID_GRAPH;
+        bp_secondary_note_failure(ctx, "secondary closure");
+        goto coordinator_fail;
+    }
+
+    for (;;) {
+        OspreyGraphDelta delta;
+        OspreyBpResult final_result;
+        uint32_t tuple_capacity = 0;
+        uint32_t cc07_tuple_count;
+        uint32_t preserved_edges;
+        uint32_t new_edges;
+        uint64_t belief_bytes;
+        uint64_t tuple_bytes;
+        uint64_t proposal_bytes;
+        uint64_t coordinator_workspace;
+
+        result = NULL;
+        tuples = NULL;
+        snapshot_beliefs = NULL;
+        status = osprey_bp_solve_fixed(ctx, graph, &result);
+        if (status != OSPREY_OK || result == NULL ||
+            !bp_result_beliefs_valid(graph, result)) {
+            if (result != NULL) osprey_bp_result_free(result);
+            result = NULL;
+            status = status == OSPREY_OK ? OSPREY_INVALID_GRAPH : status;
+            if (status == OSPREY_NON_CONVERGED) {
+                bp_secondary_note_failure(ctx, "secondary non-convergence");
+            } else if (status == OSPREY_LIMIT_EXCEEDED) {
+                bp_secondary_note_failure(ctx, "secondary workspace");
+            } else if (status == OSPREY_INVALID_MODEL) {
+                bp_secondary_note_failure(ctx, "secondary invalid model");
+            } else {
+                bp_secondary_note_failure(ctx, "secondary closure");
+            }
+            goto coordinator_fail;
         }
-        g_free(old0);
-        g_free(old1);
-        double max_delta = 0.0;
-        for (uint32_t v = 0; v < g->vars->len; v++) {
-            double b = bp_belief(bp, v);
-            g_array_index(g->vars, OspreyVar, v).belief = b;
-            double d = fabs(b - prev[v]);
-            if (d > max_delta) max_delta = d;
-            prev[v] = b;
+        status = bp_cc07_snapshot(ctx, graph, result, &tuples,
+                                   &tuple_capacity);
+        if (status != OSPREY_OK) {
+            osprey_bp_result_free(result);
+            result = NULL;
+            bp_secondary_note_failure(
+                ctx, status == OSPREY_LIMIT_EXCEEDED
+                    ? "secondary workspace" : "secondary closure");
+            goto coordinator_fail;
         }
-        if (max_delta < best_delta) best_delta = max_delta;
-        if (max_delta < OSPREY_BP_TOL) {
-            stable++;
-            if (stable >= OSPREY_BP_CONVERGED_ROUNDS) {
-                converged = true;
+        if (tuples->len == 0) {
+            status = osprey_bp_commit_result(ctx, graph, result);
+            osprey_bp_result_free(result);
+            result = NULL;
+            g_array_free(tuples, TRUE);
+            tuples = NULL;
+            if (status != OSPREY_OK) goto coordinator_fail;
+            bp_secondary_log_fixed(graph, closure_rounds);
+            osprey_bp_graph_free(graph);
+            g_free(saved_beliefs);
+            return OSPREY_OK;
+        }
+
+        snapshot_beliefs = result->beliefs;
+        result->beliefs = NULL;
+        osprey_bp_result_free(result);
+        result = NULL;
+        if (!bp_bytes_for(graph->vars->len, sizeof(double), &belief_bytes) ||
+            !bp_bytes_for(tuple_capacity, sizeof(OspreyCc07Tuple),
+                          &tuple_bytes) ||
+            !bp_bytes_for(tuples->len, sizeof(OspreyCandidateProposal),
+                          &proposal_bytes)) {
+            status = OSPREY_LIMIT_EXCEEDED;
+            bp_secondary_note_failure(ctx, "secondary workspace");
+            goto coordinator_fail;
+        }
+        coordinator_workspace = graph->workspace_bytes;
+        if (!bp_u64_add(&coordinator_workspace,
+                        graph->external_workspace_bytes) ||
+            !bp_u64_add(&coordinator_workspace, 3u * sizeof(GArray)) ||
+            !bp_u64_add(&coordinator_workspace, belief_bytes) ||
+            !bp_u64_add(&coordinator_workspace, tuple_bytes) ||
+            !bp_u64_add(&coordinator_workspace, proposal_bytes) ||
+            coordinator_workspace > graph->workspace_limit) {
+            status = OSPREY_LIMIT_EXCEEDED;
+            bp_secondary_note_failure(ctx, "secondary workspace");
+            goto coordinator_fail;
+        }
+        proposals = bp_array_new(sizeof(OspreyCandidateProposal),
+                                 tuples->len);
+        if (proposals == NULL) {
+            status = OSPREY_LIMIT_EXCEEDED;
+            bp_secondary_note_failure(ctx, "secondary workspace");
+            goto coordinator_fail;
+        }
+        for (guint i = 0; i < tuples->len; i++) {
+            const OspreyCc07Tuple *tuple = &g_array_index(
+                tuples, OspreyCc07Tuple, i);
+            OspreyKey folded_key = osprey_var_key(
+                OSPREY_PRED_PRIMITIVE_VAR, &tuple->folded_payload);
+            OspreyCandidateProposal proposal;
+
+            /* Replay must not accumulate candidate evidence.  Keep every
+             * tuple that names a candidate absent at the start of this
+             * batch so coincident folds merge once; existing candidates
+             * still reach the factor compiler below. */
+            if (bp_graph_var_id_for_key(ctx, &folded_key) != UINT32_MAX) {
+                continue;
+            }
+            memset(&proposal, 0, sizeof(proposal));
+            proposal.predicate_kind = OSPREY_PRED_PRIMITIVE_VAR;
+            proposal.payload = tuple->folded_payload;
+            proposal.direct_support = 1;
+            proposal.prior = 0.8;
+            proposal.source_rule = OSPREY_RULE_CC07;
+            g_array_append_val(proposals, proposal);
+        }
+        status = proposals->len == 0 ? OSPREY_OK : osprey_candidate_select(
+            ctx, (const OspreyCandidateProposal *)proposals->data,
+            proposals->len);
+        g_array_free(proposals, TRUE);
+        proposals = NULL;
+        if (status != OSPREY_OK) {
+            bp_secondary_note_failure(ctx, "secondary closure");
+            goto coordinator_fail;
+        }
+
+        for (guint i = 0; i < tuples->len; i++) {
+            const OspreyCc07Tuple *tuple = &g_array_index(
+                tuples, OspreyCc07Tuple, i);
+            OspreyKey folded_key = osprey_var_key(
+                OSPREY_PRED_PRIMITIVE_VAR, &tuple->folded_payload);
+            uint32_t folded_id = bp_graph_var_id_for_key(ctx, &folded_key);
+            if (folded_id == UINT32_MAX) {
+                status = OSPREY_INVALID_GRAPH;
                 break;
             }
-        } else {
-            stable = 0;
+            status = osprey_compile_cc07(
+                ctx, tuple->primitive_id, tuple->unfoldable_id,
+                tuple->foldable_id, folded_id);
+            if (status != OSPREY_OK) break;
         }
-    }
-    g_free(prev);
-    *iters_out = iters;
-    *best_delta_out = best_delta;
-    return converged;
-}
+        if (status != OSPREY_OK) {
+            bp_secondary_note_failure(ctx, "secondary closure");
+            goto coordinator_fail;
+        }
 
-/* ------------------------------------------------------------------ */
-/* CC07 heap folding closure                                           */
-/* ------------------------------------------------------------------ */
-
-static uint32_t cc07_fold_pass(OspreyContext *ctx) {
-    OspreyGraph *g = ctx->graph;
-    uint32_t created = 0;
-    for (guint i = 0; i < g->vars->len; i++) {
-        OspreyVar *u = &g_array_index(g->vars, OspreyVar, i);
-        if (u->kind != OSPREY_PRED_UNFOLDABLE_HEAP) continue;
-        if (u->belief <= 0.5) continue;
-        uint64_t s_h = u->payload.heap_fold.size;
-        for (guint j = 0; j < g->vars->len; j++) {
-            OspreyVar *t = &g_array_index(g->vars, OspreyVar, j);
-            if (t->kind != OSPREY_PRED_FOLDABLE_HEAP) continue;
-            if (t->belief <= 0.5) continue;
-            uint64_t s_t = t->payload.heap_fold.size;
-            if (s_t == 0) continue;      /* CC07 guard */
-            if (!region_eq(&u->payload.heap_fold.region,
-                             &t->payload.heap_fold.region)) continue;
-            int64_t tail_lo = (int64_t)(s_h + s_t);
-            for (guint k = 0; k < g->vars->len; k++) {
-                OspreyVar *v = &g_array_index(g->vars, OspreyVar, k);
-                if (v->kind != OSPREY_PRED_PRIMITIVE_VAR) continue;
-                const OspreyAddress *va = &v->payload.chunk.address;
-                if (va->region.kind != OSPREY_REGION_HEAP_SITE) continue;
-                if (!region_eq(&va->region,
-                                 &u->payload.heap_fold.region)) continue;
-                int64_t o = va->offset;
-                if (o < tail_lo) continue;
-                int64_t rel = o - (int64_t)s_h;
-                int64_t mod = rel % (int64_t)s_t;
-                int64_t fo = mod + (int64_t)s_h;
-                if (fo == o) continue;
-                OspreyChunk fc = v->payload.chunk;
-                fc.address.offset = fo;
-                OspreyVarPayload pv;
-                memset(&pv, 0, sizeof(pv));
-                pv.chunk = fc;
-                uint32_t nv = osprey_intern_var_id(ctx,
-                                                OSPREY_PRED_PRIMITIVE_VAR,
-                                                &pv);
-                if (nv == UINT32_MAX) continue;
-                bool is_new = (nv == g->vars->len - 1);
-                if (is_new) created++;
-                uint32_t ids3[3] = { v->id, u->id, t->id };
-                osprey_factor_add(ctx, OSPREY_RULE_CC07, 0, false,
-                                  OSPREY_P_UP, ids3, 3);
-                uint32_t ids2[2] = { nv, v->id };
-                osprey_factor_add(ctx, OSPREY_RULE_CC07, 1, true,
-                                  OSPREY_P_DN, ids2, 2);
+        status = osprey_secondary_static_closure(ctx, NULL, false);
+        if (status != OSPREY_OK) {
+            bp_secondary_note_failure(ctx, "secondary closure");
+            goto coordinator_fail;
+        }
+        if (bp_test_closure_hook != NULL) {
+            OspreyBpClosureTestHook hook = bp_test_closure_hook;
+            bp_test_closure_hook = NULL;
+            hook(ctx);
+        }
+        status = bp_graph_delta_from_prefix(ctx, graph, &delta);
+        if (status != OSPREY_OK) {
+            bp_secondary_note_failure(ctx, "secondary closure");
+            goto coordinator_fail;
+        }
+        cc07_tuple_count = tuples->len;
+        if (delta.variables_added == 0 && delta.factors_added == 0) {
+            if (delta.limit_rows_added != 0) {
+                status = OSPREY_LIMIT_EXCEEDED;
+                bp_secondary_note_failure(ctx, "secondary closure");
+                goto coordinator_fail;
             }
+            memset(&final_result, 0, sizeof(final_result));
+            final_result.status = OSPREY_OK;
+            final_result.owner = graph;
+            final_result.beliefs = snapshot_beliefs;
+            status = osprey_bp_commit_result(ctx, graph, &final_result);
+            g_array_free(snapshot_beliefs, TRUE);
+            snapshot_beliefs = NULL;
+            g_array_free(tuples, TRUE);
+            tuples = NULL;
+            if (status != OSPREY_OK) goto coordinator_fail;
+            bp_secondary_log_fixed(graph, closure_rounds);
+            osprey_bp_graph_free(graph);
+            g_free(saved_beliefs);
+            return OSPREY_OK;
         }
+        if (closure_rounds >= max_dynamic_rounds) {
+            status = OSPREY_LIMIT_EXCEEDED;
+            bp_secondary_note_failure(ctx, "closure-round-bound");
+            goto coordinator_fail;
+        }
+        g_array_free(snapshot_beliefs, TRUE);
+        snapshot_beliefs = NULL;
+        g_array_free(tuples, TRUE);
+        tuples = NULL;
+        status = osprey_bp_migrate_after_delta(ctx, graph, &delta,
+                                               &next_graph);
+        if (status != OSPREY_OK || next_graph == NULL) {
+            status = status == OSPREY_OK ? OSPREY_INVALID_GRAPH : status;
+            if (status == OSPREY_LIMIT_EXCEEDED) {
+                bp_secondary_note_failure(ctx, "secondary workspace");
+            } else if (status == OSPREY_EXACT_COMPONENT_TOO_LARGE) {
+                bp_secondary_note_failure(
+                    ctx, "exact component exceeds configured limit");
+            } else {
+                bp_secondary_note_failure(ctx, "secondary closure");
+            }
+            goto coordinator_fail;
+        }
+        if (!bp_edge_preservation_counts(ctx, graph, next_graph,
+                                         &preserved_edges, &new_edges)) {
+            status = OSPREY_INVALID_GRAPH;
+            bp_secondary_note_failure(ctx, "secondary closure");
+            goto coordinator_fail;
+        }
+        closure_rounds++;
+        log_msg("[osprey] [closure] [round %llu] [cc07-tuples %u] "
+                "[vars +%u] [base-factors +%u] [secondary-factors +%u] "
+                "[preserved-edges %u] [new-edges %u]\n",
+                (unsigned long long)closure_rounds, cc07_tuple_count,
+                delta.variables_added, delta.base_factors_added,
+                delta.secondary_factors_added, preserved_edges, new_edges);
+        osprey_bp_graph_free(graph);
+        graph = next_graph;
+        next_graph = NULL;
     }
-    return created;
+
+coordinator_fail:
+    if (proposals != NULL) g_array_free(proposals, TRUE);
+    if (result != NULL) osprey_bp_result_free(result);
+    if (snapshot_beliefs != NULL) g_array_free(snapshot_beliefs, TRUE);
+    if (tuples != NULL) g_array_free(tuples, TRUE);
+    osprey_bp_graph_free(next_graph);
+    osprey_bp_graph_free(graph);
+    bp_source_beliefs_restore(ctx, saved_beliefs, saved_count);
+    g_free(saved_beliefs);
+    if (status == OSPREY_NON_CONVERGED) {
+        return bp_secondary_failure(ctx, status, "secondary non-convergence");
+    }
+    if (status == OSPREY_INVALID_MODEL) {
+        return bp_secondary_failure(ctx, status, "secondary invalid model");
+    }
+    if (status == OSPREY_LIMIT_EXCEEDED) {
+        return bp_secondary_failure(ctx, status, "secondary workspace");
+    }
+    return bp_secondary_failure(ctx, status, "secondary closure");
 }
 
 /* ------------------------------------------------------------------ */
 /* Stage-3 entry                                                       */
 /* ------------------------------------------------------------------ */
 
-OspreyStatus osprey_infer(OspreyContext *ctx) {
+OspreyStatus osprey_infer(OspreyContext *ctx)
+{
+    OspreyStatus status;
+
     if (ctx == NULL || !ctx->config.enabled) return OSPREY_DISABLED;
-    if (ctx->graph == NULL || ctx->graph->vars->len == 0) {
-        return OSPREY_INCOMPLETE_FACTS;
+    if (ctx->graph == NULL || ctx->graph->vars == NULL ||
+        ctx->graph->vars->len == 0) return OSPREY_INCOMPLETE_FACTS;
+    status = osprey_stage4_exact(ctx);
+    if (status != OSPREY_OK) {
+        if (ctx->tx_reason == NULL) {
+            ctx->tx_reason = status == OSPREY_EXACT_COMPONENT_TOO_LARGE ||
+                             status == OSPREY_LIMIT_EXCEEDED
+                ? "exact component exceeds configured limit"
+                : "exact base inference failed";
+        }
+        return status;
     }
-    OspreyGraph *g = ctx->graph;
-
-    /* Stage 4.3 computes exact base marginals.  The legacy secondary BP
-     * path below remains explicitly untrusted and is retained only for
-     * existing fail-closed integration behavior. */
-    OspreyStatus exact_status = osprey_stage4_exact(ctx);
-    if (exact_status != OSPREY_OK) return exact_status;
-
-    /* Legacy Stage-5 placeholder: loopy BP with folding closure. */
-    uint32_t fold_rounds = 0;
-    bool converged = false;
-    uint32_t iters = 0;
-    double best_delta = INFINITY;
-    for (;;) {
-        OspBp bp;
-        bp_build(&bp, g);
-        converged = bp_run(&bp, OSPREY_BP_MAX_ITERS, &iters, &best_delta);
-        bp_free(&bp);
-        if (fold_rounds >= OSPREY_BP_MAX_FOLD_ROUNDS) break;
-        uint32_t created = cc07_fold_pass(ctx);
-        if (created == 0) break;
-        fold_rounds++;
-        log_msg("[osprey] [fold] [round %u] [new-vars %u]\n",
-                fold_rounds, created);
-    }
-
-    uint32_t above = 0;
-    for (uint32_t v = 0; v < g->vars->len; v++) {
-        OspreyVar *var = &g_array_index(g->vars, OspreyVar, v);
-        if (var->belief > 0.5) above++;
-    }
-    log_msg("[osprey] [infer] [bp] [iters %u] [converged %d] "
-            "[best-delta %.3g] [belief>0.5 %u] [fold-rounds %u]\n",
-            iters, converged ? 1 : 0, best_delta, above, fold_rounds);
-
-    /* A limit/error raised during folding closure wins over the
-     * convergence verdict (fail-closed transaction). */
-    if (ctx->last_status != OSPREY_OK) {
-        return ctx->last_status;
-    }
-    return converged ? OSPREY_OK : OSPREY_NON_CONVERGED;
+    return osprey_stage5_secondary(ctx);
 }

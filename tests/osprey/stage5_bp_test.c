@@ -13,6 +13,9 @@ static unsigned failures;
 static unsigned registered;
 static unsigned executed;
 
+void osprey_test_log_reset(void);
+const char *osprey_test_log_contents(void);
+
 /* Ten policy-stable rounds stop before exact tree arithmetic converges.  The
  * fixed 2,000-case corpus measured a maximum error of 0x1.0cd00168p-24;
  * retain a decimal bound with margin while keeping the required stop rule. */
@@ -114,6 +117,15 @@ static bool add_prior(OspreyContext *ctx, uint32_t id, double probability)
     OspreyFactorResult result = osprey_factor_add_prior(
         ctx, OSPREY_RULE_CA01, OSPREY_GRAPH_BASE_CA, false, probability, id);
     CHECK(result.status == OSPREY_OK, "base prior inserted");
+    return result.status == OSPREY_OK;
+}
+
+static bool add_prior_rule(OspreyContext *ctx, uint16_t rule, uint8_t stage,
+                           uint32_t id, double probability)
+{
+    OspreyFactorResult result = osprey_factor_add_prior(
+        ctx, rule, stage, false, probability, id);
+    CHECK(result.status == OSPREY_OK, "stage prior inserted");
     return result.status == OSPREY_OK;
 }
 
@@ -326,6 +338,19 @@ static uint32_t add_unfoldable(OspreyContext *ctx, OspreyRegionId region,
     payload.heap_fold.size = size;
     result = osprey_intern_var(ctx, OSPREY_PRED_UNFOLDABLE_HEAP, &payload);
     CHECK(result.id != UINT32_MAX, "unfoldable variable inserted");
+    return result.id;
+}
+
+static uint32_t add_foldable(OspreyContext *ctx, OspreyRegionId region,
+                             uint64_t size)
+{
+    OspreyVarPayload payload;
+    OspreyInternResult result;
+    memset(&payload, 0, sizeof(payload));
+    payload.heap_fold.region = region;
+    payload.heap_fold.size = size;
+    result = osprey_intern_var(ctx, OSPREY_PRED_FOLDABLE_HEAP, &payload);
+    CHECK(result.id != UINT32_MAX, "foldable variable inserted");
     return result.id;
 }
 
@@ -5312,8 +5337,1326 @@ static void test_stage54_changed_role_is_new_edge(void)
     osprey_free(ctx);
 }
 
+static unsigned stage55_count_text(const char *text, const char *needle)
+{
+    unsigned count = 0;
+    size_t needle_length;
+
+    if (text == NULL || needle == NULL || needle[0] == '\0') return 0;
+    needle_length = strlen(needle);
+    while ((text = strstr(text, needle)) != NULL) {
+        count++;
+        text += needle_length;
+    }
+    return count;
+}
+
+static OspreyContext *stage55_closure_context(
+    const Stage5BpClosureCase *description, const OspreyConfig *config,
+    bool reverse)
+{
+    OspreyContext *ctx;
+    OspreyVarPayload payloads[4];
+    uint8_t kinds[4] = {
+        OSPREY_PRED_PRIMITIVE_VAR,
+        OSPREY_PRED_UNFOLDABLE_HEAP,
+        OSPREY_PRED_FOLDABLE_HEAP,
+        OSPREY_PRED_PRIMITIVE_VAR,
+    };
+    uint32_t ids[4] = { UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX };
+    uint32_t count = description != NULL && description->folded_preexisting
+        ? 4u : 3u;
+    int64_t folded_offset = 0;
+
+    if (description == NULL || config == NULL ||
+        (description->folded_preexisting &&
+         !stage5_bp_reference_closure_eligible(description,
+                                               &folded_offset))) return NULL;
+    ctx = new_context_with_config(config);
+    if (ctx == NULL) return NULL;
+    memset(payloads, 0, sizeof(payloads));
+    payloads[0].chunk = make_chunk(description->region,
+                                   description->source_offset,
+                                   description->width);
+    payloads[1].heap_fold.region = description->region;
+    payloads[1].heap_fold.size = description->prefix_size;
+    payloads[2].heap_fold.region = description->region;
+    payloads[2].heap_fold.size = description->fold_size;
+    payloads[3].chunk = make_chunk(description->region, folded_offset,
+                                   description->width);
+    for (uint32_t position = 0; position < count; position++) {
+        uint32_t semantic = reverse ? count - position - 1u : position;
+        OspreyInternResult inserted = osprey_intern_var(
+            ctx, kinds[semantic], &payloads[semantic]);
+        if (inserted.id == UINT32_MAX) goto fail;
+        ids[semantic] = inserted.id;
+    }
+    if (reverse) {
+        if ((description->folded_preexisting &&
+             osprey_factor_add_prior(
+                 ctx, OSPREY_RULE_CB01, OSPREY_GRAPH_SECONDARY, false,
+                 0.5, ids[3]).status != OSPREY_OK) ||
+            osprey_factor_add_prior(
+                ctx, OSPREY_RULE_CC02, OSPREY_GRAPH_SECONDARY, false,
+                description->fold_probability, ids[2]).status != OSPREY_OK ||
+            osprey_factor_add_prior(
+                ctx, OSPREY_RULE_CC01, OSPREY_GRAPH_SECONDARY, false,
+                description->prefix_probability, ids[1]).status != OSPREY_OK ||
+            osprey_factor_add_prior(
+                ctx, OSPREY_RULE_CA01, OSPREY_GRAPH_BASE_CA, false,
+                description->primitive_probability,
+                ids[0]).status != OSPREY_OK) goto fail;
+    } else if (osprey_factor_add_prior(
+                       ctx, OSPREY_RULE_CA01, OSPREY_GRAPH_BASE_CA, false,
+                       description->primitive_probability,
+                       ids[0]).status != OSPREY_OK ||
+                   osprey_factor_add_prior(
+                       ctx, OSPREY_RULE_CC01, OSPREY_GRAPH_SECONDARY, false,
+                       description->prefix_probability,
+                       ids[1]).status != OSPREY_OK ||
+                   osprey_factor_add_prior(
+                       ctx, OSPREY_RULE_CC02, OSPREY_GRAPH_SECONDARY, false,
+                       description->fold_probability,
+                       ids[2]).status != OSPREY_OK ||
+                   (description->folded_preexisting &&
+                    osprey_factor_add_prior(
+                        ctx, OSPREY_RULE_CB01, OSPREY_GRAPH_SECONDARY, false,
+                        0.5, ids[3]).status != OSPREY_OK)) {
+        goto fail;
+    }
+    add_region_extent(ctx, description->region, description->extent);
+    if (osprey_relations_build(ctx) != OSPREY_OK) goto fail;
+    /* Extent construction validates heap sites against allocation evidence.
+     * Append it after relation construction so this bounded oracle graph has
+     * no unrelated CC01/CC02 relation-derived candidates. */
+    {
+        OspreyMallocFact allocation;
+        memset(&allocation, 0, sizeof(allocation));
+        allocation.site_pc = description->region.site_offset;
+        allocation.requested_size = description->extent;
+        allocation.sample_support = 1;
+        g_array_append_val(ctx->alloc_facts, allocation);
+    }
+    return ctx;
+
+fail:
+    osprey_free(ctx);
+    return NULL;
+}
+
+static bool stage55_factor_semantic_equal(const OspreyContext *left_ctx,
+                                          const OspreyFactor *left,
+                                          const OspreyContext *right_ctx,
+                                          const OspreyFactor *right)
+{
+    uint64_t left_probability;
+    uint64_t right_probability;
+
+    if (left_ctx == NULL || right_ctx == NULL || left_ctx->graph == NULL ||
+        right_ctx->graph == NULL || left == NULL || right == NULL ||
+        left->rule != right->rule || left->head_idx != right->head_idx ||
+        left->negative != right->negative || left->stage != right->stage ||
+        left->potential_kind != right->potential_kind ||
+        left->num_vars != right->num_vars || left->var_ids == NULL ||
+        right->var_ids == NULL) return false;
+    memcpy(&left_probability, &left->p, sizeof(left_probability));
+    memcpy(&right_probability, &right->p, sizeof(right_probability));
+    if (left_probability != right_probability) return false;
+    for (uint32_t i = 0; i < left->num_vars; i++) {
+        const OspreyVar *left_var;
+        const OspreyVar *right_var;
+        OspreyKey left_key;
+        OspreyKey right_key;
+        if (left->var_ids[i] >= left_ctx->graph->vars->len ||
+            right->var_ids[i] >= right_ctx->graph->vars->len) return false;
+        left_var = &g_array_index(left_ctx->graph->vars, OspreyVar,
+                                  left->var_ids[i]);
+        right_var = &g_array_index(right_ctx->graph->vars, OspreyVar,
+                                   right->var_ids[i]);
+        left_key = osprey_var_key(left_var->kind, &left_var->payload);
+        right_key = osprey_var_key(right_var->kind, &right_var->payload);
+        if (!osprey_key_equal(&left_key, &right_key)) return false;
+    }
+    return true;
+}
+
+static bool stage55_contexts_semantically_equal(const OspreyContext *left,
+                                                const OspreyContext *right)
+{
+    uint8_t *matched;
+    bool equal = false;
+
+    if (left == NULL || right == NULL || left->graph == NULL ||
+        right->graph == NULL || left->graph->vars == NULL ||
+        right->graph->vars == NULL || left->graph->factors == NULL ||
+        right->graph->factors == NULL ||
+        left->graph->vars->len != right->graph->vars->len ||
+        left->graph->factors->len != right->graph->factors->len ||
+        left->graph->limit_rows != right->graph->limit_rows ||
+        left->graph->cd04_extensions != right->graph->cd04_extensions ||
+        memcmp(left->graph->candidate_proposals,
+               right->graph->candidate_proposals,
+               sizeof(left->graph->candidate_proposals)) != 0) return false;
+    matched = g_try_malloc0(MAX(left->graph->vars->len,
+                                left->graph->factors->len));
+    if (matched == NULL && (left->graph->vars->len != 0 ||
+                            left->graph->factors->len != 0)) return false;
+    for (guint i = 0; i < left->graph->vars->len; i++) {
+        const OspreyVar *left_var = &g_array_index(left->graph->vars,
+                                                   OspreyVar, i);
+        OspreyKey left_key = osprey_var_key(left_var->kind,
+                                            &left_var->payload);
+        bool found = false;
+        for (guint j = 0; j < right->graph->vars->len; j++) {
+            const OspreyVar *right_var = &g_array_index(
+                right->graph->vars, OspreyVar, j);
+            OspreyKey right_key;
+            uint64_t left_belief;
+            uint64_t right_belief;
+            uint64_t left_prior;
+            uint64_t right_prior;
+            if (matched[j]) continue;
+            right_key = osprey_var_key(right_var->kind, &right_var->payload);
+            if (!osprey_key_equal(&left_key, &right_key)) continue;
+            memcpy(&left_belief, &left_var->belief, sizeof(left_belief));
+            memcpy(&right_belief, &right_var->belief, sizeof(right_belief));
+            memcpy(&left_prior, &left_var->prior, sizeof(left_prior));
+            memcpy(&right_prior, &right_var->prior, sizeof(right_prior));
+            if (left_belief != right_belief ||
+                left_var->belief_valid != right_var->belief_valid ||
+                left_var->hard_false != right_var->hard_false ||
+                left_var->region_limit_hit != right_var->region_limit_hit ||
+                left_var->direct_support != right_var->direct_support ||
+                left_var->source_rule_bits != right_var->source_rule_bits ||
+                left_prior != right_prior) goto out;
+            matched[j] = 1;
+            found = true;
+            break;
+        }
+        if (!found) goto out;
+    }
+    memset(matched, 0, left->graph->factors->len);
+    for (guint i = 0; i < left->graph->factors->len; i++) {
+        const OspreyFactor *left_factor = g_array_index(
+            left->graph->factors, OspreyFactor *, i);
+        bool found = false;
+        for (guint j = 0; j < right->graph->factors->len; j++) {
+            const OspreyFactor *right_factor;
+            if (matched[j]) continue;
+            right_factor = g_array_index(right->graph->factors,
+                                         OspreyFactor *, j);
+            if (!stage55_factor_semantic_equal(left, left_factor, right,
+                                                right_factor)) continue;
+            matched[j] = 1;
+            found = true;
+            break;
+        }
+        if (!found) goto out;
+    }
+    equal = true;
+
+out:
+    g_free(matched);
+    return equal;
+}
+
+static void stage55_capture_beliefs(const OspreyContext *ctx,
+                                    uint64_t *belief_bits,
+                                    uint8_t *validity)
+{
+    for (guint i = 0; i < ctx->graph->vars->len; i++) {
+        const OspreyVar *variable = &g_array_index(ctx->graph->vars,
+                                                   OspreyVar, i);
+        memcpy(&belief_bits[i], &variable->belief, sizeof(belief_bits[i]));
+        validity[i] = variable->belief_valid;
+    }
+}
+
+static bool stage55_beliefs_unchanged(const OspreyContext *ctx,
+                                      const uint64_t *belief_bits,
+                                      const uint8_t *validity,
+                                      uint32_t count)
+{
+    if (ctx == NULL || ctx->graph == NULL || ctx->graph->vars == NULL ||
+        ctx->graph->vars->len < count) return false;
+    for (uint32_t i = 0; i < count; i++) {
+        const OspreyVar *variable = &g_array_index(ctx->graph->vars,
+                                                   OspreyVar, i);
+        uint64_t actual;
+        memcpy(&actual, &variable->belief, sizeof(actual));
+        if (actual != belief_bits[i] ||
+            variable->belief_valid != validity[i]) return false;
+    }
+    return true;
+}
+
+static bool stage55_expected_success_diagnostics(
+    const Stage5BpClosureCase *description, const char *log)
+{
+    bool eligible;
+    int64_t folded_offset;
+    char closure[256];
+    const char *fixed;
+
+    eligible = stage5_bp_reference_closure_eligible(description,
+                                                    &folded_offset);
+    (void)folded_offset;
+    if (!eligible) {
+        return strstr(log,
+            "[secondary-fixed] [versions 1] [closure-rounds 0] "
+            "[vars 3] [factors 3] [edges 3]") != NULL &&
+            stage55_count_text(log, "[osprey] [closure]") == 0;
+    }
+    snprintf(closure, sizeof(closure),
+             "[closure] [round 1] [cc07-tuples 1] [vars +%u] "
+             "[base-factors +0] [secondary-factors +15] "
+             "[preserved-edges %u] [new-edges 33]",
+             description->folded_preexisting ? 4u : 5u,
+             description->folded_preexisting ? 4u : 3u);
+    fixed = description->folded_preexisting
+        ? "[secondary-fixed] [versions 2] [closure-rounds 1] "
+          "[vars 8] [factors 19] [edges 37]"
+        : "[secondary-fixed] [versions 2] [closure-rounds 1] "
+          "[vars 8] [factors 18] [edges 36]";
+    return strstr(log, closure) != NULL && strstr(log, fixed) != NULL &&
+           stage55_count_text(log, "[osprey] [closure]") == 1;
+}
+
+static void test_stage55_strict_eligibility(void)
+{
+    OspreyConfig config = bp_config();
+    Stage5BpClosureCase cases[8];
+
+    memset(cases, 0, sizeof(cases));
+    for (uint32_t i = 0; i < G_N_ELEMENTS(cases); i++) {
+        cases[i].region = make_region(OSPREY_REGION_HEAP_SITE,
+                                      0x5700u + i);
+        cases[i].prefix_size = 8;
+        cases[i].fold_size = 8;
+        cases[i].source_offset = 16;
+        cases[i].width = 8;
+        cases[i].extent = 64;
+        cases[i].primitive_probability = nextafter(0.5, 1.0);
+        cases[i].prefix_probability = nextafter(0.5, 1.0);
+        cases[i].fold_probability = nextafter(0.5, 1.0);
+    }
+    cases[1].primitive_probability = 0.5;
+    cases[2].prefix_probability = 0.5;
+    cases[3].fold_probability = 0.5;
+    cases[4].fold_size = 0;
+    cases[5].source_offset = 15;
+    cases[6].extent = 23;
+    cases[7].source_offset = 8;
+    config.report_threshold = 0.999;
+    for (uint32_t i = 0; i < G_N_ELEMENTS(cases); i++) {
+        OspreyContext *ctx = stage55_closure_context(&cases[i], &config,
+                                                     false);
+        CHECK(ctx != NULL, "Stage 5.5 strict-threshold fixture builds");
+        if (ctx != NULL) {
+            osprey_test_log_reset();
+            CHECK(osprey_infer(ctx) == OSPREY_OK,
+                  "Stage 5.5 eligibility near miss terminates cleanly");
+            CHECK(stage5_bp_reference_closure_matches(ctx, &cases[i]),
+                  "Stage 5.5 strict eligibility matches independent graph");
+            CHECK(stage55_expected_success_diagnostics(
+                      &cases[i], osprey_test_log_contents()),
+                  "Stage 5.5 strict eligibility emits exact diagnostics");
+        }
+        osprey_free(ctx);
+    }
+}
+
+static void test_stage55_invalid_belief_validity(void)
+{
+    OspreyContext *ctx = new_context();
+    OspreyRegionId region = make_region(OSPREY_REGION_HEAP_SITE, 0x5710);
+    uint32_t source = add_primitive_sized(ctx, region, 16, 8);
+    uint32_t prefix = add_unfoldable(ctx, region, 8);
+    uint32_t fold = add_foldable(ctx, region, 8);
+    guint vars_before = ctx->graph->vars->len;
+    guint factors_before;
+
+    add_region_extent(ctx, region, 64);
+    CHECK(add_prior(ctx, source, 0.99) &&
+              add_prior_rule(ctx, OSPREY_RULE_CC01,
+                             OSPREY_GRAPH_SECONDARY, prefix, 0.5) &&
+              add_prior_rule(ctx, OSPREY_RULE_CC02,
+                             OSPREY_GRAPH_SECONDARY, fold, 0.5),
+          "Stage 5.5 stale-validity priors inserted");
+    factors_before = ctx->graph->factors->len;
+    g_array_index(ctx->graph->vars, OspreyVar, prefix).belief = 0.99;
+    g_array_index(ctx->graph->vars, OspreyVar, prefix).belief_valid = 0;
+    g_array_index(ctx->graph->vars, OspreyVar, fold).belief = 0.99;
+    g_array_index(ctx->graph->vars, OspreyVar, fold).belief_valid = 0;
+    CHECK(osprey_relations_build(ctx) == OSPREY_OK,
+          "Stage 5.5 stale-validity relations build");
+    {
+        OspreyMallocFact allocation;
+        memset(&allocation, 0, sizeof(allocation));
+        allocation.site_pc = region.site_offset;
+        allocation.requested_size = 64;
+        allocation.sample_support = 1;
+        g_array_append_val(ctx->alloc_facts, allocation);
+    }
+    osprey_test_log_reset();
+    {
+        OspreyStatus status = osprey_infer(ctx);
+        if (status != OSPREY_OK) {
+            fprintf(stderr, "stale-validity status=%d reason=%s log=%s\n",
+                    (int)status, ctx->tx_reason == NULL ? "none" :
+                    ctx->tx_reason, osprey_test_log_contents());
+        }
+        CHECK(status == OSPREY_OK,
+              "Stage 5.5 ignores stale beliefs with clear validity");
+    }
+    CHECK(ctx->graph->vars->len == vars_before &&
+              ctx->graph->factors->len == factors_before,
+          "Stage 5.5 clear validity cannot schedule CC07");
+    CHECK(g_array_index(ctx->graph->vars, OspreyVar, prefix).belief_valid == 1 &&
+              g_array_index(ctx->graph->vars, OspreyVar,
+                            fold).belief_valid == 1 &&
+              g_array_index(ctx->graph->vars, OspreyVar, prefix).belief == 0.5 &&
+              g_array_index(ctx->graph->vars, OspreyVar, fold).belief == 0.5,
+          "Stage 5.5 recomputes clear-validity beliefs instead of reading stale values");
+    g_array_index(ctx->graph->vars, OspreyVar, prefix).belief_valid = 2;
+    CHECK(osprey_stage5_secondary(ctx) == OSPREY_INVALID_GRAPH,
+          "Stage 5.5 rejects malformed validity bits");
+    osprey_free(ctx);
+}
+
+static void test_generated_stage55_closure(void)
+{
+    enum { CASES = 2000 };
+    uint32_t rng = UINT32_C(0x55c105e5);
+    unsigned successes = 0;
+    unsigned failures_seen = 0;
+    bool reported_mismatch = false;
+
+    for (uint32_t sample = 0; sample < CASES; sample++) {
+        Stage5BpClosureCase description;
+        OspreyConfig config = bp_config();
+        OspreyContext *ctx;
+        OspreyContext *permuted;
+        OspreyStatus expected = OSPREY_OK;
+        OspreyStatus status;
+        OspreyStatus permuted_status;
+        uint64_t before_bits[4];
+        uint64_t permuted_before_bits[4];
+        uint8_t before_valid[4];
+        uint8_t permuted_before_valid[4];
+        uint32_t before_count;
+        uint32_t permuted_before_count;
+        char *log = NULL;
+        uint32_t mode;
+
+        memset(&description, 0, sizeof(description));
+        description.region = make_region(OSPREY_REGION_HEAP_SITE,
+                                          0x600000u + sample);
+        description.prefix_size = 1u + next_random(&rng) % 31u;
+        description.fold_size = 1u + next_random(&rng) % 31u;
+        description.source_offset = (int64_t)(description.prefix_size +
+                                               description.fold_size);
+        description.width = description.fold_size;
+        description.extent = (uint64_t)description.source_offset +
+                             description.width + 32u;
+        description.primitive_probability =
+            nextafter(0.5, 1.0);
+        description.prefix_probability = 0.51 +
+            (double)(next_random(&rng) % 45u) / 100.0;
+        description.fold_probability = 0.51 +
+            (double)(next_random(&rng) % 45u) / 100.0;
+        mode = sample % 16u;
+        if (mode == 1u) description.primitive_probability = 0.5;
+        if (mode == 2u) description.prefix_probability = 0.5;
+        if (mode == 3u) description.fold_probability = 0.5;
+        if (mode == 4u) description.fold_size = 0;
+        if (mode == 5u) description.source_offset--;
+        if (mode == 6u) description.extent =
+            (uint64_t)description.source_offset + description.width - 1u;
+        if (mode == 7u) description.source_offset =
+            (int64_t)description.prefix_size;
+        if (mode == 8u || mode == 9u) {
+            description.folded_preexisting = true;
+        }
+        if (mode == 10u) {
+            config.max_candidates_per_kind_region = 1;
+            expected = OSPREY_LIMIT_EXCEEDED;
+        } else if (mode == 11u) {
+            config.max_variables = 3;
+            expected = OSPREY_LIMIT_EXCEEDED;
+        } else if (mode == 12u) {
+            config.max_factors = 3;
+            expected = OSPREY_LIMIT_EXCEEDED;
+        } else if (mode == 13u) {
+            config.max_bp_table_bytes = 1;
+            expected = OSPREY_LIMIT_EXCEEDED;
+        }
+        ctx = stage55_closure_context(&description, &config, false);
+        permuted = stage55_closure_context(&description, &config, true);
+        CHECK(ctx != NULL && permuted != NULL,
+              "generated Stage 5.5 permutations build");
+        if (ctx == NULL || permuted == NULL) {
+            osprey_free(ctx);
+            osprey_free(permuted);
+            continue;
+        }
+        CHECK(osprey_stage4_exact(ctx) == OSPREY_OK &&
+                  osprey_stage4_exact(permuted) == OSPREY_OK,
+              "generated Stage 5.5 exact seeds build");
+        before_count = ctx->graph->vars->len;
+        permuted_before_count = permuted->graph->vars->len;
+        stage55_capture_beliefs(ctx, before_bits, before_valid);
+        stage55_capture_beliefs(permuted, permuted_before_bits,
+                                permuted_before_valid);
+        osprey_test_log_reset();
+        status = osprey_stage5_secondary(ctx);
+        log = strdup(osprey_test_log_contents());
+        osprey_test_log_reset();
+        permuted_status = osprey_stage5_secondary(permuted);
+        if (!reported_mismatch &&
+            (status != expected || permuted_status != expected)) {
+            fprintf(stderr,
+                    "generated mismatch sample=%u mode=%u status=%d/%d "
+                    "expected=%d reason=%s/%s log=%s\n",
+                    sample, mode, (int)status, (int)permuted_status,
+                    (int)expected, ctx->tx_reason == NULL ? "none" :
+                    ctx->tx_reason, permuted->tx_reason == NULL ? "none" :
+                    permuted->tx_reason, osprey_test_log_contents());
+            reported_mismatch = true;
+        }
+        CHECK(status == expected && permuted_status == expected,
+              "generated Stage 5.5 statuses match independent expectation");
+        CHECK(stage55_contexts_semantically_equal(ctx, permuted),
+              "generated Stage 5.5 permutations retain canonical graph");
+        CHECK(log != NULL &&
+                  strcmp(log, osprey_test_log_contents()) == 0,
+              "generated Stage 5.5 permutations retain diagnostics");
+        if (expected == OSPREY_OK) {
+            CHECK(stage5_bp_reference_closure_matches(ctx, &description) &&
+                      stage5_bp_reference_closure_matches(permuted,
+                                                          &description),
+                  "generated Stage 5.5 graph matches independent oracle");
+            CHECK(stage55_expected_success_diagnostics(
+                      &description, osprey_test_log_contents()),
+                  "generated Stage 5.5 version trace matches oracle");
+            successes++;
+        } else {
+            CHECK(stage55_beliefs_unchanged(ctx, before_bits, before_valid,
+                                             before_count) &&
+                      stage55_beliefs_unchanged(
+                          permuted, permuted_before_bits,
+                          permuted_before_valid, permuted_before_count),
+                  "generated Stage 5.5 failure preserves source beliefs");
+            CHECK(strstr(osprey_test_log_contents(),
+                         "[infer] [secondary] [reject]") != NULL,
+                  "generated Stage 5.5 cap failure is diagnosed");
+            failures_seen++;
+        }
+        free(log);
+        osprey_free(ctx);
+        osprey_free(permuted);
+    }
+    CHECK(successes != 0 && failures_seen != 0 &&
+              successes + failures_seen == CASES,
+          "generated Stage 5.5 corpus covers success and cap failure");
+}
+
+static unsigned stage55_rule_count(const OspreyContext *ctx, uint16_t rule)
+{
+    unsigned count = 0;
+    if (ctx == NULL || ctx->graph == NULL || ctx->graph->factors == NULL) {
+        return 0;
+    }
+    for (guint i = 0; i < ctx->graph->factors->len; i++) {
+        const OspreyFactor *factor = g_array_index(
+            ctx->graph->factors, OspreyFactor *, i);
+        if (factor != NULL && factor->rule == rule) count++;
+    }
+    return count;
+}
+
+static unsigned stage55_primitive_support_count(const OspreyContext *ctx,
+                                                OspreyRegionId region,
+                                                uint64_t support)
+{
+    unsigned count = 0;
+    for (guint i = 0; i < ctx->graph->vars->len; i++) {
+        const OspreyVar *variable = &g_array_index(ctx->graph->vars,
+                                                   OspreyVar, i);
+        OspreyKey actual_region = osprey_region_key(
+            &variable->payload.chunk.address.region);
+        OspreyKey expected_region = osprey_region_key(&region);
+        if (variable->kind == OSPREY_PRED_PRIMITIVE_VAR &&
+            osprey_key_equal(&actual_region, &expected_region) &&
+            variable->direct_support == support) count++;
+    }
+    return count;
+}
+
+static bool stage55_multiround_hook_added;
+
+static void stage55_support_new_cc03_prefix(OspreyContext *ctx)
+{
+    if (ctx == NULL || ctx->graph == NULL) return;
+    for (guint i = 0; i < ctx->graph->vars->len; i++) {
+        const OspreyVar *variable = &g_array_index(ctx->graph->vars,
+                                                   OspreyVar, i);
+        if (variable->kind == OSPREY_PRED_UNFOLDABLE_HEAP &&
+            variable->payload.heap_fold.size == 16) {
+            stage55_multiround_hook_added =
+                osprey_factor_add_prior(ctx, OSPREY_RULE_CB02,
+                                        OSPREY_GRAPH_SECONDARY, false,
+                                        0.99, variable->id).status == OSPREY_OK;
+            return;
+        }
+    }
+}
+
+static void test_stage55_factor_only_and_multiround(void)
+{
+    OspreyConfig config = bp_config();
+    Stage5BpClosureCase description;
+    OspreyContext *ctx;
+    OspreyContext *permuted = NULL;
+    OspreyRegionId region;
+    char *canonical_log = NULL;
+
+    memset(&description, 0, sizeof(description));
+    description.region = make_region(OSPREY_REGION_HEAP_SITE, 0x5720);
+    description.source_offset = 16;
+    description.width = 8;
+    description.prefix_size = 8;
+    description.fold_size = 8;
+    description.extent = 64;
+    description.primitive_probability = 0.99;
+    description.prefix_probability = 0.99;
+    description.fold_probability = 0.99;
+    description.folded_preexisting = true;
+    ctx = stage55_closure_context(&description, &config, false);
+    CHECK(ctx != NULL, "Stage 5.5 factor-only fixture builds");
+    if (ctx != NULL) {
+        OspreyStatus status;
+        osprey_test_log_reset();
+        status = osprey_infer(ctx);
+        if (status != OSPREY_OK) {
+            fprintf(stderr, "factor-only status=%d reason=%s log=%s\n",
+                    (int)status, ctx->tx_reason == NULL ? "none" :
+                    ctx->tx_reason, osprey_test_log_contents());
+        }
+        CHECK(status == OSPREY_OK,
+              "Stage 5.5 pre-existing fold reaches fixed point");
+        CHECK(stage5_bp_reference_closure_matches(ctx, &description),
+              "Stage 5.5 factor-only growth matches exact identities");
+        CHECK(stage55_expected_success_diagnostics(
+                  &description, osprey_test_log_contents()),
+              "Stage 5.5 factor-only delta is exact");
+    }
+    osprey_free(ctx);
+
+    ctx = new_context();
+    region = make_region(OSPREY_REGION_HEAP_SITE, 0x5721);
+    uint32_t source_a = add_primitive_sized(ctx, region, 32, 8);
+    uint32_t source_b = add_primitive_sized(ctx, region, 40, 8);
+    uint32_t prefix = add_unfoldable(ctx, region, 8);
+    uint32_t fold = add_foldable(ctx, region, 8);
+    add_region_extent(ctx, region, 96);
+    CHECK(add_prior(ctx, source_a, 0.99) && add_prior(ctx, source_b, 0.99) &&
+              add_prior_rule(ctx, OSPREY_RULE_CC01,
+                             OSPREY_GRAPH_SECONDARY, prefix,
+                             nextafter(0.5, 1.0)) &&
+              add_prior_rule(ctx, OSPREY_RULE_CC02,
+                             OSPREY_GRAPH_SECONDARY, fold, 0.99),
+          "Stage 5.5 many-to-one priors insert");
+    CHECK(osprey_relations_build(ctx) == OSPREY_OK,
+          "Stage 5.5 many-to-one relations build");
+    {
+        OspreyMallocFact allocation;
+        memset(&allocation, 0, sizeof(allocation));
+        allocation.site_pc = region.site_offset;
+        allocation.requested_size = 96;
+        allocation.sample_support = 1;
+        g_array_append_val(ctx->alloc_facts, allocation);
+    }
+    permuted = reverse_clone_context(ctx);
+    CHECK(permuted != NULL,
+          "Stage 5.5 reversed many-to-one graph clones");
+    if (permuted != NULL) {
+        g_array_append_vals(permuted->region_instances,
+                            ctx->region_instances->data,
+                            ctx->region_instances->len);
+        CHECK(osprey_relations_build(permuted) == OSPREY_OK,
+              "Stage 5.5 reversed many-to-one relations build");
+        g_array_append_vals(permuted->alloc_facts, ctx->alloc_facts->data,
+                            ctx->alloc_facts->len);
+    }
+    stage55_multiround_hook_added = false;
+    osprey_bp_test_set_closure_hook(stage55_support_new_cc03_prefix);
+    osprey_test_log_reset();
+    OspreyStatus status = osprey_infer(ctx);
+    osprey_bp_test_set_closure_hook(NULL);
+    canonical_log = strdup(osprey_test_log_contents());
+    CHECK(status == OSPREY_OK,
+          "Stage 5.5 many-to-one cascade reaches fixed point");
+    CHECK(stage55_multiround_hook_added,
+          "Stage 5.5 observes the new CC03 prefix before migration");
+    if (permuted != NULL) {
+        stage55_multiround_hook_added = false;
+        osprey_bp_test_set_closure_hook(stage55_support_new_cc03_prefix);
+        osprey_bp_test_set_reverse_cc07_tuples(true);
+        osprey_test_log_reset();
+        OspreyStatus permuted_status = osprey_infer(permuted);
+        osprey_bp_test_set_reverse_cc07_tuples(false);
+        osprey_bp_test_set_closure_hook(NULL);
+        CHECK(permuted_status == OSPREY_OK &&
+                  stage55_multiround_hook_added &&
+                  stage55_contexts_semantically_equal(ctx, permuted) &&
+                  canonical_log != NULL &&
+                  strcmp(canonical_log, osprey_test_log_contents()) == 0,
+              "Stage 5.5 variable/factor/proposal permutations are identical");
+    }
+    CHECK(ctx->graph->vars->len == 14 && ctx->graph->factors->len == 51 &&
+              stage55_rule_count(ctx, OSPREY_RULE_CC07) == 8 &&
+              stage55_rule_count(ctx, OSPREY_RULE_CC03) == 4 &&
+              stage55_rule_count(ctx, OSPREY_RULE_CD07) == 4 &&
+              stage55_rule_count(ctx, OSPREY_RULE_CC04) == 20 &&
+              stage55_rule_count(ctx, OSPREY_RULE_CC05) == 10,
+          "Stage 5.5 multi-round closure has exact variables and factors");
+    CHECK(stage55_primitive_support_count(ctx, region, 2) == 2 &&
+              ctx->graph->candidate_proposals[OSPREY_RULE_CC07] == 4,
+          "Stage 5.5 merges each many-to-one fold exactly once");
+    CHECK(stage55_count_text(osprey_test_log_contents(),
+                             "[osprey] [closure]") == 2 &&
+              strstr(osprey_test_log_contents(),
+                     "[secondary-fixed] [versions 3] [closure-rounds 2] "
+                     "[vars 14] [factors 51] [edges 109]") != NULL &&
+              strstr(osprey_test_log_contents(),
+                     "[preserved-edges 0]") == NULL,
+          "Stage 5.5 multi-version trace preserves every old message edge");
+    free(canonical_log);
+    osprey_free(permuted);
+    osprey_free(ctx);
+}
+
+static OspreyContext *stage55_ca08_context(const OspreyConfig *config)
+{
+    Stage5BpClosureCase description;
+    OspreyContext *ctx;
+    uint32_t scalar;
+
+    memset(&description, 0, sizeof(description));
+    description.region = make_region(OSPREY_REGION_HEAP_SITE, 0x5722);
+    description.source_offset = 16;
+    description.width = 8;
+    description.prefix_size = 8;
+    description.fold_size = 8;
+    description.extent = 64;
+    description.primitive_probability = 0.99;
+    description.prefix_probability = 0.99;
+    description.fold_probability = 0.99;
+    ctx = stage55_closure_context(&description, config, false);
+    if (ctx == NULL) return NULL;
+    scalar = add_scalar(ctx, description.region, 8);
+    if (scalar == UINT32_MAX ||
+        osprey_factor_add_prior(ctx, OSPREY_RULE_CB01,
+                                OSPREY_GRAPH_SECONDARY, false, 0.7,
+                                scalar).status != OSPREY_OK) {
+        osprey_free(ctx);
+        return NULL;
+    }
+    return ctx;
+}
+
+static void test_stage55_ca08_exact_resolve(void)
+{
+    OspreyConfig config = bp_config();
+    OspreyContext *ctx = stage55_ca08_context(&config);
+
+    CHECK(ctx != NULL, "Stage 5.5 CA08 exact-resolve fixture builds");
+    if (ctx != NULL) {
+        OspreyStatus exact_status = osprey_stage4_exact(ctx);
+        if (exact_status != OSPREY_OK) {
+            fprintf(stderr, "CA08 seed status=%d reason=%s\n",
+                    (int)exact_status, ctx->tx_reason == NULL ? "none" :
+                    ctx->tx_reason);
+        }
+        CHECK(exact_status == OSPREY_OK,
+              "Stage 5.5 CA08 initial exact solve succeeds");
+        osprey_test_log_reset();
+        CHECK(osprey_stage5_secondary(ctx) == OSPREY_OK,
+              "Stage 5.5 CA08 growth reaches fixed point");
+        CHECK(stage55_rule_count(ctx, OSPREY_RULE_CA08) == 2 &&
+                  ctx->graph->vars->len == 9 &&
+                  ctx->graph->factors->len == 21,
+              "Stage 5.5 CD07 field adds exact CA08 factor pair");
+        CHECK(stage55_count_text(osprey_test_log_contents(),
+                                 "[infer] [exact]") == 1 &&
+                  strstr(osprey_test_log_contents(),
+                         "[base-factors +2]") != NULL &&
+                  strstr(osprey_test_log_contents(),
+                         "[secondary-fixed] [versions 2] "
+                         "[closure-rounds 1] [vars 9] [factors 21] "
+                         "[edges 41]") != NULL,
+              "Stage 5.5 observes one post-CA08 exact re-solve");
+    }
+    osprey_free(ctx);
+}
+
+static bool stage55_impossible_hook_added;
+
+static void stage55_add_impossible_support(OspreyContext *ctx)
+{
+    if (ctx == NULL || ctx->graph == NULL) return;
+    for (guint i = 0; i < ctx->graph->vars->len; i++) {
+        const OspreyVar *variable = &g_array_index(ctx->graph->vars,
+                                                   OspreyVar, i);
+        if (variable->kind == OSPREY_PRED_PRIMITIVE_VAR &&
+            variable->payload.chunk.address.offset == 16) {
+            stage55_impossible_hook_added =
+                osprey_factor_add_prior(ctx, OSPREY_RULE_CB01,
+                                        OSPREY_GRAPH_SECONDARY, false,
+                                        0.0, variable->id).status == OSPREY_OK;
+            return;
+        }
+    }
+}
+
+static void test_stage55_impossible_after_growth(void)
+{
+    OspreyConfig config = bp_config();
+    Stage5BpClosureCase description;
+    OspreyContext *ctx;
+    uint64_t before_bits[8];
+    uint8_t before_valid[8];
+    uint32_t before_count;
+
+    memset(&description, 0, sizeof(description));
+    description.region = make_region(OSPREY_REGION_HEAP_SITE, 0x5723);
+    description.source_offset = 16;
+    description.width = 8;
+    description.prefix_size = 8;
+    description.fold_size = 8;
+    description.extent = 64;
+    description.primitive_probability = 1.0;
+    description.prefix_probability = 0.99;
+    description.fold_probability = 0.99;
+    ctx = stage55_closure_context(&description, &config, false);
+    CHECK(ctx != NULL && osprey_stage4_exact(ctx) == OSPREY_OK,
+          "Stage 5.5 impossible-support fixture seeds exactly");
+    if (ctx != NULL) {
+        before_count = ctx->graph->vars->len;
+        stage55_capture_beliefs(ctx, before_bits, before_valid);
+        stage55_impossible_hook_added = false;
+        osprey_bp_test_set_closure_hook(stage55_add_impossible_support);
+        osprey_test_log_reset();
+        CHECK(osprey_stage5_secondary(ctx) == OSPREY_INVALID_MODEL,
+              "Stage 5.5 rejects impossible support after growth");
+        osprey_bp_test_set_closure_hook(NULL);
+        CHECK(stage55_impossible_hook_added &&
+                  stage55_beliefs_unchanged(ctx, before_bits, before_valid,
+                                             before_count),
+              "Stage 5.5 impossible later version preserves source beliefs");
+        CHECK(stage55_count_text(osprey_test_log_contents(),
+                                 "[osprey] [closure]") == 1 &&
+                  strstr(osprey_test_log_contents(),
+                         "[reason secondary invalid model]") != NULL &&
+                  strstr(osprey_test_log_contents(),
+                         "[secondary-fixed]") == NULL,
+              "Stage 5.5 impossible later version cannot publish fixed state");
+    }
+    osprey_free(ctx);
+}
+
+static OspreyContext *stage55_nonconvergent_context(void)
+{
+    OspreyConfig config = bp_config();
+    Stage5BpClosureCase description;
+    OspreyContext *ctx;
+    OspreyRegionId region;
+    uint32_t ids[7];
+
+    memset(&description, 0, sizeof(description));
+    description.region = make_region(OSPREY_REGION_HEAP_SITE, 0x5724);
+    description.source_offset = 16;
+    description.width = 8;
+    description.prefix_size = 8;
+    description.fold_size = 8;
+    description.extent = 64;
+    description.primitive_probability = 0.99;
+    description.prefix_probability = 0.99;
+    description.fold_probability = 0.99;
+    ctx = stage55_closure_context(&description, &config, false);
+    if (ctx == NULL) return NULL;
+    region = make_region(OSPREY_REGION_GLOBAL, 0x5725);
+    for (uint32_t i = 0; i < G_N_ELEMENTS(ids); i++) {
+        ids[i] = add_primitive(ctx, region, (int64_t)i * 8);
+    }
+    if (!add_prior(ctx, ids[0], 0.9) || !add_prior(ctx, ids[2], 0.01) ||
+        !add_prior(ctx, ids[3], 0.1) || !add_prior(ctx, ids[4], 0.9) ||
+        !add_prior(ctx, ids[5], 0.99) || !add_prior(ctx, ids[6], 0.1)) {
+        osprey_free(ctx);
+        return NULL;
+    }
+#define ADD_STAGE55_NC(_p, _head, ...) do {                                \
+    uint32_t antecedents[] = { __VA_ARGS__ };                               \
+    if (!add_implication_probability(                                      \
+            ctx, OSPREY_RULE_CB01, OSPREY_GRAPH_SECONDARY, false, (_p),    \
+            antecedents, G_N_ELEMENTS(antecedents), (_head))) goto fail;    \
+} while (0)
+    ADD_STAGE55_NC(0.01, ids[4], ids[1], ids[0]);
+    ADD_STAGE55_NC(0.2, ids[3], ids[0]);
+    ADD_STAGE55_NC(0.999, ids[2], ids[0]);
+    ADD_STAGE55_NC(0.999, ids[2], ids[0], ids[1]);
+    ADD_STAGE55_NC(0.2, ids[5], ids[0]);
+    ADD_STAGE55_NC(0.999, ids[2], ids[3], ids[1]);
+    ADD_STAGE55_NC(0.99, ids[3], ids[6], ids[4], ids[2]);
+    ADD_STAGE55_NC(0.1, ids[0], ids[5]);
+    ADD_STAGE55_NC(0.9, ids[0], ids[2], ids[1]);
+    ADD_STAGE55_NC(0.99, ids[2], ids[4]);
+    ADD_STAGE55_NC(0.2, ids[5], ids[0], ids[1]);
+    ADD_STAGE55_NC(0.9, ids[0], ids[2]);
+    ADD_STAGE55_NC(0.001, ids[5], ids[0]);
+    ADD_STAGE55_NC(0.01, ids[2], ids[3], ids[5]);
+    ADD_STAGE55_NC(0.99, ids[2], ids[5]);
+#undef ADD_STAGE55_NC
+    return ctx;
+
+fail:
+#undef ADD_STAGE55_NC
+    osprey_free(ctx);
+    return NULL;
+}
+
+static void test_stage55_nonconvergence_before_closure(void)
+{
+    OspreyContext *ctx = stage55_nonconvergent_context();
+    uint64_t before_bits[16];
+    uint8_t before_valid[16];
+    uint32_t before_count;
+
+    CHECK(ctx != NULL && osprey_stage4_exact(ctx) == OSPREY_OK,
+          "Stage 5.5 nonconvergence fixture seeds exactly");
+    if (ctx != NULL) {
+        before_count = ctx->graph->vars->len;
+        stage55_capture_beliefs(ctx, before_bits, before_valid);
+        osprey_test_log_reset();
+        CHECK(osprey_stage5_secondary(ctx) == OSPREY_NON_CONVERGED,
+              "Stage 5.5 stops before closure on nonconvergence");
+        CHECK(stage55_rule_count(ctx, OSPREY_RULE_CC07) == 0 &&
+                  stage55_beliefs_unchanged(ctx, before_bits, before_valid,
+                                             before_count),
+              "Stage 5.5 nonconvergence schedules no tuple or publication");
+        CHECK(stage55_count_text(osprey_test_log_contents(),
+                                 "[osprey] [closure]") == 0 &&
+                  strstr(osprey_test_log_contents(),
+                         "[secondary-fixed]") == NULL,
+              "Stage 5.5 nonconvergence has no closure version");
+    }
+    osprey_free(ctx);
+}
+
+static bool stage55_run_limit_case(OspreyConfig config,
+                                   Stage5BpClosureCase description)
+{
+    OspreyContext *ctx = stage55_closure_context(&description, &config,
+                                                 false);
+    uint64_t before_bits[8];
+    uint8_t before_valid[8];
+    uint32_t before_count;
+    bool passed = false;
+
+    if (ctx == NULL || osprey_stage4_exact(ctx) != OSPREY_OK) goto out;
+    before_count = ctx->graph->vars->len;
+    stage55_capture_beliefs(ctx, before_bits, before_valid);
+    osprey_test_log_reset();
+    passed = osprey_stage5_secondary(ctx) == OSPREY_LIMIT_EXCEEDED &&
+        stage55_beliefs_unchanged(ctx, before_bits, before_valid,
+                                  before_count) &&
+        strstr(osprey_test_log_contents(),
+               "[infer] [secondary] [reject]") != NULL &&
+        strstr(osprey_test_log_contents(), "[secondary-fixed]") == NULL;
+
+out:
+    osprey_free(ctx);
+    return passed;
+}
+
+static void test_stage55_caps_round_and_arithmetic(void)
+{
+    Stage5BpClosureCase description;
+    OspreyConfig config;
+    OspreyContext *ctx;
+    uint64_t before_bits[8];
+    uint8_t before_valid[8];
+    uint32_t before_count;
+
+    memset(&description, 0, sizeof(description));
+    description.region = make_region(OSPREY_REGION_HEAP_SITE, 0x5726);
+    description.source_offset = 16;
+    description.width = 8;
+    description.prefix_size = 8;
+    description.fold_size = 8;
+    description.extent = 64;
+    description.primitive_probability = 0.99;
+    description.prefix_probability = 0.99;
+    description.fold_probability = 0.99;
+
+    config = bp_config();
+    config.max_candidates_per_kind_region = 1;
+    CHECK(stage55_run_limit_case(config, description),
+          "Stage 5.5 rejects candidate cap atomically");
+    config = bp_config();
+    config.max_variables = 3;
+    CHECK(stage55_run_limit_case(config, description),
+          "Stage 5.5 rejects global variable cap atomically");
+    config = bp_config();
+    config.max_factors = 3;
+    CHECK(stage55_run_limit_case(config, description),
+          "Stage 5.5 rejects factor cap atomically");
+    config = bp_config();
+    config.max_bp_table_bytes = 1;
+    CHECK(stage55_run_limit_case(config, description),
+          "Stage 5.5 rejects workspace cap atomically");
+
+    config = bp_config();
+    ctx = stage55_closure_context(&description, &config, false);
+    CHECK(ctx != NULL && osprey_stage4_exact(ctx) == OSPREY_OK,
+          "Stage 5.5 round-bound fixture seeds exactly");
+    if (ctx != NULL) {
+        before_count = ctx->graph->vars->len;
+        stage55_capture_beliefs(ctx, before_bits, before_valid);
+        osprey_bp_test_set_closure_round_bound(0);
+        osprey_test_log_reset();
+        CHECK(osprey_stage5_secondary(ctx) == OSPREY_LIMIT_EXCEEDED &&
+                  stage55_beliefs_unchanged(ctx, before_bits, before_valid,
+                                             before_count),
+              "Stage 5.5 rejects the dynamic round bound atomically");
+        CHECK(strstr(osprey_test_log_contents(),
+                     "[reason closure-round-bound]") != NULL,
+              "Stage 5.5 identifies dynamic round-bound rejection");
+        osprey_bp_test_set_closure_round_bound(UINT64_MAX);
+    }
+    osprey_free(ctx);
+
+    config = bp_config();
+    description.region.site_offset++;
+    description.prefix_size = INT64_MAX;
+    description.fold_size = 1;
+    description.source_offset = 16;
+    description.width = 8;
+    ctx = stage55_closure_context(&description, &config, false);
+    CHECK(ctx != NULL && osprey_stage4_exact(ctx) == OSPREY_OK,
+          "Stage 5.5 arithmetic fixture seeds exactly");
+    if (ctx != NULL) {
+        before_count = ctx->graph->vars->len;
+        stage55_capture_beliefs(ctx, before_bits, before_valid);
+        CHECK(osprey_stage5_secondary(ctx) == OSPREY_GRAPH_ARITHMETIC &&
+                  stage55_beliefs_unchanged(ctx, before_bits, before_valid,
+                                             before_count),
+              "Stage 5.5 rejects threshold overflow atomically");
+    }
+    osprey_free(ctx);
+}
+
+static void test_stage55_exact_resolve_failure(void)
+{
+    OspreyConfig config = bp_config();
+    OspreyContext *ctx;
+    uint64_t before_bits[8];
+    uint8_t before_valid[8];
+    uint32_t before_count;
+
+    config.max_exact_clique_vars = 1;
+    ctx = stage55_ca08_context(&config);
+    CHECK(ctx != NULL && osprey_stage4_exact(ctx) == OSPREY_OK,
+          "Stage 5.5 exact-failure fixture seeds one-variable cliques");
+    if (ctx != NULL) {
+        before_count = ctx->graph->vars->len;
+        stage55_capture_beliefs(ctx, before_bits, before_valid);
+        osprey_test_log_reset();
+        CHECK(osprey_stage5_secondary(ctx) ==
+                  OSPREY_EXACT_COMPONENT_TOO_LARGE &&
+                  stage55_beliefs_unchanged(ctx, before_bits, before_valid,
+                                             before_count),
+              "Stage 5.5 failed exact re-solve preserves source beliefs");
+        CHECK(strstr(osprey_test_log_contents(),
+                     "[reason exact component exceeds configured limit]") !=
+                  NULL &&
+                  strstr(osprey_test_log_contents(),
+                         "[secondary-fixed]") == NULL,
+              "Stage 5.5 failed exact re-solve cannot publish fixed state");
+    }
+    osprey_free(ctx);
+}
+
+static void test_stage55_coordinator_allocation_failures(void)
+{
+    OspreyConfig config = bp_config();
+    Stage5BpClosureCase description;
+    uint32_t failures_exercised = 0;
+    bool reached_success = false;
+    bool reported_status = false;
+
+    memset(&description, 0, sizeof(description));
+    description.region = make_region(OSPREY_REGION_HEAP_SITE, 0x5728);
+    description.source_offset = 16;
+    description.width = 8;
+    description.prefix_size = 8;
+    description.fold_size = 8;
+    description.extent = 64;
+    description.primitive_probability = 0.99;
+    description.prefix_probability = 0.99;
+    description.fold_probability = 0.99;
+    for (int64_t allocation = 0; allocation < 512; allocation++) {
+        OspreyContext *ctx = stage55_closure_context(&description, &config,
+                                                     false);
+        uint64_t before_bits[8];
+        uint8_t before_valid[8];
+        uint32_t before_count;
+        OspreyStatus status;
+        if (ctx == NULL || osprey_stage4_exact(ctx) != OSPREY_OK) {
+            osprey_free(ctx);
+            break;
+        }
+        before_count = ctx->graph->vars->len;
+        stage55_capture_beliefs(ctx, before_bits, before_valid);
+        osprey_bp_test_set_alloc_fail_after(allocation);
+        status = osprey_stage5_secondary(ctx);
+        osprey_bp_test_set_alloc_fail_after(-1);
+        if (status == OSPREY_OK) {
+            reached_success = stage5_bp_reference_closure_matches(
+                ctx, &description);
+            osprey_free(ctx);
+            break;
+        }
+        if (!reported_status && status != OSPREY_LIMIT_EXCEEDED &&
+            status != OSPREY_INVALID_GRAPH) {
+            fprintf(stderr,
+                    "allocation mismatch at %lld status=%d reason=%s\n",
+                    (long long)allocation, (int)status,
+                    ctx->tx_reason == NULL ? "none" : ctx->tx_reason);
+            reported_status = true;
+        }
+        CHECK((status == OSPREY_LIMIT_EXCEEDED ||
+               status == OSPREY_INVALID_GRAPH) &&
+                  stage55_beliefs_unchanged(ctx, before_bits, before_valid,
+                                             before_count),
+              "Stage 5.5 allocation failure preserves source beliefs");
+        failures_exercised++;
+        osprey_free(ctx);
+    }
+    osprey_bp_test_set_alloc_fail_after(-1);
+    CHECK(reached_success && failures_exercised >= 16,
+          "Stage 5.5 exercises every coordinator allocation checkpoint");
+}
+
+static void test_stage55_external_workspace_accounting(void)
+{
+    OspreyContext *ctx = new_context();
+    OspreyRegionId region = make_region(OSPREY_REGION_GLOBAL, 0x5551);
+    OspreyBpGraph *graph = NULL;
+    OspreyBpResult *result = NULL;
+    uint32_t id = add_primitive(ctx, region, 0);
+    uint64_t spare;
+
+    set_seed(ctx, id, 0.6);
+    CHECK(add_prior(ctx, id, 0.6),
+          "Stage 5.5 workspace fixture prior inserted");
+    CHECK(osprey_bp_graph_build(ctx, &graph) == OSPREY_OK && graph != NULL,
+          "Stage 5.5 workspace fixture graph builds");
+    if (graph != NULL) {
+        CHECK(graph->workspace_limit > graph->workspace_bytes,
+              "Stage 5.5 workspace fixture has external capacity");
+        spare = graph->workspace_limit - graph->workspace_bytes;
+        graph->external_workspace_bytes = spare;
+        CHECK(osprey_bp_graph_validate(ctx, graph),
+              "Stage 5.5 exact external reservation validates");
+        CHECK(osprey_bp_solve_fixed(ctx, graph, &result) ==
+                  OSPREY_LIMIT_EXCEEDED && result == NULL,
+              "Stage 5.5 solve charges the live coordinator snapshot");
+        graph->external_workspace_bytes = spare + 1u;
+        CHECK(!osprey_bp_graph_validate(ctx, graph),
+              "Stage 5.5 oversized external reservation rejects");
+        graph->external_workspace_bytes = 0;
+    }
+    osprey_bp_result_free(result);
+    osprey_bp_graph_free(graph);
+    osprey_free(ctx);
+}
+
+static void test_stage55_disjoint_heap_frontier(void)
+{
+    enum { REGION_COUNT = 32 };
+    OspreyConfig config = bp_config();
+    OspreyContext *ctx;
+    unsigned folded_count = 0;
+
+    /* The old global P01×P03×P04 reservation materialized 32^3 tuples
+     * although only 32 same-region tuples were eligible, exhausting this
+     * otherwise sufficient workspace before closure. */
+    config.max_bp_table_bytes = 4u << 20;
+    ctx = new_context_with_config(&config);
+    for (unsigned i = 0; i < REGION_COUNT; i++) {
+        OspreyRegionId region = make_region(OSPREY_REGION_HEAP_SITE,
+                                            0x5560u + i);
+        uint32_t source = add_primitive_sized(ctx, region, 32, 8);
+        uint32_t unfoldable = add_unfoldable(ctx, region, 8);
+        uint32_t foldable = add_foldable(ctx, region, 8);
+        OspreyMallocFact allocation;
+
+        add_region_extent(ctx, region, 128);
+        memset(&allocation, 0, sizeof(allocation));
+        allocation.site_pc = region.site_offset;
+        allocation.requested_size = 128;
+        allocation.sample_support = 1;
+        g_array_append_val(ctx->alloc_facts, allocation);
+        CHECK(add_prior(ctx, source, 0.99) &&
+                  add_prior_rule(ctx, OSPREY_RULE_CC01,
+                                 OSPREY_GRAPH_SECONDARY,
+                                 unfoldable, 0.99) &&
+                  add_prior_rule(ctx, OSPREY_RULE_CC02,
+                                 OSPREY_GRAPH_SECONDARY,
+                                 foldable, 0.99),
+              "Stage 5.5 disjoint-region priors inserted");
+    }
+    CHECK(osprey_relations_build(ctx) == OSPREY_OK,
+          "Stage 5.5 disjoint-region relations built");
+    CHECK(osprey_infer(ctx) == OSPREY_OK,
+          "Stage 5.5 reserves only same-region CC07 tuples");
+    for (guint i = 0; i < ctx->graph->vars->len; i++) {
+        const OspreyVar *variable = &g_array_index(
+            ctx->graph->vars, OspreyVar, i);
+        if (variable->kind == OSPREY_PRED_PRIMITIVE_VAR &&
+            variable->payload.chunk.address.region.kind ==
+                OSPREY_REGION_HEAP_SITE &&
+            variable->payload.chunk.address.offset == 8) {
+            folded_count++;
+        }
+    }
+    CHECK(folded_count == REGION_COUNT,
+          "Stage 5.5 closes every disjoint eligible heap");
+    osprey_free(ctx);
+}
+
+static void test_stage55_cc07_fixed_point(void)
+{
+    OspreyContext *ctx = new_context();
+    OspreyRegionId region = make_region(OSPREY_REGION_HEAP_SITE, 0x5550);
+    uint32_t source = add_primitive_sized(ctx, region, 32, 8);
+    uint32_t unfoldable = add_unfoldable(ctx, region, 8);
+    uint32_t foldable = add_foldable(ctx, region, 8);
+    unsigned cc07_factors = 0;
+    unsigned primitive_vars = 0;
+    bool folded_present = false;
+    guint variables_before;
+    guint factors_before;
+    uint64_t folded_support_before = 0;
+    uint64_t cc07_proposals_before;
+
+    add_region_extent(ctx, region, 128);
+    OspreyMallocFact allocation;
+    memset(&allocation, 0, sizeof(allocation));
+    allocation.site_pc = region.site_offset;
+    allocation.requested_size = 128;
+    allocation.sample_support = 1;
+    g_array_append_val(ctx->alloc_facts, allocation);
+    CHECK(add_prior(ctx, source, 0.99) &&
+              add_prior_rule(ctx, OSPREY_RULE_CC01,
+                             OSPREY_GRAPH_SECONDARY, unfoldable, 0.99) &&
+              add_prior_rule(ctx, OSPREY_RULE_CC02,
+                             OSPREY_GRAPH_SECONDARY, foldable, 0.99),
+          "Stage 5.5 CC07 priors inserted");
+    CHECK(osprey_relations_build(ctx) == OSPREY_OK,
+          "Stage 5.5 empty relations built");
+    CHECK(osprey_infer(ctx) == OSPREY_OK,
+          "Stage 5.5 production inference reaches fixed point");
+    for (guint i = 0; i < ctx->graph->factors->len; i++) {
+        const OspreyFactor *factor = g_array_index(
+            ctx->graph->factors, OspreyFactor *, i);
+        if (factor != NULL && factor->rule == OSPREY_RULE_CC07) cc07_factors++;
+    }
+    for (guint i = 0; i < ctx->graph->vars->len; i++) {
+        const OspreyVar *variable = &g_array_index(
+            ctx->graph->vars, OspreyVar, i);
+        CHECK(variable->belief_valid == 1 && isfinite(variable->belief) &&
+                  variable->belief >= 0.0 && variable->belief <= 1.0,
+              "Stage 5.5 publishes finite normalized beliefs");
+        if (variable->kind == OSPREY_PRED_PRIMITIVE_VAR) primitive_vars++;
+        if (variable->kind == OSPREY_PRED_PRIMITIVE_VAR &&
+            variable->payload.chunk.address.region.kind ==
+                OSPREY_REGION_HEAP_SITE &&
+            variable->payload.chunk.address.offset == 8) {
+            folded_present = true;
+            folded_support_before = variable->direct_support;
+        }
+    }
+    CHECK(primitive_vars == 2 && folded_present,
+          "Stage 5.5 inserts one folded PrimitiveVar");
+    CHECK(cc07_factors == 2,
+          "Stage 5.5 inserts exactly two CC07 factors");
+    CHECK(folded_support_before == 1 &&
+              ctx->graph->candidate_proposals[OSPREY_RULE_CC07] == 1,
+          "Stage 5.5 records CC07 candidate evidence once");
+    CHECK(osprey_stage4_exact(ctx) == OSPREY_OK,
+          "Stage 5.5 repeated exact solve succeeds");
+    CHECK(g_array_index(ctx->graph->vars, OspreyVar, source).belief_valid == 1,
+          "Stage 5.5 exact reseed retains base validity");
+    CHECK(g_array_index(ctx->graph->vars, OspreyVar,
+                        unfoldable).belief_valid == 0 &&
+              g_array_index(ctx->graph->vars, OspreyVar,
+                            foldable).belief_valid == 0,
+          "Stage 5.5 exact reseed clears secondary validity");
+    for (guint i = 0; i < ctx->graph->vars->len; i++) {
+        const OspreyVar *variable = &g_array_index(
+            ctx->graph->vars, OspreyVar, i);
+        if (variable->kind == OSPREY_PRED_PRIMITIVE_VAR &&
+            variable->payload.chunk.address.region.kind ==
+                OSPREY_REGION_HEAP_SITE &&
+            variable->payload.chunk.address.offset == 8) {
+            CHECK(variable->belief_valid == 0,
+                  "Stage 5.5 exact reseed clears folded validity");
+        }
+    }
+    variables_before = ctx->graph->vars->len;
+    factors_before = ctx->graph->factors->len;
+    cc07_proposals_before =
+        ctx->graph->candidate_proposals[OSPREY_RULE_CC07];
+    CHECK(osprey_infer(ctx) == OSPREY_OK,
+          "Stage 5.5 repeated production inference remains fixed");
+    CHECK(ctx->graph->vars->len == variables_before &&
+              ctx->graph->factors->len == factors_before,
+          "Stage 5.5 repeated invocation is idempotent");
+    for (guint i = 0; i < ctx->graph->vars->len; i++) {
+        const OspreyVar *variable = &g_array_index(
+            ctx->graph->vars, OspreyVar, i);
+        if (variable->kind == OSPREY_PRED_PRIMITIVE_VAR &&
+            variable->payload.chunk.address.region.kind ==
+                OSPREY_REGION_HEAP_SITE &&
+            variable->payload.chunk.address.offset == 8) {
+            CHECK(variable->direct_support == folded_support_before,
+                  "Stage 5.5 replay preserves folded evidence");
+        }
+    }
+    CHECK(ctx->graph->candidate_proposals[OSPREY_RULE_CC07] ==
+              cc07_proposals_before,
+          "Stage 5.5 replay preserves proposal accounting");
+    osprey_free(ctx);
+}
+
 int main(void)
 {
+    RUN(test_stage55_strict_eligibility);
+    RUN(test_stage55_invalid_belief_validity);
+    RUN(test_generated_stage55_closure);
+    RUN(test_stage55_factor_only_and_multiround);
+    RUN(test_stage55_ca08_exact_resolve);
+    RUN(test_stage55_impossible_after_growth);
+    RUN(test_stage55_nonconvergence_before_closure);
+    RUN(test_stage55_caps_round_and_arithmetic);
+    RUN(test_stage55_exact_resolve_failure);
+    RUN(test_stage55_coordinator_allocation_failures);
+    RUN(test_stage55_external_workspace_accounting);
+    RUN(test_stage55_disjoint_heap_frontier);
+    RUN(test_stage55_cc07_fixed_point);
     RUN(test_stage54_static_closure_idempotence);
     RUN(test_stage54_new_primitive_cascade);
     RUN(test_stage54_unfoldable_prefix_closure);
@@ -5381,7 +6724,8 @@ int main(void)
         return 1;
     }
     printf("PASS stage5_bp (%u/%u; fixed forests 2000/2000; "
-           "loopy %u/%u; projections 2000/2000)\n", executed, registered,
-           OSPREY_BP_LOOPY_CORPUS_CASES, OSPREY_BP_LOOPY_CORPUS_CASES);
+           "loopy %u/%u; projections 2000/2000; closure 2000/2000)\n",
+           executed, registered, OSPREY_BP_LOOPY_CORPUS_CASES,
+           OSPREY_BP_LOOPY_CORPUS_CASES);
     return 0;
 }

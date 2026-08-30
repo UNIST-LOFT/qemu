@@ -1394,6 +1394,12 @@ OspreyStatus osprey_candidate_select(OspreyContext *ctx,
         graph_set_error(ctx, OSPREY_INVALID_GRAPH);
         return OSPREY_INVALID_GRAPH;
     }
+    if (count > G_MAXUINT ||
+        count > SIZE_MAX / sizeof(CandidateEntry) ||
+        count > SIZE_MAX / sizeof(CandidateBucketDelta)) {
+        graph_set_error(ctx, OSPREY_LIMIT_EXCEEDED);
+        return OSPREY_LIMIT_EXCEEDED;
+    }
     for (size_t i = 0; i < count; i++) {
         uint16_t rule = proposals[i].source_rule;
         if (rule < OSPREY_RULE_COUNT &&
@@ -1407,7 +1413,8 @@ OspreyStatus osprey_candidate_select(OspreyContext *ctx,
         return extent_status;
     }
 
-    GArray *entries = g_array_new(FALSE, FALSE, sizeof(CandidateEntry));
+    GArray *entries = g_array_sized_new(FALSE, FALSE, sizeof(CandidateEntry),
+                                         (guint)count);
     GHashTable *by_key = g_hash_table_new_full(osprey_key_hash,
                                                osprey_key_equal,
                                                osprey_key_free, NULL);
@@ -1457,8 +1464,10 @@ OspreyStatus osprey_candidate_select(OspreyContext *ctx,
     g_hash_table_destroy(by_key);
     g_array_sort(entries, candidate_entry_compare);
 
-    GArray *selected = g_array_new(FALSE, FALSE, sizeof(CandidateEntry));
-    GArray *deltas = g_array_new(FALSE, FALSE, sizeof(CandidateBucketDelta));
+    GArray *selected = g_array_sized_new(
+        FALSE, FALSE, sizeof(CandidateEntry), (guint)count);
+    GArray *deltas = g_array_sized_new(
+        FALSE, FALSE, sizeof(CandidateBucketDelta), (guint)count);
     uint64_t new_count = 0;
     bool limit_hit = false;
     for (guint i = 0; i < entries->len;) {
