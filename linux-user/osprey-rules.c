@@ -2973,19 +2973,31 @@ OspreyStatus osprey_secondary_static_closure(OspreyContext *ctx,
                 if (delta != NULL) memset(delta, 0, sizeof(*delta));
                 return rules_error(ctx, OSPREY_INVALID_GRAPH);
             }
-            if (factor->rule >= OSPREY_RULE_CA01 &&
-                factor->rule <= OSPREY_RULE_CA08) {
+            if (factor->stage == OSPREY_GRAPH_BASE_CA) {
+                if (factor->rule < OSPREY_RULE_CA01 ||
+                    factor->rule > OSPREY_RULE_CA08) {
+                    if (delta != NULL) memset(delta, 0, sizeof(*delta));
+                    return rules_error(ctx, OSPREY_INVALID_GRAPH);
+                }
                 if (delta->base_factors_added == UINT32_MAX) {
                     if (delta != NULL) memset(delta, 0, sizeof(*delta));
                     return rules_error(ctx, OSPREY_GRAPH_ARITHMETIC);
                 }
                 delta->base_factors_added++;
-            } else {
+            } else if (factor->stage == OSPREY_GRAPH_SECONDARY) {
+                if (factor->rule <= OSPREY_RULE_CA08 ||
+                    factor->rule >= OSPREY_RULE_COUNT) {
+                    if (delta != NULL) memset(delta, 0, sizeof(*delta));
+                    return rules_error(ctx, OSPREY_INVALID_GRAPH);
+                }
                 if (delta->secondary_factors_added == UINT32_MAX) {
                     if (delta != NULL) memset(delta, 0, sizeof(*delta));
                     return rules_error(ctx, OSPREY_GRAPH_ARITHMETIC);
                 }
                 delta->secondary_factors_added++;
+            } else {
+                if (delta != NULL) memset(delta, 0, sizeof(*delta));
+                return rules_error(ctx, OSPREY_INVALID_GRAPH);
             }
         }
     }

@@ -1043,6 +1043,7 @@ typedef struct OspreyBpGraph {
     double *scratch_message;
     double *beliefs;
     uint64_t message_values;
+    uint64_t source_limit_rows;   /* graph limit counter at projection time */
     uint64_t version;             /* canonical graph version, starts at 0 */
     uint64_t workspace_bytes;
     uint64_t workspace_limit;
@@ -1133,6 +1134,8 @@ OspreyStatus osprey_stage5_static_replay(OspreyContext *ctx,
 bool osprey_bp_graph_validate(const OspreyContext *ctx,
                               const OspreyBpGraph *graph);
 void osprey_bp_test_set_alloc_fail_after(int64_t allocations);
+typedef void (*OspreyBpMigrationTestHook)(OspreyContext *ctx);
+void osprey_bp_test_set_migration_hook(OspreyBpMigrationTestHook hook);
 
 /* Deterministic projection dump used by focused tests. */
 bool osprey_bp_graph_dump_file(const OspreyContext *ctx,

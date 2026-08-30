@@ -3326,10 +3326,16 @@ OspreyStatus osprey_stage4_exact(OspreyContext *ctx)
 #define OSPREY_BP_DEFAULT_TABLE_BYTES (256ULL * 1024ULL * 1024ULL)
 
 static int64_t bp_test_alloc_fail_after = -1;
+static OspreyBpMigrationTestHook bp_test_migration_hook;
 
 void osprey_bp_test_set_alloc_fail_after(int64_t allocations)
 {
     bp_test_alloc_fail_after = allocations;
+}
+
+void osprey_bp_test_set_migration_hook(OspreyBpMigrationTestHook hook)
+{
+    bp_test_migration_hook = hook;
 }
 
 static bool bp_alloc_allowed(void)
@@ -3768,6 +3774,7 @@ OspreyStatus osprey_bp_graph_build(OspreyContext *ctx,
         reason = "allocation graph";
         goto fail;
     }
+    graph->source_limit_rows = source->limit_rows;
     graph->version = 0;
     graph->workspace_limit = bp_workspace_limit(&ctx->config);
     graph->message_state = OSPREY_BP_MESSAGES_INITIAL;
@@ -4288,7 +4295,8 @@ bool osprey_bp_graph_validate(const OspreyContext *ctx,
         source->vars->len > UINT32_MAX || source->factors->len > UINT32_MAX ||
         graph->vars->len != source->vars->len ||
         graph->factors->len != source->factors->len ||
-        graph->var_edges->len != graph->edges->len) return false;
+        graph->var_edges->len != graph->edges->len ||
+        graph->source_limit_rows != source->limit_rows) return false;
     variable_count = source->vars->len;
     factor_count = source->factors->len;
     if (graph->edges->len > UINT32_MAX) return false;
@@ -4769,6 +4777,7 @@ static bool bp_round_graph_valid(const OspreyContext *ctx,
         graph->vars->len != source->vars->len ||
         graph->factors->len != source->factors->len ||
         graph->var_edges->len != graph->edges->len ||
+        graph->source_limit_rows != source->limit_rows ||
         graph->edges->len == 0 || graph->edges->len > UINT32_MAX) {
         return false;
     }
@@ -5324,6 +5333,7 @@ typedef struct OspreyBpSourceFingerprint {
     uint32_t variable_count;
     uint32_t factor_count;
     uint32_t edge_count;
+    uint64_t limit_rows;
     OspreyKey *variables;
     OspreyBpSemanticFactorKey *factors;
     OspreyBpSemanticEdgeKey *edges;
@@ -5525,6 +5535,7 @@ static bool bp_source_fingerprint_capture(
     source = ctx->graph;
     fingerprint->variable_count = source->vars->len;
     fingerprint->factor_count = source->factors->len;
+    fingerprint->limit_rows = source->limit_rows;
     if (!bp_bytes_for(fingerprint->variable_count, sizeof(OspreyKey),
                       &bytes)) return false;
     fingerprint->variables = bp_try_alloc((size_t)bytes);
@@ -5597,6 +5608,7 @@ static bool bp_source_fingerprint_matches(
     source = ctx->graph;
     if (source->vars->len != fingerprint->variable_count ||
         source->factors->len != fingerprint->factor_count ||
+        source->limit_rows != fingerprint->limit_rows ||
         (fingerprint->edge_count != 0 && fingerprint->edges == NULL)) {
         return false;
     }
@@ -5725,23 +5737,30 @@ static bool bp_graph_validate_prefix(const OspreyContext *ctx,
 
     if (ctx == NULL || ctx->graph == NULL || graph == NULL ||
         graph->vars == NULL || graph->factors == NULL ||
-        ctx->graph->vars == NULL || ctx->graph->factors == NULL ||
-        graph->vars->len > ctx->graph->vars->len ||
-        graph->factors->len > ctx->graph->factors->len) return false;
-    source_view = *ctx->graph;
-    vars_view = *ctx->graph->vars;
-    factors_view = *ctx->graph->factors;
-    vars_view.len = graph->vars->len;
-    factors_view.len = graph->factors->len;
-    source_view.vars = &vars_view;
-    source_view.factors = &factors_view;
-    context_view = *ctx;
-    context_view.graph = &source_view;
-    if (osprey_bp_graph_validate(&context_view, graph)) return true;
+        ctx->graph->vars == NULL || ctx->graph->factors == NULL) return false;
+    /* A direct migration may consume a source graph that removed variables or
+     * factors.  Only construct the cheap production-ID prefix view when the
+     * old graph still fits inside the current arrays; otherwise the semantic
+     * edge-key snapshot below is the only safe validation view. */
+    if (graph->vars->len <= ctx->graph->vars->len &&
+        graph->factors->len <= ctx->graph->factors->len) {
+        source_view = *ctx->graph;
+        vars_view = *ctx->graph->vars;
+        factors_view = *ctx->graph->factors;
+        vars_view.len = graph->vars->len;
+        factors_view.len = graph->factors->len;
+        source_view.limit_rows = graph->source_limit_rows;
+        source_view.vars = &vars_view;
+        source_view.factors = &factors_view;
+        context_view = *ctx;
+        context_view.graph = &source_view;
+        if (osprey_bp_graph_validate(&context_view, graph)) return true;
+    }
     /* Production storage IDs are locators, not semantic identity.  Rebuild
      * the old variable and factor snapshot from its complete edge keys so a
-     * reordered source or an explicitly replaced factor can still validate;
-     * migration then decides which semantic edges are retained or new. */
+     * reordered source, an explicitly replaced factor, or source shrink can
+     * still validate; migration then decides which semantic edges are
+     * retained or new. */
     return bp_graph_validate_snapshot(ctx, graph);
 }
 
@@ -5761,11 +5780,8 @@ static bool bp_graph_validate_snapshot(
     if (ctx == NULL || ctx->graph == NULL || graph == NULL ||
         graph->vars == NULL || graph->factors == NULL || graph->edges == NULL ||
         graph->var_edges == NULL || ctx->graph->vars == NULL ||
-        ctx->graph->factors == NULL ||
-        graph->vars->len > ctx->graph->vars->len ||
-        graph->factors->len > ctx->graph->factors->len ||
-        graph->vars->len == 0 || graph->factors->len == 0 ||
-        graph->edges->len == 0) return false;
+        ctx->graph->factors == NULL || graph->vars->len == 0 ||
+        graph->factors->len == 0 || graph->edges->len == 0) return false;
     source = ctx->graph;
     variable_data = g_try_new0(OspreyVar, graph->vars->len);
     variable_seen = g_try_new0(uint8_t, graph->vars->len);
@@ -5882,6 +5898,7 @@ static bool bp_graph_validate_snapshot(
     vars_view.data = (gchar *)variable_data;
     factors_view.len = graph->factors->len;
     factors_view.data = (gchar *)factor_data;
+    source_view.limit_rows = graph->source_limit_rows;
     source_view.vars = &vars_view;
     source_view.factors = &factors_view;
     context_view = *ctx;
@@ -6092,6 +6109,11 @@ static OspreyStatus bp_graph_migrate_internal(
     new_seen = bp_try_alloc0((size_t)peak);
     if (new_seen == NULL) goto allocation_failure;
 
+    if (bp_test_migration_hook != NULL) {
+        OspreyBpMigrationTestHook hook = bp_test_migration_hook;
+        bp_test_migration_hook = NULL;
+        hook(ctx);
+    }
     for (uint32_t edge_id = 0; edge_id < old_edge_count; edge_id++) {
         old_entries[edge_id].edge_id = edge_id;
         if (!bp_semantic_edge_from_old_graph(old_graph, edge_id,
@@ -6245,6 +6267,15 @@ static OspreyStatus bp_graph_migrate_build(
         return bp_migration_failure(ctx, OSPREY_INVALID_GRAPH,
                                     "invalid old BP graph");
     }
+    if (ctx->graph == NULL ||
+        ctx->graph->limit_rows < old_graph->source_limit_rows) {
+        return bp_migration_failure(ctx, OSPREY_INVALID_GRAPH,
+                                    "invalid source limit counter");
+    }
+    if (ctx->graph->limit_rows != old_graph->source_limit_rows) {
+        return bp_migration_failure(ctx, OSPREY_LIMIT_EXCEEDED,
+                                    "source graph dropped candidates");
+    }
     uint64_t new_required;
     uint64_t peak;
     uint32_t new_edge_count;
@@ -6300,6 +6331,7 @@ static bool bp_delta_matches_append(const OspreyContext *ctx,
     uint64_t variable_delta;
     uint64_t factor_delta;
     uint64_t classified_factors;
+    uint64_t limit_delta;
     uint32_t base_factors = 0;
     uint32_t secondary_factors = 0;
 
@@ -6307,8 +6339,10 @@ static bool bp_delta_matches_append(const OspreyContext *ctx,
         delta == NULL || ctx->graph->vars == NULL ||
         ctx->graph->factors == NULL || old_graph->vars == NULL ||
         old_graph->factors == NULL || old_graph->edges == NULL ||
+        old_graph->var_edges == NULL ||
         ctx->graph->vars->len < old_graph->vars->len ||
-        ctx->graph->factors->len < old_graph->factors->len) {
+        ctx->graph->factors->len < old_graph->factors->len ||
+        old_graph->source_limit_rows > ctx->graph->limit_rows) {
         return false;
     }
     source = ctx->graph;
@@ -6316,15 +6350,68 @@ static bool bp_delta_matches_append(const OspreyContext *ctx,
     factor_delta = (uint64_t)source->factors->len - old_graph->factors->len;
     classified_factors = (uint64_t)delta->base_factors_added +
                          delta->secondary_factors_added;
+    limit_delta = source->limit_rows - old_graph->source_limit_rows;
     if (variable_delta != delta->variables_added ||
         factor_delta != delta->factors_added ||
-        factor_delta != classified_factors) {
+        factor_delta != classified_factors ||
+        limit_delta > UINT32_MAX ||
+        limit_delta != delta->limit_rows_added) {
         return false;
     }
 
     /* The Stage-5 coordinator is monotonic: the old semantic prefix cannot
      * be edited in place.  Direct osprey_bp_graph_migrate() still supports
      * treating an explicitly replaced factor as a new semantic edge. */
+    for (guint local = 0; local < old_graph->vars->len; local++) {
+        const OspreyBpVarRef *ref = &g_array_index(
+            old_graph->vars, OspreyBpVarRef, local);
+        const OspreyVar *variable;
+        OspreyKey old_key;
+        OspreyKey current_key;
+        uint32_t edge_id;
+        OspreyBpSemanticEdgeKey old_edge;
+        if (ref->graph_var_id >= old_graph->vars->len ||
+            ref->graph_var_id >= source->vars->len ||
+            ref->var_edge_begin >= old_graph->var_edges->len) {
+            return false;
+        }
+        edge_id = g_array_index(old_graph->var_edges, uint32_t,
+                                ref->var_edge_begin);
+        if (!bp_semantic_edge_from_old_graph(old_graph, edge_id, &old_edge)) {
+            return false;
+        }
+        variable = &g_array_index(source->vars, OspreyVar,
+                                  ref->graph_var_id);
+        if (variable->id != ref->graph_var_id ||
+            !exact_payload_valid(variable->kind, &variable->payload)) {
+            return false;
+        }
+        old_key = old_edge.variable;
+        current_key = osprey_var_key(variable->kind, &variable->payload);
+        if (exact_key_compare(&old_key, &current_key) != 0) return false;
+    }
+    for (guint i = old_graph->vars->len; i < source->vars->len; i++) {
+        const OspreyVar *variable = &g_array_index(source->vars, OspreyVar, i);
+        OspreyKey key;
+        if (variable->id != i ||
+            !exact_payload_valid(variable->kind, &variable->payload)) {
+            return false;
+        }
+        key = osprey_var_key(variable->kind, &variable->payload);
+        for (guint j = 0; j < i; j++) {
+            const OspreyVar *previous = &g_array_index(
+                source->vars, OspreyVar, j);
+            OspreyKey previous_key;
+            if (previous->id != j ||
+                !exact_payload_valid(previous->kind, &previous->payload)) {
+                return false;
+            }
+            previous_key = osprey_var_key(previous->kind,
+                                          &previous->payload);
+            if (exact_key_compare(&key, &previous_key) == 0) return false;
+        }
+    }
+
     for (guint local = 0; local < old_graph->factors->len; local++) {
         const OspreyBpFactorRef *ref = &g_array_index(
             old_graph->factors, OspreyBpFactorRef, local);
@@ -6388,6 +6475,11 @@ OspreyStatus osprey_bp_migrate_after_delta(OspreyContext *ctx,
         return bp_migration_failure(ctx, OSPREY_INVALID_GRAPH,
                                     "inconsistent graph delta");
     }
+    if (delta->limit_rows_added != 0) {
+        *out = NULL;
+        return bp_migration_failure(ctx, OSPREY_LIMIT_EXCEEDED,
+                                    "graph growth dropped candidates");
+    }
     if (delta->base_factors_added != 0) {
         status = osprey_stage4_exact(ctx);
         if (status != OSPREY_OK) {
@@ -6423,10 +6515,12 @@ OspreyStatus osprey_stage5_static_replay(OspreyContext *ctx,
     if (status != OSPREY_OK) return status;
     if (ctx->graph->vars->len < old_variable_count ||
         ctx->graph->factors->len < old_factor_count ||
+        ctx->graph->limit_rows < old_graph->source_limit_rows ||
         ctx->graph->vars->len > UINT32_MAX ||
         ctx->graph->factors->len > UINT32_MAX ||
         ctx->graph->vars->len - old_variable_count > UINT32_MAX ||
-        ctx->graph->factors->len - old_factor_count > UINT32_MAX) {
+        ctx->graph->factors->len - old_factor_count > UINT32_MAX ||
+        ctx->graph->limit_rows - old_graph->source_limit_rows > UINT32_MAX) {
         return bp_migration_failure(ctx, OSPREY_GRAPH_ARITHMETIC,
                                     "Stage 5 graph delta overflow");
     }
@@ -6434,6 +6528,8 @@ OspreyStatus osprey_stage5_static_replay(OspreyContext *ctx,
                                         old_variable_count);
     delta->factors_added = (uint32_t)(ctx->graph->factors->len -
                                       old_factor_count);
+    delta->limit_rows_added = (uint32_t)(ctx->graph->limit_rows -
+                                         old_graph->source_limit_rows);
     delta->base_factors_added = 0;
     delta->secondary_factors_added = 0;
     for (uint64_t i = old_factor_count; i < ctx->graph->factors->len; i++) {
@@ -6452,7 +6548,8 @@ OspreyStatus osprey_stage5_static_replay(OspreyContext *ctx,
                                         "invalid Stage 5 delta factor stage");
         }
     }
-    if (delta->variables_added == 0 && delta->factors_added == 0) {
+    if (delta->variables_added == 0 && delta->factors_added == 0 &&
+        delta->limit_rows_added == 0) {
         return OSPREY_OK;
     }
     return osprey_bp_migrate_after_delta(ctx, old_graph, delta, out);
