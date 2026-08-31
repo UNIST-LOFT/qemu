@@ -21,6 +21,20 @@ OspreyStatus stage5_bp_reference_compute_factor_half(
     const OspreyContext *ctx, const OspreyBpGraph *graph,
     const double *vf_messages, double *fv_messages);
 
+/* Independent staged probability-space damping oracle.  It computes the
+ * variable half-step, damps it, computes the factor half-step from that
+ * damped family, then damps the factor family without production helpers. */
+OspreyStatus stage5_bp_reference_compute_round_damped(
+    const OspreyContext *ctx, const OspreyBpGraph *graph,
+    OspreyBpMessages *messages, double coefficient);
+
+/* Independent bounded exact enumerator for tree/forest acceptance.  It scans
+ * semantic factors, assigns canonical local variables, and accumulates every
+ * marginal and logZ in the log domain. */
+bool stage5_bp_reference_beliefs(const OspreyContext *ctx,
+                                 const OspreyBpGraph *graph,
+                                 double *beliefs_out, double *logz_out);
+
 /* Independent bounded Stage 5.5 closure description.  The oracle uses direct
  * checked arithmetic and declarative semantic factor signatures; it does not
  * call production closure, candidate, BP, migration, or log helpers. */

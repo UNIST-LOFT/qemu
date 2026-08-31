@@ -12,6 +12,7 @@
 static unsigned failures;
 static unsigned registered;
 static unsigned executed;
+static uint64_t peak_bp_workspace;
 
 void osprey_test_log_reset(void);
 const char *osprey_test_log_contents(void);
@@ -20,7 +21,7 @@ const char *osprey_test_log_contents(void);
  * fixed 2,000-case corpus measured a maximum error of 0x1.0cd00168p-24;
  * retain a decimal bound with margin while keeping the required stop rule. */
 #define OSPREY_BP_FOREST_ORACLE_TOL 1e-7
-#define OSPREY_BP_LOOPY_CORPUS_CASES 256u
+#define OSPREY_BP_LOOPY_CORPUS_CASES 2000u
 #define OSPREY_BP_LOOPY_TRACE_ROUNDS 16u
 
 #define CHECK(condition, message) do {                                      \
@@ -658,7 +659,11 @@ static void test_cross_region_bridge(void)
 static void test_exact_seed_values(void)
 {
     const double probabilities[] = {
-        0.0, 1.0, DBL_MIN, 0.5, nextafter(1.0, 0.0)
+        0.0, 1.0, DBL_MIN,
+        nextafter(0.2, 0.0), 0.2, nextafter(0.2, 1.0),
+        nextafter(0.5, 0.0), 0.5, nextafter(0.5, 1.0),
+        nextafter(0.8, 0.0), 0.8, nextafter(0.8, 1.0),
+        nextafter(1.0, 0.0)
     };
     OspreyContext *ctx = new_context();
     OspreyRegionId region = make_region(OSPREY_REGION_GLOBAL, 0x20);
@@ -1602,90 +1607,10 @@ static void dump_generated_initial_state(unsigned sample,
 static bool brute_force_beliefs(const OspreyContext *ctx,
                                 const OspreyBpGraph *graph, double *out)
 {
-    uint32_t variable_count;
-    uint64_t assignment_count;
-    long double total = 0.0L;
-    long double *true_weights;
+    double logz;
 
-    if (ctx == NULL || graph == NULL || out == NULL || ctx->graph == NULL ||
-        ctx->graph->vars == NULL || ctx->graph->factors == NULL ||
-        ctx->graph->vars->len == 0 || ctx->graph->vars->len >= 63 ||
-        graph->local_by_graph_var == NULL) return false;
-    variable_count = ctx->graph->vars->len;
-    assignment_count = UINT64_C(1) << variable_count;
-    true_weights = g_new0(long double, variable_count);
-    for (uint64_t mask = 0; mask < assignment_count; mask++) {
-        long double log_weight = 0.0L;
-        bool supported = true;
-
-        for (guint factor_index = 0;
-             factor_index < ctx->graph->factors->len; factor_index++) {
-            const OspreyFactor *factor = g_array_index(
-                ctx->graph->factors, OspreyFactor *, factor_index);
-            uint8_t assignment[OSPREY_FACTOR_MAX_ARITY];
-            double factor_log_weight;
-
-            if (factor == NULL || factor->num_vars == 0 ||
-                factor->num_vars > OSPREY_FACTOR_MAX_ARITY) {
-                g_free(true_weights);
-                return false;
-            }
-            for (uint32_t position = 0; position < factor->num_vars;
-                 position++) {
-                uint32_t graph_var = factor->var_ids[position];
-                if (graph_var >= variable_count) {
-                    g_free(true_weights);
-                    return false;
-                }
-                assignment[position] = (uint8_t)((mask >> graph_var) & 1u);
-            }
-            if (!osprey_factor_log_weight(factor, assignment,
-                                           &factor_log_weight)) {
-                g_free(true_weights);
-                return false;
-            }
-            if (factor_log_weight == -INFINITY) {
-                supported = false;
-                break;
-            }
-            if (!isfinite(factor_log_weight)) {
-                g_free(true_weights);
-                return false;
-            }
-            log_weight += (long double)factor_log_weight;
-        }
-        if (!supported) continue;
-        long double weight = expl(log_weight);
-        if (!(weight >= 0.0L) || !isfinite((double)weight)) {
-            g_free(true_weights);
-            return false;
-        }
-        total += weight;
-        for (uint32_t graph_var = 0; graph_var < variable_count;
-             graph_var++) {
-            if ((mask >> graph_var) & 1u) true_weights[graph_var] += weight;
-        }
-    }
-    if (!(total > 0.0L) || !isfinite((double)total)) {
-        g_free(true_weights);
-        return false;
-    }
-    for (uint32_t local = 0; local < variable_count; local++) {
-        uint32_t graph_var = graph->vars == NULL || local >= graph->vars->len
-            ? UINT32_MAX
-            : g_array_index(graph->vars, OspreyBpVarRef, local).graph_var_id;
-        if (graph_var >= variable_count) {
-            g_free(true_weights);
-            return false;
-        }
-        out[local] = (double)(true_weights[graph_var] / total);
-        if (!isfinite(out[local]) || out[local] < 0.0 || out[local] > 1.0) {
-            g_free(true_weights);
-            return false;
-        }
-    }
-    g_free(true_weights);
-    return true;
+    return stage5_bp_reference_beliefs(ctx, graph, out, &logz) &&
+           isfinite(logz);
 }
 
 static uint64_t double_bits(double value)
@@ -2115,7 +2040,11 @@ static bool run_damped_trace_pair(
     bool *changed_out, uint64_t *trace_digests,
     uint64_t *permuted_trace_digests, unsigned *failed_round_out)
 {
+    double *oracle_vf = NULL;
+    double *oracle_fv = NULL;
     bool changed = false;
+    bool valid = false;
+    size_t message_bytes;
 
     if (changed_out != NULL) *changed_out = false;
     if (failed_round_out != NULL) *failed_round_out = UINT32_MAX;
@@ -2123,34 +2052,59 @@ static bool run_damped_trace_pair(
         permuted_graph == NULL || changed_out == NULL ||
         trace_digests == NULL || permuted_trace_digests == NULL ||
         failed_round_out == NULL ||
-        graph->message_values != permuted_graph->message_values) return false;
+        graph->message_values != permuted_graph->message_values ||
+        graph->message_values > SIZE_MAX / sizeof(double)) return false;
+    message_bytes = (size_t)graph->message_values * sizeof(double);
+    oracle_vf = g_try_new(double, (gsize)graph->message_values);
+    oracle_fv = g_try_new(double, (gsize)graph->message_values);
+    if (oracle_vf == NULL || oracle_fv == NULL) goto out;
+    valid = true;
     for (unsigned round = 0; round < OSPREY_BP_LOOPY_TRACE_ROUNDS;
          round++) {
         OspreyBpMessages messages = graph_messages(graph);
         OspreyBpMessages permuted_messages = graph_messages(permuted_graph);
+        OspreyBpMessages oracle_messages = {
+            graph->msg_vf_current, oracle_vf,
+            graph->msg_fv_current, oracle_fv, graph->message_values
+        };
+        OspreyStatus oracle_status =
+            stage5_bp_reference_compute_round_damped(
+                ctx, graph, &oracle_messages, 0.5);
         OspreyStatus status = osprey_bp_compute_round_damped(
             ctx, graph, &messages, NULL, 0.5);
         OspreyStatus permuted_status = osprey_bp_compute_round_damped(
             permuted_ctx, permuted_graph, &permuted_messages, NULL, 0.5);
+        bool oracle_matches = oracle_status == OSPREY_OK;
 
+        for (guint edge_id = 0;
+             edge_id < graph->edges->len && oracle_matches; edge_id++) {
+            size_t index = (size_t)edge_id * 2u;
+            oracle_matches = message_pair_close(
+                                 &graph->msg_vf_next[index],
+                                 &oracle_vf[index]) &&
+                             message_pair_close(
+                                 &graph->msg_fv_next[index],
+                                 &oracle_fv[index]);
+        }
         trace_digests[round] = message_families_digest(graph, true);
         permuted_trace_digests[round] = message_families_digest(
             permuted_graph, true);
         if (status != OSPREY_OK || permuted_status != OSPREY_OK ||
-            !message_families_normalized(graph, true) ||
+            !oracle_matches || !message_families_normalized(graph, true) ||
             !message_families_normalized(permuted_graph, true) ||
             trace_digests[round] != permuted_trace_digests[round] ||
             memcmp(graph->msg_vf_next, permuted_graph->msg_vf_next,
-                   (size_t)graph->message_values * sizeof(double)) != 0 ||
+                   message_bytes) != 0 ||
             memcmp(graph->msg_fv_next, permuted_graph->msg_fv_next,
-                   (size_t)graph->message_values * sizeof(double)) != 0) {
+                   message_bytes) != 0) {
             *failed_round_out = round + 1u;
-            return false;
+            valid = false;
+            break;
         }
         if (memcmp(graph->msg_vf_current, graph->msg_vf_next,
-                   (size_t)graph->message_values * sizeof(double)) != 0 ||
+                   message_bytes) != 0 ||
             memcmp(graph->msg_fv_current, graph->msg_fv_next,
-                   (size_t)graph->message_values * sizeof(double)) != 0) {
+                   message_bytes) != 0) {
             changed = true;
         }
         test_swap_damped_buffers(graph);
@@ -2160,11 +2114,106 @@ static bool run_damped_trace_pair(
             !next_message_families_empty(graph) ||
             !next_message_families_empty(permuted_graph)) {
             *failed_round_out = round + 1u;
-            return false;
+            valid = false;
+            break;
         }
     }
-    *changed_out = changed;
-    return true;
+    if (valid) *changed_out = changed;
+
+out:
+    g_free(oracle_vf);
+    g_free(oracle_fv);
+    return valid;
+}
+
+static void check_damped_reference_raw_half_boundary(void)
+{
+    OspreyContext *ctx = new_context();
+    OspreyRegionId region = make_region(OSPREY_REGION_HEAP_SITE, 0x1a2);
+    uint32_t ids[4];
+    uint32_t antecedents[3];
+    OspreyBpGraph *graph = NULL;
+    double *raw_vf = NULL;
+    double *raw_fv = NULL;
+    double *oracle_vf = NULL;
+    double *oracle_fv = NULL;
+
+    ids[0] = add_primitive(ctx, region, 24);
+    ids[1] = add_unfoldable(ctx, region, 8);
+    ids[2] = add_foldable(ctx, region, 8);
+    ids[3] = add_primitive(ctx, region, 0);
+    CHECK(add_prior(ctx, ids[0], 0.5) &&
+              add_prior_rule(ctx, OSPREY_RULE_CC01,
+                             OSPREY_GRAPH_SECONDARY, ids[1], 0.5) &&
+              add_prior_rule(ctx, OSPREY_RULE_CC02,
+                             OSPREY_GRAPH_SECONDARY, ids[2], 0.5) &&
+              add_prior(ctx, ids[3], 0.5),
+          "raw-half damping priors inserted");
+    memcpy(antecedents, ids, sizeof(antecedents));
+    add_implication_probability(ctx, OSPREY_RULE_CC07,
+                                OSPREY_GRAPH_SECONDARY, false, 0.8,
+                                antecedents, G_N_ELEMENTS(antecedents),
+                                ids[3]);
+    CHECK(osprey_bp_graph_build(ctx, &graph) == OSPREY_OK && graph != NULL,
+          "raw-half damping boundary graph builds");
+    if (graph != NULL) {
+        OspreyBpMessages production = graph_messages(graph);
+        OspreyBpMessages raw;
+        OspreyBpMessages oracle;
+        bool matches = true;
+
+        raw_vf = g_new(double, (size_t)graph->message_values);
+        raw_fv = g_new(double, (size_t)graph->message_values);
+        oracle_vf = g_new(double, (size_t)graph->message_values);
+        oracle_fv = g_new(double, (size_t)graph->message_values);
+        for (guint edge_id = 0; edge_id < graph->edges->len; edge_id++) {
+            const OspreyBpEdge *edge = &g_array_index(
+                graph->edges, OspreyBpEdge, edge_id);
+            const OspreyFactor *factor = g_array_index(
+                ctx->graph->factors, OspreyFactor *, edge->graph_factor_id);
+            size_t index = (size_t)edge_id * 2u;
+
+            if (factor->num_vars == 1) {
+                graph->msg_fv_current[index] = 0.0;
+                graph->msg_fv_current[index + 1u] = -DBL_MAX;
+            }
+        }
+        raw = (OspreyBpMessages){
+            graph->msg_vf_current, raw_vf,
+            graph->msg_fv_current, raw_fv, graph->message_values
+        };
+        CHECK(stage5_bp_reference_compute_round(ctx, graph, &raw) ==
+                  OSPREY_INVALID_GRAPH,
+              "undamped factor half rejects the extreme raw family");
+        oracle = (OspreyBpMessages){
+            graph->msg_vf_current, oracle_vf,
+            graph->msg_fv_current, oracle_fv, graph->message_values
+        };
+        CHECK(stage5_bp_reference_compute_round_damped(
+                  ctx, graph, &oracle, 0.5) == OSPREY_OK,
+              "reference damping stops raw evaluation after the variable half");
+        CHECK(osprey_bp_compute_round_damped(
+                  ctx, graph, &production, NULL, 0.5) == OSPREY_OK,
+              "production damping accepts the softened factor inputs");
+        for (guint edge_id = 0; edge_id < graph->edges->len; edge_id++) {
+            size_t index = (size_t)edge_id * 2u;
+            if (!message_pair_close(&graph->msg_vf_next[index],
+                                    &oracle_vf[index]) ||
+                !message_pair_close(&graph->msg_fv_next[index],
+                                    &oracle_fv[index])) {
+                matches = false;
+                break;
+            }
+        }
+        CHECK(matches,
+              "raw-half boundary matches the independent damped scheduler");
+    }
+    g_free(raw_vf);
+    g_free(raw_fv);
+    g_free(oracle_vf);
+    g_free(oracle_fv);
+    osprey_bp_graph_free(graph);
+    osprey_free(ctx);
 }
 
 static void test_fixed_round_damping(void)
@@ -2292,6 +2341,7 @@ static void test_fixed_round_damping(void)
     g_free(first_fv);
     osprey_bp_graph_free(graph);
     osprey_free(ctx);
+    check_damped_reference_raw_half_boundary();
 }
 
 static void test_fixed_graph_solver(void)
@@ -3172,7 +3222,9 @@ static void test_generated_loopy_corpus(void)
             if (status != OSPREY_OK || permuted_status != OSPREY_OK ||
                 graph == NULL || permuted_graph == NULL ||
                 !osprey_bp_graph_validate(ctx, graph) ||
+                !stage5_bp_reference_matches(ctx, graph) ||
                 !osprey_bp_graph_validate(permuted_ctx, permuted_graph) ||
+                !stage5_bp_reference_matches(permuted_ctx, permuted_graph) ||
                 graph->components->len != 1u ||
                 permuted_graph->components->len != 1u) {
                 ok = false;
@@ -5351,6 +5403,188 @@ static unsigned stage55_count_text(const char *text, const char *needle)
     return count;
 }
 
+typedef struct Stage56DiagnosticSummary {
+    uint32_t bp_rows;
+    uint32_t closure_rows;
+    uint32_t fixed_rows;
+    uint32_t reject_rows;
+    uint32_t last_iterations;
+    uint32_t last_stable;
+    uint32_t last_converged;
+    uint64_t last_delta_bits;
+    uint64_t max_workspace;
+} Stage56DiagnosticSummary;
+
+static bool stage56_diagnostics_valid(const char *log, bool expect_reject,
+                                      Stage56DiagnosticSummary *summary_out)
+{
+    Stage56DiagnosticSummary summary;
+    char **lines;
+    bool valid = true;
+
+    if (log == NULL || summary_out == NULL || strstr(log, "0x") != NULL ||
+        strstr(log, "[hash ") != NULL || strstr(log, "[pointer ") != NULL ||
+        strstr(log, "[var-id ") != NULL ||
+        strstr(log, "[factor-id ") != NULL ||
+        strstr(log, "[edge-id ") != NULL ||
+        strstr(log, "[belief ") != NULL) return false;
+    memset(&summary, 0, sizeof(summary));
+    lines = g_strsplit(log, "\n", -1);
+    if (lines == NULL) return false;
+    for (uint32_t i = 0; lines[i] != NULL && valid; i++) {
+        const char *line = lines[i];
+        int consumed = -1;
+
+        if (g_str_has_prefix(line, "[osprey] [infer] [bp] [version ")) {
+            unsigned long long version;
+            unsigned long long delta;
+            unsigned long long workspace;
+            unsigned components;
+            unsigned vars;
+            unsigned factors;
+            unsigned edges;
+            unsigned iterations;
+            unsigned converged;
+            unsigned stable;
+            char canonical[512];
+
+            if (sscanf(line,
+                       "[osprey] [infer] [bp] [version %llu] "
+                       "[components %u] [vars %u] [factors %u] [edges %u] "
+                       "[iters %u] [converged %u] [max-delta %16llx] "
+                       "[stable %u] [workspace %llu]%n",
+                       &version, &components, &vars, &factors, &edges,
+                       &iterations, &converged, &delta, &stable, &workspace,
+                       &consumed) != 10 || consumed < 0 || line[consumed] != '\0') {
+                valid = false;
+                break;
+            }
+            snprintf(canonical, sizeof(canonical),
+                     "[osprey] [infer] [bp] [version %llu] "
+                     "[components %u] [vars %u] [factors %u] [edges %u] "
+                     "[iters %u] [converged %u] [max-delta %016llx] "
+                     "[stable %u] [workspace %llu]",
+                     version, components, vars, factors, edges, iterations,
+                     converged, delta, stable, workspace);
+            valid = strcmp(line, canonical) == 0 &&
+                    version == summary.bp_rows && components != 0 &&
+                    vars != 0 && factors != 0 && edges != 0 &&
+                    converged <= 1;
+            summary.bp_rows++;
+            summary.last_iterations = iterations;
+            summary.last_stable = stable;
+            summary.last_converged = converged;
+            summary.last_delta_bits = delta;
+            if (workspace > summary.max_workspace) {
+                summary.max_workspace = workspace;
+            }
+        } else if (g_str_has_prefix(line, "[osprey] [closure] [round ")) {
+            unsigned long long round;
+            unsigned tuples;
+            unsigned vars;
+            unsigned base_factors;
+            unsigned secondary_factors;
+            unsigned preserved;
+            unsigned new_edges;
+            char canonical[512];
+
+            if (sscanf(line,
+                       "[osprey] [closure] [round %llu] [cc07-tuples %u] "
+                       "[vars +%u] [base-factors +%u] "
+                       "[secondary-factors +%u] [preserved-edges %u] "
+                       "[new-edges %u]%n",
+                       &round, &tuples, &vars, &base_factors,
+                       &secondary_factors, &preserved, &new_edges,
+                       &consumed) != 7 || consumed < 0 || line[consumed] != '\0') {
+                valid = false;
+                break;
+            }
+            snprintf(canonical, sizeof(canonical),
+                     "[osprey] [closure] [round %llu] [cc07-tuples %u] "
+                     "[vars +%u] [base-factors +%u] "
+                     "[secondary-factors +%u] [preserved-edges %u] "
+                     "[new-edges %u]",
+                     round, tuples, vars, base_factors, secondary_factors,
+                     preserved, new_edges);
+            valid = strcmp(line, canonical) == 0 &&
+                    round == (uint64_t)summary.closure_rows + 1u &&
+                    tuples != 0 && (vars != 0 || base_factors != 0 ||
+                                     secondary_factors != 0) && new_edges != 0;
+            summary.closure_rows++;
+        } else if (g_str_has_prefix(
+                       line, "[osprey] [infer] [secondary-fixed] ")) {
+            unsigned long long versions;
+            unsigned long long closure_rounds;
+            unsigned vars;
+            unsigned factors;
+            unsigned edges;
+            char canonical[384];
+
+            if (sscanf(line,
+                       "[osprey] [infer] [secondary-fixed] [versions %llu] "
+                       "[closure-rounds %llu] [vars %u] [factors %u] "
+                       "[edges %u]%n",
+                       &versions, &closure_rounds, &vars, &factors, &edges,
+                       &consumed) != 5 || consumed < 0 || line[consumed] != '\0') {
+                valid = false;
+                break;
+            }
+            snprintf(canonical, sizeof(canonical),
+                     "[osprey] [infer] [secondary-fixed] [versions %llu] "
+                     "[closure-rounds %llu] [vars %u] [factors %u] "
+                     "[edges %u]",
+                     versions, closure_rounds, vars, factors, edges);
+            valid = strcmp(line, canonical) == 0 &&
+                    versions == summary.bp_rows &&
+                    closure_rounds == summary.closure_rows && vars != 0 &&
+                    factors != 0 && edges != 0;
+            summary.fixed_rows++;
+        } else if (g_str_has_prefix(
+                       line, "[osprey] [infer] [secondary] [reject] ")) {
+            int status;
+            char reason[256];
+            char canonical[512];
+
+            if (sscanf(line,
+                       "[osprey] [infer] [secondary] [reject] [status %d] "
+                       "[reason %255[^]]]%n",
+                       &status, reason, &consumed) != 2 || consumed < 0 ||
+                line[consumed] != '\0') {
+                valid = false;
+                break;
+            }
+            snprintf(canonical, sizeof(canonical),
+                     "[osprey] [infer] [secondary] [reject] [status %d] "
+                     "[reason %s]", status, reason);
+            valid = strcmp(line, canonical) == 0 && status != OSPREY_OK &&
+                    reason[0] != '\0';
+            summary.reject_rows++;
+        } else if (g_str_has_prefix(line, "[osprey] [closure]") ||
+                   g_str_has_prefix(
+                       line, "[osprey] [infer] [secondary-fixed]") ||
+                   g_str_has_prefix(
+                       line, "[osprey] [infer] [secondary] [reject]") ||
+                   (g_str_has_prefix(line, "[osprey] [infer] [bp]") &&
+                    !g_str_has_prefix(
+                        line, "[osprey] [infer] [bp] [stage "))) {
+            valid = false;
+        }
+    }
+    g_strfreev(lines);
+    valid = valid && summary.bp_rows != 0 &&
+            summary.closure_rows + 1u == summary.bp_rows &&
+            summary.fixed_rows + summary.reject_rows == 1u &&
+            (expect_reject ? summary.reject_rows == 1u
+                           : summary.fixed_rows == 1u);
+    if (valid) {
+        *summary_out = summary;
+        if (summary.max_workspace > peak_bp_workspace) {
+            peak_bp_workspace = summary.max_workspace;
+        }
+    }
+    return valid;
+}
+
 static OspreyContext *stage55_closure_context(
     const Stage5BpClosureCase *description, const OspreyConfig *config,
     bool reverse)
@@ -5597,10 +5831,14 @@ static bool stage55_expected_success_diagnostics(
     int64_t folded_offset;
     char closure[256];
     const char *fixed;
+    Stage56DiagnosticSummary diagnostics;
 
     eligible = stage5_bp_reference_closure_eligible(description,
                                                     &folded_offset);
     (void)folded_offset;
+    if (!stage56_diagnostics_valid(log, false, &diagnostics) ||
+        diagnostics.bp_rows != (eligible ? 2u : 1u) ||
+        diagnostics.closure_rows != (eligible ? 1u : 0u)) return false;
     if (!eligible) {
         return strstr(log,
             "[secondary-fixed] [versions 1] [closure-rounds 0] "
@@ -6254,6 +6492,133 @@ static void test_stage55_nonconvergence_before_closure(void)
     osprey_free(ctx);
 }
 
+static void test_stage56_transaction_nonconvergence(void)
+{
+    OspreyContext *ctx = stage55_nonconvergent_context();
+    OspreyGraph *failed_graph;
+    OspreyGraph *committed_graph;
+    OspreyModel *committed_model;
+    uint64_t *before_bits = NULL;
+    uint8_t *before_valid = NULL;
+    uint32_t before_count = 0;
+    OspreyStatus status;
+    Stage56DiagnosticSummary diagnostics;
+    const char *log;
+
+    CHECK(ctx != NULL && osprey_stage4_exact(ctx) == OSPREY_OK,
+          "Stage 5.6 transaction fixture seeds exact beliefs");
+    if (ctx == NULL) return;
+    failed_graph = ctx->graph;
+    ctx->graph = NULL;
+
+    /* Install an opaque pre-existing model solely to prove consumer hiding.
+     * Stage 5.6 never decodes or validates a positive replacement model. */
+    osprey_tx_begin(ctx);
+    ctx->staged_graph = osprey_graph_new();
+    ctx->staged_model = g_new0(OspreyModel, 1);
+    osprey_tx_install(ctx);
+    committed_graph = ctx->graph;
+    committed_model = ctx->model;
+    CHECK(committed_graph != NULL && committed_model != NULL &&
+              osprey_model(ctx) == committed_model,
+          "Stage 5.6 pre-existing committed model is initially visible");
+
+    osprey_tx_begin(ctx);
+    CHECK(osprey_model(ctx) == NULL && ctx->model == committed_model,
+          "Stage 5.6 new transaction hides the prior committed model");
+    ctx->staged_graph = failed_graph;
+    ctx->graph = failed_graph;
+    before_count = failed_graph->vars->len;
+    before_bits = g_new(uint64_t, before_count);
+    before_valid = g_new(uint8_t, before_count);
+    stage55_capture_beliefs(ctx, before_bits, before_valid);
+
+    osprey_test_log_reset();
+    status = osprey_stage5_secondary(ctx);
+    CHECK(status == OSPREY_NON_CONVERGED &&
+              stage55_beliefs_unchanged(ctx, before_bits, before_valid,
+                                         before_count),
+          "Stage 5.6 real nonconvergence preserves all source beliefs");
+    ctx->graph = committed_graph;
+    osprey_tx_reject(ctx, status, "infer", "secondary non-convergence");
+    osprey_tx_reject(ctx, OSPREY_INVALID_MODEL, "decode",
+                     "later failure must not replace infer");
+    log = osprey_test_log_contents();
+    CHECK(osprey_tx_status(ctx) == OSPREY_NON_CONVERGED &&
+              strcmp(osprey_tx_stage(ctx), "infer") == 0 &&
+              strcmp(ctx->tx_reason, "secondary non-convergence") == 0 &&
+              stage55_count_text(log, "[osprey] [reject]") == 1,
+          "Stage 5.6 first transaction failure remains sticky");
+    CHECK(osprey_model(ctx) == NULL && ctx->model == committed_model &&
+              ctx->staged_graph == failed_graph,
+          "Stage 5.6 failed transaction exposes no model or partial graph");
+    {
+        bool diagnostic_ok = stage56_diagnostics_valid(
+            log, true, &diagnostics);
+        if (!diagnostic_ok || diagnostics.bp_rows != 1 ||
+            diagnostics.closure_rows != 0 ||
+            diagnostics.last_iterations != 500 ||
+            diagnostics.last_converged != 0 || diagnostics.last_stable >= 10 ||
+            diagnostics.last_delta_bits !=
+                UINT64_C(0x3fa81430e875b210)) {
+            fprintf(stderr, "Stage 5.6 transaction diagnostics:\n%s", log);
+            if (diagnostic_ok) {
+                fprintf(stderr,
+                        "parsed rows=%u/%u iters=%u converged=%u stable=%u "
+                        "delta=%016llx\n",
+                        diagnostics.bp_rows, diagnostics.closure_rows,
+                        diagnostics.last_iterations,
+                        diagnostics.last_converged, diagnostics.last_stable,
+                        (unsigned long long)diagnostics.last_delta_bits);
+            }
+        }
+        CHECK(diagnostic_ok && diagnostics.bp_rows == 1 &&
+                  diagnostics.closure_rows == 0 &&
+                  diagnostics.last_iterations == 500 &&
+                  diagnostics.last_converged == 0 &&
+                  diagnostics.last_stable < 10 &&
+                  diagnostics.last_delta_bits ==
+                      UINT64_C(0x3fa81430e875b210),
+              "Stage 5.6 nonconvergence diagnostics are canonical and exact");
+    }
+    osprey_tx_abort(ctx);
+    CHECK(ctx->staged_graph == NULL && ctx->staged_model == NULL,
+          "Stage 5.6 abort releases staged transaction ownership");
+
+    /* Recovery stops at the trusted Stage 5 boundary: a clean coordinator
+     * succeeds and publishes graph beliefs, but no decoder/model is run. */
+    osprey_tx_begin(ctx);
+    ctx->staged_graph = osprey_graph_new();
+    ctx->graph = ctx->staged_graph;
+    {
+        OspreyRegionId region = make_region(OSPREY_REGION_GLOBAL, 0x5730);
+        uint32_t id = add_primitive(ctx, region, 0);
+        add_prior(ctx, id, 0.8);
+    }
+    osprey_test_log_reset();
+    status = osprey_infer(ctx);
+    log = osprey_test_log_contents();
+    CHECK(status == OSPREY_OK && osprey_tx_ok(ctx) &&
+              ctx->graph->vars->len == 1 &&
+              g_array_index(ctx->graph->vars, OspreyVar, 0).belief_valid == 1 &&
+              osprey_model(ctx) == NULL,
+          "Stage 5.6 later clean transaction succeeds without decoding");
+    CHECK(stage56_diagnostics_valid(log, false, &diagnostics) &&
+              diagnostics.bp_rows == 1 && diagnostics.closure_rows == 0 &&
+              diagnostics.last_converged == 1 &&
+              diagnostics.last_stable == 10,
+          "Stage 5.6 recovery diagnostics have one fixed graph version");
+    ctx->graph = committed_graph;
+    osprey_tx_abort(ctx);
+    CHECK(ctx->staged_graph == NULL && ctx->model == committed_model &&
+              osprey_model(ctx) == NULL,
+          "Stage 5.6 recovery cleanup retains but hides the old model");
+
+    g_free(before_bits);
+    g_free(before_valid);
+    osprey_free(ctx);
+}
+
 static bool stage55_run_limit_case(OspreyConfig config,
                                    Stage5BpClosureCase description)
 {
@@ -6489,6 +6854,7 @@ static void test_stage55_disjoint_heap_frontier(void)
     OspreyConfig config = bp_config();
     OspreyContext *ctx;
     unsigned folded_count = 0;
+    Stage56DiagnosticSummary diagnostics;
 
     /* The old global P01×P03×P04 reservation materialized 32^3 tuples
      * although only 32 same-region tuples were eligible, exhausting this
@@ -6520,8 +6886,12 @@ static void test_stage55_disjoint_heap_frontier(void)
     }
     CHECK(osprey_relations_build(ctx) == OSPREY_OK,
           "Stage 5.5 disjoint-region relations built");
+    osprey_test_log_reset();
     CHECK(osprey_infer(ctx) == OSPREY_OK,
           "Stage 5.5 reserves only same-region CC07 tuples");
+    CHECK(stage56_diagnostics_valid(osprey_test_log_contents(), false,
+                                    &diagnostics),
+          "Stage 5.6 parses the largest fixed-point workspace trace");
     for (guint i = 0; i < ctx->graph->vars->len; i++) {
         const OspreyVar *variable = &g_array_index(
             ctx->graph->vars, OspreyVar, i);
@@ -6651,6 +7021,7 @@ int main(void)
     RUN(test_stage55_ca08_exact_resolve);
     RUN(test_stage55_impossible_after_growth);
     RUN(test_stage55_nonconvergence_before_closure);
+    RUN(test_stage56_transaction_nonconvergence);
     RUN(test_stage55_caps_round_and_arithmetic);
     RUN(test_stage55_exact_resolve_failure);
     RUN(test_stage55_coordinator_allocation_failures);
@@ -6724,8 +7095,10 @@ int main(void)
         return 1;
     }
     printf("PASS stage5_bp (%u/%u; fixed forests 2000/2000; "
-           "loopy %u/%u; projections 2000/2000; closure 2000/2000)\n",
+           "loopy %u/%u; projections 2000/2000; closure 2000/2000; "
+           "peak BP workspace %llu bytes)\n",
            executed, registered, OSPREY_BP_LOOPY_CORPUS_CASES,
-           OSPREY_BP_LOOPY_CORPUS_CASES);
+           OSPREY_BP_LOOPY_CORPUS_CASES,
+           (unsigned long long)peak_bp_workspace);
     return 0;
 }
