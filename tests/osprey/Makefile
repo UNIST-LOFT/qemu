@@ -42,6 +42,8 @@ EXACT_UNIT_BIN := $(WORK)/stage4_exact
 EXACT_ASAN_BIN := $(WORK)/stage4_exact_asan
 BP_UNIT_BIN := $(WORK)/stage5_bp
 BP_ASAN_BIN := $(WORK)/stage5_bp_asan
+DECODE_UNIT_BIN := $(WORK)/stage6_decode
+DECODE_ASAN_BIN := $(WORK)/stage6_decode_asan
 OSPREY_SRCS := ../../linux-user/osprey.c \
                ../../linux-user/osprey-facts.c \
                ../../linux-user/osprey-graph.c \
@@ -84,15 +86,18 @@ PLT_FILES  := $(addprefix $(WORK)/,$(addsuffix .plt,$(TESTS)))
         unit-stage3-graph unit-stage3-graph-asan \
         unit-stage3-rules unit-stage3-rules-asan \
         unit-stage4-exact unit-stage4-exact-asan \
-        unit-stage5-bp unit-stage5-bp-asan guests plts clean
+        unit-stage5-bp unit-stage5-bp-asan \
+        unit-stage6-decode unit-stage6-decode-asan guests plts clean
 check: inventory run unit unit-asan-osprey unit-stage3-relations \
        unit-stage3-relations-asan unit-stage3-graph unit-stage3-graph-asan \
        unit-stage3-rules unit-stage3-rules-asan unit-stage4-exact \
-       unit-stage4-exact-asan unit-stage5-bp unit-stage5-bp-asan
+       unit-stage4-exact-asan unit-stage5-bp unit-stage5-bp-asan \
+       unit-stage6-decode unit-stage6-decode-asan
 run unit unit-asan-osprey unit-stage3-relations unit-stage3-relations-asan \
 unit-stage3-graph unit-stage3-graph-asan unit-stage3-rules \
 unit-stage3-rules-asan unit-stage4-exact unit-stage4-exact-asan \
-unit-stage5-bp unit-stage5-bp-asan: inventory
+unit-stage5-bp unit-stage5-bp-asan unit-stage6-decode \
+unit-stage6-decode-asan: inventory
 inventory:
 	@python3 $(INVENTORY)
 run: guests plts
@@ -254,6 +259,22 @@ $(BP_ASAN_BIN): stage5_bp_test.c stage5_bp_reference.c \
 	$(CC) $(ASAN_CFLAGS) -o $@ stage5_bp_test.c \
 		stage5_bp_reference.c stage3_test_support.c $(OSPREY_ASAN_OBJS) \
 		-lglib-2.0 -lpthread -lm
+
+unit-stage6-decode: $(DECODE_UNIT_BIN)
+	@$(DECODE_UNIT_BIN)
+
+$(DECODE_UNIT_BIN): stage6_decode_test.c stage3_test_support.c \
+		$(OSPREY_OBJS) | $(WORK)
+	$(CC) $(UNIT_CFLAGS) -o $@ stage6_decode_test.c \
+		stage3_test_support.c $(OSPREY_OBJS) -lglib-2.0 -lpthread -lm
+
+unit-stage6-decode-asan: $(DECODE_ASAN_BIN)
+	@ASAN_OPTIONS=detect_leaks=1 $(DECODE_ASAN_BIN)
+
+$(DECODE_ASAN_BIN): stage6_decode_test.c stage3_test_support.c \
+		$(OSPREY_ASAN_OBJS) | $(WORK)
+	$(CC) $(ASAN_CFLAGS) -o $@ stage6_decode_test.c \
+		stage3_test_support.c $(OSPREY_ASAN_OBJS) -lglib-2.0 -lpthread -lm
 
 $(UNIT_ASAN_BIN): unit_test.c $(OSPREY_OBJS) | $(WORK)
 	$(CC) $(UNIT_CFLAGS) -fsanitize=address -fno-omit-frame-pointer \

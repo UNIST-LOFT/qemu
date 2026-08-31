@@ -83,6 +83,7 @@ static bool osprey_parse_u64(const char *name, uint64_t *out) {
 }
 
 bool osprey_config_from_env(OspreyConfig *config) {
+    if (config == NULL) return false;
     memset(config, 0, sizeof(*config));
     config->enabled = false;
     config->shared_bytes = OSPREY_DEFAULT_SHARED_MB * 1024u * 1024u;
@@ -175,8 +176,10 @@ bool osprey_config_from_env(OspreyConfig *config) {
     v = getenv("BINRADAR_OSPREY_REPORT_THRESHOLD");
     if (v != NULL && v[0] != '\0') {
         char *end = NULL;
+        errno = 0;
         double d = strtod(v, &end);
-        if (end == v || *end != '\0' || d < 0.0 || d > 1.0) {
+        if (errno == ERANGE || end == v || *end != '\0' ||
+            !isfinite(d) || d < 0.0 || d > 1.0) {
             fprintf(stderr,
                     "[osprey] [config] [invalid] [var BINRADAR_OSPREY_REPORT_THRESHOLD] [value %s]\n",
                     v);

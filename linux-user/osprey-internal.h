@@ -948,6 +948,107 @@ typedef struct OspreyRegionExtent {
     int64_t hi;                    /* exclusive; lo <= hi */
 } OspreyRegionExtent;
 
+/* ------------------------------------------------------------------ */
+/* Stage 6.1 canonical decoder input                                  */
+
+/* Decoder family ordinals are stable only within one OspreyDecodeInput;
+ * they are not graph IDs and never participate in semantic identity. */
+typedef enum OspreyDecodeCandidateFamily {
+    OSPREY_DECODE_FAMILY_PRIMITIVE = 1,
+    OSPREY_DECODE_FAMILY_SCALAR = 2,
+    OSPREY_DECODE_FAMILY_ARRAY = 3,
+    OSPREY_DECODE_FAMILY_FIELD = 4,
+    OSPREY_DECODE_FAMILY_POINTER = 5,
+} OspreyDecodeCandidateFamily;
+
+typedef struct OspreyDecodeCandidate {
+    OspreyKey key;             /* complete predicate identity */
+    OspreyVarPayload payload;  /* owned immutable canonical payload */
+    uint32_t source_graph_id;  /* locator only; never ordering/identity */
+    uint8_t predicate_kind;    /* P01/P07/P08/P09/P10 */
+    uint8_t reserved[3];
+    double posterior;          /* finite value in [0,1] */
+    uint64_t posterior_bits;   /* exact binary64 payload */
+    uint64_t direct_support;
+    uint64_t source_rule_bits;
+} OspreyDecodeCandidate;
+
+typedef struct OspreyDecodeCandidateRef {
+    uint32_t ordinal;          /* ordinal in the referenced family array */
+    uint8_t family;            /* OspreyDecodeCandidateFamily */
+    uint8_t reserved[3];
+} OspreyDecodeCandidateRef;
+
+typedef struct OspreyDecodeChunkRange {
+    OspreyChunk chunk;         /* complete canonical range key */
+    uint32_t begin;
+    uint32_t count;
+} OspreyDecodeChunkRange;
+
+typedef struct OspreyDecodeBaseRange {
+    OspreyAddress base;        /* complete canonical range key */
+    uint32_t begin;
+    uint32_t count;
+} OspreyDecodeBaseRange;
+
+typedef struct OspreyDecodeRegionRange {
+    OspreyRegionId region;      /* complete canonical range key */
+    uint32_t begin;
+    uint32_t count;
+} OspreyDecodeRegionRange;
+
+typedef struct OspreyDecodeRegionStrideRange {
+    OspreyRegionId region;      /* complete canonical region key */
+    uint64_t stride;
+    uint32_t begin;
+    uint32_t count;
+} OspreyDecodeRegionStrideRange;
+
+typedef struct OspreyDecodeInput {
+    /* Primary candidate arrays, each sorted by complete predicate key. */
+    OspreyDecodeCandidate *primitive_candidates;
+    uint32_t primitive_count;
+    OspreyDecodeCandidate *scalar_candidates;
+    uint32_t scalar_count;
+    OspreyDecodeCandidate *array_candidates;
+    uint32_t array_count;
+    OspreyDecodeCandidate *field_candidates;
+    uint32_t field_count;
+    OspreyDecodeCandidate *pointer_candidates;
+    uint32_t pointer_count;
+
+    /* Complete-chunk view over P01/P07/P09/P10 candidates. */
+    OspreyDecodeCandidateRef *chunk_candidates;
+    uint32_t chunk_candidate_count;
+    OspreyDecodeChunkRange *chunk_ranges;
+    uint32_t chunk_range_count;
+
+    /* Complete-base view over P09 candidates. */
+    uint32_t *field_by_base;
+    uint32_t field_by_base_count;
+    OspreyDecodeBaseRange *field_base_ranges;
+    uint32_t field_base_range_count;
+
+    /* Complete-region and complete-region/stride views over P08
+     * candidates. */
+    uint32_t *array_by_region;
+    uint32_t array_by_region_count;
+    OspreyDecodeRegionRange *array_region_ranges;
+    uint32_t array_region_range_count;
+    uint32_t *array_by_region_stride;
+    uint32_t array_by_region_stride_count;
+    OspreyDecodeRegionStrideRange *array_region_stride_ranges;
+    uint32_t array_region_stride_range_count;
+
+    /* Owned immutable region extent snapshot. */
+    OspreyRegionExtent *extents;
+    uint32_t extent_count;
+
+    /* Disjoint projected-family diagnostics. */
+    uint64_t discarded_hard_false;
+    uint64_t discarded_threshold;
+} OspreyDecodeInput;
+
 /* R10-R12 hint instances: parallel-copy / unified-access / points-to
  * evidence for homomorphic segments.  a1 and a2 are region-anchor
  * addresses; size is the common offset delta s. */
@@ -1298,6 +1399,10 @@ OspreyStatus osprey_infer(OspreyContext *ctx);
 /* Shared graph builders (osprey-graph.c); used by Stage 3 construction
  * and the Stage 5 dynamic closure. */
 OspreyKey osprey_var_key(uint8_t kind, const OspreyVarPayload *payload);
+/* One accepted payload-shape validator shared by graph and decoder
+ * boundaries.  It does not inspect extents or beliefs. */
+bool osprey_var_payload_valid(uint8_t kind,
+                              const OspreyVarPayload *payload);
 OspreyInternResult osprey_intern_var(OspreyContext *ctx, uint8_t kind,
                                      const OspreyVarPayload *payload);
 
@@ -1379,6 +1484,14 @@ struct OspreyModel {
     GHashTable *ptr_by_chunk; /* OspreyKey* -> pointer obj (index+1);
                                  independent of scalar/field exclusivity */
 };
+
+/* Stage 6.1: canonical, fully owned projection of final graph beliefs.
+ * This boundary does not select roles or build/install a model. */
+OspreyStatus osprey_decode_input_build(const OspreyContext *ctx,
+                                       OspreyDecodeInput **out);
+void osprey_decode_input_free(OspreyDecodeInput *input);
+bool osprey_decode_input_dump_file(const OspreyDecodeInput *input, FILE *out);
+void osprey_decode_test_set_alloc_fail_after(int64_t allocations);
 
 /* Stage 6 entry (osprey-decode.c): consistent decoding of posterior
  * predicates (§10 of the reference): hard-false/threshold discard,

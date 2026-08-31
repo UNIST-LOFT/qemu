@@ -49,6 +49,8 @@ static bool chunk_identity_valid(const OspreyChunk *chunk)
            chunk->size != 0;
 }
 
+static bool signed_size_end(int64_t offset, uint64_t size, int64_t *end);
+
 static int region_compare(const OspreyRegionId *a, const OspreyRegionId *b)
 {
     int c = cmp_u64((uint64_t)a->kind, (uint64_t)b->kind);
@@ -218,11 +220,13 @@ static bool canonicalize_payload(uint8_t kind, const OspreyVarPayload *in,
         out->prim_access = in->prim_access;
         return true;
     case OSPREY_PRED_UNFOLDABLE_HEAP:
-        if (in->heap_fold.region.kind != OSPREY_REGION_HEAP_SITE) return false;
+        if (!region_valid(&in->heap_fold.region) ||
+            in->heap_fold.region.kind != OSPREY_REGION_HEAP_SITE) return false;
         out->heap_fold = in->heap_fold;
         return true;
     case OSPREY_PRED_FOLDABLE_HEAP:
-        if (in->heap_fold.region.kind != OSPREY_REGION_HEAP_SITE) return false;
+        if (!region_valid(&in->heap_fold.region) ||
+            in->heap_fold.region.kind != OSPREY_REGION_HEAP_SITE) return false;
         out->heap_fold = in->heap_fold;
         return true;
     case OSPREY_PRED_HOMO_SEGMENT:
@@ -267,6 +271,62 @@ static bool canonicalize_payload(uint8_t kind, const OspreyVarPayload *in,
             !address_valid(&in->attached.base)) return false;
         out->attached = in->attached;
         return true;
+    default:
+        return false;
+    }
+}
+
+bool osprey_var_payload_valid(uint8_t kind,
+                              const OspreyVarPayload *payload)
+{
+    OspreyVarPayload canonical;
+    int64_t end;
+
+    if (!canonicalize_payload(kind, payload, &canonical)) return false;
+    switch (kind) {
+    case OSPREY_PRED_PRIMITIVE_VAR:
+    case OSPREY_PRED_SCALAR:
+        return signed_size_end(payload->chunk.address.offset,
+                               payload->chunk.size, &end);
+    case OSPREY_PRED_PRIMITIVE_ACCESS:
+        return signed_size_end(payload->prim_access.chunk.address.offset,
+                               payload->prim_access.chunk.size, &end);
+    case OSPREY_PRED_UNFOLDABLE_HEAP:
+    case OSPREY_PRED_FOLDABLE_HEAP:
+        return payload->heap_fold.size <= (uint64_t)INT64_MAX;
+    case OSPREY_PRED_HOMO_SEGMENT: {
+        int64_t partner_end;
+        /* Interning accepts symmetric endpoints, but a final graph row is
+         * already canonical and both half-open spans are representable. */
+        return address_compare(&payload->segment.a1,
+                               &payload->segment.a2) <= 0 &&
+               osprey_check_add(payload->segment.a1.offset,
+                                payload->segment.size, &end) &&
+               osprey_check_add(payload->segment.a2.offset,
+                                payload->segment.size, &partner_end);
+    }
+    case OSPREY_PRED_ARRAY:
+        /* canonicalize_payload() checked same-region half-open geometry and
+         * the signed span.  Exact stride division belongs to Stage 6.3. */
+        return true;
+    case OSPREY_PRED_ARRAY_START:
+        return true;
+    case OSPREY_PRED_FIELD_OF: {
+        int64_t base_end;
+        int64_t relative;
+        return region_compare(&payload->attached.chunk.address.region,
+                              &payload->attached.base.region) == 0 &&
+               signed_size_end(payload->attached.chunk.address.offset,
+                               payload->attached.chunk.size, &end) &&
+               signed_size_end(payload->attached.base.offset,
+                               payload->attached.chunk.size, &base_end) &&
+               osprey_check_sub(payload->attached.chunk.address.offset,
+                                payload->attached.base.offset, &relative) &&
+               relative >= 0;
+    }
+    case OSPREY_PRED_POINTER:
+        return signed_size_end(payload->attached.chunk.address.offset,
+                               payload->attached.chunk.size, &end);
     default:
         return false;
     }
