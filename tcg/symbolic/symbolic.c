@@ -638,17 +638,7 @@ static inline void    load_configuration(void)
     var = getenv("BINRADAR_PATCH_SHM_KEY");
     if (var) {
         uintptr_t patch_shm_key = strtoull(var, NULL, 16);
-        int shmid = shmget(patch_shm_key, sizeof(uint32_t) * 2, 0666 | IPC_CREAT);
-        if (shmid == -1) {
-            perror("shmget failed");
-            exit(1);
-        }
-        uint32_t *shm_ptr = shmat(shmid, NULL, 0);
-        if (shm_ptr == (uint32_t *)-1) {
-            perror("shmat failed");
-            exit(1);
-        }
-        snapshot_set_binradar_patch_shm(shm_ptr);
+        snapshot_init_binradar_patch_shm(patch_shm_key);
     }
 
     var = getenv("SYMBOLIC_EXEC_START_ADDR");

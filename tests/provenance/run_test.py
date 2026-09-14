@@ -35,7 +35,7 @@ import time
 from typing import Any
 
 
-HANDSHAKE_EXPECTED = 0x41464C01
+HANDSHAKE_EXPECTED = 0x41464C02
 
 # ---------------------------------------------------------------------------
 # Test configuration
@@ -49,8 +49,8 @@ HANDSHAKE_EXPECTED = 0x41464C01
 #     None = rc must just be nonzero.  Negative values are host signals
 #     (Python returncode convention); positive values are _exit() codes.
 # finding: None or dict(reason=<substring>, is_uaf=<0|1>, count=N)
-# fs_status: forkserver tests only — expected child exit status from the
-#     driver's 12-byte status record.
+# Forkserver v3 returns one 12-byte logical-iteration summary; child outcomes
+# are verified from the structured tracer log rather than the control pipe.
 # reason: substring required in the [snapshot] [crash] reason field.
 # timeout: per-run timeout seconds (forkserver child timeout is separate).
 # final_queries: exact `Number of queries` summary expected from symbolic mode.
@@ -99,7 +99,7 @@ TESTS: list[dict[str, Any]] = [
                               "width": 16})),
     dict(name="t14_ea_static", mode="mem", rc=(0,), verdict="normal", finding=None),
     dict(name="t15_ea_dynamic", mode="mem", rc=(0,), verdict="normal", finding=None),
-    dict(name="t16_ea_forkserver", mode="fors", rc=(2,), fs_status=0,
+    dict(name="t16_ea_forkserver", mode="fors", rc=(2,),
          verdict="normal", finding=None),
     dict(name="t17_free_null", mode="mem", rc=(0,), verdict="normal", finding=None),
     dict(name="t18_memchr_unaligned", mode="sym", rc=(0,), verdict="normal",
@@ -125,13 +125,13 @@ TESTS: list[dict[str, Any]] = [
     dict(name="t26_use_after_free_gen", mode="mem", rc=(0,), verdict="crash",
          finding=dict(reason="heap-use-after-free", is_uaf=1,
                       fields={"obj_id": 1, "gen": 1, "size": 16, "offset": 0})),
-    dict(name="t27_timeout_crash", mode="fors", rc=(2,), fs_status=139,
+    dict(name="t27_timeout_crash", mode="fors", rc=(2,),
          verdict="crash",
          finding=dict(reason="heap-use-after-free", is_uaf=1,
                       fields={"obj_id": 1, "gen": 1, "size": 8, "offset": 0,
                               "width": 1}),
          note="timeout transport: deferred UAF surfaces as synthetic 139"),
-    dict(name="t79_forkserver_abort", mode="fors", rc=(2,), fs_status=139,
+    dict(name="t79_forkserver_abort", mode="fors", rc=(2,),
          verdict="crash", fs_binradar=True, fs_abort_count=3,
          fs_child_timeout=3, timeout=90,
          finding=dict(reason="heap-use-after-free", is_uaf=1, count=3,
@@ -437,7 +437,7 @@ TESTS += PHASE5_TESTS
 # saw a banner EOF.  This must now handshake, run the child to a normal
 # exit, and report no finding.
 PHASE6_TESTS: list[dict[str, Any]] = [
-    dict(name="t80_xmm_preentry_forkserver", mode="fors", rc=(2,), fs_status=0,
+    dict(name="t80_xmm_preentry_forkserver", mode="fors", rc=(2,),
          verdict="normal", finding=None,
          note="pre-entry movss under sem-events: banner instead of abort"),
 ]
@@ -594,7 +594,7 @@ def run_forkserver(test, guest, qemu, workdir):
     (remaining == 0), close the parent pipe.  With ``fs_binradar`` the
     driver also sets up the binradar patch shm/fd so the forkserver runs
     its binradar-mode loop (patch-id iteration, child-timeout abort).
-    Returns (tracer_rc, first_child_status, stderr_text)."""
+    Returns (tracer_rc, None, stderr_text); outcomes live in stderr rows."""
     run_dir = tempfile.mkdtemp(prefix="prov-fs-")
     env = dict(os.environ)
     env.update(BASE_ENV)
@@ -677,17 +677,20 @@ def run_forkserver(test, guest, qemu, workdir):
         # Non-binradar forkserver tests see remaining == 0 after the first
         # iteration, i.e. exactly one child as before.
         remaining = 1
-        child_status = -1
+        child_status = None
+        expected_iteration = 1
         for _ in range(20):
             os.write(ctrl_w, struct.pack("<I", 0))  # was_killed
-            status = read_exact(stat_r, 12)
-            if len(status) != 12:
+            summary = read_exact(stat_r, 12)
+            if len(summary) != 12:
                 break
-            child_status = struct.unpack("<III", status)[0]
-            rem = read_exact(stat_r, 4)
-            if len(rem) != 4:
-                break
-            remaining = struct.unpack("<I", rem)[0]
+            iteration, representative_runs, remaining = struct.unpack(
+                "<III", summary)
+            if iteration != expected_iteration or representative_runs == 0:
+                raise RuntimeError(
+                    f"invalid forkserver summary: iteration={iteration}, "
+                    f"runs={representative_runs}")
+            expected_iteration += 1
             if remaining == 0:
                 break
 

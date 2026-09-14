@@ -7,6 +7,11 @@
 #include "../tcg/symbolic/symbolic-struct.h"
 #include "sbsv.h"
 #include "qemu/rcu.h"
+#include "qapi/error.h"
+#include "qapi/qmp/qdict.h"
+#include "qapi/qmp/qjson.h"
+#include "qapi/qmp/qlist.h"
+#include "qapi/qmp/qnum.h"
 
 #include <fcntl.h>
 #include <poll.h>
@@ -16,7 +21,7 @@
 
 #define SNAPSHOT_EXIT_DESC_LEN 256
 #define SNAPSHOT_BT_DEPTH 64
-#define BINRADAR_FORKSERVER_PROTOCOL_V2 0x41464c01u
+#define BINRADAR_FORKSERVER_PROTOCOL_V3 0x41464c02u
 // #define SNAPSHOT_DEBUG
 
 #ifdef SNAPSHOT_DEBUG
@@ -415,6 +420,91 @@ typedef struct BinradarResult {
     PatchedResult *patch_results; // Array<PatchedResult *>, length = patch_cnt + 1
 } BinradarResult;
 
+#define BRCACHE_SNAPSHOT_MAGIC 0x48435242u
+#define BRCACHE_SNAPSHOT_VERSION 1u
+#define BRCACHE_FLAG_TRUNCATED 1u
+#define BRCACHE_FLAG_CWE805 2u
+#define BRCACHE_FLAG_INVALID 4u
+#define BRCACHE_MAX_CAPTURE_BYTES (64u * 1024u * 1024u)
+#define BRCACHE_MAX_DESCRIPTOR 4095u
+#define BRCACHE_MAX_EXPR_DEPTH 256u
+
+typedef enum BinradarCacheFamily {
+    BRCACHE_FAMILY_NONE,
+    BRCACHE_FAMILY_GENERIC,
+    BRCACHE_FAMILY_CWE805,
+} BinradarCacheFamily;
+
+typedef enum BinradarExprOp {
+    BRCACHE_EXPR_LITERAL,
+    BRCACHE_EXPR_VARIABLE,
+    BRCACHE_EXPR_NOT,
+    BRCACHE_EXPR_EQ,
+    BRCACHE_EXPR_NE,
+    BRCACHE_EXPR_GT,
+    BRCACHE_EXPR_GE,
+    BRCACHE_EXPR_LT,
+    BRCACHE_EXPR_LE,
+    BRCACHE_EXPR_ADD,
+    BRCACHE_EXPR_SUB,
+    BRCACHE_EXPR_MUL,
+    BRCACHE_EXPR_DIV,
+    BRCACHE_EXPR_REM,
+    BRCACHE_EXPR_AND,
+    BRCACHE_EXPR_OR,
+    BRCACHE_EXPR_XOR,
+    BRCACHE_EXPR_SHL,
+    BRCACHE_EXPR_SHR,
+} BinradarExprOp;
+
+typedef struct BinradarExprNode {
+    BinradarExprOp op;
+    uint32_t left;
+    uint32_t right;
+    uint16_t variable;
+    int64_t literal;
+} BinradarExprNode;
+
+typedef enum BinradarCacheCellKind {
+    BRCACHE_CELL_REGISTER,
+    BRCACHE_CELL_STACK8,
+    BRCACHE_CELL_STACK16,
+    BRCACHE_CELL_STACK32,
+    BRCACHE_CELL_STACK64,
+} BinradarCacheCellKind;
+
+typedef struct BinradarCachePredicate {
+    char *descriptor;
+    GArray *expr_nodes;
+    uint32_t expr_root;
+    uint8_t cwe_kind;
+    BinradarCacheCellKind cell_kind;
+    uint32_t cell_index;
+    uint8_t scale;
+} BinradarCachePredicate;
+
+typedef struct BinradarPatchSelector {
+    uint32_t patch_id;
+    uint32_t iteration;
+    uint32_t descriptor_length;
+    uint32_t descriptor_capacity;
+    char descriptor[];
+} BinradarPatchSelector;
+
+typedef struct BinradarSnapshotHeader {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t patch_id;
+    uint32_t branch;
+    uint64_t stack_size;
+    uint64_t flags;
+} BinradarSnapshotHeader;
+
+_Static_assert(sizeof(BinradarSnapshotHeader) == 32,
+               "cached snapshot header layout changed");
+_Static_assert(offsetof(BinradarPatchSelector, descriptor) == 16,
+               "cached selector prefix changed");
+
 typedef struct BinradarManager {
     uint32_t patch_cnt;
     int patch_fd_r;
@@ -430,6 +520,17 @@ typedef struct BinradarManager {
     uint32_t *patch_list;
     // Max patch id that can be indexed in patch_results (allocated size = patch_max_id + 1).
     uint32_t patch_max_id;
+    bool cache_enabled;
+    bool cache_inference_enabled;
+    BinradarCacheFamily cache_family;
+    BinradarCachePredicate *cache_predicates;
+    uint32_t cache_predicate_count;
+    uint32_t cache_stack_size;
+    int cache_fd_r;
+    GByteArray *cache_bytes;
+    bool cache_capture_overflow;
+    BinradarPatchSelector *selector;
+    size_t selector_size;
 } BinradarManager;
 
 static SharedTraceData *shared_trace_data = NULL;
@@ -476,6 +577,8 @@ static void snapshot_modification_manager_reset(bool analysis_started);
 static void exit_with_status(int status);
 static int binradar_manager_cur_patch_id(BinradarManager *manager, int new_patch_id);
 static int binradar_manager_cur_iter(BinradarManager *manager, int new_iter);
+static PatchedResult *get_patched_result_tmp(BinradarManager *manager,
+                                             uint32_t patch_id);
 bool is_e9_relocated_call(target_ulong pc, target_ulong *call_site,
                           target_ulong *ret_addr);
 
@@ -639,6 +742,7 @@ void check_all_env_var(void) {
     check_env_var("BINRADAR_PROBE_FILE");
     check_env_var("BINRADAR_QUERY_WINDOW_FILE");
     check_env_var("BINRADAR_FORKSERVER_CHILD_TIMEOUT");
+    check_env_var("BINRADAR_FORKSERVER_ITERATION_TIMEOUT");
     // Memcheck related
     check_env_var("BINRADAR_MEMCHECK_ENABLE");
     // Patch related
@@ -647,6 +751,10 @@ void check_all_env_var(void) {
     check_env_var("PATCH_ID"); // Used by brpatch, 123456
     check_env_var("BINRADAR_PATCH_CNT");
     check_env_var("BINRADAR_PATCH_FILTER_FILE");
+    check_env_var("BINRADAR_PATCH_CACHE_ENABLE");
+    check_env_var("BINRADAR_PATCH_MANIFEST");
+    check_env_var("BINRADAR_PATCH_CACHED_FD_R");
+    check_env_var("PATCH_CACHED_FD");
     // e9tool patch region related
     check_env_var("E9_EXCLUDE_RANGES");
     // E9Patch relocated call jumps (jump-addr:call-site:ret-addr, comma separated)
@@ -696,6 +804,278 @@ static void exit_with_status(int status) {
     trace_mem_flush();
     snapshot_modification_manager_reset(false);
     exit(status);
+}
+
+typedef struct BinradarExprParser {
+    const char *cursor;
+    GArray *nodes;
+    uint32_t depth;
+} BinradarExprParser;
+
+static bool binradar_parse_u64(const char **cursor, uint64_t *value)
+{
+    const char *p = *cursor;
+    uint64_t result = 0;
+    if (*p < '0' || *p > '9') return false;
+    do {
+        uint32_t digit = (uint32_t)(*p - '0');
+        if (result > (UINT64_MAX - digit) / 10u) return false;
+        result = result * 10u + digit;
+        p++;
+    } while (*p >= '0' && *p <= '9');
+    *cursor = p;
+    *value = result;
+    return true;
+}
+
+static bool binradar_parse_expr(BinradarExprParser *parser,
+                                uint32_t *index_out)
+{
+    BinradarExprNode node = {0};
+    uint64_t number;
+    char op;
+    if (parser->depth++ >= BRCACHE_MAX_EXPR_DEPTH ||
+        *parser->cursor == '\0') {
+        parser->depth--;
+        return false;
+    }
+    op = *parser->cursor++;
+    if (op == 'p' || op == 'n' || op == 'v') {
+        if (!binradar_parse_u64(&parser->cursor, &number)) goto invalid;
+        if (op == 'v') {
+            if (number > 15) goto invalid;
+            node.op = BRCACHE_EXPR_VARIABLE;
+            node.variable = (uint16_t)number;
+        } else {
+            node.op = BRCACHE_EXPR_LITERAL;
+            node.literal = (int64_t)(op == 'n' ? 0u - number : number);
+        }
+    } else if (op == '~') {
+        node.op = BRCACHE_EXPR_NOT;
+        if (!binradar_parse_expr(parser, &node.left)) goto invalid;
+    } else {
+        switch (op) {
+        case '=': node.op = BRCACHE_EXPR_EQ; break;
+        case '!': node.op = BRCACHE_EXPR_NE; break;
+        case '>':
+            node.op = *parser->cursor == '=' ? BRCACHE_EXPR_GE
+                                              : BRCACHE_EXPR_GT;
+            if (*parser->cursor == '=') parser->cursor++;
+            break;
+        case '<':
+            node.op = *parser->cursor == '=' ? BRCACHE_EXPR_LE
+                                              : BRCACHE_EXPR_LT;
+            if (*parser->cursor == '=') parser->cursor++;
+            break;
+        case '+': node.op = BRCACHE_EXPR_ADD; break;
+        case '-': node.op = BRCACHE_EXPR_SUB; break;
+        case '*': node.op = BRCACHE_EXPR_MUL; break;
+        case '/': node.op = BRCACHE_EXPR_DIV; break;
+        case '%': node.op = BRCACHE_EXPR_REM; break;
+        case '&': node.op = BRCACHE_EXPR_AND; break;
+        case '|': node.op = BRCACHE_EXPR_OR; break;
+        case '^': node.op = BRCACHE_EXPR_XOR; break;
+        case 'l': node.op = BRCACHE_EXPR_SHL; break;
+        case 'r': node.op = BRCACHE_EXPR_SHR; break;
+        default: goto invalid;
+        }
+        if (!binradar_parse_expr(parser, &node.left) ||
+            !binradar_parse_expr(parser, &node.right)) goto invalid;
+    }
+    g_array_append_val(parser->nodes, node);
+    *index_out = parser->nodes->len - 1;
+    parser->depth--;
+    return true;
+invalid:
+    parser->depth--;
+    return false;
+}
+
+static bool binradar_parse_generic_predicate(BinradarCachePredicate *predicate,
+                                             const char *descriptor)
+{
+    BinradarExprParser parser = {0};
+    parser.cursor = descriptor;
+    parser.nodes = g_array_new(FALSE, FALSE, sizeof(BinradarExprNode));
+    if (!binradar_parse_expr(&parser, &predicate->expr_root) ||
+        *parser.cursor != '\0') {
+        g_array_free(parser.nodes, TRUE);
+        return false;
+    }
+    predicate->expr_nodes = parser.nodes;
+    return true;
+}
+
+static bool binradar_parse_decimal_u32(const char **cursor, uint32_t *value)
+{
+    uint64_t parsed;
+    if (!binradar_parse_u64(cursor, &parsed) || parsed > UINT32_MAX) {
+        return false;
+    }
+    *value = (uint32_t)parsed;
+    return true;
+}
+
+static bool binradar_parse_cwe_predicate(BinradarCachePredicate *predicate,
+                                         const char *descriptor)
+{
+    const char *p = descriptor;
+    uint32_t value;
+    if (p[0] != 'c' || (p[1] != '1' && p[1] != '2')) return false;
+    predicate->cwe_kind = (uint8_t)(p[1] - '0');
+    p += 2;
+    if (*p == 'p') {
+        p++;
+        predicate->cell_kind = BRCACHE_CELL_REGISTER;
+        if (!binradar_parse_decimal_u32(&p, &value) || value > 15) {
+            return false;
+        }
+        predicate->cell_index = value;
+    } else if (*p == 's') {
+        p++;
+        if (!binradar_parse_decimal_u32(&p, &value) || *p++ != 'i') {
+            return false;
+        }
+        switch (value) {
+        case 8: predicate->cell_kind = BRCACHE_CELL_STACK8; break;
+        case 16: predicate->cell_kind = BRCACHE_CELL_STACK16; break;
+        case 32: predicate->cell_kind = BRCACHE_CELL_STACK32; break;
+        case 64: predicate->cell_kind = BRCACHE_CELL_STACK64; break;
+        default: return false;
+        }
+        if (!binradar_parse_decimal_u32(&p, &predicate->cell_index)) {
+            return false;
+        }
+    } else {
+        return false;
+    }
+    if (predicate->cwe_kind == 1) {
+        if (predicate->cell_kind != BRCACHE_CELL_REGISTER &&
+            predicate->cell_kind != BRCACHE_CELL_STACK64) return false;
+        predicate->scale = 1;
+    } else {
+        if (predicate->cell_kind == BRCACHE_CELL_STACK64 || *p++ != 'q' ||
+            !binradar_parse_decimal_u32(&p, &value) ||
+            (value != 1 && value != 2 && value != 4 && value != 8)) {
+            return false;
+        }
+        predicate->scale = (uint8_t)value;
+    }
+    return *p == '\0';
+}
+
+static bool binradar_qnum_positive_u32(QObject *obj, uint32_t *value)
+{
+    QNum *number = qobject_to(QNum, obj);
+    uint64_t parsed;
+    if (number == NULL || !qnum_get_try_uint(number, &parsed) ||
+        parsed == 0 || parsed > UINT32_MAX) return false;
+    *value = (uint32_t)parsed;
+    return true;
+}
+
+static bool binradar_manager_load_manifest(BinradarManager *manager,
+                                           const char *path)
+{
+    gchar *content = NULL;
+    gsize content_len = 0;
+    GError *file_error = NULL;
+    Error *json_error = NULL;
+    QObject *root = NULL;
+    bool ok = false;
+    size_t max_descriptor = 0;
+
+    if (!g_file_get_contents(path, &content, &content_len, &file_error)) {
+        log_msg("[binradar] [cache-manifest] [error %s]\n",
+                file_error != NULL ? file_error->message : "read failed");
+        goto out;
+    }
+    root = qobject_from_json(content, &json_error);
+    QDict *dict = root != NULL ? qobject_to(QDict, root) : NULL;
+    if (dict == NULL || qdict_get_try_int(dict, "version", -1) != 1) {
+        log_msg("[binradar] [cache-manifest] [error invalid-version]\n");
+        goto out;
+    }
+    const char *kind = qdict_get_try_str(dict, "kind");
+    if (kind != NULL && strcmp(kind, "generic-erm") == 0) {
+        manager->cache_family = BRCACHE_FAMILY_GENERIC;
+    } else if (kind != NULL && strcmp(kind, "CWE805-erm") == 0) {
+        manager->cache_family = BRCACHE_FAMILY_CWE805;
+    } else {
+        log_msg("[binradar] [cache-manifest] [error invalid-family]\n");
+        goto out;
+    }
+    QList *rows = qobject_to(QList, qdict_get(dict, "predicates"));
+    if (rows == NULL || qlist_size(rows) > UINT32_MAX - 1u) {
+        log_msg("[binradar] [cache-manifest] [error invalid-predicates]\n");
+        goto out;
+    }
+    manager->cache_predicate_count = (uint32_t)qlist_size(rows);
+    manager->cache_predicates = g_new0(BinradarCachePredicate,
+                                       manager->cache_predicate_count + 1u);
+    const QListEntry *entry;
+    uint32_t expected_id = 1;
+    QLIST_FOREACH_ENTRY(rows, entry) {
+        QDict *row = qobject_to(QDict, qlist_entry_obj(entry));
+        uint32_t id, source_line;
+        if (row == NULL ||
+            !binradar_qnum_positive_u32(qdict_get(row, "id"), &id) ||
+            id != expected_id ||
+            !binradar_qnum_positive_u32(qdict_get(row, "source_line"),
+                                        &source_line)) {
+            log_msg("[binradar] [cache-manifest] [error invalid-row] "
+                    "[index %u]\n", expected_id);
+            goto out;
+        }
+        const char *descriptor = qdict_get_try_str(row, "descriptor");
+        size_t descriptor_len = descriptor != NULL ? strlen(descriptor) : 0;
+        if (descriptor_len == 0 || descriptor_len > BRCACHE_MAX_DESCRIPTOR) {
+            log_msg("[binradar] [cache-manifest] [error descriptor-size] "
+                    "[id %u]\n", id);
+            goto out;
+        }
+        BinradarCachePredicate *predicate = &manager->cache_predicates[id];
+        predicate->descriptor = g_strdup(descriptor);
+        bool parsed = manager->cache_family == BRCACHE_FAMILY_GENERIC
+            ? binradar_parse_generic_predicate(predicate, descriptor)
+            : binradar_parse_cwe_predicate(predicate, descriptor);
+        if (!parsed) {
+            log_msg("[binradar] [cache-manifest] [error descriptor-grammar] "
+                    "[id %u]\n", id);
+            goto out;
+        }
+        max_descriptor = MAX(max_descriptor, descriptor_len);
+        expected_id++;
+    }
+    for (uint32_t i = 0; i < manager->patch_cnt; i++) {
+        uint32_t id = manager->patch_list != NULL ? manager->patch_list[i]
+                                                  : i + 1u;
+        if (id == 0 || id > manager->cache_predicate_count ||
+            manager->cache_predicates[id].descriptor == NULL) {
+            log_msg("[binradar] [cache-manifest] [error missing-active-id] "
+                    "[id %u]\n", id);
+            goto out;
+        }
+    }
+    manager->selector_size = offsetof(BinradarPatchSelector, descriptor) +
+                             max_descriptor + 1u;
+    if (manager->selector_size < sizeof(BinradarPatchSelector)) {
+        manager->selector_size = sizeof(BinradarPatchSelector);
+    }
+    ok = true;
+    log_msg("[binradar] [cache-manifest] [loaded] [family %s] "
+            "[predicates %u] [selector-size %zu]\n", kind,
+            manager->cache_predicate_count, manager->selector_size);
+out:
+    if (json_error != NULL) {
+        log_msg("[binradar] [cache-manifest] [json-error %s]\n",
+                error_get_pretty(json_error));
+        error_free(json_error);
+    }
+    if (file_error != NULL) g_error_free(file_error);
+    qobject_unref(root);
+    g_free(content);
+    return ok;
 }
 
 static void binradar_manager_load_filter(BinradarManager *manager, const char *path) {
@@ -757,37 +1137,88 @@ static void binradar_manager_load_filter(BinradarManager *manager, const char *p
     }
 }
 
-void snapshot_set_binradar_patch_shm(uint32_t *shm) {
+void snapshot_init_binradar_patch_shm(uintptr_t key) {
+    const char *var;
+    size_t shm_size = sizeof(uint32_t) * 2u;
     binradar_manager = g_new0(BinradarManager, 1);
     binradar_manager->patch_cnt = 1;
+    binradar_manager->patch_fd_r = -1;
+    binradar_manager->cache_fd_r = -1;
     binradar_manager->results = g_ptr_array_new();
-    binradar_manager->cur_patch_id = shm;
-    *binradar_manager->cur_patch_id = 0;
-    binradar_manager->cur_iter = shm + 1;
-    *binradar_manager->cur_iter = 0;
-    char *var = getenv("BINRADAR_PATCH_FD_R");
-    if (var != NULL) {
-        binradar_manager->patch_fd_r = atoi(var);
-    } else {
-        log_msg("BINRADAR_PATCH_FD_R not set");
-        exit_with_status(1);
-    }
+
     var = getenv("BINRADAR_PATCH_CNT");
-    if (var != NULL) {
-        binradar_manager->patch_cnt = atoi(var);
-    } else {
-        log_msg("BINRADAR_PATCH_CNT not set");
+    if (var == NULL || atoi(var) < 0) {
+        log_msg("BINRADAR_PATCH_CNT not set or invalid\n");
         exit_with_status(1);
     }
-    binradar_manager->patch_list = NULL;
+    binradar_manager->patch_cnt = (uint32_t)atoi(var);
     binradar_manager->patch_max_id = binradar_manager->patch_cnt;
     var = getenv("BINRADAR_PATCH_FILTER_FILE");
     if (var != NULL && var[0] != '\0') {
         binradar_manager_load_filter(binradar_manager, var);
     }
-    binradar_manager->current = binradar_manager_alloc_one_iter(binradar_manager);
-    binradar_manager->patch_result_parser = sbsv_parser_new(SBSV_PARSER_DEFAULT);
-    sbsv_parser_add_schema(binradar_manager->patch_result_parser, "[patch] [id: int] [br: int] [v: int]");
+
+    var = getenv("BINRADAR_PATCH_CACHE_ENABLE");
+    binradar_manager->cache_enabled = var != NULL && strcmp(var, "1") == 0;
+    binradar_manager->cache_inference_enabled =
+        binradar_manager->cache_enabled;
+    if (binradar_manager->cache_enabled) {
+        const char *manifest = getenv("BINRADAR_PATCH_MANIFEST");
+        const char *cache_fd = getenv("BINRADAR_PATCH_CACHED_FD_R");
+        if (manifest == NULL || manifest[0] == '\0' || cache_fd == NULL ||
+            atoi(cache_fd) <= 2 ||
+            !binradar_manager_load_manifest(binradar_manager, manifest)) {
+            log_msg("[binradar] [cache-manifest] [fatal configuration]\n");
+            exit_with_status(1);
+        }
+        binradar_manager->cache_fd_r = atoi(cache_fd);
+        if (binradar_manager->cache_family == BRCACHE_FAMILY_CWE805) {
+            const char *stack_size = getenv("BRCACHE_STACK_SIZE");
+            uint64_t parsed = stack_size != NULL
+                ? strtoull(stack_size, NULL, 0) : 0;
+            if (parsed == 0 || parsed > (1u << 20)) {
+                log_msg("[binradar] [cache-manifest] "
+                        "[error invalid-stack-size]\n");
+                exit_with_status(1);
+            }
+            binradar_manager->cache_stack_size = (uint32_t)parsed;
+        }
+        shm_size = binradar_manager->selector_size;
+        binradar_manager->cache_bytes = g_byte_array_new();
+    }
+
+    int shmid = shmget((key_t)key, shm_size, 0666 | IPC_CREAT);
+    if (shmid == -1) {
+        perror("shmget failed");
+        exit_with_status(1);
+    }
+    uint32_t *shm = shmat(shmid, NULL, 0);
+    if (shm == (void *)-1) {
+        perror("shmat failed");
+        exit_with_status(1);
+    }
+    memset(shm, 0, shm_size);
+    binradar_manager->cur_patch_id = shm;
+    binradar_manager->cur_iter = shm + 1;
+    if (binradar_manager->cache_enabled) {
+        binradar_manager->selector = (BinradarPatchSelector *)shm;
+        binradar_manager->selector->descriptor_capacity =
+            (uint32_t)(shm_size - offsetof(BinradarPatchSelector,
+                                           descriptor));
+    }
+
+    var = getenv("BINRADAR_PATCH_FD_R");
+    if (var == NULL || atoi(var) <= 2) {
+        log_msg("BINRADAR_PATCH_FD_R not set\n");
+        exit_with_status(1);
+    }
+    binradar_manager->patch_fd_r = atoi(var);
+    binradar_manager->current = binradar_manager_alloc_one_iter(
+        binradar_manager);
+    binradar_manager->patch_result_parser = sbsv_parser_new(
+        SBSV_PARSER_DEFAULT);
+    sbsv_parser_add_schema(binradar_manager->patch_result_parser,
+        "[patch] [id: int] [br: int] [v: int]");
 }
 
 static void snapshot_load_binradar_env(void) {
@@ -4605,12 +5036,6 @@ static int binradar_manager_cur_iter(BinradarManager *manager, int new_iter) {
     return *manager->cur_iter;
 }
 
-static int binradar_manager_get_patch_cnt(BinradarManager *manager) {
-    if (manager == NULL) return 0;
-    if (manager->current == NULL) return 0;
-    return manager->patch_cnt;
-}
-
 // Actual patch id for iteration index (0 = original program, then candidates)
 static int binradar_manager_patch_id_at(BinradarManager *manager, uint32_t index) {
     if (manager == NULL) return 0;
@@ -4618,6 +5043,341 @@ static int binradar_manager_patch_id_at(BinradarManager *manager, uint32_t index
     if (index > manager->patch_cnt) return 0;
     if (manager->patch_list == NULL) return (int)index;
     return (int)manager->patch_list[index - 1];
+}
+
+static int64_t binradar_shift_right(int64_t value, int64_t amount)
+{
+    if (amount >= 64) return value < 0 ? -1 : 0;
+    if (amount <= -64) return 0;
+    if (amount < 0) return (int64_t)((uint64_t)value << (uint64_t)-amount);
+    if (amount == 0) return value;
+    uint64_t bits = (uint64_t)value >> (uint64_t)amount;
+    if (value < 0) bits |= ~(uint64_t)0 << (64u - (uint64_t)amount);
+    return (int64_t)bits;
+}
+
+static int64_t binradar_shift_left(int64_t value, int64_t amount)
+{
+    if (amount >= 64) return 0;
+    if (amount <= -64) return value < 0 ? -1 : 0;
+    if (amount < 0) return binradar_shift_right(value, -amount);
+    return (int64_t)((uint64_t)value << (uint64_t)amount);
+}
+
+static bool binradar_eval_expr(const BinradarCachePredicate *predicate,
+                               uint32_t index, const uint64_t regs[16],
+                               int64_t *value, bool *crashed)
+{
+    if (predicate->expr_nodes == NULL ||
+        index >= predicate->expr_nodes->len) return false;
+    const BinradarExprNode *node = &g_array_index(
+        predicate->expr_nodes, BinradarExprNode, index);
+    int64_t left = 0, right = 0;
+    if (node->op == BRCACHE_EXPR_LITERAL) {
+        *value = node->literal;
+        return true;
+    }
+    if (node->op == BRCACHE_EXPR_VARIABLE) {
+        *value = (int64_t)regs[node->variable];
+        return true;
+    }
+    if (!binradar_eval_expr(predicate, node->left, regs, &left, crashed)) {
+        return false;
+    }
+    if (node->op == BRCACHE_EXPR_NOT) {
+        *value = ~left;
+        return true;
+    }
+    if (!binradar_eval_expr(predicate, node->right, regs, &right, crashed)) {
+        return false;
+    }
+    switch (node->op) {
+    case BRCACHE_EXPR_EQ: *value = left == right; break;
+    case BRCACHE_EXPR_NE: *value = left != right; break;
+    case BRCACHE_EXPR_GT: *value = left > right; break;
+    case BRCACHE_EXPR_GE: *value = left >= right; break;
+    case BRCACHE_EXPR_LT: *value = left < right; break;
+    case BRCACHE_EXPR_LE: *value = left <= right; break;
+    case BRCACHE_EXPR_ADD:
+        *value = (int64_t)((uint64_t)left + (uint64_t)right); break;
+    case BRCACHE_EXPR_SUB:
+        *value = (int64_t)((uint64_t)left - (uint64_t)right); break;
+    case BRCACHE_EXPR_MUL:
+        *value = (int64_t)((uint64_t)left * (uint64_t)right); break;
+    case BRCACHE_EXPR_DIV:
+        if (right == 0 || (left == INT64_MIN && right == -1)) {
+            *crashed = true;
+            *value = 0;
+        } else {
+            *value = left / right;
+        }
+        break;
+    case BRCACHE_EXPR_REM:
+        if (right == 0 || (left == INT64_MIN && right == -1)) {
+            *crashed = true;
+            *value = 0;
+        } else {
+            *value = left % right;
+        }
+        break;
+    case BRCACHE_EXPR_AND: *value = left & right; break;
+    case BRCACHE_EXPR_OR: *value = left | right; break;
+    case BRCACHE_EXPR_XOR: *value = left ^ right; break;
+    case BRCACHE_EXPR_SHL: *value = binradar_shift_left(left, right); break;
+    case BRCACHE_EXPR_SHR: *value = binradar_shift_right(left, right); break;
+    default: return false;
+    }
+    return true;
+}
+
+typedef struct BinradarCacheClamp {
+    uint64_t begin;
+    uint64_t end;
+} BinradarCacheClamp;
+
+static bool binradar_cache_read_cell(const BinradarCachePredicate *predicate,
+                                     const uint64_t regs[16],
+                                     const uint8_t *stack, size_t stack_size,
+                                     uint64_t *value)
+{
+    if (predicate->cell_kind == BRCACHE_CELL_REGISTER) {
+        *value = regs[predicate->cell_index];
+        return true;
+    }
+    size_t width = predicate->cell_kind == BRCACHE_CELL_STACK8 ? 1u :
+                   predicate->cell_kind == BRCACHE_CELL_STACK16 ? 2u :
+                   predicate->cell_kind == BRCACHE_CELL_STACK32 ? 4u : 8u;
+    if (predicate->cell_index > SIZE_MAX / width) return false;
+    size_t offset = (size_t)predicate->cell_index * width;
+    if (offset > stack_size || width > stack_size - offset) return false;
+    *value = 0;
+    memcpy(value, stack + offset, width);
+    return true;
+}
+
+static bool binradar_eval_cache_predicate(
+        const BinradarManager *manager, uint32_t patch_id,
+        const uint64_t regs[16], const BinradarCacheClamp *clamps,
+        const uint8_t *stack, size_t stack_size, int *branch)
+{
+    if (patch_id == 0) {
+        *branch = 0;
+        return true;
+    }
+    if (patch_id > manager->cache_predicate_count) return false;
+    const BinradarCachePredicate *predicate =
+        &manager->cache_predicates[patch_id];
+    if (manager->cache_family == BRCACHE_FAMILY_GENERIC) {
+        int64_t value = 0;
+        bool crashed = false;
+        if (!binradar_eval_expr(predicate, predicate->expr_root, regs,
+                                &value, &crashed)) return false;
+        *branch = crashed ? 2 : value != 0;
+        return true;
+    }
+    uint64_t value;
+    if (clamps == NULL ||
+        !binradar_cache_read_cell(predicate, regs, stack, stack_size,
+                                  &value)) return false;
+    if (predicate->cwe_kind == 2) {
+        if (value > UINT64_MAX / predicate->scale) {
+            *branch = 2;
+            return true;
+        }
+        value *= predicate->scale;
+    }
+    for (size_t i = 256; i-- > 0;) {
+        if (predicate->cwe_kind == 1) {
+            if (value >= clamps[i].begin && value < clamps[i].end) {
+                *branch = 0;
+                return true;
+            }
+        } else if (value < clamps[i].end - clamps[i].begin) {
+            *branch = 0;
+            return true;
+        }
+    }
+    *branch = 1;
+    return true;
+}
+
+static bool binradar_cache_vector(BinradarManager *manager,
+                                  uint32_t selected_patch,
+                                  uint32_t evaluated_patch,
+                                  GArray **vector_out)
+{
+    GArray *vector = g_array_new(FALSE, FALSE, sizeof(int));
+    size_t offset = 0;
+    uint64_t expected_flags = manager->cache_family == BRCACHE_FAMILY_CWE805
+        ? BRCACHE_FLAG_CWE805 : 0;
+    size_t expected_record = sizeof(BinradarSnapshotHeader) +
+                             16u * sizeof(uint64_t);
+    if (manager->cache_family == BRCACHE_FAMILY_CWE805) {
+        expected_record += 256u * sizeof(BinradarCacheClamp) +
+                           manager->cache_stack_size;
+    }
+    while (offset < manager->cache_bytes->len) {
+        if (manager->cache_bytes->len - offset <
+            sizeof(BinradarSnapshotHeader)) goto invalid;
+        BinradarSnapshotHeader header;
+        memcpy(&header, manager->cache_bytes->data + offset, sizeof(header));
+        if (header.magic != BRCACHE_SNAPSHOT_MAGIC ||
+            header.version != BRCACHE_SNAPSHOT_VERSION ||
+            header.patch_id != selected_patch || header.branch > 2 ||
+            header.flags != expected_flags ||
+            header.stack_size !=
+                (manager->cache_family == BRCACHE_FAMILY_CWE805
+                    ? manager->cache_stack_size : 0) ||
+            expected_record > manager->cache_bytes->len - offset) {
+            goto invalid;
+        }
+        const uint8_t *payload = manager->cache_bytes->data + offset +
+                                 sizeof(header);
+        BinradarCacheClamp clamps_storage[256];
+        const BinradarCacheClamp *clamps = NULL;
+        if (manager->cache_family == BRCACHE_FAMILY_CWE805) {
+            memcpy(clamps_storage, payload, sizeof(clamps_storage));
+            clamps = clamps_storage;
+            payload += sizeof(clamps_storage);
+        }
+        uint64_t regs[16];
+        memcpy(regs, payload, sizeof(regs));
+        payload += sizeof(regs);
+        int evaluated;
+        if (!binradar_eval_cache_predicate(
+                manager, evaluated_patch, regs, clamps, payload,
+                manager->cache_family == BRCACHE_FAMILY_CWE805
+                    ? manager->cache_stack_size : 0,
+                &evaluated)) goto invalid;
+        if (evaluated_patch == selected_patch &&
+            evaluated != (int)header.branch) goto invalid;
+        g_array_append_val(vector, evaluated);
+        offset += expected_record;
+    }
+    *vector_out = vector;
+    return true;
+invalid:
+    g_array_free(vector, TRUE);
+    return false;
+}
+
+static bool binradar_branch_vectors_equal(const GArray *left,
+                                          const GArray *right)
+{
+    if (left == NULL || right == NULL || left->len != right->len) return false;
+    for (guint i = 0; i < left->len; i++) {
+        if (g_array_index(left, int, i) != g_array_index(right, int, i)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void binradar_cache_disable(BinradarManager *manager,
+                                   const char *reason)
+{
+    if (!manager->cache_inference_enabled) return;
+    manager->cache_inference_enabled = false;
+    log_msg("[binradar] [cache-disabled] [reason %s]\n", reason);
+}
+
+static bool binradar_publish_selector(BinradarManager *manager,
+                                      uint32_t patch_id, uint32_t iteration)
+{
+    binradar_manager_cur_patch_id(manager, (int)patch_id);
+    binradar_manager_cur_iter(manager, (int)iteration);
+    if (!manager->cache_enabled) return true;
+    const char *descriptor = patch_id == 0 ? "p0" :
+        manager->cache_predicates[patch_id].descriptor;
+    size_t length = descriptor != NULL ? strlen(descriptor) : 0;
+    if (length >= manager->selector->descriptor_capacity) return false;
+    manager->selector->descriptor_length = (uint32_t)length;
+    memcpy(manager->selector->descriptor, descriptor, length + 1u);
+    __sync_synchronize();
+    manager->selector->patch_id = patch_id;
+    manager->selector->iteration = iteration;
+    return true;
+}
+
+static void binradar_clear_current(BinradarManager *manager)
+{
+    if (manager == NULL || manager->current == NULL) return;
+    for (uint32_t patch = 0; patch <= manager->patch_max_id; patch++) {
+        PatchedResult *result = &manager->current->patch_results[patch];
+        if (result->br_taken != NULL) {
+            g_array_free(result->br_taken, TRUE);
+        }
+    }
+    memset(manager->current->patch_results, 0,
+           sizeof(PatchedResult) * (manager->patch_max_id + 1u));
+}
+
+static void binradar_restore_uncached_candidates(BinradarManager *manager,
+                                                  bool *uncovered,
+                                                  const bool *executed)
+{
+    if (manager == NULL || uncovered == NULL || executed == NULL) return;
+    for (uint32_t i = 0; i < manager->patch_cnt; i++) {
+        uint32_t patch = (uint32_t)binradar_manager_patch_id_at(manager,
+                                                                i + 1u);
+        if (executed[patch]) continue;
+        PatchedResult *result = get_patched_result_tmp(manager, patch);
+        if (result->br_taken != NULL) {
+            g_array_free(result->br_taken, TRUE);
+        }
+        memset(result, 0, sizeof(*result));
+        uncovered[patch] = true;
+    }
+}
+
+static GArray *binradar_clone_branch_vector(const GArray *source)
+{
+    GArray *clone = g_array_sized_new(FALSE, FALSE, sizeof(int), source->len);
+    if (source->len != 0) {
+        g_array_append_vals(clone, source->data, source->len);
+    }
+    return clone;
+}
+
+static void binradar_record_outcome(BinradarManager *manager,
+                                    uint32_t patch_id)
+{
+    SnapshotExitInfo *info = snapshot_exit_info_ptr();
+    PatchedResult *result = get_patched_result_tmp(manager, patch_id);
+    if (info == NULL || !info->valid) return;
+    result->patch_id = patch_id;
+    result->is_crash = info->crashed;
+    result->fault_loc = info->fault_addr;
+}
+
+static void binradar_materialize_cache_hit(BinradarManager *manager,
+                                           uint32_t patch_id,
+                                           uint32_t representative,
+                                           const GArray *branches)
+{
+    SnapshotExitInfo *info = snapshot_exit_info_ptr();
+    PatchedResult *result = get_patched_result_tmp(manager, patch_id);
+    result->patch_id = patch_id;
+    result->br_taken = binradar_clone_branch_vector(branches);
+    if (info != NULL && info->valid) {
+        result->is_crash = info->crashed;
+        result->fault_loc = info->fault_addr;
+        int iter = binradar_manager_cur_iter(manager, -1);
+        if (info->crashed) {
+            log_msg("[binradar] [crash] [iter %d] [patch %u] "
+                    "[guest_pc %lx] [guest_cs_base %lx] [fault_addr %lx] "
+                    "[host_fault_addr %lx] [reason %s]\n", iter, patch_id,
+                    info->guest_pc, info->guest_cs_base, info->fault_addr,
+                    info->host_fault_addr, info->description);
+        } else {
+            log_msg("[binradar] [normal] [iter %d] [patch %u] "
+                    "[guest_pc %lx] [guest_cs_base %lx] [reason %s]\n",
+                    iter, patch_id, info->guest_pc, info->guest_cs_base,
+                    info->description);
+        }
+        log_msg("[binradar] [cache-hit] [iter %d] [patch %u] "
+                "[representative %u]\n", iter, patch_id, representative);
+    }
 }
 
 static void binradar_commit(BinradarManager *manager) {
@@ -4760,10 +5520,36 @@ static void binradar_manager_drain_patch_fd_once(BinradarManager *manager) {
     }
 }
 
-static void binradar_manager_reset_line_buf(BinradarManager *manager) {
+static void binradar_manager_drain_cache_fd_once(BinradarManager *manager) {
+    uint8_t buf[8192];
+    if (manager == NULL || manager->cache_fd_r < 0) return;
+    for (;;) {
+        ssize_t n = read(manager->cache_fd_r, buf, sizeof(buf));
+        if (n > 0) {
+            if (!manager->cache_capture_overflow &&
+                (size_t)n <= BRCACHE_MAX_CAPTURE_BYTES -
+                             manager->cache_bytes->len) {
+                g_byte_array_append(manager->cache_bytes, buf, (guint)n);
+            } else {
+                manager->cache_capture_overflow = true;
+            }
+            continue;
+        }
+        if (n == 0 || errno == EAGAIN || errno == EWOULDBLOCK) break;
+        if (errno == EINTR) continue;
+        manager->cache_capture_overflow = true;
+        break;
+    }
+}
+
+static void binradar_manager_reset_capture(BinradarManager *manager) {
     if (manager == NULL) return;
     manager->line_idx = 0;
     memset(manager->line_buf, 0, sizeof(manager->line_buf));
+    if (manager->cache_bytes != NULL) {
+        g_byte_array_set_size(manager->cache_bytes, 0);
+    }
+    manager->cache_capture_overflow = false;
 }
 
 static void snapshot_prepare_mutation_epoch(void)
@@ -4785,8 +5571,16 @@ static int64_t forkserver_child_timeout_ms(void) {
     const char *var = getenv("BINRADAR_FORKSERVER_CHILD_TIMEOUT");
     if (var == NULL) return -1;
     int64_t secs = atoll(var);
-    if (secs <= 0) return -1;
+    if (secs <= 0 || secs > INT64_MAX / 1000) return -1;
     return secs * 1000;
+}
+
+static int64_t forkserver_iteration_deadline_us(void) {
+    const char *var = getenv("BINRADAR_FORKSERVER_ITERATION_TIMEOUT");
+    if (var == NULL) return -1;
+    int64_t secs = atoll(var);
+    if (secs <= 0 || secs > INT64_MAX / G_USEC_PER_SEC) return -1;
+    return g_get_monotonic_time() + secs * G_USEC_PER_SEC;
 }
 
 /* Abort an always-hanging mutation plan after this many consecutive
@@ -4855,330 +5649,355 @@ static bool report_shared_prov_finding(uint32_t *status_out) {
     return true;
 }
 
-/* Wait for the forkserver child, draining patch results while it runs.
- * Returns 0 when the child exited on its own, 1 when it was SIGKILLed
- * after BINRADAR_FORKSERVER_CHILD_TIMEOUT (the forkserver loop uses this
- * to count consecutive timeouts and abort always-hanging plans), and -1
- * on an internal wait error. */
-static int wait_child_and_drain_patch(pid_t child_pid, uint32_t *status_out) {
-        if (binradar_manager == NULL) {
-        // Not binradar mode - fallback to original
-        int64_t timeout_ms = forkserver_child_timeout_ms();
-        if (timeout_ms < 0) {
-            return waitpid(child_pid, (int *)status_out, 0) >= 0 ? 0 : -1;
-        }
-        // Bounded wait with deadline
-        int status = 0;
-        int64_t deadline = g_get_monotonic_time() + timeout_ms * 1000; /* us */
-        for (;;) {
-            pid_t r = waitpid(child_pid, &status, WNOHANG);
-            if (r == child_pid) {
-                *status_out = (uint32_t)status;
-                /* Child exited on its own; a deferred finding is already
-                 * surfaced by the child's finalize path. */
-                return 0;
-            }
-            if (r < 0) {
-                log_msg("waitpid(WNOHANG)\n");
-                return -1;
-            }
-            if (g_get_monotonic_time() >= deadline) {
-                log_msg("[forkserver] [child-timeout] killing child %d after %ld ms\n",
-                        (int)child_pid, (long)timeout_ms);
-                kill(child_pid, SIGKILL);
-                waitpid(child_pid, &status, 0);
-                *status_out = (uint32_t)status;
-                /* Timeout-safe transport: the child may have recorded a
-                 * provenance finding before looping forever.  Surface it
-                 * as a synthetic crash instead of a bare timeout. */
-                report_shared_prov_finding(status_out);
-                return 1;
-            }
-            g_usleep(50 * 1000);
-        }
-    }
-
-    struct pollfd pfd;
+/* Wait while draining both result channels.  Return 1 for a child timeout,
+ * 2 for the aggregate iteration deadline, and -1 for an internal error. */
+static int wait_child_and_drain_patch(pid_t child_pid, uint32_t *status_out,
+                                      int64_t iteration_deadline_us) {
     int status = 0;
-    bool child_exited = false;
+    int64_t child_timeout_ms = forkserver_child_timeout_ms();
+    int64_t child_deadline = child_timeout_ms >= 0
+        ? g_get_monotonic_time() + child_timeout_ms * 1000 : -1;
+    struct pollfd pfds[2];
+    nfds_t nfds = 0;
 
-    memset(&pfd, 0, sizeof(pfd));
-    pfd.fd = binradar_manager->patch_fd_r;
-    pfd.events = POLLIN | POLLHUP | POLLERR;
-
-    if (binradar_manager->patch_fd_r > 0) {
+    if (binradar_manager != NULL) {
         set_nonblock(binradar_manager->patch_fd_r);
+        pfds[nfds].fd = binradar_manager->patch_fd_r;
+        pfds[nfds].events = POLLIN | POLLHUP | POLLERR;
+        nfds++;
+        if (binradar_manager->cache_fd_r >= 0) {
+            set_nonblock(binradar_manager->cache_fd_r);
+            pfds[nfds].fd = binradar_manager->cache_fd_r;
+            pfds[nfds].events = POLLIN | POLLHUP | POLLERR;
+            nfds++;
+        }
     }
 
-    int64_t timeout_ms = forkserver_child_timeout_ms();
-    int64_t deadline = (timeout_ms >= 0) ? g_get_monotonic_time() + timeout_ms * 1000 : -1; /* us */
-    bool child_timed_out = false;
-
-    while (!child_exited) {
-        if (deadline >= 0 && g_get_monotonic_time() >= deadline) {
-            log_msg("[forkserver] [child-timeout] killing child %d after %ld ms\n",
-                    (int)child_pid, (long)timeout_ms);
-            kill(child_pid, SIGKILL);
-            waitpid(child_pid, &status, 0);
-            child_exited = true;
-            child_timed_out = true;
-            /* Timeout-safe transport: surface a deferred finding as a
-             * synthetic crash (see non-binradar path above). */
-            report_shared_prov_finding((uint32_t *)&status);
-            break;
-        }
-
-        pid_t r = waitpid(child_pid, &status, WNOHANG);
-        if (r == child_pid) {
-            child_exited = true;
-            break;
-        } else if (r < 0) {
+    for (;;) {
+        pid_t waited = waitpid(child_pid, &status, WNOHANG);
+        if (waited == child_pid) break;
+        if (waited < 0) {
             log_msg("waitpid(WNOHANG)\n");
             return -1;
         }
-
-        int pr = poll(&pfd, 1, 50);
-        if (pr < 0) {
-            if (errno == EINTR) {
-                continue;
+        int64_t now = g_get_monotonic_time();
+        bool iteration_timeout = iteration_deadline_us >= 0 &&
+                                 now >= iteration_deadline_us;
+        bool child_timeout = child_deadline >= 0 && now >= child_deadline;
+        if (iteration_timeout || child_timeout) {
+            log_msg(iteration_timeout
+                    ? "[forkserver] [iteration-timeout] killing child %d\n"
+                    : "[forkserver] [child-timeout] killing child %d after %ld ms\n",
+                    (int)child_pid, (long)child_timeout_ms);
+            kill(child_pid, SIGKILL);
+            if (waitpid(child_pid, &status, 0) < 0) return -1;
+            report_shared_prov_finding((uint32_t *)&status);
+            if (binradar_manager != NULL) {
+                binradar_manager_drain_patch_fd_once(binradar_manager);
+                binradar_manager_drain_cache_fd_once(binradar_manager);
             }
+            *status_out = (uint32_t)status;
+            return iteration_timeout ? 2 : 1;
+        }
+        if (nfds == 0) {
+            g_usleep(50 * 1000);
+            continue;
+        }
+        int pr = poll(pfds, nfds, 50);
+        if (pr < 0) {
+            if (errno == EINTR) continue;
             log_msg("poll\n");
             return -1;
         }
-
-        if (pr == 0) {
-            continue;
-        }
-
-        if (pfd.revents & (POLLIN | POLLHUP)) {
-            binradar_manager_drain_patch_fd_once(binradar_manager);
-        }
-
-        if (pfd.revents & POLLERR) {
-            log_msg("patch pipe POLLERR\n");
-            binradar_manager_drain_patch_fd_once(binradar_manager);
+        if (pr > 0) {
+            if (pfds[0].revents & (POLLIN | POLLHUP | POLLERR)) {
+                binradar_manager_drain_patch_fd_once(binradar_manager);
+            }
+            if (nfds == 2 &&
+                (pfds[1].revents & (POLLIN | POLLHUP | POLLERR))) {
+                binradar_manager_drain_cache_fd_once(binradar_manager);
+            }
         }
     }
-
-    binradar_manager_drain_patch_fd_once(binradar_manager);
-
+    if (binradar_manager != NULL) {
+        binradar_manager_drain_patch_fd_once(binradar_manager);
+        binradar_manager_drain_cache_fd_once(binradar_manager);
+    }
     *status_out = (uint32_t)status;
-    return child_timed_out ? 1 : 0;
+    return 0;
 }
 
 
-void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env, const ArgumentInfo *arg_info, size_t num_arg_regs) {
+void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
+                         const ArgumentInfo *arg_info, size_t num_arg_regs) {
     log_msg("[snapshot] [forkserver] [called %d]\n", forkserver_installed);
     if (forkserver_installed) return;
     forkserver_installed = true;
     rcu_disable_atfork();
     snapshot_save();
-    if (binradar_forkserver_ctrl_r == -1 || binradar_forkserver_stat_w == -1) {
-        log_msg("[snapshot] [forkserver] [error] invalid binradar control fds\n");
-        exit_with_status(1);
-    }
-    pid_t child_pid;
-    // int   t_fd[2];
-    int patch_cnt = 0;
-    if (binradar_manager != NULL) {
-        patch_cnt = binradar_manager_get_patch_cnt(binradar_manager);
-        binradar_manager_reset_line_buf(binradar_manager);
-    }
-    int binradar_iter = 0;
-    int binradar_patch_id = 0;
-    bool binradar_mode = (binradar_manager != NULL);
-    
-    uint32_t   was_killed;
-    uint32_t version = BINRADAR_FORKSERVER_PROTOCOL_V2;
-    uint32_t tmp = version ^ 0xffffffff, reply_value;
-    uint8_t *msg = (uint8_t *)&version;
-    uint8_t *reply = (uint8_t *)&reply_value;
-    uint32_t status[3] = {0, 0, 0}; // status[0]: child exit status, status[1]: patch id, status[2]: iter
-    uint32_t remaining_mods = 0;
-    /* Consecutive child-timeout kills; an always-hanging mutation plan
-     * (deterministic deadlock at one patch id) must abort instead of
-     * burning one child timeout per remaining mod. */
-    int consecutive_child_timeouts = 0;
-    int abort_after_timeouts = forkserver_timeout_abort_count();
-    bool plan_aborted = false;
-    /* Tell the parent that we're alive. If the parent doesn't want
-       to talk, assume that we're not running in forkserver mode. */
-  
-    if (write_exact(binradar_forkserver_stat_w, msg, 4) < 0) {
-        log_msg("[snapshot] [forkserver] [error] failed to write to %d %d\n", binradar_forkserver_stat_w, status);
-        exit_with_status(1);
-    }
-  
-    afl_forksrv_pid = getpid();
-  
-    if (read_exact(binradar_forkserver_ctrl_r, reply, 4) < 0) {
-        log_msg("[snapshot] [forkserver] [error] fuzzolic not responding to %d\n", binradar_forkserver_ctrl_r);
-        exit_with_status(1);
-    }
-    if (tmp != reply_value) {
-        log_msg("wrong forkserver message from fuzzolic.py");
+    if (binradar_forkserver_ctrl_r == -1 ||
+        binradar_forkserver_stat_w == -1) {
+        log_msg("[snapshot] [forkserver] [error] invalid control fds\n");
         exit_with_status(1);
     }
 
-    // send welcome message as final message
-    if (write_exact(binradar_forkserver_stat_w, msg, 4) < 0) { 
-        log_msg("[snapshot] [forkserver] [error] failed to send final handshake to %d %d\n", binradar_forkserver_stat_w, status);
+    bool binradar_mode = binradar_manager != NULL;
+    uint32_t iteration = 0;
+    uint32_t version = BINRADAR_FORKSERVER_PROTOCOL_V3;
+    uint32_t expected_reply = version ^ UINT32_MAX;
+    uint32_t reply_value;
+    int consecutive_child_timeouts = 0;
+    int abort_after_timeouts = forkserver_timeout_abort_count();
+
+    if (write_exact(binradar_forkserver_stat_w, &version, sizeof(version)) < 0) {
         exit_with_status(1);
     }
-  
-  
-    // END forkserver handshake
-    log_msg("[forkserver] [start]\n");
-  
-    /* All right, let's await orders... */
-  
-    while (1) {
-  
-        /* Whoops, parent dead? */
-    
-        if (read_exact(binradar_forkserver_ctrl_r, &was_killed, 4) < 0) {
+    afl_forksrv_pid = getpid();
+    if (read_exact(binradar_forkserver_ctrl_r, &reply_value,
+                   sizeof(reply_value)) < 0 ||
+        reply_value != expected_reply) {
+        log_msg("[snapshot] [forkserver] [error] protocol-v3 handshake\n");
+        exit_with_status(1);
+    }
+    if (write_exact(binradar_forkserver_stat_w, &version, sizeof(version)) < 0) {
+        exit_with_status(1);
+    }
+    log_msg("[forkserver] [start] [protocol 3]\n");
+
+    for (;;) {
+        uint32_t was_killed;
+        if (read_exact(binradar_forkserver_ctrl_r, &was_killed,
+                       sizeof(was_killed)) < 0) {
             log_msg("[forkserver] [exit] parent (fuzzolic) dead or exit\n");
             exit_with_status(2);
         }
-        if (binradar_mode && binradar_iter == 0) {
-            binradar_iter = 1;
-            binradar_patch_id = 0;
-        } else if (!binradar_mode) {
-            binradar_iter++;
-        }
-        binradar_manager_cur_iter(binradar_manager, binradar_iter);
+        iteration++;
+        uint32_t representative_runs = 0;
+        uint32_t remaining_mods = 0;
+        bool iteration_aborted = false;
+        int64_t iteration_deadline = forkserver_iteration_deadline_us();
+        bool *uncovered = NULL;
+        bool *executed = NULL;
+        SnapshotExitInfo baseline_exit = {0};
+        bool baseline_exit_valid = false;
 
-        /* Establish a channel with child to grab translation commands. We'll
-        read from t_fd[0], child will write to TSL_FD. */
-
-        // if (pipe(t_fd) || dup2(t_fd[1], TSL_FD) < 0) exit(3);
-        // close(t_fd[1]);
-        if (binradar_mode) {
-            int actual_patch_id = binradar_manager_patch_id_at(binradar_manager, (uint32_t)binradar_patch_id);
-            status[1] = actual_patch_id;
-            status[2] = binradar_iter;
-            binradar_manager_cur_patch_id(binradar_manager, actual_patch_id);
-            log_msg("[binradar] [shm] [patch-id %d] [iter %d]\n", *binradar_manager->cur_patch_id, *binradar_manager->cur_iter);
+        if (binradar_mode && iteration > 1) {
+            uncovered = g_new0(bool, binradar_manager->patch_max_id + 1u);
+            executed = g_new0(bool, binradar_manager->patch_max_id + 1u);
+            for (uint32_t i = 0; i < binradar_manager->patch_cnt; i++) {
+                uint32_t patch = (uint32_t)binradar_manager_patch_id_at(
+                    binradar_manager, i + 1u);
+                uncovered[patch] = true;
+            }
         }
-        fflush(NULL);
-        trace_mem_flush();
-        log_msg_flush();
-        /* OSPREY: prepare the shared run for the next sample.  After
-         * the snapshot freeze, this resets only the per-child suffix,
-         * preserving the frozen pre-snapshot prefix (Stage 2.1); the
-         * child inherits `prefix ∪ empty suffix` via fork. */
-        if (g_osprey_ctx != NULL && g_osprey_shared_run != NULL) {
-            osprey_shared_run_prepare(g_osprey_ctx, g_osprey_shared_run,
-                                      (uint64_t)binradar_iter);
-        }
-        snapshot_prepare_mutation_epoch();
-        child_pid = fork();
-        if (child_pid < 0) exit_with_status(4);
 
-        if (!child_pid) {
-#ifdef SNAPSHOT_DEBUG
-            snapshot_install_crash_handler();
-#endif
-            /* Child process. Reset shared trace data, close descriptors, run target program. */
-            snapshot_modify_memory(cpu_env);
-            /* Fresh per-input run: no inherited deferred fault. */
-            provenance_clear_pending_fault();
-            /* OSPREY: child side attaches to the shared run (post-fork
-             * re-registration in case the parent reset recreated it). */
+        uint32_t selected_patch = 0;
+        for (;;) {
+            uint32_t child_status = 0;
+            if (binradar_mode) {
+                binradar_manager_reset_capture(binradar_manager);
+                if (!binradar_publish_selector(binradar_manager,
+                                                selected_patch, iteration)) {
+                    log_msg("[binradar] [cache-fatal] "
+                            "[reason selector-publication]\n");
+                    exit_with_status(5);
+                }
+                if (shared_trace_data != NULL) {
+                    memset(&shared_trace_data->exit_info, 0,
+                           sizeof(shared_trace_data->exit_info));
+                }
+                log_msg("[binradar] [shm] [patch-id %u] [iter %u]\n",
+                        selected_patch, iteration);
+            }
+
+            fflush(NULL);
+            trace_mem_flush();
+            log_msg_flush();
             if (g_osprey_ctx != NULL && g_osprey_shared_run != NULL) {
-                osprey_child_use_shared_run(g_osprey_ctx,
-                                            g_osprey_shared_run);
+                osprey_shared_run_prepare(g_osprey_ctx, g_osprey_shared_run,
+                                          iteration);
             }
-            afl_fork_child = 1;
-            close(binradar_forkserver_ctrl_r);
-            close(binradar_forkserver_stat_w);
-            // close(t_fd[0]);
-            return;
-
-        }
-
-        /* Parent. */
-
-        // close(TSL_FD);
-
-
-        /* Parent. */
-
-        /* Collect translation requests until child dies and closes the pipe. */
-
-        // afl_wait_tsl(cpu, t_fd[0]);
-
-        /* Get and relay exit status to parent. */
-
-        int wait_rc = wait_child_and_drain_patch(child_pid, status);
-        if (wait_rc < 0) exit_with_status(6);
-        if (wait_rc > 0) {
-            consecutive_child_timeouts++;
-            log_msg("[forkserver] [child-timeout] [consecutive %d]\n",
-                    consecutive_child_timeouts);
-        } else {
-            consecutive_child_timeouts = 0;
-        }
-        if (binradar_mode && !plan_aborted && abort_after_timeouts > 0 &&
-            consecutive_child_timeouts >= abort_after_timeouts) {
-            log_msg("[forkserver] [abort] [consecutive-timeout %d] [remaining %u]\n",
-                    consecutive_child_timeouts, remaining_mods);
-            plan_aborted = true;
-            remaining_mods = 0;
-        }
-
-        // Child process exit
-        trace_mem_flush();
-        /* OSPREY: the child has finished writing; merge its sample into
-         * the committed context tables (parent side).  Only the
-         * unmodified baseline sample (patch 0, iteration 1) is merged;
-         * later mutation runs are never merged.  A failed merge rejects
-         * the analysis transaction (Stage 0). */
-        if (wait_rc == 0 && g_osprey_ctx != NULL &&
-            g_osprey_shared_run != NULL && g_osprey_ctx->config.enabled &&
-            binradar_mode && binradar_iter == 1 && binradar_patch_id == 0) {
-            OspreyStatus mst = osprey_parent_merge_sample(
-                g_osprey_ctx, g_osprey_shared_run);
-            if (mst != OSPREY_OK && mst != OSPREY_DISABLED) {
-                /* The merge already rejected the transaction; do not
-                 * run analysis on incomplete facts. */
-                log_msg("[forkserver] [osprey] [merge-failed] [status %d]\n",
-                        (int)mst);
+            snapshot_prepare_mutation_epoch();
+            pid_t child_pid = fork();
+            if (child_pid < 0) exit_with_status(4);
+            if (child_pid == 0) {
+#ifdef SNAPSHOT_DEBUG
+                snapshot_install_crash_handler();
+#endif
+                snapshot_modify_memory(cpu_env);
+                provenance_clear_pending_fault();
+                if (g_osprey_ctx != NULL && g_osprey_shared_run != NULL) {
+                    osprey_child_use_shared_run(g_osprey_ctx,
+                                                g_osprey_shared_run);
+                }
+                afl_fork_child = 1;
+                close(binradar_forkserver_ctrl_r);
+                close(binradar_forkserver_stat_w);
+                return;
             }
-        }
-        if (write_exact(binradar_forkserver_stat_w, status, sizeof(status)) < 0) exit_with_status(7);
 
-        if (binradar_mode && !plan_aborted) {
-            if (binradar_iter == 1) {
-                /* OSPREY: baseline sample is merged; run the in-process
-                 * analysis (closure/inference in Stages 2-4) only when
-                 * the merge succeeded (fail-closed transaction). */
-                if (wait_rc == 0 && g_osprey_ctx != NULL &&
-                    g_osprey_ctx->config.enabled &&
-                    osprey_tx_ok(g_osprey_ctx)) {
-                    if (!snapshot_test_install_applied_model()) {
-                        osprey_analyze(g_osprey_ctx);
+            representative_runs++;
+            int wait_rc = wait_child_and_drain_patch(
+                child_pid, &child_status, iteration_deadline);
+            if (wait_rc < 0) exit_with_status(6);
+            if (wait_rc > 0) {
+                consecutive_child_timeouts++;
+                log_msg("[forkserver] [child-timeout] [consecutive %d]\n",
+                        consecutive_child_timeouts);
+            } else {
+                consecutive_child_timeouts = 0;
+            }
+            if (wait_rc == 2 ||
+                (abort_after_timeouts > 0 &&
+                 consecutive_child_timeouts >= abort_after_timeouts)) {
+                log_msg("[forkserver] [abort] [consecutive-timeout %d] "
+                        "[iter %u] [runs %u]\n",
+                        consecutive_child_timeouts, iteration,
+                        representative_runs);
+                iteration_aborted = true;
+                break;
+            }
+            trace_mem_flush();
+
+            SnapshotExitInfo *exit_info = snapshot_exit_info_ptr();
+            if (binradar_mode && (exit_info == NULL || !exit_info->valid)) {
+                log_msg("[binradar] [iteration-discarded] [iter %u] "
+                        "[reason unusable-exit] [patch %u]\n",
+                        iteration, selected_patch);
+                iteration_aborted = true;
+                break;
+            }
+            if (binradar_mode) {
+                binradar_record_outcome(binradar_manager, selected_patch);
+                if (executed != NULL && selected_patch != 0) {
+                    executed[selected_patch] = true;
+                }
+            }
+            if (binradar_mode && selected_patch == 0) {
+                baseline_exit = *exit_info;
+                baseline_exit_valid = true;
+            }
+
+            if (wait_rc == 0 && g_osprey_ctx != NULL &&
+                g_osprey_shared_run != NULL && g_osprey_ctx->config.enabled &&
+                binradar_mode && iteration == 1 && selected_patch == 0) {
+                OspreyStatus merged = osprey_parent_merge_sample(
+                    g_osprey_ctx, g_osprey_shared_run);
+                if (merged != OSPREY_OK && merged != OSPREY_DISABLED) {
+                    log_msg("[forkserver] [osprey] [merge-failed] "
+                            "[status %d]\n", (int)merged);
+                }
+            }
+
+            if (binradar_mode && binradar_manager->cache_enabled &&
+                binradar_manager->cache_inference_enabled) {
+                PatchedResult *observed = get_patched_result_tmp(
+                    binradar_manager, selected_patch);
+                if (observed->br_taken == NULL) {
+                    observed->br_taken = g_array_new(FALSE, FALSE,
+                                                     sizeof(int));
+                }
+                GArray *selected_vector = NULL;
+                if (binradar_manager->cache_capture_overflow ||
+                    !binradar_cache_vector(binradar_manager, selected_patch,
+                                            selected_patch,
+                                            &selected_vector) ||
+                    !binradar_branch_vectors_equal(observed->br_taken,
+                                                    selected_vector)) {
+                    if (selected_vector != NULL) {
+                        g_array_free(selected_vector, TRUE);
+                    }
+                    binradar_cache_disable(binradar_manager,
+                                           "representative-mismatch");
+                    binradar_restore_uncached_candidates(
+                        binradar_manager, uncovered, executed);
+                } else {
+                    g_array_free(selected_vector, TRUE);
+                    if (iteration > 1) {
+                        for (uint32_t i = 0;
+                             i < binradar_manager->patch_cnt; i++) {
+                            uint32_t candidate =
+                                (uint32_t)binradar_manager_patch_id_at(
+                                    binradar_manager, i + 1u);
+                            if (!uncovered[candidate] ||
+                                candidate == selected_patch) continue;
+                            GArray *candidate_vector = NULL;
+                            if (!binradar_cache_vector(
+                                    binradar_manager, selected_patch,
+                                    candidate, &candidate_vector)) {
+                                binradar_cache_disable(
+                                    binradar_manager,
+                                    "candidate-evaluation");
+                                binradar_restore_uncached_candidates(
+                                    binradar_manager, uncovered, executed);
+                                break;
+                            }
+                            if (binradar_branch_vectors_equal(
+                                    observed->br_taken, candidate_vector)) {
+                                binradar_materialize_cache_hit(
+                                    binradar_manager, candidate,
+                                    selected_patch, candidate_vector);
+                                uncovered[candidate] = false;
+                            }
+                            g_array_free(candidate_vector, TRUE);
+                        }
                     }
                 }
-                remaining_mods = analyze_collected_data(arg_info, num_arg_regs);
-                binradar_commit(binradar_manager);
-                binradar_iter = 2;
-                binradar_patch_id = 0;
-            } else if (binradar_patch_id >= patch_cnt) {
-                binradar_commit(binradar_manager);
-                remaining_mods = analyze_collected_data(arg_info, num_arg_regs);
-                binradar_iter++;
-                binradar_patch_id = 0;
-            } else {
-                binradar_patch_id++;
             }
+
+            if (!binradar_mode || iteration == 1) break;
+            if (selected_patch != 0) uncovered[selected_patch] = false;
+            selected_patch = 0;
+            for (uint32_t i = 0; i < binradar_manager->patch_cnt; i++) {
+                uint32_t candidate =
+                    (uint32_t)binradar_manager_patch_id_at(
+                        binradar_manager, i + 1u);
+                if (uncovered[candidate]) {
+                    selected_patch = candidate;
+                    break;
+                }
+            }
+            if (selected_patch == 0) break;
         }
 
-        // Send remaining count
-        if (write_exact(binradar_forkserver_stat_w, &remaining_mods, 4) < 0) exit_with_status(10);
-  
-    }
+        if (binradar_mode) {
+            if (iteration_aborted || !baseline_exit_valid) {
+                binradar_clear_current(binradar_manager);
+                remaining_mods = 0;
+            } else {
+                *snapshot_exit_info_ptr() = baseline_exit;
+                if (iteration == 1) {
+                    if (g_osprey_ctx != NULL && g_osprey_ctx->config.enabled &&
+                        osprey_tx_ok(g_osprey_ctx)) {
+                        if (!snapshot_test_install_applied_model()) {
+                            osprey_analyze(g_osprey_ctx);
+                        }
+                    }
+                    remaining_mods = analyze_collected_data(
+                        arg_info, num_arg_regs);
+                } else {
+                    binradar_commit(binradar_manager);
+                    remaining_mods = analyze_collected_data(
+                        arg_info, num_arg_regs);
+                }
+                if (iteration == 1) {
+                    binradar_commit(binradar_manager);
+                }
+            }
+        }
+        g_free(executed);
+        g_free(uncovered);
 
+        uint32_t summary[3] = {
+            iteration,
+            representative_runs,
+            remaining_mods,
+        };
+        if (write_exact(binradar_forkserver_stat_w, summary,
+                        sizeof(summary)) < 0) {
+            exit_with_status(7);
+        }
+    }
 }
 
 SnapshotMemRegion *mr_manager_heap_search_pub(target_ulong addr) { return mr_manager_heap_search(addr); }

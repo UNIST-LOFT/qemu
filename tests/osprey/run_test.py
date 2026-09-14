@@ -31,7 +31,7 @@ import tempfile
 import time
 
 
-HANDSHAKE_EXPECTED = 0x41464C01
+HANDSHAKE_EXPECTED = 0x41464C02
 
 # ---------------------------------------------------------------------------
 # Test configuration
@@ -1176,15 +1176,22 @@ def run_binradar(test, guest, qemu, workdir):
         if ack_value != HANDSHAKE_EXPECTED:
             raise RuntimeError(f"unexpected forkserver ack: {ack_value:#x}")
 
+        expected_iteration = 0
+
         def run_one_iteration(label):
+            nonlocal expected_iteration
             os.write(ctrl_w, struct.pack("<I", 0))
-            status_bytes = read_exact(stat_r, 12)
-            if len(status_bytes) != 12:
-                raise RuntimeError(f"{label} status EOF")
-            remaining_bytes = read_exact(stat_r, 4)
-            if len(remaining_bytes) != 4:
-                raise RuntimeError(f"{label} remaining EOF")
-            return struct.unpack("<I", remaining_bytes)[0]
+            summary_bytes = read_exact(stat_r, 12)
+            if len(summary_bytes) != 12:
+                raise RuntimeError(f"{label} summary EOF")
+            iteration, representative_runs, remaining = struct.unpack(
+                "<III", summary_bytes)
+            expected_iteration += 1
+            if iteration != expected_iteration or representative_runs == 0:
+                raise RuntimeError(
+                    f"{label} invalid forkserver summary: iteration="
+                    f"{iteration}, runs={representative_runs}")
+            return remaining
 
         # Baseline iteration.  Its returned count is the first owned plan
         # plus the queued tail after analyze_collected_data().
@@ -1199,8 +1206,8 @@ def run_binradar(test, guest, qemu, workdir):
                 remaining_count = run_one_iteration(
                     f"mutation-{rounds}")
         else:
-            # Existing fixtures intentionally observe only the first child
-            # after the iteration-1 analysis barrier.
+            # Existing fixtures observe one logical mutation iteration after
+            # the iteration-1 analysis barrier.
             run_one_iteration("second")
 
         os.close(ctrl_w)

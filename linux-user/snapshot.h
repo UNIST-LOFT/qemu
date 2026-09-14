@@ -120,7 +120,7 @@ bool is_in_e9_exclude_region(target_ulong pc);
 void parse_e9_relocated_calls(uintptr_t load_bias);
 void check_all_env_var(void);
 
-void snapshot_set_binradar_patch_shm(uint32_t *shm);
+void snapshot_init_binradar_patch_shm(uintptr_t key);
 const char *snapshot_mem_region_str(SnapshotMemRegion *mr);
 
 guint coverage_edge_hash(gconstpointer key);
