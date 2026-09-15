@@ -437,13 +437,12 @@ void binradar_trace_call(target_ulong pc, target_ulong return_addr,
     if (!trace_enabled) {
         return;
     }
-    if (pending_patch_hit && pending_patch_pc != pc) {
-        flush_pending_patch();
-    }
+    /* The call instruction belongs to the current (caller) frame.  Record a
+     * patch hit before pushing the callee, so BINRADAR_ENTRYPOINT snapshots
+     * the function containing PATCH_LOC and replay naturally reaches the
+     * patched call and its dest() action. */
+    flush_pending_patch();
     push_frame(entry, entry != 0, return_addr);
-    if (pending_patch_hit && pending_patch_pc == pc) {
-        flush_pending_patch();
-    }
 }
 
 void binradar_trace_ret(target_ulong pc, target_ulong return_addr)
@@ -469,20 +468,11 @@ void binradar_trace_relocated_call(target_ulong entry, target_ulong call_site,
     }
 
     /* E9Patch's CALLQ relocation re-emits a call as
-     * `push ret_addr; jmp target` from the trampoline.  The caller passes
-     * the original call site and its return address, so push a call frame
-     * that keeps the tracer's call-chain (and the fault-addr attribution)
-     * identical to the unpatched binary.  The pending patch hit from the
-     * rewritten site is flushed like a real call at the site: before the
-     * push if it came from elsewhere, after the push (so it is attributed
-     * to the callee) if it is from this site. */
-    if (pending_patch_hit && pending_patch_pc != call_site) {
-        flush_pending_patch();
-    }
+     * `push ret_addr; jmp target` from the trampoline.  The original call
+     * instruction still belongs to the current (caller) frame, so consume
+     * its pending patch hit before pushing the relocated callee frame. */
+    flush_pending_patch();
     push_frame(entry, entry != 0, ret_addr);
-    if (pending_patch_hit && pending_patch_pc == call_site) {
-        flush_pending_patch();
-    }
 }
 
 static BinradarGroup *new_group(void)
