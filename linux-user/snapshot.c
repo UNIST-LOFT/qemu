@@ -1202,9 +1202,16 @@ void snapshot_init_binradar_patch_shm(uintptr_t key) {
     binradar_manager->cur_iter = shm + 1;
     if (binradar_manager->cache_enabled) {
         binradar_manager->selector = (BinradarPatchSelector *)shm;
+        /* Iteration 0 is unpublished.  An E9 call may run before the guest
+         * reaches BINRADAR_ENTRYPOINT and starts the forkserver; the cached
+         * runtime must preserve original control flow until iteration 1. */
+        binradar_manager->selector->patch_id = 0;
+        binradar_manager->selector->iteration = 0;
+        binradar_manager->selector->descriptor_length = 0;
         binradar_manager->selector->descriptor_capacity =
             (uint32_t)(shm_size - offsetof(BinradarPatchSelector,
                                            descriptor));
+        binradar_manager->selector->descriptor[0] = '\0';
     }
 
     var = getenv("BINRADAR_PATCH_FD_R");
@@ -5284,18 +5291,25 @@ static void binradar_cache_disable(BinradarManager *manager,
 static bool binradar_publish_selector(BinradarManager *manager,
                                       uint32_t patch_id, uint32_t iteration)
 {
-    binradar_manager_cur_patch_id(manager, (int)patch_id);
-    binradar_manager_cur_iter(manager, (int)iteration);
-    if (!manager->cache_enabled) return true;
+    if (!manager->cache_enabled) {
+        binradar_manager_cur_patch_id(manager, (int)patch_id);
+        binradar_manager_cur_iter(manager, (int)iteration);
+        return true;
+    }
     const char *descriptor = patch_id == 0 ? "p0" :
         manager->cache_predicates[patch_id].descriptor;
     size_t length = descriptor != NULL ? strlen(descriptor) : 0;
     if (length >= manager->selector->descriptor_capacity) return false;
-    manager->selector->descriptor_length = (uint32_t)length;
-    memcpy(manager->selector->descriptor, descriptor, length + 1u);
+
+    /* Iteration is the publication flag.  Keep it at the unpublished value
+     * until the complete descriptor and patch id are visible. */
+    binradar_manager_cur_iter(manager, 0);
     __sync_synchronize();
-    manager->selector->patch_id = patch_id;
-    manager->selector->iteration = iteration;
+    memcpy(manager->selector->descriptor, descriptor, length + 1u);
+    manager->selector->descriptor_length = (uint32_t)length;
+    binradar_manager_cur_patch_id(manager, (int)patch_id);
+    __sync_synchronize();
+    binradar_manager_cur_iter(manager, (int)iteration);
     return true;
 }
 
