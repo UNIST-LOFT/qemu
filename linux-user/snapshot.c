@@ -5280,6 +5280,20 @@ static bool binradar_branch_vectors_equal(const GArray *left,
     return true;
 }
 
+/* A child normally replays from the entry of the function containing
+ * PATCH_LOC and reaches the cached dest() action.  A mutation can still divert
+ * control before PATCH_LOC; then no text row is written and br_taken remains
+ * NULL.  The corresponding capture vector is empty because neither channel
+ * observed a patch-site branch.  Keep the committed value NULL -- .brpatched
+ * and FINAL encode that honest no-observation state as `[br null]`; publishing
+ * an empty array would produce the invalid SBSV token `[br ]`. */
+static bool binradar_observed_vector_matches(const GArray *observed,
+                                             const GArray *other)
+{
+    if (observed == NULL) return other != NULL && other->len == 0;
+    return binradar_branch_vectors_equal(observed, other);
+}
+
 static void binradar_cache_disable(BinradarManager *manager,
                                    const char *reason)
 {
@@ -5372,7 +5386,8 @@ static void binradar_materialize_cache_hit(BinradarManager *manager,
     SnapshotExitInfo *info = snapshot_exit_info_ptr();
     PatchedResult *result = get_patched_result_tmp(manager, patch_id);
     result->patch_id = patch_id;
-    result->br_taken = binradar_clone_branch_vector(branches);
+    result->br_taken = branches->len == 0
+        ? NULL : binradar_clone_branch_vector(branches);
     if (info != NULL && info->valid) {
         result->is_crash = info->crashed;
         result->fault_loc = info->fault_addr;
@@ -5907,17 +5922,13 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
                 binradar_manager->cache_inference_enabled) {
                 PatchedResult *observed = get_patched_result_tmp(
                     binradar_manager, selected_patch);
-                if (observed->br_taken == NULL) {
-                    observed->br_taken = g_array_new(FALSE, FALSE,
-                                                     sizeof(int));
-                }
                 GArray *selected_vector = NULL;
                 if (binradar_manager->cache_capture_overflow ||
                     !binradar_cache_vector(binradar_manager, selected_patch,
                                             selected_patch,
                                             &selected_vector) ||
-                    !binradar_branch_vectors_equal(observed->br_taken,
-                                                    selected_vector)) {
+                    !binradar_observed_vector_matches(observed->br_taken,
+                                                     selected_vector)) {
                     if (selected_vector != NULL) {
                         g_array_free(selected_vector, TRUE);
                     }
@@ -5946,7 +5957,7 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
                                     binradar_manager, uncovered, executed);
                                 break;
                             }
-                            if (binradar_branch_vectors_equal(
+                            if (binradar_observed_vector_matches(
                                     observed->br_taken, candidate_vector)) {
                                 binradar_materialize_cache_hit(
                                     binradar_manager, candidate,
