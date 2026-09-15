@@ -1,6 +1,7 @@
 #include "sbsv.h"
 
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -118,27 +119,6 @@ const char* sbsv_status_str(sbsv_status status) {
     }
 }
 
-static sbsv_status sbsv_copy_to_heap(const char* src, size_t len, char** output) {
-    char* result;
-
-    if (output == NULL) {
-        return SBSV_ERR_INVALID_ARG;
-    }
-
-    result = (char*)malloc(len + 1);
-    if (result == NULL) {
-        return SBSV_ERR_ALLOC;
-    }
-
-    if (len > 0) {
-        memcpy(result, src, len);
-    }
-    result[len] = '\0';
-
-    *output = result;
-    return SBSV_OK;
-}
-
 static bool sbsv_is_space(char ch) {
     return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' || ch == '\f' || ch == '\v';
 }
@@ -196,51 +176,6 @@ static sbsv_status sbsv_append_bytes(char** buffer, size_t* len, size_t* cap, co
     }
     *len += src_len;
     (*buffer)[*len] = '\0';
-    return SBSV_OK;
-}
-
-static sbsv_status sbsv_append_token(sbsv_token_list* tokens, size_t* token_cap, char* token) {
-    char** new_items;
-
-    if (tokens->count >= *token_cap) {
-        size_t new_cap = (*token_cap == 0) ? 4 : (*token_cap * 2);
-        while (tokens->count >= new_cap) {
-            new_cap *= 2;
-        }
-        new_items = (char**)realloc(tokens->items, sizeof(char*) * new_cap);
-        if (new_items == NULL) {
-            return SBSV_ERR_ALLOC;
-        }
-        tokens->items = new_items;
-        *token_cap = new_cap;
-    }
-
-    tokens->items[tokens->count] = token;
-    tokens->count += 1;
-    return SBSV_OK;
-}
-
-static sbsv_status sbsv_finalize_token(const char* token_buf, size_t token_len, sbsv_token_list* out_tokens, size_t* token_cap) {
-    const char* start;
-    const char* end;
-    char* final_token = NULL;
-    sbsv_status status;
-
-    start = token_buf;
-    end = token_buf + token_len;
-    sbsv_trim_view(&start, &end);
-
-    status = sbsv_copy_to_heap(start, (size_t)(end - start), &final_token);
-    if (status != SBSV_OK) {
-        return status;
-    }
-
-    status = sbsv_append_token(out_tokens, token_cap, final_token);
-    if (status != SBSV_OK) {
-        free(final_token);
-        return status;
-    }
-
     return SBSV_OK;
 }
 
@@ -429,16 +364,18 @@ sbsv_status sbsv_unescape_str(const char* input, char** output) {
 }
 
 static sbsv_status sbsv_tokenize_line_internal(const char* line, sbsv_token_list* out_tokens, int strict) {
-    int level;
     size_t length;
-    size_t i;
-    bool escape;
-    bool quote;
-    char* current;
-    size_t current_len;
-    size_t current_cap;
-    size_t token_cap;
-    sbsv_status status;
+    size_t max_tokens;
+    size_t pointer_bytes;
+    char** items;
+    void* allocation = NULL;
+    char* write_cursor;
+    char* token_start = NULL;
+    const char* read_cursor;
+    int level = 0;
+    bool escape = false;
+    bool quote = false;
+    size_t count = 0;
 
     if (line == NULL || out_tokens == NULL) {
         return SBSV_ERR_INVALID_ARG;
@@ -446,126 +383,160 @@ static sbsv_status sbsv_tokenize_line_internal(const char* line, sbsv_token_list
 
     out_tokens->items = NULL;
     out_tokens->count = 0;
-
-    level = 0;
+    out_tokens->allocation = NULL;
     length = strlen(line);
-    escape = false;
-    quote = false;
-    current = NULL;
-    current_len = 0;
-    current_cap = 0;
-    token_cap = 0;
-
-    status = sbsv_append_char(&current, &current_len, &current_cap, '\0');
-    if (status != SBSV_OK) {
-        return status;
+    max_tokens = length / 2 + 1;
+    if (
+        max_tokens > SIZE_MAX / sizeof(char*)
+        || max_tokens * sizeof(char*) > SIZE_MAX - length - 1
+    ) {
+        return SBSV_ERR_ALLOC;
     }
-    current_len = 0;
+    pointer_bytes = max_tokens * sizeof(char*);
+    allocation = malloc(pointer_bytes + length + 1);
+    if (allocation == NULL) {
+        return SBSV_ERR_ALLOC;
+    }
+    items = (char**)allocation;
+    write_cursor = (char*)allocation + pointer_bytes;
 
-    for (i = 0; i < length; ++i) {
-        char ch = line[i];
+    if (
+        memchr(line, '\\', length) == NULL
+        && memchr(line, '"', length) == NULL
+    ) {
+        for (read_cursor = line; *read_cursor != '\0'; ++read_cursor) {
+            char ch = *read_cursor;
+            if (ch == '[') {
+                level += 1;
+                if (level == 1) {
+                    token_start = write_cursor;
+                } else {
+                    *write_cursor++ = ch;
+                }
+            } else if (ch == ']') {
+                level -= 1;
+                if (level < 0) {
+                    if (strict) {
+                        free(allocation);
+                        return SBSV_ERR_INVALID_ARG;
+                    }
+                    level = 0;
+                    token_start = NULL;
+                } else if (level == 0) {
+                    const char* trimmed_start = token_start;
+                    const char* trimmed_end = write_cursor;
+                    size_t token_length;
+
+                    sbsv_trim_view(&trimmed_start, &trimmed_end);
+                    token_length = (size_t)(trimmed_end - trimmed_start);
+                    if (trimmed_start != token_start && token_length > 0) {
+                        memmove(token_start, trimmed_start, token_length);
+                    }
+                    items[count++] = token_start;
+                    write_cursor = token_start + token_length;
+                    *write_cursor++ = '\0';
+                    token_start = NULL;
+                } else {
+                    *write_cursor++ = ch;
+                }
+            } else if (level > 0) {
+                *write_cursor++ = ch;
+            }
+        }
+        if (level > 0) {
+            free(allocation);
+            return SBSV_ERR_INVALID_ARG;
+        }
+        goto finished;
+    }
+
+    for (read_cursor = line; *read_cursor != '\0'; ++read_cursor) {
+        char ch = *read_cursor;
 
         if (escape) {
             escape = false;
-
-            if (level > 0) {
-                status = sbsv_append_char(&current, &current_len, &current_cap, '\\');
-                if (status == SBSV_OK) {
-                    status = sbsv_append_char(&current, &current_len, &current_cap, ch);
-                }
-
-                if (status != SBSV_OK) {
-                    free(current);
-                    sbsv_free_token_list(out_tokens);
-                    return status;
-                }
-            }
+            *write_cursor++ = ch;
             continue;
         }
-
-        if (ch == '\\') {
-            if (level > 0) {
-                escape = true;
-                continue;
-            }
+        if (ch == '\\' && level > 0) {
+            escape = true;
+            *write_cursor++ = ch;
+            continue;
         }
-
-        if (ch == '"' && level > 0 && (quote || sbsv_can_start_quote(current, current_len))) {
+        if (
+            ch == '"'
+            && level > 0
+            && (
+                quote
+                || sbsv_can_start_quote(
+                    token_start,
+                    token_start == NULL ? 0 : (size_t)(write_cursor - token_start)
+                )
+            )
+        ) {
             quote = !quote;
-            status = sbsv_append_char(&current, &current_len, &current_cap, ch);
-            if (status != SBSV_OK) {
-                free(current);
-                sbsv_free_token_list(out_tokens);
-                return status;
-            }
+            *write_cursor++ = ch;
             continue;
         }
 
         if (ch == '[' && !quote) {
             level += 1;
             if (level == 1) {
-                if (current_len > 0) {
-                    status = sbsv_finalize_token(current, current_len, out_tokens, &token_cap);
-                    if (status != SBSV_OK) {
-                        free(current);
-                        sbsv_free_token_list(out_tokens);
-                        return status;
-                    }
-                }
-                current_len = 0;
-                current[0] = '\0';
-                continue;
+                token_start = write_cursor;
+            } else {
+                *write_cursor++ = ch;
             }
-        } else if (ch == ']' && !quote) {
+            continue;
+        }
+        if (ch == ']' && !quote) {
             level -= 1;
             if (level < 0) {
                 if (strict) {
-                    free(current);
-                    sbsv_free_token_list(out_tokens);
+                    free(allocation);
                     return SBSV_ERR_INVALID_ARG;
                 }
                 level = 0;
+                token_start = NULL;
                 continue;
             }
             if (level == 0) {
-                status = sbsv_finalize_token(current, current_len, out_tokens, &token_cap);
-                if (status != SBSV_OK) {
-                    free(current);
-                    sbsv_free_token_list(out_tokens);
-                    return status;
+                const char* trimmed_start = token_start;
+                const char* trimmed_end = write_cursor;
+                size_t token_length;
+
+                sbsv_trim_view(&trimmed_start, &trimmed_end);
+                token_length = (size_t)(trimmed_end - trimmed_start);
+                if (trimmed_start != token_start && token_length > 0) {
+                    memmove(token_start, trimmed_start, token_length);
                 }
-                current_len = 0;
-                current[0] = '\0';
-                continue;
+                items[count++] = token_start;
+                write_cursor = token_start + token_length;
+                *write_cursor++ = '\0';
+                token_start = NULL;
+            } else {
+                *write_cursor++ = ch;
             }
+            continue;
         }
 
         if (level > 0) {
-            status = sbsv_append_char(&current, &current_len, &current_cap, ch);
-            if (status != SBSV_OK) {
-                free(current);
-                sbsv_free_token_list(out_tokens);
-                return status;
-            }
-        }
-    }
-
-    if (escape && level > 0) {
-        status = sbsv_append_char(&current, &current_len, &current_cap, '\\');
-        if (status != SBSV_OK) {
-            free(current);
-            sbsv_free_token_list(out_tokens);
-            return status;
+            *write_cursor++ = ch;
         }
     }
 
     if (quote || level > 0) {
-        free(current);
-        sbsv_free_token_list(out_tokens);
+        free(allocation);
         return SBSV_ERR_INVALID_ARG;
     }
 
-    free(current);
+finished:
+    if (count == 0) {
+        free(allocation);
+        return SBSV_OK;
+    }
+    out_tokens->items = items;
+    out_tokens->count = count;
+    out_tokens->allocation = allocation;
     return SBSV_OK;
 }
 
@@ -577,19 +548,14 @@ sbsv_status sbsv_tokenize_line_strict(const char* line, sbsv_token_list* out_tok
 }
 
 void sbsv_free_token_list(sbsv_token_list* tokens) {
-    size_t i;
-
-    if (tokens == NULL || tokens->items == NULL) {
+    if (tokens == NULL) {
         return;
     }
 
-    for (i = 0; i < tokens->count; ++i) {
-        free(tokens->items[i]);
-    }
-
-    free(tokens->items);
+    free(tokens->allocation);
     tokens->items = NULL;
     tokens->count = 0;
+    tokens->allocation = NULL;
 }
 
 void sbsv_free_string(char* value) {

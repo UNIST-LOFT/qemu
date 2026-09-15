@@ -10,7 +10,7 @@ extern "C" {
 
 #define SBSV_VERSION_MAJOR 0
 #define SBSV_VERSION_MINOR 3
-#define SBSV_VERSION_PATCH 0
+#define SBSV_VERSION_PATCH 1
 
 typedef enum {
     SBSV_OK = 0,
@@ -21,6 +21,7 @@ typedef enum {
 typedef struct {
     char** items;
     size_t count;
+    void* allocation;
 } sbsv_token_list;
 
 typedef enum {

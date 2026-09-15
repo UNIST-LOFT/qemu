@@ -86,9 +86,11 @@ struct sbsv_body_parser {
 
 typedef struct {
     char* schema_name;
+    sbsv_token_list tokens;
     char** data_tokens;
     size_t data_count;
     size_t data_capacity;
+    int data_tokens_borrowed;
     sbsv_field* ignored_fields;
     size_t ignored_field_count;
     size_t ignored_field_capacity;
@@ -96,7 +98,9 @@ typedef struct {
 
 typedef struct {
     char* schema_name;
+    size_t schema_name_length;
     int ambiguous_sub_schema;
+    char inline_schema_name[128];
 } sbsv_schema_prefix_scan;
 
 static sbsv_status sbsv_parse_row_for_schema(
@@ -462,6 +466,8 @@ void sbsv_parser_free(sbsv_parser* parser) {
         return;
     }
 
+    sbsv_parser_clear_rows(parser);
+
     for (i = 0; i < parser->schema_count; ++i) {
         sbsv_schema_free(&parser->schemas[i]);
     }
@@ -482,7 +488,6 @@ void sbsv_parser_free(sbsv_parser* parser) {
     }
     free(parser->ignored_prefix);
 
-    sbsv_parser_clear_rows(parser);
     free(parser->rows);
 
     free(parser->last_error);
@@ -575,12 +580,16 @@ static bool sbsv_scan_can_start_quote(const char* current, size_t current_len) {
     return words == 1;
 }
 
-static sbsv_status sbsv_append_schema_name_suffix_range(char** name, const char* start, size_t len) {
+static sbsv_status sbsv_append_schema_name_suffix_range(
+    sbsv_schema_prefix_scan* scan,
+    const char* start,
+    size_t len
+) {
     const char* trimmed_start = start;
     size_t trimmed_len = len;
-    size_t old_len;
+    size_t separator = scan->schema_name == NULL ? 0 : 1;
     size_t new_len;
-    char* next;
+    char* destination;
 
     while (trimmed_len > 0 && sbsv_is_space_char(*trimmed_start)) {
         trimmed_start += 1;
@@ -592,29 +601,31 @@ static sbsv_status sbsv_append_schema_name_suffix_range(char** name, const char*
     if (trimmed_len == 0) {
         return SBSV_OK;
     }
-    if (*name == NULL) {
-        next = (char*)malloc(trimmed_len + 1);
-        if (next == NULL) {
-            return SBSV_ERR_ALLOC;
-        }
-        memcpy(next, trimmed_start, trimmed_len);
-        next[trimmed_len] = '\0';
-        *name = next;
-        return SBSV_OK;
-    }
-
-    old_len = strlen(*name);
-    new_len = old_len + 1 + trimmed_len;
-    next = (char*)malloc(new_len + 1);
-    if (next == NULL) {
+    if (scan->schema_name_length > SIZE_MAX - separator - trimmed_len) {
         return SBSV_ERR_ALLOC;
     }
-    memcpy(next, *name, old_len);
-    next[old_len] = '$';
-    memcpy(next + old_len + 1, trimmed_start, trimmed_len);
-    next[new_len] = '\0';
-    free(*name);
-    *name = next;
+    new_len = scan->schema_name_length + separator + trimmed_len;
+
+    if (new_len < sizeof(scan->inline_schema_name)) {
+        destination = scan->inline_schema_name;
+    } else if (scan->schema_name == scan->inline_schema_name) {
+        destination = (char*)malloc(new_len + 1);
+        if (destination != NULL) {
+            memcpy(destination, scan->inline_schema_name, scan->schema_name_length);
+        }
+    } else {
+        destination = (char*)realloc(scan->schema_name, new_len + 1);
+    }
+    if (destination == NULL) {
+        return SBSV_ERR_ALLOC;
+    }
+    if (separator != 0) {
+        destination[scan->schema_name_length] = '$';
+    }
+    memcpy(destination + scan->schema_name_length + separator, trimmed_start, trimmed_len);
+    destination[new_len] = '\0';
+    scan->schema_name = destination;
+    scan->schema_name_length = new_len;
     return SBSV_OK;
 }
 
@@ -622,9 +633,54 @@ static void sbsv_schema_prefix_scan_free(sbsv_schema_prefix_scan* scan) {
     if (scan == NULL) {
         return;
     }
-    free(scan->schema_name);
+    if (scan->schema_name != scan->inline_schema_name) {
+        free(scan->schema_name);
+    }
     scan->schema_name = NULL;
+    scan->schema_name_length = 0;
     scan->ambiguous_sub_schema = 0;
+}
+
+static int sbsv_schema_root_may_match(const sbsv_parser* parser, const char* line) {
+    const char* start;
+    const char* end;
+    size_t root_len;
+    size_t i;
+
+    if (parser == NULL || line == NULL || parser->ignored_prefix_count > 0) {
+        return 1;
+    }
+    start = strchr(line, '[');
+    if (start == NULL) {
+        return 0;
+    }
+    start += 1;
+    end = strchr(start, ']');
+    if (end == NULL) {
+        return 0;
+    }
+    while (start < end && sbsv_is_space_char(*start)) {
+        start += 1;
+    }
+    while (end > start && sbsv_is_space_char(end[-1])) {
+        end -= 1;
+    }
+    root_len = (size_t)(end - start);
+    if (root_len == 0 || sbsv_token_view_has_value(start, root_len)) {
+        return 0;
+    }
+
+    for (i = 0; i < parser->schema_count; ++i) {
+        const char* schema_name = parser->schemas[i].name;
+        const char* separator = strchr(schema_name, '$');
+        size_t schema_root_len = separator == NULL
+            ? strlen(schema_name)
+            : (size_t)(separator - schema_name);
+        if (schema_root_len == root_len && memcmp(schema_name, start, root_len) == 0) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 static int sbsv_schema_name_may_match(sbsv_parser* parser, const char* schema_name, int ambiguous_sub_schema) {
@@ -662,8 +718,7 @@ static sbsv_status sbsv_scan_schema_name_prefix(sbsv_parser* parser, const char*
     bool quote = false;
     const char* token_start = NULL;
     size_t current_len = 0;
-    size_t i;
-    size_t length;
+    const char* cursor;
 
     if (line == NULL || out_scan == NULL) {
         return SBSV_ERR_INVALID_ARG;
@@ -671,10 +726,9 @@ static sbsv_status sbsv_scan_schema_name_prefix(sbsv_parser* parser, const char*
 
     memset(out_scan, 0, sizeof(*out_scan));
     ignored_prefix_count = parser == NULL ? 0 : parser->ignored_prefix_count;
-    length = strlen(line);
 
-    for (i = 0; i < length; ++i) {
-        char ch = line[i];
+    for (cursor = line; *cursor != '\0'; ++cursor) {
+        char ch = *cursor;
 
         if (escape) {
             escape = false;
@@ -698,7 +752,7 @@ static sbsv_status sbsv_scan_schema_name_prefix(sbsv_parser* parser, const char*
         if (ch == '[' && !quote) {
             level += 1;
             if (level == 1) {
-                token_start = line + i + 1;
+                token_start = cursor + 1;
                 current_len = 0;
                 continue;
             }
@@ -710,7 +764,7 @@ static sbsv_status sbsv_scan_schema_name_prefix(sbsv_parser* parser, const char*
                         if (sbsv_token_view_has_value(token_start, current_len)) {
                             return SBSV_OK;
                         }
-                        sbsv_status status = sbsv_append_schema_name_suffix_range(&out_scan->schema_name, token_start, current_len);
+                        sbsv_status status = sbsv_append_schema_name_suffix_range(out_scan, token_start, current_len);
                         if (status != SBSV_OK) {
                             sbsv_schema_prefix_scan_free(out_scan);
                             return status;
@@ -2071,16 +2125,30 @@ static sbsv_status sbsv_parse_value(
     return SBSV_ERR_INVALID_ARG;
 }
 
-static sbsv_status sbsv_preprocess_line(sbsv_parser* parser, const char* line, sbsv_preprocessed_line* out_line) {
-    sbsv_token_list tokens;
+static sbsv_status sbsv_preprocess_line(
+    sbsv_parser* parser,
+    const sbsv_schema* matched_schema,
+    const char* line,
+    sbsv_preprocessed_line* out_line
+) {
     size_t i;
     size_t start_index = 0;
     int may_have_sub_schema = 1;
     sbsv_status status;
 
-    memset(out_line, 0, sizeof(*out_line));
-    memset(&tokens, 0, sizeof(tokens));
+    out_line->schema_name = NULL;
+    out_line->tokens.items = NULL;
+    out_line->tokens.count = 0;
+    out_line->tokens.allocation = NULL;
+    out_line->data_tokens = NULL;
+    out_line->data_count = 0;
+    out_line->data_capacity = 0;
+    out_line->data_tokens_borrowed = 0;
+    out_line->ignored_fields = NULL;
+    out_line->ignored_field_count = 0;
+    out_line->ignored_field_capacity = 0;
 
+#define tokens (out_line->tokens)
     status = sbsv_tokenize_line_strict(line, &tokens);
     if (status != SBSV_OK) {
         return status;
@@ -2129,68 +2197,74 @@ static sbsv_status sbsv_preprocess_line(sbsv_parser* parser, const char* line, s
         start_index = parser->ignored_prefix_count;
     }
 
-    for (i = start_index; i < tokens.count; ++i) {
-        char* key = NULL;
-        char* value = NULL;
-
-        sbsv_split_token_default(tokens.items[i], &key, &value);
-        if (key == NULL || value == NULL) {
-            free(key);
-            free(value);
-            sbsv_free_token_list(&tokens);
-            return SBSV_ERR_ALLOC;
+    if (matched_schema != NULL) {
+        size_t schema_token_count = 1;
+        const char* cursor;
+        for (cursor = matched_schema->name; *cursor != '\0'; ++cursor) {
+            if (*cursor == '$') {
+                schema_token_count += 1;
+            }
         }
+        if (tokens.count < start_index + schema_token_count) {
+            sbsv_parser_set_error(
+                parser,
+                "Invalid data: expected %zu schema tokens, got %zu",
+                schema_token_count,
+                tokens.count - start_index
+            );
+            sbsv_free_token_list(&tokens);
+            return SBSV_ERR_INVALID_ARG;
+        }
+        start_index += schema_token_count;
+        out_line->data_tokens = tokens.items + start_index;
+        out_line->data_count = tokens.count - start_index;
+        out_line->data_tokens_borrowed = 1;
+        return SBSV_OK;
+    }
 
-        if (strlen(key) > 0 && strlen(value) == 0 && may_have_sub_schema) {
+    for (i = start_index; i < tokens.count; ++i) {
+        const char* token = tokens.items[i];
+        size_t token_len = strlen(token);
+
+        if (
+            token_len > 0
+            && !sbsv_token_view_has_value(token, token_len)
+            && may_have_sub_schema
+        ) {
             if (out_line->schema_name == NULL) {
-                out_line->schema_name = sbsv_strdup_local(key);
+                out_line->schema_name = sbsv_strdup_local(token);
                 if (out_line->schema_name == NULL) {
-                    free(key);
-                    free(value);
                     sbsv_free_token_list(&tokens);
                     return SBSV_ERR_ALLOC;
                 }
             } else {
-                sbsv_status append_status = sbsv_parser_add_schema_name_suffix(&out_line->schema_name, key);
+                sbsv_status append_status = sbsv_parser_add_schema_name_suffix(
+                    &out_line->schema_name,
+                    token
+                );
                 if (append_status != SBSV_OK) {
-                    free(key);
-                    free(value);
                     sbsv_free_token_list(&tokens);
                     return append_status;
                 }
             }
         } else {
-            char* copied = tokens.items[i];
-            tokens.items[i] = NULL;
             sbsv_status grow_status;
             may_have_sub_schema = 0;
-            if (copied == NULL) {
-                free(key);
-                free(value);
-                sbsv_free_token_list(&tokens);
-                return SBSV_ERR_ALLOC;
-            }
 
             grow_status = sbsv_grow_array((void**)&out_line->data_tokens, sizeof(char*), &out_line->data_capacity, out_line->data_count + 1);
             if (grow_status != SBSV_OK) {
-                free(copied);
-                free(key);
-                free(value);
                 sbsv_free_token_list(&tokens);
                 return grow_status;
             }
 
-            out_line->data_tokens[out_line->data_count] = copied;
+            out_line->data_tokens[out_line->data_count] = tokens.items[i];
             out_line->data_count += 1;
         }
-
-        free(key);
-        free(value);
     }
 
-    sbsv_free_token_list(&tokens);
     return SBSV_OK;
 }
+#undef tokens
 
 static void sbsv_preprocessed_line_free(sbsv_preprocessed_line* pre) {
     size_t i;
@@ -2198,10 +2272,10 @@ static void sbsv_preprocessed_line_free(sbsv_preprocessed_line* pre) {
         return;
     }
     free(pre->schema_name);
-    for (i = 0; i < pre->data_count; ++i) {
-        free(pre->data_tokens[i]);
+    sbsv_free_token_list(&pre->tokens);
+    if (!pre->data_tokens_borrowed) {
+        free(pre->data_tokens);
     }
-    free(pre->data_tokens);
     for (i = 0; i < pre->ignored_field_count; ++i) {
         sbsv_value_clear(&pre->ignored_fields[i].value);
     }
@@ -2462,9 +2536,10 @@ static sbsv_status sbsv_row_prepend_fields(sbsv_row* row, sbsv_preprocessed_line
 }
 
 static sbsv_status sbsv_parser_parse_line_internal(sbsv_parser* parser, const char* line, size_t line_number, int append, sbsv_row** out_row) {
-    char* stripped;
+    const char* content;
+    const char* stripped;
     sbsv_preprocessed_line pre;
-    sbsv_schema* schema;
+    sbsv_schema* schema = NULL;
     sbsv_row* row = NULL;
     sbsv_status status;
 
@@ -2476,30 +2551,50 @@ static sbsv_status sbsv_parser_parse_line_internal(sbsv_parser* parser, const ch
         return SBSV_ERR_INVALID_ARG;
     }
 
-    stripped = sbsv_strdup_local(line);
-    if (stripped == NULL) {
-        return SBSV_ERR_ALLOC;
+    content = line;
+    while (sbsv_is_space_char(*content)) {
+        content += 1;
     }
-    sbsv_trim_inplace(stripped);
-
-    if (stripped[0] == '\0' || stripped[0] == '#') {
-        free(stripped);
+    if (*content == '\0' || *content == '#') {
         return SBSV_OK;
     }
+    if (parser->ignore_unknown) {
+        sbsv_schema_prefix_scan scan;
+        if (!sbsv_schema_root_may_match(parser, content)) {
+            return SBSV_OK;
+        }
+        status = sbsv_scan_schema_name_prefix(parser, content, &scan);
+        if (status != SBSV_OK) {
+            return status;
+        }
+        schema = sbsv_find_schema(parser, scan.schema_name);
+        if (
+            schema == NULL
+            && !sbsv_schema_name_may_match(
+                parser,
+                scan.schema_name,
+                scan.ambiguous_sub_schema
+            )
+        ) {
+            sbsv_schema_prefix_scan_free(&scan);
+            return SBSV_OK;
+        }
+        sbsv_schema_prefix_scan_free(&scan);
+    }
 
-    status = sbsv_preprocess_line(parser, stripped, &pre);
+    stripped = content;
+    status = sbsv_preprocess_line(parser, schema, stripped, &pre);
     if (status != SBSV_OK) {
         if (parser->ignore_unknown) {
             sbsv_schema_prefix_scan scan;
             sbsv_status scan_status = sbsv_scan_schema_name_prefix(parser, stripped, &scan);
             if (scan_status != SBSV_OK) {
-                free(stripped);
+                sbsv_preprocessed_line_free(&pre);
                 return scan_status;
             }
             if (!sbsv_schema_name_may_match(parser, scan.schema_name, scan.ambiguous_sub_schema)) {
                 sbsv_schema_prefix_scan_free(&scan);
                 sbsv_preprocessed_line_free(&pre);
-                free(stripped);
                 return SBSV_OK;
             }
             sbsv_schema_prefix_scan_free(&scan);
@@ -2511,33 +2606,30 @@ static sbsv_status sbsv_parser_parse_line_internal(sbsv_parser* parser, const ch
             free(detail_copy);
         }
         sbsv_preprocessed_line_free(&pre);
-        free(stripped);
         return status;
     }
 
-    if (pre.schema_name == NULL) {
-        if (parser->ignore_unknown) {
-            sbsv_preprocessed_line_free(&pre);
-            free(stripped);
-            return SBSV_OK;
-        }
-        sbsv_parser_set_error(parser, "Parse error (line=%zu, schema=<missing>, input='%s'): Unknown schema '<missing>'", line_number, stripped);
-        sbsv_preprocessed_line_free(&pre);
-        free(stripped);
-        return SBSV_ERR_INVALID_ARG;
-    }
-
-    schema = sbsv_find_schema(parser, pre.schema_name);
     if (schema == NULL) {
-        if (parser->ignore_unknown) {
+        if (pre.schema_name == NULL) {
+            if (parser->ignore_unknown) {
+                sbsv_preprocessed_line_free(&pre);
+                return SBSV_OK;
+            }
+            sbsv_parser_set_error(parser, "Parse error (line=%zu, schema=<missing>, input='%s'): Unknown schema '<missing>'", line_number, stripped);
             sbsv_preprocessed_line_free(&pre);
-            free(stripped);
-            return SBSV_OK;
+            return SBSV_ERR_INVALID_ARG;
         }
-        sbsv_parser_set_error(parser, "Parse error (line=%zu, schema=%s, input='%s'): Unknown schema '%s'", line_number, pre.schema_name, stripped, pre.schema_name);
-        sbsv_preprocessed_line_free(&pre);
-        free(stripped);
-        return SBSV_ERR_INVALID_ARG;
+
+        schema = sbsv_find_schema(parser, pre.schema_name);
+        if (schema == NULL) {
+            if (parser->ignore_unknown) {
+                sbsv_preprocessed_line_free(&pre);
+                return SBSV_OK;
+            }
+            sbsv_parser_set_error(parser, "Parse error (line=%zu, schema=%s, input='%s'): Unknown schema '%s'", line_number, pre.schema_name, stripped, pre.schema_name);
+            sbsv_preprocessed_line_free(&pre);
+            return SBSV_ERR_INVALID_ARG;
+        }
     }
 
     status = sbsv_parse_row_for_schema(parser, schema, pre.data_tokens, pre.data_count, &row);
@@ -2551,7 +2643,6 @@ static sbsv_status sbsv_parser_parse_line_internal(sbsv_parser* parser, const ch
             sbsv_parser_set_error(parser, "Parse error (line=%zu, schema=%s, input='%s'): parse error", line_number, schema->name, stripped);
         }
         sbsv_preprocessed_line_free(&pre);
-        free(stripped);
         return status;
     }
 
@@ -2559,7 +2650,6 @@ static sbsv_status sbsv_parser_parse_line_internal(sbsv_parser* parser, const ch
     if (status != SBSV_OK) {
         sbsv_row_free(row);
         sbsv_preprocessed_line_free(&pre);
-        free(stripped);
         return status;
     }
 
@@ -2577,7 +2667,6 @@ static sbsv_status sbsv_parser_parse_line_internal(sbsv_parser* parser, const ch
     }
 
     sbsv_preprocessed_line_free(&pre);
-    free(stripped);
     return status;
 }
 
