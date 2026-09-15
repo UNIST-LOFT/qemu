@@ -428,7 +428,7 @@ sbsv_status sbsv_unescape_str(const char* input, char** output) {
     return SBSV_OK;
 }
 
-sbsv_status sbsv_tokenize_line(const char* line, sbsv_token_list* out_tokens) {
+static sbsv_status sbsv_tokenize_line_internal(const char* line, sbsv_token_list* out_tokens, int strict) {
     int level;
     size_t length;
     size_t i;
@@ -519,6 +519,11 @@ sbsv_status sbsv_tokenize_line(const char* line, sbsv_token_list* out_tokens) {
         } else if (ch == ']' && !quote) {
             level -= 1;
             if (level < 0) {
+                if (strict) {
+                    free(current);
+                    sbsv_free_token_list(out_tokens);
+                    return SBSV_ERR_INVALID_ARG;
+                }
                 level = 0;
                 continue;
             }
@@ -562,6 +567,13 @@ sbsv_status sbsv_tokenize_line(const char* line, sbsv_token_list* out_tokens) {
 
     free(current);
     return SBSV_OK;
+}
+
+sbsv_status sbsv_tokenize_line(const char* line, sbsv_token_list* out_tokens) {
+    return sbsv_tokenize_line_internal(line, out_tokens, 0);
+}
+sbsv_status sbsv_tokenize_line_strict(const char* line, sbsv_token_list* out_tokens) {
+    return sbsv_tokenize_line_internal(line, out_tokens, 1);
 }
 
 void sbsv_free_token_list(sbsv_token_list* tokens) {
