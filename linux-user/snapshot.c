@@ -410,6 +410,7 @@ typedef struct SharedTraceData {
 
 typedef struct PatchedResult {
     uint32_t patch_id;
+    uint32_t representative;
     GArray *br_taken; // Array<int> (0 = not taken, 1 = taken, 2 = patch crashed)
     bool is_crash;
     uint64_t fault_loc;
@@ -511,11 +512,11 @@ typedef struct BinradarManager {
     uint32_t *cur_patch_id; // Shared memory
     uint32_t *cur_iter; // Shared memory
     sbsv_parser *patch_result_parser;
-    GPtrArray *results; // Array<BinradarResult *>
-    BinradarResult *current; // For temp use before write to results array
+    BinradarResult *current; // Current iteration before evidence commit
+    FILE *evidence_file;
     size_t line_idx;
     char line_buf[4096];
-    // Candidate patch ids (survived patches from filter.sbsv), length patch_cnt.
+    // Candidate patch ids (survivors from filter.br or legacy SBSV), length patch_cnt.
     // NULL means candidates are 1..patch_cnt.
     uint32_t *patch_list;
     // Max patch id that can be indexed in patch_results (allocated size = patch_max_id + 1).
@@ -622,6 +623,123 @@ static int write_exact(int fd, const void *buf, size_t len) {
     }
 
     return 0;
+}
+
+#define BR_EVIDENCE_HEADER_SIZE 16u
+#define BR_EVIDENCE_FRAME_HEADER_SIZE 8u
+#define BR_EVIDENCE_MAGIC "BRDATAB1"
+#define BR_EVIDENCE_VERSION 1u
+#define BR_EVIDENCE_KIND_FILTER 1u
+#define BR_EVIDENCE_KIND_BINRADAR 3u
+#define BR_EVIDENCE_RECORD_FILTER 1u
+#define BR_EVIDENCE_RECORD_BINRADAR_ITERATION 4u
+#define BR_EVIDENCE_MAX_FRAME (256u * 1024u * 1024u)
+#define BR_EVIDENCE_GROUP_BRANCH_NULL 1u
+#define BR_EVIDENCE_OUTCOME_NORMAL 1u
+#define BR_EVIDENCE_OUTCOME_CRASH 2u
+
+static uint16_t br_evidence_read_u16(const uint8_t *p)
+{
+    return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
+
+static uint32_t br_evidence_read_u32(const uint8_t *p)
+{
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static void br_evidence_append_u16(GByteArray *out, uint16_t value)
+{
+    uint8_t bytes[2] = {(uint8_t)value, (uint8_t)(value >> 8)};
+    g_byte_array_append(out, bytes, sizeof(bytes));
+}
+
+static void br_evidence_append_u32(GByteArray *out, uint32_t value)
+{
+    uint8_t bytes[4] = {
+        (uint8_t)value, (uint8_t)(value >> 8),
+        (uint8_t)(value >> 16), (uint8_t)(value >> 24),
+    };
+    g_byte_array_append(out, bytes, sizeof(bytes));
+}
+
+static void br_evidence_append_u64(GByteArray *out, uint64_t value)
+{
+    uint8_t bytes[8];
+    for (unsigned i = 0; i < sizeof(bytes); i++) {
+        bytes[i] = (uint8_t)(value >> (i * 8u));
+    }
+    g_byte_array_append(out, bytes, sizeof(bytes));
+}
+
+static void br_evidence_append_uleb32(GByteArray *out, uint32_t value)
+{
+    do {
+        uint8_t byte = (uint8_t)(value & 0x7fu);
+        value >>= 7;
+        if (value != 0) byte |= 0x80u;
+        g_byte_array_append(out, &byte, 1);
+    } while (value != 0);
+}
+
+static uint32_t br_evidence_crc32_update(uint32_t crc,
+                                         const uint8_t *data, size_t len)
+{
+    crc = ~crc;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (unsigned bit = 0; bit < 8; bit++) {
+            uint32_t mask = (uint32_t)-(int32_t)(crc & 1u);
+            crc = (crc >> 1) ^ (0xedb88320u & mask);
+        }
+    }
+    return ~crc;
+}
+
+static uint32_t br_evidence_frame_crc(uint16_t type, uint16_t flags,
+                                      const uint8_t *payload, size_t len)
+{
+    uint8_t prefix[4] = {
+        (uint8_t)type, (uint8_t)(type >> 8),
+        (uint8_t)flags, (uint8_t)(flags >> 8),
+    };
+    uint32_t crc = br_evidence_crc32_update(0, prefix, sizeof(prefix));
+    return br_evidence_crc32_update(crc, payload, len);
+}
+
+static bool br_evidence_write_header(FILE *fp, uint16_t kind)
+{
+    GByteArray *header = g_byte_array_sized_new(BR_EVIDENCE_HEADER_SIZE);
+    g_byte_array_append(header, (const uint8_t *)BR_EVIDENCE_MAGIC, 8);
+    br_evidence_append_u16(header, BR_EVIDENCE_VERSION);
+    br_evidence_append_u16(header, kind);
+    br_evidence_append_u32(header, 0);
+    bool ok = fwrite(header->data, 1, header->len, fp) == header->len;
+    g_byte_array_free(header, TRUE);
+    return ok;
+}
+
+static bool br_evidence_write_frame(FILE *fp, uint16_t type,
+                                    const GByteArray *payload)
+{
+    if (payload->len > BR_EVIDENCE_MAX_FRAME) return false;
+    GByteArray *header = g_byte_array_sized_new(
+        BR_EVIDENCE_FRAME_HEADER_SIZE);
+    br_evidence_append_u32(header, payload->len);
+    br_evidence_append_u16(header, type);
+    br_evidence_append_u16(header, 0);
+    uint32_t crc = br_evidence_frame_crc(type, 0, payload->data, payload->len);
+    uint8_t checksum[4] = {
+        (uint8_t)crc, (uint8_t)(crc >> 8),
+        (uint8_t)(crc >> 16), (uint8_t)(crc >> 24),
+    };
+    bool ok = fwrite(header->data, 1, header->len, fp) == header->len &&
+              fwrite(payload->data, 1, payload->len, fp) == payload->len &&
+              fwrite(checksum, 1, sizeof(checksum), fp) == sizeof(checksum) &&
+              fflush(fp) == 0;
+    g_byte_array_free(header, TRUE);
+    return ok;
 }
 
 /* Parse E9_EXCLUDE_RANGES: a canonical comma-separated list of half-open
@@ -751,6 +869,7 @@ void check_all_env_var(void) {
     check_env_var("PATCH_ID"); // Used by brpatch, 123456
     check_env_var("BINRADAR_PATCH_CNT");
     check_env_var("BINRADAR_PATCH_FILTER_FILE");
+    check_env_var("BINRADAR_EVIDENCE_FILE");
     check_env_var("BINRADAR_PATCH_CACHE_ENABLE");
     check_env_var("BINRADAR_PATCH_MANIFEST");
     check_env_var("BINRADAR_PATCH_CACHED_FD_R");
@@ -1078,63 +1197,145 @@ out:
     return ok;
 }
 
-static void binradar_manager_load_filter(BinradarManager *manager, const char *path) {
+static void binradar_manager_install_filter(BinradarManager *manager,
+                                             GArray *ids,
+                                             const char *path)
+{
+    if (ids->len == 0) {
+        log_msg("[binradar] [patch-filter] [no-survivors] [file %s]\n", path);
+        manager->patch_cnt = 0;
+        manager->patch_max_id = 0;
+        return;
+    }
+    manager->patch_list = g_new(uint32_t, ids->len);
+    uint32_t max_id = 0;
+    for (guint i = 0; i < ids->len; i++) {
+        uint32_t patch = g_array_index(ids, uint32_t, i);
+        manager->patch_list[i] = patch;
+        max_id = MAX(max_id, patch);
+    }
+    manager->patch_cnt = ids->len;
+    manager->patch_max_id = max_id;
+    log_msg("[binradar] [patch-filter] [file %s] [cnt %u] [max-id %u]\n",
+            path, manager->patch_cnt, manager->patch_max_id);
+}
+
+static bool binradar_manager_load_filter_binary(BinradarManager *manager,
+                                                 const char *path,
+                                                 const uint8_t *data,
+                                                 size_t size)
+{
+    if (size < BR_EVIDENCE_HEADER_SIZE + BR_EVIDENCE_FRAME_HEADER_SIZE + 4u ||
+        memcmp(data, BR_EVIDENCE_MAGIC, 8) != 0 ||
+        br_evidence_read_u16(data + 8) != BR_EVIDENCE_VERSION ||
+        br_evidence_read_u16(data + 10) != BR_EVIDENCE_KIND_FILTER ||
+        br_evidence_read_u32(data + 12) != 0) {
+        return false;
+    }
+    const uint8_t *frame = data + BR_EVIDENCE_HEADER_SIZE;
+    uint32_t length = br_evidence_read_u32(frame);
+    uint16_t type = br_evidence_read_u16(frame + 4);
+    uint16_t flags = br_evidence_read_u16(frame + 6);
+    size_t expected_size = BR_EVIDENCE_HEADER_SIZE +
+        BR_EVIDENCE_FRAME_HEADER_SIZE + (size_t)length + 4u;
+    if (length > BR_EVIDENCE_MAX_FRAME || expected_size != size ||
+        type != BR_EVIDENCE_RECORD_FILTER || flags != 0 || length < 12u) {
+        return false;
+    }
+    const uint8_t *payload = frame + BR_EVIDENCE_FRAME_HEADER_SIZE;
+    uint32_t expected_crc = br_evidence_read_u32(payload + length);
+    if (br_evidence_frame_crc(type, flags, payload, length) != expected_crc) {
+        return false;
+    }
+    uint32_t total = br_evidence_read_u32(payload);
+    uint32_t passed = br_evidence_read_u32(payload + 4);
+    uint32_t bitmap_size = br_evidence_read_u32(payload + 8);
+    if (total == UINT32_MAX ||
+        (uint64_t)bitmap_size != ((uint64_t)total + 7u) / 8u ||
+        length != 12u + bitmap_size) {
+        return false;
+    }
+    const uint8_t *bitmap = payload + 12;
+    if (total % 8u != 0 && bitmap_size > 0 &&
+        (bitmap[bitmap_size - 1u] >> (total % 8u)) != 0) {
+        return false;
+    }
+    GArray *ids = g_array_sized_new(FALSE, FALSE, sizeof(uint32_t), passed);
+    for (uint32_t patch = 1; patch <= total; patch++) {
+        if (bitmap[(patch - 1u) / 8u] & (1u << ((patch - 1u) % 8u))) {
+            g_array_append_val(ids, patch);
+        }
+    }
+    if (ids->len != passed || passed != manager->patch_cnt) {
+        g_array_free(ids, TRUE);
+        return false;
+    }
+    binradar_manager_install_filter(manager, ids, path);
+    g_array_free(ids, TRUE);
+    return true;
+}
+
+static void binradar_manager_load_filter(BinradarManager *manager,
+                                         const char *path)
+{
+    gchar *contents = NULL;
+    gsize size = 0;
+    if (!g_file_get_contents(path, &contents, &size, NULL)) {
+        log_msg("[binradar] [patch-filter] [error read] [file %s]\n", path);
+        exit_with_status(1);
+    }
+    if (size >= 8 && memcmp(contents, BR_EVIDENCE_MAGIC, 8) == 0) {
+        bool ok = binradar_manager_load_filter_binary(
+            manager, path, (const uint8_t *)contents, size);
+        g_free(contents);
+        if (!ok) {
+            log_msg("[binradar] [patch-filter] [error binary] [file %s]\n",
+                    path);
+            exit_with_status(1);
+        }
+        return;
+    }
+    g_free(contents);
+
     FILE *fp = fopen(path, "r");
     if (fp == NULL) {
-        log_msg("[binradar] [patch-filter] [error] cannot open filter file: %s\n", path);
-        return;
+        log_msg("[binradar] [patch-filter] [error open] [file %s]\n", path);
+        exit_with_status(1);
     }
     sbsv_parser *parser = sbsv_parser_new(SBSV_PARSER_DEFAULT);
     sbsv_parser_add_schema(parser, "[patch] [id: int] [pass: bool]");
     sbsv_status status = sbsv_parser_load_file(parser, fp);
     fclose(fp);
     if (status != SBSV_OK) {
-        log_msg("[binradar] [patch-filter] [error] failed to parse filter file: %s [status %s]\n",
-                path, sbsv_status_str(status));
+        log_msg("[binradar] [patch-filter] [error parse] [file %s] "
+                "[status %s]\n", path, sbsv_status_str(status));
         sbsv_parser_free(parser);
-        return;
+        exit_with_status(1);
     }
     const sbsv_row **rows = NULL;
     size_t count = 0;
     if (sbsv_parser_get_rows(parser, "patch", &rows, &count) != SBSV_OK) {
-        log_msg("[binradar] [patch-filter] [error] failed to get patch rows: %s\n", path);
         sbsv_parser_free(parser);
-        return;
+        exit_with_status(1);
     }
     GArray *ids = g_array_new(FALSE, FALSE, sizeof(uint32_t));
-    uint32_t max_id = 0;
     for (size_t i = 0; i < count; i++) {
         long long id = sbsv_row_get_int(rows[i], "id", NULL);
         int pass = sbsv_row_get_bool(rows[i], "pass", NULL);
         if (pass && id > 0 && (uint64_t)id <= UINT32_MAX) {
-            uint32_t patch_id = (uint32_t)id;
-            g_array_append_val(ids, patch_id);
-            if (patch_id > max_id) {
-                max_id = patch_id;
-            }
+            uint32_t patch = (uint32_t)id;
+            g_array_append_val(ids, patch);
         }
     }
     sbsv_free_row_ref_array(rows);
     sbsv_parser_free(parser);
-    if (ids->len == 0) {
-        log_msg("[binradar] [patch-filter] [no-survivors] [file %s]\n", path);
-        manager->patch_cnt = 0;
-        manager->patch_max_id = 0;
+    if (ids->len != manager->patch_cnt) {
         g_array_free(ids, TRUE);
-        return;
+        log_msg("[binradar] [patch-filter] [error count] [file %s]\n", path);
+        exit_with_status(1);
     }
-    manager->patch_list = g_new(uint32_t, ids->len);
-    for (guint i = 0; i < ids->len; i++) {
-        manager->patch_list[i] = g_array_index(ids, uint32_t, i);
-    }
-    manager->patch_cnt = ids->len;
-    manager->patch_max_id = max_id;
+    binradar_manager_install_filter(manager, ids, path);
     g_array_free(ids, TRUE);
-    log_msg("[binradar] [patch-filter] [file %s] [cnt %u] [max-id %u]\n",
-            path, manager->patch_cnt, manager->patch_max_id);
-    for (uint32_t i = 0; i < manager->patch_cnt; i++) {
-        log_msg("[binradar] [patch-filter] [id %u]\n", manager->patch_list[i]);
-    }
 }
 
 void snapshot_init_binradar_patch_shm(uintptr_t key) {
@@ -1144,7 +1345,6 @@ void snapshot_init_binradar_patch_shm(uintptr_t key) {
     binradar_manager->patch_cnt = 1;
     binradar_manager->patch_fd_r = -1;
     binradar_manager->cache_fd_r = -1;
-    binradar_manager->results = g_ptr_array_new();
 
     var = getenv("BINRADAR_PATCH_CNT");
     if (var == NULL || atoi(var) < 0) {
@@ -1157,6 +1357,21 @@ void snapshot_init_binradar_patch_shm(uintptr_t key) {
     if (var != NULL && var[0] != '\0') {
         binradar_manager_load_filter(binradar_manager, var);
     }
+
+    var = getenv("BINRADAR_EVIDENCE_FILE");
+    if (var == NULL || var[0] == '\0') {
+        log_msg("[binradar] [evidence] [error missing-path]\n");
+        exit_with_status(1);
+    }
+    binradar_manager->evidence_file = fopen(var, "wb");
+    if (binradar_manager->evidence_file == NULL ||
+        !br_evidence_write_header(binradar_manager->evidence_file,
+                                  BR_EVIDENCE_KIND_BINRADAR) ||
+        fflush(binradar_manager->evidence_file) != 0) {
+        log_msg("[binradar] [evidence] [error open] [file %s]\n", var);
+        exit_with_status(1);
+    }
+    log_msg("[binradar] [evidence] [file %s] [version 1]\n", var);
 
     var = getenv("BINRADAR_PATCH_CACHE_ENABLE");
     binradar_manager->cache_enabled = var != NULL && strcmp(var, "1") == 0;
@@ -5374,6 +5589,7 @@ static void binradar_record_outcome(BinradarManager *manager,
     PatchedResult *result = get_patched_result_tmp(manager, patch_id);
     if (info == NULL || !info->valid) return;
     result->patch_id = patch_id;
+    result->representative = patch_id;
     result->is_crash = info->crashed;
     result->fault_loc = info->fault_addr;
 }
@@ -5386,64 +5602,116 @@ static void binradar_materialize_cache_hit(BinradarManager *manager,
     SnapshotExitInfo *info = snapshot_exit_info_ptr();
     PatchedResult *result = get_patched_result_tmp(manager, patch_id);
     result->patch_id = patch_id;
+    result->representative = representative;
     result->br_taken = branches->len == 0
         ? NULL : binradar_clone_branch_vector(branches);
     if (info != NULL && info->valid) {
         result->is_crash = info->crashed;
         result->fault_loc = info->fault_addr;
-        int iter = binradar_manager_cur_iter(manager, -1);
-        if (info->crashed) {
-            log_msg("[binradar] [crash] [iter %d] [patch %u] "
-                    "[guest_pc %lx] [guest_cs_base %lx] [fault_addr %lx] "
-                    "[host_fault_addr %lx] [reason %s]\n", iter, patch_id,
-                    info->guest_pc, info->guest_cs_base, info->fault_addr,
-                    info->host_fault_addr, info->description);
-        } else {
-            log_msg("[binradar] [normal] [iter %d] [patch %u] "
-                    "[guest_pc %lx] [guest_cs_base %lx] [reason %s]\n",
-                    iter, patch_id, info->guest_pc, info->guest_cs_base,
-                    info->description);
-        }
-        log_msg("[binradar] [cache-hit] [iter %d] [patch %u] "
-                "[representative %u]\n", iter, patch_id, representative);
     }
 }
 
-static void binradar_commit(BinradarManager *manager) {
-    // Clone current patched result and add to results
-    if (manager == NULL) return;
-    if (manager->current == NULL) return;
+static gint binradar_compare_u32(gconstpointer left, gconstpointer right)
+{
+    uint32_t a = *(const uint32_t *)left;
+    uint32_t b = *(const uint32_t *)right;
+    return a < b ? -1 : a > b;
+}
+
+static void binradar_commit(BinradarManager *manager)
+{
+    if (manager == NULL || manager->current == NULL ||
+        manager->evidence_file == NULL) return;
     int cur_iter = binradar_manager_cur_iter(manager, -1);
     if (cur_iter < 1) return;
-    BinradarResult *clone = binradar_manager_alloc_one_iter(manager);
-    clone->iter = cur_iter;
-    char br_buf[4096];
-    memset(br_buf, 0, sizeof(br_buf));
-    for (uint32_t i = 0; i < manager->patch_cnt + 1; i++) {
-        int patch = binradar_manager_patch_id_at(manager, i);
-        PatchedResult res = manager->current->patch_results[patch];
-        if (res.br_taken == NULL) {
-            log_msg("[binradar] [commit] [iter %d] [patch %d] [br null]\n", cur_iter, patch);
-            clone->patch_results[patch] = res;
-            continue;
+
+    GArray **members = g_new0(GArray *, manager->patch_max_id + 1u);
+    uint32_t result_count = cur_iter == 1 ? 1u : manager->patch_cnt + 1u;
+    uint32_t group_count = 0;
+    for (uint32_t i = 0; i < result_count; i++) {
+        uint32_t patch = (uint32_t)binradar_manager_patch_id_at(manager, i);
+        PatchedResult *result = &manager->current->patch_results[patch];
+        uint32_t representative = result->representative;
+        if (result->patch_id != patch || representative > manager->patch_max_id) {
+            log_msg("[binradar] [evidence] [error incomplete-result] "
+                    "[iter %d] [patch %u]\n", cur_iter, patch);
+            exit_with_status(1);
         }
-        size_t n = res.br_taken->len;
-        if (n >= sizeof(br_buf)) {
-            n = sizeof(br_buf) - 1;
+        if (members[representative] == NULL) {
+            members[representative] = g_array_new(FALSE, FALSE,
+                                                   sizeof(uint32_t));
+            group_count++;
         }
-        for (size_t j = 0; j < n; j++) {
-            int taken = g_array_index(res.br_taken, int, j);
-            br_buf[j] = taken == 2 ? '2' : (taken ? '1' : '0');
+        g_array_append_val(members[representative], patch);
+    }
+
+    GByteArray *payload = g_byte_array_new();
+    br_evidence_append_u32(payload, (uint32_t)cur_iter);
+    br_evidence_append_u32(payload, group_count);
+    for (uint32_t i = 0; i < result_count; i++) {
+        uint32_t representative =
+            (uint32_t)binradar_manager_patch_id_at(manager, i);
+        GArray *group = members[representative];
+        if (group == NULL) continue;
+        g_array_sort(group, binradar_compare_u32);
+        PatchedResult *result =
+            &manager->current->patch_results[representative];
+        uint8_t outcome = result->is_crash
+            ? BR_EVIDENCE_OUTCOME_CRASH : BR_EVIDENCE_OUTCOME_NORMAL;
+        uint8_t flags = result->br_taken == NULL
+            ? BR_EVIDENCE_GROUP_BRANCH_NULL : 0;
+        uint32_t branch_count = result->br_taken != NULL
+            ? result->br_taken->len : 0;
+
+        br_evidence_append_u32(payload, representative);
+        g_byte_array_append(payload, &outcome, 1);
+        g_byte_array_append(payload, &flags, 1);
+        br_evidence_append_u16(payload, 0);
+        br_evidence_append_u64(payload, result->fault_loc);
+        br_evidence_append_u32(payload, branch_count);
+        br_evidence_append_u32(payload, group->len);
+
+        uint8_t packed = 0;
+        for (uint32_t branch = 0; branch < branch_count; branch++) {
+            int value = g_array_index(result->br_taken, int, branch);
+            if (value < 0 || value > 2) {
+                log_msg("[binradar] [evidence] [error branch] "
+                        "[iter %d] [patch %u]\n", cur_iter,
+                        representative);
+                exit_with_status(1);
+            }
+            packed |= (uint8_t)value << ((branch % 4u) * 2u);
+            if (branch % 4u == 3u || branch + 1u == branch_count) {
+                g_byte_array_append(payload, &packed, 1);
+                packed = 0;
+            }
         }
-        br_buf[n] = '\0';
-        log_msg("[binradar] [commit] [iter %d] [patch %d] [br %s]\n", cur_iter, patch, br_buf);
-        clone->patch_results[patch] = res;
-        if (cur_iter == 1) {
-            break;
+
+        uint32_t previous = 0;
+        for (guint member_index = 0; member_index < group->len;
+             member_index++) {
+            uint32_t member = g_array_index(group, uint32_t, member_index);
+            uint32_t delta = member_index == 0 ? member : member - previous;
+            br_evidence_append_uleb32(payload, delta);
+            previous = member;
         }
     }
-    memset(manager->current->patch_results, 0, sizeof(PatchedResult) * (manager->patch_max_id + 1));
-    g_ptr_array_add(manager->results, clone);
+
+    if (!br_evidence_write_frame(manager->evidence_file,
+                                  BR_EVIDENCE_RECORD_BINRADAR_ITERATION,
+                                  payload)) {
+        log_msg("[binradar] [evidence] [error write] [iter %d]\n", cur_iter);
+        exit_with_status(1);
+    }
+    log_msg("[binradar] [commit] [iter %d] [groups %u] [patches %u] "
+            "[bytes %u]\n", cur_iter, group_count, result_count,
+            payload->len);
+    g_byte_array_free(payload, TRUE);
+    for (uint32_t patch = 0; patch <= manager->patch_max_id; patch++) {
+        if (members[patch] != NULL) g_array_free(members[patch], TRUE);
+    }
+    g_free(members);
+    binradar_clear_current(manager);
 }
 
 static void set_nonblock(int fd) {

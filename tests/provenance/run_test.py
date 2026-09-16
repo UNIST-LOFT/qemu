@@ -620,6 +620,8 @@ def run_forkserver(test, guest, qemu, workdir):
                 f"shmget failed: {ctypes.geterrno()}")
         env["BINRADAR_PATCH_SHM_KEY"] = hex(patch_shm_key)
         env["BINRADAR_PATCH_CNT"] = "2"
+        env["BINRADAR_EVIDENCE_FILE"] = os.path.join(
+            run_dir, "binradar.br")
         patch_r, patch_w = os.pipe()
         env["BINRADAR_PATCH_FD_R"] = str(patch_r)
     ctrl_r = ctrl_w = stat_r = stat_w = None

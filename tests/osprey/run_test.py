@@ -29,6 +29,12 @@ import subprocess
 import sys
 import tempfile
 import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(ROOT / "fuzzolic"))
+
+import binradar_evidence
 
 
 HANDSHAKE_EXPECTED = 0x41464C02
@@ -1117,8 +1123,13 @@ def run_binradar(test, guest, qemu, workdir):
     env["PLT_INFO_FILE"] = guest + ".plt"
     env["BINRADAR_FORKSERVER_CHILD_TIMEOUT"] = "4"
     env["BINRADAR_MEMCHECK_ENABLE"] = str(test.get("memcheck", 1))
-    env["BINRADAR_PATCH_CNT"] = str(test.get("patch_count", 1))
-    env["BINRADAR_PATCH_FILTER_FILE"] = ""
+    patch_count = int(test.get("patch_count", 1))
+    env["BINRADAR_PATCH_CNT"] = str(patch_count)
+    filter_path = os.path.join(run_dir, "filter.br")
+    binradar_evidence.write_filter(
+        filter_path, patch_count, range(1, patch_count + 1))
+    env["BINRADAR_PATCH_FILTER_FILE"] = filter_path
+    env["BINRADAR_EVIDENCE_FILE"] = os.path.join(run_dir, "binradar.br")
     env["BINRADAR_PATCH_SHM_KEY"] = hex(random.getrandbits(32))
     observation_path = None
     if test.get("observe_applied"):
@@ -1222,6 +1233,24 @@ def run_binradar(test, guest, qemu, workdir):
         if observation_path is not None and os.path.exists(observation_path):
             with open(observation_path, "r", errors="replace") as f:
                 stderr_text += "\n" + f.read()
+        evidence = list(binradar_evidence.read_binradar(
+            env["BINRADAR_EVIDENCE_FILE"]))
+        if len(evidence) != expected_iteration:
+            raise RuntimeError(
+                f"BINRADAR evidence has {len(evidence)} iteration(s), "
+                f"expected {expected_iteration}")
+        patch_count = int(env["BINRADAR_PATCH_CNT"])
+        for record in evidence:
+            members = {
+                patch for group in record.groups for patch in group.members
+            }
+            expected_members = ({0} if record.iteration == 1
+                                else set(range(patch_count + 1)))
+            if members != expected_members:
+                raise RuntimeError(
+                    f"BINRADAR evidence iteration {record.iteration} "
+                    f"members {sorted(members)} != "
+                    f"{sorted(expected_members)}")
         return (proc.returncode, stderr_text)
     finally:
         if ctrl_w is not None:
