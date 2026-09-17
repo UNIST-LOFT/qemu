@@ -532,6 +532,10 @@ typedef struct BinradarManager {
     bool cache_capture_overflow;
     BinradarPatchSelector *selector;
     size_t selector_size;
+    /* Optional per-representative feedback.  Only .brcached provides the
+     * complete BRCH snapshots needed by this contract. */
+    char *feedback_dir;
+    target_ulong poc_fault_addr;
 } BinradarManager;
 
 static SharedTraceData *shared_trace_data = NULL;
@@ -1400,6 +1404,32 @@ void snapshot_init_binradar_patch_shm(uintptr_t key) {
         }
         shm_size = binradar_manager->selector_size;
         binradar_manager->cache_bytes = g_byte_array_new();
+    }
+
+    const char *feedback_dir = getenv("BINRADAR_FEEDBACK_DIR");
+    if (feedback_dir != NULL && feedback_dir[0] != '\0') {
+        if (!binradar_manager->cache_enabled) {
+            log_msg("[binradar] [feedback] [disabled] "
+                    "[reason brcached-required]\n");
+        } else {
+            const char *fault_text = getenv("BINRADAR_POC_FAULT_ADDR");
+            char *end = NULL;
+            errno = 0;
+            unsigned long long fault = fault_text != NULL
+                ? strtoull(fault_text, &end, 0) : 0;
+            if (fault_text == NULL || fault_text[0] == '\0' || errno != 0 ||
+                end == fault_text || *end != '\0' ||
+                (target_ulong)fault != fault ||
+                !g_file_test(feedback_dir, G_FILE_TEST_IS_DIR)) {
+                log_msg("[binradar] [feedback] [error configuration]\n");
+                exit_with_status(1);
+            }
+            binradar_manager->feedback_dir = g_strdup(feedback_dir);
+            binradar_manager->poc_fault_addr = (target_ulong)fault;
+            log_msg("[binradar] [feedback] [enabled] [dir %s] "
+                    "[poc-fault-addr %lx]\n", feedback_dir,
+                    binradar_manager->poc_fault_addr);
+        }
     }
 
     int shmid = shmget((key_t)key, shm_size, 0666 | IPC_CREAT);
@@ -5509,6 +5539,131 @@ static bool binradar_observed_vector_matches(const GArray *observed,
     return binradar_branch_vectors_equal(observed, other);
 }
 
+static const char *binradar_feedback_mutation_kind(SnapshotMutationKind kind)
+{
+    switch (kind) {
+    case SNAPSHOT_MUTATION_BYTES: return "bytes";
+    case SNAPSHOT_MUTATION_POINTER_NULL: return "pointer-null";
+    case SNAPSHOT_MUTATION_POINTER_OOB: return "pointer-oob";
+    case SNAPSHOT_MUTATION_POINTER_FRESH: return "pointer-fresh";
+    }
+    return "invalid";
+}
+
+static bool binradar_feedback_write_atomic(const char *path,
+                                           const void *data, size_t size)
+{
+    bool ok = false;
+    char *temporary = g_strdup_printf("%s.tmp-%ld", path, (long)getpid());
+    int fd = open(temporary, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd >= 0) {
+        bool complete = write_exact(fd, data, size) == 0 && fsync(fd) == 0;
+        int close_status = close(fd);
+        fd = -1;
+        if (complete && close_status == 0 && rename(temporary, path) == 0) {
+            ok = true;
+        }
+    }
+    if (!ok) unlink(temporary);
+    g_free(temporary);
+    return ok;
+}
+
+/* Commit one pair for one real child execution.  Cache-materialized members
+ * never call this function: they have no child-local snapshot of their own. */
+static bool binradar_feedback_write(BinradarManager *manager,
+                                    uint32_t iteration, uint32_t patch_id,
+                                    const GArray *branches)
+{
+    if (manager == NULL || manager->feedback_dir == NULL || iteration <= 1 ||
+        manager->cache_bytes == NULL || branches == NULL) return true;
+    PatchedResult *run = get_patched_result_tmp(manager, patch_id);
+    if (run->patch_id != patch_id || run->representative != patch_id) {
+        return false;
+    }
+
+    char *stem = g_strdup_printf("iteration-%08u-patch-%08u",
+                                 iteration, patch_id);
+    char *snapshot_name = g_strconcat(stem, ".brch", NULL);
+    char *metadata_name = g_strconcat(stem, ".sbsv", NULL);
+    char *snapshot_path = g_build_filename(manager->feedback_dir,
+                                           snapshot_name, NULL);
+    char *metadata_path = g_build_filename(manager->feedback_dir,
+                                           metadata_name, NULL);
+    GString *metadata = g_string_new(NULL);
+    const bool same_fault = run->is_crash &&
+        run->fault_loc == manager->poc_fault_addr;
+    const char *result = !run->is_crash ? "benign" :
+        same_fault ? "malicious" : "ignored";
+    const SnapshotMutationPlan *plan = mod_manager != NULL
+        ? mod_manager->current : NULL;
+    const uint32_t mutation_writes = plan != NULL ? plan->num_mods : 0;
+
+    GString *branch_text = g_string_new(NULL);
+    if (branches->len == 0) {
+        g_string_append(branch_text, "none");
+    } else {
+        for (guint i = 0; i < branches->len; i++) {
+            if (i != 0) g_string_append_c(branch_text, ',');
+            g_string_append_printf(branch_text, "%d",
+                g_array_index(branches, int, i));
+        }
+    }
+    g_string_append_printf(metadata,
+        "[binradar-feedback] [version 1] [iteration %u] [patch %u] "
+        "[snapshot-file %s] [snapshot-count %u] [branches %s] "
+        "[outcome %s] [fault-addr %lx] [poc-fault-addr %lx] "
+        "[same-fault %s] [result %s] [mutation-writes %u]\n",
+        iteration, patch_id, snapshot_name, branches->len, branch_text->str,
+        run->is_crash ? "crash" : "normal", run->fault_loc,
+        manager->poc_fault_addr, same_fault ? "true" : "false", result,
+        mutation_writes);
+    g_string_free(branch_text, TRUE);
+
+    for (uint32_t i = 0; plan != NULL && i < plan->num_mods; i++) {
+        const SnapshotMutationWrite *write = &plan->mods[i];
+        g_string_append_printf(metadata,
+            "[binradar-mutation] [index %u] [kind %s] "
+            "[addr %lx] [size %u] [value ", i,
+            binradar_feedback_mutation_kind(write->kind), write->addr,
+            write->size);
+        if (write->kind == SNAPSHOT_MUTATION_POINTER_FRESH) {
+            g_string_append(metadata, "dynamic");
+        } else {
+            for (uint32_t byte = 0; byte < write->size; byte++) {
+                g_string_append_printf(metadata, "%02x", write->value[byte]);
+            }
+        }
+        g_string_append_printf(metadata, "] [target-extent %llu]\n",
+            (unsigned long long)write->target.extent);
+    }
+
+    bool ok = binradar_feedback_write_atomic(
+        snapshot_path, manager->cache_bytes->data, manager->cache_bytes->len);
+    if (ok) {
+        ok = binradar_feedback_write_atomic(metadata_path, metadata->str,
+                                            metadata->len);
+    }
+    if (!ok) {
+        unlink(snapshot_path);
+        unlink(metadata_path);
+        log_msg("[binradar] [feedback] [error write] [iter %u] [patch %u]\n",
+                iteration, patch_id);
+    } else {
+        log_msg("[binradar] [feedback] [commit] [iter %u] [patch %u] "
+                "[snapshots %u] [bytes %u] [result %s]\n",
+                iteration, patch_id, branches->len, manager->cache_bytes->len,
+                result);
+    }
+    g_string_free(metadata, TRUE);
+    g_free(metadata_path);
+    g_free(snapshot_path);
+    g_free(metadata_name);
+    g_free(snapshot_name);
+    g_free(stem);
+    return ok;
+}
+
 static void binradar_cache_disable(BinradarManager *manager,
                                    const char *reason)
 {
@@ -6186,27 +6341,42 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
                 }
             }
 
-            if (binradar_mode && binradar_manager->cache_enabled &&
-                binradar_manager->cache_inference_enabled) {
+            if (binradar_mode && binradar_manager->cache_enabled) {
                 PatchedResult *observed = get_patched_result_tmp(
                     binradar_manager, selected_patch);
                 GArray *selected_vector = NULL;
-                if (binradar_manager->cache_capture_overflow ||
-                    !binradar_cache_vector(binradar_manager, selected_patch,
-                                            selected_patch,
-                                            &selected_vector) ||
-                    !binradar_observed_vector_matches(observed->br_taken,
-                                                     selected_vector)) {
+                bool selected_valid =
+                    !binradar_manager->cache_capture_overflow &&
+                    binradar_cache_vector(binradar_manager, selected_patch,
+                                          selected_patch,
+                                          &selected_vector) &&
+                    binradar_observed_vector_matches(observed->br_taken,
+                                                     selected_vector);
+                if (!selected_valid) {
                     if (selected_vector != NULL) {
                         g_array_free(selected_vector, TRUE);
                     }
-                    binradar_cache_disable(binradar_manager,
-                                           "representative-mismatch");
-                    binradar_restore_uncached_candidates(
-                        binradar_manager, uncovered, executed);
+                    if (binradar_manager->feedback_dir != NULL) {
+                        log_msg("[binradar] [feedback] [error snapshot] "
+                                "[iter %u] [patch %u]\n",
+                                iteration, selected_patch);
+                        exit_with_status(1);
+                    }
+                    if (binradar_manager->cache_inference_enabled) {
+                        binradar_cache_disable(binradar_manager,
+                                               "representative-mismatch");
+                        binradar_restore_uncached_candidates(
+                            binradar_manager, uncovered, executed);
+                    }
                 } else {
-                    g_array_free(selected_vector, TRUE);
-                    if (iteration > 1) {
+                    if (!binradar_feedback_write(binradar_manager, iteration,
+                                                 selected_patch,
+                                                 selected_vector)) {
+                        g_array_free(selected_vector, TRUE);
+                        exit_with_status(1);
+                    }
+                    if (binradar_manager->cache_inference_enabled &&
+                        iteration > 1) {
                         for (uint32_t i = 0;
                              i < binradar_manager->patch_cnt; i++) {
                             uint32_t candidate =
@@ -6235,6 +6405,7 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
                             g_array_free(candidate_vector, TRUE);
                         }
                     }
+                    g_array_free(selected_vector, TRUE);
                 }
             }
 

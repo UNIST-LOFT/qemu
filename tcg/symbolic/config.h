@@ -36,9 +36,10 @@ typedef struct SymbolicConfig {
     //
     int8_t      debug_fuzz_expr;
     /* Runtime NO_EXTERNAL_SOLVER=1 mode: back the expr pool / query queue /
-     * bitmap with process-local heap memory instead of SysV shm and skip the
+     * bitmap with anonymous MAP_SHARED memory instead of SysV shm and skip the
      * SHM_READY handshake, so the tracer runs without a solver attached.
-     * Data structures are byte-identical to solver mode for bug reproduction. */
+     * Child writes remain visible after fork; no fixed address is needed
+     * because an independent process never attaches to these mappings. */
     int8_t      no_external_solver;
     uint64_t    debug_fuzz_expr_idx;
     uint64_t    debug_fuzz_expr_value;

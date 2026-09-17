@@ -36,6 +36,10 @@ from typing import Any
 
 
 HANDSHAKE_EXPECTED = 0x41464C02
+LOCAL_SOLVER_MAPPING_SIZES = {
+    "expression pool": 8 * 1024 * 1024 * 32,
+    "query queue": 1024 * 1024 * 24,
+}
 
 # ---------------------------------------------------------------------------
 # Test configuration
@@ -100,7 +104,9 @@ TESTS: list[dict[str, Any]] = [
     dict(name="t14_ea_static", mode="mem", rc=(0,), verdict="normal", finding=None),
     dict(name="t15_ea_dynamic", mode="mem", rc=(0,), verdict="normal", finding=None),
     dict(name="t16_ea_forkserver", mode="fors", rc=(2,),
-         verdict="normal", finding=None),
+         verdict="normal", finding=None, check_local_solver_mapping=True,
+         note="standalone solver pool and queue use shared mappings required "
+              "for forkserver child publication"),
     dict(name="t17_free_null", mode="mem", rc=(0,), verdict="normal", finding=None),
     dict(name="t18_memchr_unaligned", mode="sym", rc=(0,), verdict="normal",
          finding=None),
@@ -589,6 +595,26 @@ def cleanup_shm(env):
             subprocess.run(["ipcrm", "-M", k], capture_output=True)
 
 
+def check_local_solver_mapping(pid):
+    """Require all local solver buffers to match shm fork semantics."""
+    shared_sizes = []
+    with open(f"/proc/{pid}/maps", encoding="ascii") as maps_file:
+        for line in maps_file:
+            fields = line.split()
+            permissions = fields[1]
+            if len(permissions) < 4 or permissions[3] != "s":
+                continue
+            start_text, end_text = fields[0].split("-", 1)
+            shared_sizes.append(int(end_text, 16) - int(start_text, 16))
+    missing = [name for name, size in LOCAL_SOLVER_MAPPING_SIZES.items()
+               if size not in shared_sizes]
+    if missing:
+        raise RuntimeError(
+            "NO_EXTERNAL_SOLVER mappings are not shared: " +
+            ", ".join(missing) + "; observed sizes=" +
+            ",".join(hex(size) for size in sorted(shared_sizes)))
+
+
 def run_forkserver(test, guest, qemu, workdir):
     """Forkserver driver: handshake, iterate children until the plan ends
     (remaining == 0), close the parent pipe.  With ``fs_binradar`` the
@@ -674,6 +700,8 @@ def run_forkserver(test, guest, qemu, workdir):
         ack_value = struct.unpack("<I", ack)[0]
         if ack_value != HANDSHAKE_EXPECTED:
             raise RuntimeError(f"unexpected forkserver ack: {ack_value:#x}")
+        if test.get("check_local_solver_mapping"):
+            check_local_solver_mapping(proc.pid)
 
         # Iterate children until the plan reports no remaining mods.
         # Non-binradar forkserver tests see remaining == 0 after the first

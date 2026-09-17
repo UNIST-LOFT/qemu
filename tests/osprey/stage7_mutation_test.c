@@ -91,6 +91,35 @@ int walk_memory_regions(void *priv, walk_memory_regions_fn fn) {
 }
 void rcu_disable_atfork(void) {}
 
+/* The focused runner never loads a cache manifest, but snapshot.c contains
+ * that production path.  Keep its QAPI dependencies inert in this standalone
+ * link rather than pulling the complete QEMU object graph into the unit. */
+void qobject_destroy(QObject *obj) { (void)obj; }
+bool qnum_get_try_uint(const QNum *qn, uint64_t *value) {
+    (void)qn; (void)value;
+    return false;
+}
+QObject *qobject_from_json(const char *text, Error **errp) {
+    (void)text; (void)errp;
+    return NULL;
+}
+int64_t qdict_get_try_int(const QDict *dict, const char *key,
+                          int64_t fallback) {
+    (void)dict; (void)key;
+    return fallback;
+}
+const char *qdict_get_try_str(const QDict *dict, const char *key) {
+    (void)dict; (void)key;
+    return NULL;
+}
+QObject *qdict_get(const QDict *dict, const char *key) {
+    (void)dict; (void)key;
+    return NULL;
+}
+size_t qlist_size(const QList *list) { (void)list; return 0; }
+const char *error_get_pretty(const Error *err) { (void)err; return ""; }
+void error_free(Error *err) { (void)err; }
+
 /* No-op mutex stubs: the unit runner is single-threaded. */
 void qemu_mutex_init(QemuMutex *m) { memset(m, 0, sizeof(*m)); }
 void qemu_mutex_destroy(QemuMutex *m) { (void)m; }
@@ -2201,6 +2230,146 @@ static void test_child_application_does_not_mutate_plan(void)
     g_free(env);
 }
 
+static void test_cached_feedback_writer(void)
+{
+    GError *error = NULL;
+    char *directory = g_dir_make_tmp("binradar-feedback-test-XXXXXX", &error);
+    CHECK(directory != NULL && error == NULL,
+          "feedback writer creates temporary directory");
+    if (directory == NULL) {
+        if (error != NULL) g_error_free(error);
+        return;
+    }
+
+    BinradarManager manager = {0};
+    manager.patch_max_id = 3;
+    manager.current = binradar_manager_alloc_one_iter(&manager);
+    manager.feedback_dir = directory;
+    manager.poc_fault_addr = 0x1234;
+    manager.cache_bytes = g_byte_array_new();
+    const uint8_t snapshot[] = {'B', 'R', 'C', 'H'};
+    g_byte_array_append(manager.cache_bytes, snapshot, sizeof(snapshot));
+
+    GArray *branches = g_array_new(FALSE, FALSE, sizeof(int));
+    int branch = 0;
+    g_array_append_val(branches, branch);
+    branch = 1;
+    g_array_append_val(branches, branch);
+
+    SnapshotMutationWrite write = {0};
+    write.kind = SNAPSHOT_MUTATION_BYTES;
+    write.addr = 0x4000;
+    write.size = 2;
+    write.value[0] = 0xaa;
+    write.value[1] = 0xbb;
+    SnapshotMutationPlan plan = {.num_mods = 1, .mods = &write};
+    ModificationManager local_mod_manager = {.current = &plan};
+    ModificationManager *saved_mod_manager = mod_manager;
+    mod_manager = &local_mod_manager;
+
+    const char *expected_results[] = {"benign", "ignored", "malicious"};
+    const bool crashes[] = {false, true, true};
+    const target_ulong faults[] = {0, 0x5678, 0x1234};
+    for (uint32_t patch = 1; patch <= 3; patch++) {
+        PatchedResult *result = &manager.current->patch_results[patch];
+        result->patch_id = patch;
+        result->representative = patch;
+        result->is_crash = crashes[patch - 1];
+        result->fault_loc = faults[patch - 1];
+        CHECK(binradar_feedback_write(&manager, 2, patch, branches),
+              "feedback writer commits representative pair");
+
+        char *metadata_name = g_strdup_printf(
+            "iteration-00000002-patch-%08u.sbsv", patch);
+        char *metadata_path = g_build_filename(directory, metadata_name, NULL);
+        char *metadata = NULL;
+        gsize metadata_size = 0;
+        CHECK(g_file_get_contents(metadata_path, &metadata, &metadata_size,
+                                  NULL),
+              "feedback metadata is readable");
+        if (metadata != NULL) {
+            char *classification = g_strdup_printf("[result %s]",
+                                                    expected_results[patch - 1]);
+            CHECK(strstr(metadata, classification) != NULL,
+                  "feedback classification matches POC fault location");
+            CHECK(strstr(metadata, "[branches 0,1]") != NULL &&
+                  strstr(metadata, "[value aabb]") != NULL,
+                  "feedback metadata records branches and mutation");
+            if (patch == 3) {
+                sbsv_parser *parser = sbsv_parser_new(SBSV_PARSER_DEFAULT);
+                CHECK(sbsv_parser_add_schema(parser,
+                    "[binradar-feedback] [version: int] [iteration: int] "
+                    "[patch: int] [snapshot-file: str] "
+                    "[snapshot-count: int] [branches: str] [outcome: str] "
+                    "[fault-addr: str] [poc-fault-addr: str] "
+                    "[same-fault: bool] [result: str] "
+                    "[mutation-writes: int]") == SBSV_OK &&
+                    sbsv_parser_add_schema(parser,
+                    "[binradar-mutation] [index: int] "
+                    "[kind: str] [addr: str] [size: int] [value: str] "
+                    "[target-extent: int]") == SBSV_OK &&
+                    sbsv_parser_loads(parser, metadata) == SBSV_OK,
+                    "feedback metadata is valid SBSV");
+                const sbsv_row **rows = NULL;
+                size_t row_count = 0;
+                CHECK(sbsv_parser_get_rows(parser, "binradar-feedback",
+                                           &rows, &row_count) == SBSV_OK &&
+                      row_count == 1,
+                      "feedback metadata has one run row");
+                sbsv_free_row_ref_array(rows);
+                rows = NULL;
+                row_count = 0;
+                CHECK(sbsv_parser_get_rows(parser,
+                                           "binradar-mutation",
+                                           &rows, &row_count) == SBSV_OK &&
+                      row_count == 1,
+                      "feedback metadata has one mutation row");
+                sbsv_free_row_ref_array(rows);
+                sbsv_parser_free(parser);
+            }
+            g_free(classification);
+        }
+        g_free(metadata);
+        g_free(metadata_path);
+        g_free(metadata_name);
+    }
+
+    char *snapshot_path = g_build_filename(
+        directory, "iteration-00000002-patch-00000003.brch", NULL);
+    char *snapshot_data = NULL;
+    gsize snapshot_size = 0;
+    CHECK(g_file_get_contents(snapshot_path, &snapshot_data, &snapshot_size,
+                              NULL) &&
+          snapshot_size == sizeof(snapshot) &&
+          memcmp(snapshot_data, snapshot, sizeof(snapshot)) == 0,
+          "feedback snapshot preserves validated BRCH bytes");
+    g_free(snapshot_data);
+    g_free(snapshot_path);
+
+    mod_manager = saved_mod_manager;
+    for (uint32_t patch = 1; patch <= 3; patch++) {
+        char *stem = g_strdup_printf(
+            "iteration-00000002-patch-%08u", patch);
+        char *name = g_strconcat(stem, ".brch", NULL);
+        char *path = g_build_filename(directory, name, NULL);
+        unlink(path);
+        g_free(path);
+        g_free(name);
+        name = g_strconcat(stem, ".sbsv", NULL);
+        path = g_build_filename(directory, name, NULL);
+        unlink(path);
+        g_free(path);
+        g_free(name);
+        g_free(stem);
+    }
+    rmdir(directory);
+    g_array_free(branches, TRUE);
+    g_byte_array_free(manager.cache_bytes, TRUE);
+    g_free(manager.current->patch_results);
+    g_free(manager.current);
+    g_free(directory);
+}
+
 /* ------------------------------------------------------------------ */
 /* Entry                                                               */
 /* ------------------------------------------------------------------ */
@@ -2244,6 +2413,7 @@ int main(void)
     test_manager_fifo_and_cleanup();
     test_child_multiwrite_atomicity();
     test_child_application_does_not_mutate_plan();
+    test_cached_feedback_writer();
 
     osprey_free_runtime_regions();
     teardown_guest_memory();

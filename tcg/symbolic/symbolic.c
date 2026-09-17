@@ -792,6 +792,17 @@ static inline void save_coverage_bitmap(const char* path, uint8_t* data,
     fclose(fp);
 }
 
+static void *alloc_local_solver_mapping(size_t size)
+{
+    void *mapping = mmap(NULL, size, PROT_READ | PROT_WRITE,
+                         MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (mapping == MAP_FAILED) {
+        perror("mmap local solver transport");
+        exit(EXIT_FAILURE);
+    }
+    return mapping;
+}
+
 static inline void save_coverage_log(const char*  path,
                                      GHashTable** coverage_log)
 {
@@ -831,13 +842,17 @@ void init_symbolic_mode(void)
     }
 
     if (s_config.no_external_solver) {
-        /* NO_EXTERNAL_SOLVER mode: process-local heap backing with the same
-         * data structures as solver mode (pool at EXPR_POOL_ADDR-compatible
-         * layout, query queue, bitmap). No SysV shm, no solver handshake. */
-        pool        = g_malloc0(sizeof(Expr) * EXPR_POOL_CAPACITY);
-        query_queue = g_malloc0(sizeof(Query) * EXPR_QUERY_CAPACITY);
+        /* Match the external solver transport's fork visibility. Forkserver
+         * children publish expressions and queries for their parent through
+         * these mappings; private heap allocations lose those writes. A fixed
+         * address is unnecessary because no independent process attaches. */
+        pool = alloc_local_solver_mapping(
+            sizeof(Expr) * EXPR_POOL_CAPACITY);
+        query_queue = alloc_local_solver_mapping(
+            sizeof(Query) * EXPR_QUERY_CAPACITY);
 #if BRANCH_COVERAGE == FUZZOLIC
-        bitmap      = g_malloc0(sizeof(uint8_t) * BRANCH_BITMAP_SIZE);
+        bitmap = alloc_local_solver_mapping(
+            sizeof(uint8_t) * BRANCH_BITMAP_SIZE);
 #endif
         printf("\nTRACER in NO_EXTERNAL_SOLVER mode\n");
     } else {
