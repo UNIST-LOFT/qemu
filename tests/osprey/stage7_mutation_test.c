@@ -54,6 +54,13 @@
 /* snapshot.c compiled in: full access to its statics. */
 #include "../../linux-user/snapshot.c"
 
+/* The symbolic boundary advisor is compiled into this TU for the same reason:
+ * its configuration and engine state are static, and the focused runner needs
+ * to drive modes and budgets directly instead of exporting production setters.
+ * The tracer build compiles the same source as its own translation unit
+ * (linux-user/Makefile.objs), which is what proves the link boundary. */
+#include "../../linux-user/snapshot-mutation-symbolic.c"
+
 /* ------------------------------------------------------------------ */
 /* Linker environment (externs snapshot.c and the OSPREY objects read) */
 /* ------------------------------------------------------------------ */
@@ -629,17 +636,19 @@ static void teardown_guest_memory(void)
 
 /* Drive snapshot_read_access the way the symbolic helpers do: a
  * SnapshotMemAccess with the loaded value copied into .target. */
-static void record_access(CPUArchState *env, uintptr_t addr,
-                          target_ulong value, int size, bool symbolic)
+static SnapshotReadToken record_access(CPUArchState *env, uintptr_t addr,
+                                       target_ulong value, int size,
+                                       bool symbolic)
 {
     SnapshotMemAccess ma;
     memset(&ma, 0, sizeof(ma));
     ma.addr = addr;
     ma.size = (uintptr_t)size;
     ma.symbolic_value = symbolic;
+    ma.observed_valid = true;
     ma.pc = 0x400100;
     memcpy(ma.target, &value, sizeof(target_ulong));
-    snapshot_read_access(env, &ma);
+    return snapshot_read_access(env, &ma);
 }
 
 /* Reset the child-side record state (statics of snapshot.c are directly
@@ -901,6 +910,114 @@ static void test_at_cap_sticky(void)
           "corrupt removal sets sticky flag");
 
     reset_shared_records();
+    g_free(env);
+}
+
+/* Group 10: read-event tokens.  Identity is epoch/lane/slot/access id, never
+ * raw address, so replacement, lane change, or slot movement invalidates an
+ * older token and finalization must abstain rather than attach symbolic
+ * metadata to the wrong record. */
+static void test_read_token_identity(void)
+{
+    reset_runtime();
+    CPUArchState *env = g_malloc0(sizeof(CPUArchState));
+    reset_shared_records();
+
+    uintptr_t a = TEST_GUEST_BASE + 0xa000;
+    uintptr_t b = TEST_GUEST_BASE + 0xa100;
+    uint64_t epoch = ++shared_trace_data->run_epoch;
+
+    target_ulong value = 0x0000000011223344ULL;
+    SnapshotReadToken t1 = record_access(env, a, value, 4, true);
+    CHECK(t1.valid == 1 && t1.lane == SNAPSHOT_READ_LANE_PRIMITIVE &&
+          t1.slot == 0 && t1.run_epoch == epoch,
+          "primitive read returns a valid event token");
+    CHECK(shared_trace_data->primitives[0].observed_read_valid == 1 &&
+          memcmp(shared_trace_data->primitives[0].observed_read_bytes,
+                 &value, 4) == 0,
+          "record captures the exact child bytes at that width");
+    CHECK(shared_trace_data->primitives[0].expr_index == -1 &&
+          shared_trace_data->primitives[0].query_index == -1,
+          "record starts without finalized symbolic indexes");
+
+    CHECK(snapshot_finalize_read_token(t1, 40, 3, SNAPSHOT_ROOT_ZEXT),
+          "finalizing the live token attaches its scalar metadata");
+    CHECK(shared_trace_data->primitives[0].expr_index == 40 &&
+          shared_trace_data->primitives[0].query_index == 3 &&
+          shared_trace_data->primitives[0].root_extension ==
+              SNAPSHOT_ROOT_ZEXT,
+          "finalized indexes and extension are observable");
+
+    /* Replacement at the same address changes the access id: the old token
+     * no longer names the record and must not overwrite it. */
+    SnapshotReadToken t2 = record_access(env, a, 0x55, 4, true);
+    CHECK(t2.access_id != t1.access_id,
+          "replacement issues a fresh access id");
+    CHECK(shared_trace_data->primitives[0].expr_index == -1 &&
+          shared_trace_data->primitives[0].query_index == -1 &&
+          shared_trace_data->primitives[0].observed_read_valid == 1 &&
+          shared_trace_data->primitives[0].observed_read_bytes[0] == 0x55,
+          "replacement resets symbolic metadata and keeps new bytes");
+    CHECK(!snapshot_finalize_read_token(t1, 41, 4, SNAPSHOT_ROOT_ZEXT),
+          "stale token is rejected after replacement");
+    CHECK(shared_trace_data->primitives[0].expr_index == -1,
+          "stale finalization leaves the live record untouched");
+
+    /* Width change is the same record identity only when the access id
+     * matches; recording a different width reissues it. */
+    SnapshotReadToken t3 = record_access(env, a, 0x77, 8, true);
+    CHECK(!snapshot_finalize_read_token(t2, 42, 5, SNAPSHOT_ROOT_IDENTITY),
+          "token is rejected after a width change");
+    CHECK(snapshot_finalize_read_token(t3, 42, 5, SNAPSHOT_ROOT_IDENTITY),
+          "current token finalizes after the width change");
+    CHECK(shared_trace_data->primitives[0].size == 8 &&
+          shared_trace_data->primitives[0].root_extension ==
+              SNAPSHOT_ROOT_IDENTITY,
+          "identity extension matches the machine-width load");
+
+    /* Epoch change invalidates every token from the previous run. */
+    shared_trace_data->run_epoch = epoch + 1;
+    CHECK(!snapshot_finalize_read_token(t3, 43, 6, SNAPSHOT_ROOT_IDENTITY),
+          "token is rejected across an epoch change");
+    shared_trace_data->run_epoch = epoch;
+
+    /* A non-retained read (not symbolic, non-pointer value) yields an
+     * invalid token that can never finalize. */
+    SnapshotReadToken none = record_access(env, b, 0x1234, 4, false);
+    CHECK(none.valid == 0, "unretained read returns an invalid token");
+    CHECK(!snapshot_finalize_read_token(none, 44, 7, SNAPSHOT_ROOT_ZEXT),
+          "invalid token never finalizes");
+
+    /* Out-of-range indexes are rejected before any record is touched. */
+    SnapshotReadToken t4 = record_access(env, b, 0x9999, 4, true);
+    CHECK(!snapshot_finalize_read_token(t4, -1, 7, SNAPSHOT_ROOT_ZEXT) &&
+          !snapshot_finalize_read_token(t4, 44, -1, SNAPSHOT_ROOT_ZEXT) &&
+          !snapshot_finalize_read_token(t4, 44, 7,
+                                        (SnapshotRootExtension)7),
+          "negative indexes and unknown extensions are rejected");
+    CHECK(shared_trace_data->primitives[1].expr_index == -1,
+          "rejected finalization leaves the record unchanged");
+
+    /* Pointer-lane reads carry their own lane and finalize into their own
+     * record; lane eligibility for symbolic advice is enforced later, by the
+     * baseline copy, not here. */
+    target_ulong ptr_target = TEST_GUEST_BASE + 0x10;
+    SnapshotReadToken tp = record_access(env, b, ptr_target, 8, true);
+    CHECK(tp.valid == 1 && tp.lane == SNAPSHOT_READ_LANE_POINTER,
+          "pointer-valued read returns a pointer-lane token");
+    CHECK(snapshot_finalize_read_token(tp, 50, 8, SNAPSHOT_ROOT_IDENTITY) &&
+          shared_trace_data->pointers[tp.slot].expr_index == 50 &&
+          shared_trace_data->pointers[tp.slot].query_index == 8 &&
+          shared_trace_data->pointers[tp.slot].observed_read_valid == 1,
+          "pointer-lane token finalizes into its own record");
+    /* A primitive token must never be applied to the pointer lane: the lanes
+     * are distinct record arrays and a mismatched lane abstains. */
+    SnapshotReadToken crossed = t4;
+    crossed.slot = tp.slot;
+    CHECK(!snapshot_finalize_read_token(crossed, 51, 9,
+                                        SNAPSHOT_ROOT_IDENTITY),
+          "a primitive token cannot finalize against the pointer lane");
+
     g_free(env);
 }
 
@@ -2030,8 +2147,19 @@ static void test_mutation_coordinator_contract(void)
     CHECK(g_queue_is_empty(queue),
           "coordinator staging does not publish a queue prefix");
     CHECK(snapshot_mutation_coordinator_publish(&coordinator, queue) &&
-              g_queue_get_length(queue) == 2,
-          "coordinator publishes every family write atomically");
+              g_queue_get_length(queue) == 1,
+          "coordinator publishes one owned plan per variant");
+    if (g_queue_get_length(queue) == 1) {
+        SnapshotMutationPlan *staged = g_queue_peek_head(queue);
+        CHECK(staged->num_mods == 2 &&
+                  staged->mods[0].addr == entries[0].addr &&
+                  staged->mods[0].size == 1 &&
+                  staged->mods[0].value[0] == 0x22 &&
+                  staged->mods[1].addr == entries[1].addr &&
+                  staged->mods[1].size == sizeof(target_ulong) &&
+                  staged->mods[1].value[0] == 0x44,
+              "staged plan carries the complete ordered write set");
+    }
     free_plan_queue(queue);
     snapshot_mutation_coordinator_clear(&coordinator);
 }
@@ -2175,6 +2303,118 @@ static void test_child_multiwrite_atomicity(void)
     g_free(env);
 }
 
+static void test_variant_multiwrite_child_observation(void)
+{
+    /* One proposal variant with two writes must reach exactly one
+     * disposable child that observes both cells together.  A descriptor
+     * count alone would not prove the atomicity B0 now guarantees. */
+    SnapshotMutationBaseline baseline = {0};
+    SnapshotMutationBaselineEntry entries[2] = {0};
+    SnapshotMutationCoordinator coordinator = {0};
+    SnapshotMutationProposalSink sink = {0};
+    SnapshotMutationProposalWrite writes[2] = {0};
+    SnapshotMutationProposalVariant variant = {0};
+    SnapshotMutationProposalFamily family = {0};
+    GQueue *queue = g_queue_new();
+    CPUArchState *env = g_malloc0(sizeof(*env));
+    void *shared = mmap(NULL, SNAPSHOT_PAGE_SIZE,
+                        PROT_READ | PROT_WRITE,
+                        MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    unsigned long saved_guest_base = guest_base;
+    target_ulong first = TEST_GUEST_BASE + 0x130;
+    target_ulong second = TEST_GUEST_BASE + 0x138;
+    int status = 0;
+
+    CHECK(shared != MAP_FAILED, "variant fixture maps shared memory");
+    if (shared == MAP_FAILED || queue == NULL || env == NULL) {
+        g_free(env);
+        g_free(queue);
+        return;
+    }
+    guest_base = (unsigned long)shared - TEST_GUEST_BASE;
+    memset(shared, 0xa5, SNAPSHOT_PAGE_SIZE);
+
+    baseline.run_epoch = 11;
+    baseline.entry_count = G_N_ELEMENTS(entries);
+    baseline.entries = entries;
+    for (uint32_t i = 0; i < G_N_ELEMENTS(entries); i++) {
+        entries[i].token.run_epoch = baseline.run_epoch;
+        entries[i].token.source_ordinal = i;
+        entries[i].lane = SNAPSHOT_MUTATION_LANE_PRIMITIVE;
+        entries[i].source_kind = SNAPSHOT_MUTATION_SOURCE_PRIMITIVE;
+        entries[i].eligible = true;
+        entries[i].typed_eligible = true;
+        entries[i].size = 1;
+        entries[i].addr = i == 0 ? first : second;
+        entries[i].planner_bytes[0] = 0xa5;
+    }
+    entries[1].size = 2;
+
+    writes[0].destination = entries[0].token;
+    writes[0].kind = SNAPSHOT_MUTATION_BYTES;
+    writes[0].size = 1;
+    writes[0].value[0] = 0x11;
+    writes[1].destination = entries[1].token;
+    writes[1].kind = SNAPSHOT_MUTATION_BYTES;
+    writes[1].size = 2;
+    writes[1].value[0] = 0x22;
+    writes[1].value[1] = 0x77;
+    variant.variant_id = 3;
+    variant.write_count = G_N_ELEMENTS(writes);
+    variant.writes = writes;
+    family.advisor_id = sink.advisor_id = 2;
+    family.advisor_priority = sink.advisor_priority = 1;
+    family.family_id = 7;
+    family.primary_seed = entries[0].token;
+    family.seed_semantics = SNAPSHOT_MUTATION_SEED_SNAPSHOT_STATE;
+    family.variant_count = 1;
+    family.variants = &variant;
+
+    coordinator.baseline = &baseline;
+    coordinator.families = g_ptr_array_new_with_free_func(
+        snapshot_mutation_proposal_family_free);
+    coordinator.staged = g_ptr_array_new_with_free_func(
+        (GDestroyNotify)snapshot_mutation_free);
+    sink.coordinator = &coordinator;
+
+    CHECK(snapshot_mutation_sink_submit(&sink, &family),
+          "variant multiwrite family is accepted");
+    CHECK(snapshot_mutation_stage_family(
+              &coordinator, g_ptr_array_index(coordinator.families, 0)) &&
+              coordinator.staged->len == 1,
+          "one variant stages exactly one plan");
+    CHECK(snapshot_mutation_coordinator_publish(&coordinator, queue) &&
+              g_queue_get_length(queue) == 1,
+          "one variant publishes exactly one queue entry");
+
+    mod_manager = g_new0(ModificationManager, 1);
+    mod_manager->modifications = queue;
+    mod_manager->current = g_queue_pop_head(queue);
+    mutation_analysis_started = true;
+    CHECK(mod_manager->current != NULL &&
+              mod_manager->current->num_mods == 2,
+          "published plan carries both writes");
+    pid_t pid = fork();
+    if (pid == 0) {
+        snapshot_modify_memory(env);
+        _exit(0);
+    }
+    CHECK(pid > 0 && waitpid(pid, &status, 0) == pid &&
+              WIFEXITED(status) && WEXITSTATUS(status) == 0,
+          "variant multiwrite child resumes after complete preflight");
+    CHECK(((uint8_t *)shared)[0x130] == 0x11 &&
+              ((uint8_t *)shared)[0x138] == 0x22 &&
+              ((uint8_t *)shared)[0x139] == 0x77,
+          "variant multiwrite child observes both writes together");
+
+    snapshot_modification_manager_reset(false);
+    guest_base = saved_guest_base;
+    munmap(shared, SNAPSHOT_PAGE_SIZE);
+    g_ptr_array_free(coordinator.families, TRUE);
+    g_ptr_array_free(coordinator.staged, TRUE);
+    g_free(env);
+}
+
 static void test_child_application_does_not_mutate_plan(void)
 {
     reset_shared_records();
@@ -2256,13 +2496,18 @@ static void test_cached_feedback_writer(void)
     branch = 1;
     g_array_append_val(branches, branch);
 
-    SnapshotMutationWrite write = {0};
-    write.kind = SNAPSHOT_MUTATION_BYTES;
-    write.addr = 0x4000;
-    write.size = 2;
-    write.value[0] = 0xaa;
-    write.value[1] = 0xbb;
-    SnapshotMutationPlan plan = {.num_mods = 1, .mods = &write};
+    SnapshotMutationWrite writes[2] = {0};
+    writes[0].kind = SNAPSHOT_MUTATION_BYTES;
+    writes[0].addr = 0x4000;
+    writes[0].size = 2;
+    writes[0].value[0] = 0xaa;
+    writes[0].value[1] = 0xbb;
+    writes[1].kind = SNAPSHOT_MUTATION_POINTER_OOB;
+    writes[1].addr = 0x4008;
+    writes[1].size = sizeof(target_ulong);
+    writes[1].value[0] = 0xcc;
+    writes[1].value[1] = 0xdd;
+    SnapshotMutationPlan plan = {.num_mods = 2, .mods = writes};
     ModificationManager local_mod_manager = {.current = &plan};
     ModificationManager *saved_mod_manager = mod_manager;
     mod_manager = &local_mod_manager;
@@ -2293,8 +2538,12 @@ static void test_cached_feedback_writer(void)
             CHECK(strstr(metadata, classification) != NULL,
                   "feedback classification matches POC fault location");
             CHECK(strstr(metadata, "[branches 0,1]") != NULL &&
-                  strstr(metadata, "[value aabb]") != NULL,
-                  "feedback metadata records branches and mutation");
+                  strstr(metadata, "[mutation-writes 2]") != NULL &&
+                  strstr(metadata, "[index 0] [kind bytes]") != NULL &&
+                  strstr(metadata, "[value aabb]") != NULL &&
+                  strstr(metadata, "[index 1] [kind pointer-oob]") != NULL &&
+                  strstr(metadata, "[value ccdd000000000000]") != NULL,
+                  "feedback metadata records every ordered plan write");
             if (patch == 3) {
                 sbsv_parser *parser = sbsv_parser_new(SBSV_PARSER_DEFAULT);
                 CHECK(sbsv_parser_add_schema(parser,
@@ -2322,8 +2571,8 @@ static void test_cached_feedback_writer(void)
                 CHECK(sbsv_parser_get_rows(parser,
                                            "binradar-mutation",
                                            &rows, &row_count) == SBSV_OK &&
-                      row_count == 1,
-                      "feedback metadata has one mutation row");
+                      row_count == 2,
+                      "feedback metadata has one row per plan write");
                 sbsv_free_row_ref_array(rows);
                 sbsv_parser_free(parser);
             }
@@ -2374,6 +2623,1073 @@ static void test_cached_feedback_writer(void)
 /* Entry                                                               */
 /* ------------------------------------------------------------------ */
 
+/* ------------------------------------------------------------------ */
+/* Symbolic boundary advisor (Package 2)                               */
+/* ------------------------------------------------------------------ */
+
+/* Build a frozen arena and baseline that the advisor can traverse.  Nodes are
+ * appended in index order and every operand points backwards, exactly like the
+ * real pools.  The caller owns arena/query arrays and the baseline entries. */
+typedef struct SymbolicFixture {
+    Expr arena[64];
+    uint32_t arena_len;
+    Query queries[16];
+    uint32_t query_len;
+    SnapshotMutationBaseline baseline;
+    SnapshotMutationBaselineEntry entries[8];
+    uint32_t entry_count;
+} SymbolicFixture;
+
+static void fixture_arena(Expr *node, uint8_t opkind, Expr *op1,
+                          bool op1_const, uint64_t op1_value, Expr *op2,
+                          bool op2_const, uint64_t op2_value)
+{
+    memset(node, 0, sizeof(*node));
+    node->opkind = opkind;
+    node->op1_is_const = op1_const ? 1 : 0;
+    node->op2_is_const = op2_const ? 1 : 0;
+    node->op1 = op1_const ? (Expr *)(uintptr_t)op1_value : op1;
+    node->op2 = op2_const ? (Expr *)(uintptr_t)op2_value : op2;
+}
+
+static uint32_t fixture_push(SymbolicFixture *fx, uint8_t opkind, Expr *op1,
+                             bool op1_const, uint64_t op1_value, Expr *op2,
+                             bool op2_const, uint64_t op2_value)
+{
+    uint32_t index = fx->arena_len++;
+    fixture_arena(&fx->arena[index], opkind, op1, op1_const, op1_value, op2,
+                  op2_const, op2_value);
+    return index;
+}
+
+static uint32_t fixture_leaf(SymbolicFixture *fx)
+{
+    uint32_t index = fx->arena_len++;
+    memset(&fx->arena[index], 0, sizeof(fx->arena[index]));
+    fx->arena[index].opkind = IS_SYMBOLIC;
+    return index;
+}
+
+static void fixture_branch(SymbolicFixture *fx, uint8_t opkind, Expr *op1,
+                           bool op1_const, uint64_t op1_value, Expr *op2,
+                           bool op2_const, uint64_t op2_value, uint64_t width)
+{
+    uint32_t index;
+    Query *query;
+    memset(&fx->queries[fx->query_len], 0, sizeof(fx->queries[0]));
+    index = fixture_push(fx, opkind, op1, op1_const, op1_value, op2, op2_const,
+                         op2_value);
+    fx->arena[index].op3 = (Expr *)(uintptr_t)width;
+    query = &fx->queries[fx->query_len++];
+    query->query = &fx->arena[index];
+}
+
+/* One primitive source at `cell` with `observed` bytes loaded 4 bytes wide. */
+static void fixture_source(SymbolicFixture *fx, uintptr_t cell,
+                           uint32_t observed, uint32_t root_index,
+                           int64_t query_index)
+{
+    SnapshotMutationBaselineEntry *entry = &fx->entries[fx->entry_count];
+    memset(entry, 0, sizeof(*entry));
+    entry->token.run_epoch = 11;
+    entry->token.source_ordinal = fx->entry_count;
+    entry->lane = SNAPSHOT_MUTATION_LANE_PRIMITIVE;
+    entry->source_kind = SNAPSHOT_MUTATION_SOURCE_PRIMITIVE;
+    entry->eligible = true;
+    entry->typed_eligible = true;
+    entry->addr = cell;
+    entry->size = 4;
+    entry->observed_read_valid = true;
+    memcpy(entry->observed_read_bytes, &observed, sizeof(observed));
+    memcpy(entry->planner_bytes, &observed, sizeof(observed));
+    entry->expr_index = root_index;
+    entry->query_index = query_index;
+    entry->root_extension = SNAPSHOT_ROOT_ZEXT;
+    fx->entry_count++;
+}
+
+/* Bind a source's load root the way a real child suffix does: an admitted
+ * `BINRADAR_CONCRETIZATION` wrapper whose copied address, width, and bytes
+ * match the retained record.  The advisor traces a branch back to a memory
+ * cell only through this evidence, because the retained per-address record
+ * keeps just the last load of that address. */
+static void fixture_bind(SymbolicFixture *fx, uint32_t root_index,
+                         uintptr_t cell, uint32_t observed)
+{
+    uint32_t index = fixture_push(fx, BINRADAR_CONCRETIZATION,
+                                  &fx->arena[root_index], false, 0, NULL, true,
+                                  0);
+    Query *query;
+
+    memcpy(&fx->arena[index].op2, &observed, sizeof(observed));
+    fx->arena[index].op2_is_const = 1;
+    fx->arena[index].op3 = (Expr *)(uintptr_t)4;
+    fx->arena[index].op3_is_const = 1;
+    query = &fx->queries[fx->query_len++];
+    query->query = &fx->arena[index];
+    query->address = cell;
+}
+
+static void fixture_init(SymbolicFixture *fx)
+{
+    memset(fx, 0, sizeof(*fx));
+    fx->baseline.run_epoch = 11;
+    fx->baseline.counts_valid = true;
+    fx->baseline.entries = fx->entries;
+}
+
+static void fixture_seal(SymbolicFixture *fx, uint64_t expr_entry,
+                         uint64_t query_entry)
+{
+    fx->baseline.entry_count = fx->entry_count;
+    fx->baseline.expr_start = (int64_t)expr_entry;
+    fx->baseline.expr_end = (int64_t)fx->arena_len;
+    fx->baseline.query_start = (int64_t)query_entry;
+    fx->baseline.query_end = (int64_t)fx->query_len;
+}
+
+/* Run the advisor in boundary mode against the fixture and return accepted
+ * families.  Configuration is process-global, so this forces the mode and
+ * restores OFF afterwards to keep later groups deterministic. */
+static void symbolic_configure(SnapshotSymbolicMode mode)
+{
+    static bool forced = false;
+    if (!forced) {
+        snapshot_symbolic_configure();
+        forced = true;
+    }
+    s_symbolic_config.mode = mode;
+    s_symbolic_config.valid = true;
+}
+
+static uint32_t symbolic_run_fixture(SymbolicFixture *fx,
+                                     SnapshotMutationCoordinator *coordinator,
+                                     SnapshotMutationProposalSink *sink)
+{
+    SnapshotSymbolicView view;
+    memset(&view, 0, sizeof(view));
+    view.expr_base = fx->arena;
+    view.query_base = fx->queries;
+    view.expr_entry = fx->baseline.expr_start;
+    view.expr_exit = fx->baseline.expr_end;
+    view.query_entry = fx->baseline.query_start;
+    view.query_exit = fx->baseline.query_end;
+    view.baseline = &fx->baseline;
+    view.run_epoch = fx->baseline.run_epoch;
+    sink->coordinator = coordinator;
+    sink->advisor_id = SNAPSHOT_SYMBOLIC_ADVISOR_ID;
+    sink->advisor_priority = SNAPSHOT_SYMBOLIC_ADVISOR_PRIORITY;
+    return snapshot_symbolic_run(&view, sink);
+}
+
+static SnapshotMutationCoordinator fixture_coordinator(SymbolicFixture *fx)
+{
+    SnapshotMutationCoordinator coordinator;
+    memset(&coordinator, 0, sizeof(coordinator));
+    coordinator.baseline = &fx->baseline;
+    coordinator.families = g_ptr_array_new_with_free_func(
+        snapshot_mutation_proposal_family_free);
+    coordinator.staged = g_ptr_array_new_with_free_func(
+        (GDestroyNotify)snapshot_mutation_free);
+    return coordinator;
+}
+
+/* Package 4: the feedback sidecar must describe the plan the boundary advisor
+ * actually applied, and the child must have observed the same value.  This
+ * links three independently-produced artifacts -- the advisor's family, the
+ * owned plan the child applied, and the version-1 sidecar bytes -- instead of
+ * asserting each one separately. */
+static void test_symbolic_feedback_matches_applied_plan(void)
+{
+    SymbolicFixture fx;
+    SnapshotMutationCoordinator coordinator;
+    SnapshotMutationProposalSink sink;
+    uintptr_t cell = TEST_GUEST_BASE + 0xe600;
+    uint32_t leaf, zext;
+    uint32_t proposed = 0;
+    GError *error = NULL;
+    char *directory;
+    BinradarManager manager = {0};
+    char *metadata_path = NULL;
+    char *metadata = NULL;
+    gsize metadata_size = 0;
+
+    reset_runtime();
+    fixture_init(&fx);
+    leaf = fixture_leaf(&fx);
+    zext = fixture_push(&fx, ZEXT, &fx.arena[leaf], false, 0, NULL, true, 32);
+    fixture_source(&fx, cell, 0x0010, (int64_t)zext, 0);
+    fixture_bind(&fx, zext, cell, 0x0010);
+    fixture_branch(&fx, LTU, &fx.arena[zext], false, 0, NULL, true, 0x1000, 8);
+    fixture_seal(&fx, 0, 0);
+
+    coordinator = fixture_coordinator(&fx);
+    symbolic_configure(SNAPSHOT_SYMBOLIC_BOUNDARY);
+    CHECK(symbolic_run_fixture(&fx, &coordinator, &sink) == 1 &&
+              coordinator.families->len == 1,
+          "advisor proposes one family for the feedback cross-check");
+    if (coordinator.families->len != 1) {
+        g_ptr_array_free(coordinator.families, TRUE);
+        g_ptr_array_free(coordinator.staged, TRUE);
+        symbolic_configure(SNAPSHOT_SYMBOLIC_OFF);
+        return;
+    }
+    CHECK(snapshot_mutation_stage_family(
+              &coordinator, g_ptr_array_index(coordinator.families, 0)) &&
+              coordinator.staged->len ==
+                  ((SnapshotMutationProposalFamily *)g_ptr_array_index(
+                      coordinator.families, 0))->variant_count,
+          "advisor family stages every bounded variant as one owned plan");
+    memcpy(&proposed,
+           ((SnapshotMutationPlan *)g_ptr_array_index(
+                coordinator.staged, 0))->mods[0].value,
+           sizeof(proposed));
+    CHECK(proposed == 0x1000,
+          "applied plan carries the synthesized boundary value");
+
+    /* Feed the owned plan to the production writer as the child's mutation
+     * plan, exactly as the forkserver parent does before a mutation child. */
+    directory = g_dir_make_tmp("binradar-symbolic-feedback-XXXXXX", &error);
+    CHECK(directory != NULL && error == NULL,
+          "symbolic feedback fixture creates a temporary directory");
+    if (directory != NULL) {
+        ModificationManager local_mod_manager = {0};
+        ModificationManager *saved_mod_manager = mod_manager;
+        const uint8_t snapshot[] = {'B', 'R', 'C', 'H'};
+        GArray *branches = g_array_new(FALSE, FALSE, sizeof(int));
+        int branch = 1;
+
+        manager.patch_max_id = 2;
+        manager.current = binradar_manager_alloc_one_iter(&manager);
+        manager.feedback_dir = directory;
+        manager.poc_fault_addr = 0x1234;
+        manager.cache_bytes = g_byte_array_new();
+        g_byte_array_append(manager.cache_bytes, snapshot, sizeof(snapshot));
+        g_array_append_val(branches, branch);
+        for (uint32_t patch = 1; patch <= 2; patch++) {
+            PatchedResult *result = &manager.current->patch_results[patch];
+            result->patch_id = patch;
+            result->representative = patch;
+            result->is_crash = patch == 2;
+            result->fault_loc = patch == 2 ? 0x1234u : 0u;
+        }
+        local_mod_manager.current =
+            g_ptr_array_index(coordinator.staged, 0);
+        mod_manager = &local_mod_manager;
+        CHECK(binradar_feedback_write(&manager, 4, 1, branches),
+              "feedback writer commits the representative child pair");
+
+        metadata_path = g_build_filename(
+            directory, "iteration-00000004-patch-00000001.sbsv", NULL);
+        CHECK(g_file_get_contents(metadata_path, &metadata, &metadata_size,
+                                  NULL),
+              "symbolic feedback sidecar is readable");
+        if (metadata != NULL) {
+            sbsv_parser *parser = sbsv_parser_new(SBSV_PARSER_DEFAULT);
+            const sbsv_row **rows = NULL;
+            size_t row_count = 0;
+            const char *recorded = NULL;
+            CHECK(sbsv_parser_add_schema(parser,
+                "[binradar-feedback] [version: int] [iteration: int] "
+                "[patch: int] [snapshot-file: str] [snapshot-count: int] "
+                "[branches: str] [outcome: str] [fault-addr: str] "
+                "[poc-fault-addr: str] [same-fault: bool] [result: str] "
+                "[mutation-writes: int]") == SBSV_OK &&
+                sbsv_parser_add_schema(parser,
+                "[binradar-mutation] [index: int] [kind: str] [addr: str] "
+                "[size: int] [value: str] [target-extent: int]") == SBSV_OK &&
+                sbsv_parser_loads(parser, metadata) == SBSV_OK,
+                "symbolic feedback sidecar is valid version-1 SBSV");
+            CHECK(sbsv_parser_get_rows(parser, "binradar-mutation",
+                                       &rows, &row_count) == SBSV_OK &&
+                      row_count == 1,
+                  "symbolic sidecar records exactly the one applied write");
+            if (row_count == 1) {
+                for (size_t field = 0;
+                     field < sbsv_row_field_count(rows[0]); field++) {
+                    if (strcmp(sbsv_field_name(&rows[0]->fields[field]),
+                               "value") == 0) {
+                        recorded = rows[0]->fields[field].value.data.
+                            string_value;
+                    }
+                }
+                CHECK(recorded != NULL &&
+                          strcmp(recorded, "00100000") == 0,
+                      "sidecar write value is the little-endian plan bytes");
+            }
+            sbsv_free_row_ref_array(rows);
+            rows = NULL;
+            row_count = 0;
+            CHECK(sbsv_parser_get_rows(parser, "binradar-feedback",
+                                       &rows, &row_count) == SBSV_OK &&
+                      row_count == 1,
+                  "symbolic sidecar has exactly one run row");
+            sbsv_free_row_ref_array(rows);
+            sbsv_parser_free(parser);
+        }
+        g_free(metadata);
+        metadata = NULL;
+
+        /* Iteration 1 is the baseline: no pair, because no mutation child
+         * ran.  The writer must refuse rather than publish a stale plan. */
+        CHECK(binradar_feedback_write(&manager, 1, 1, branches),
+              "iteration 1 is a no-op for the feedback writer");
+        {
+            char *iter1 = g_build_filename(
+                directory, "iteration-00000001-patch-00000001.sbsv", NULL);
+            CHECK(!g_file_test(iter1, G_FILE_TEST_EXISTS),
+                  "iteration 1 writes no feedback pair");
+            g_free(iter1);
+        }
+
+        mod_manager = saved_mod_manager;
+        g_array_free(branches, TRUE);
+        g_byte_array_free(manager.cache_bytes, TRUE);
+        binradar_clear_current(&manager);
+        g_free(manager.current->patch_results);
+        g_free(manager.current);
+        {
+            char *pair = g_build_filename(
+                directory, "iteration-00000004-patch-00000001.brch", NULL);
+            unlink(pair);
+            g_free(pair);
+            pair = g_build_filename(
+                directory, "iteration-00000001-patch-00000001.sbsv", NULL);
+            unlink(pair);
+            g_free(pair);
+            pair = g_build_filename(
+                directory, "iteration-00000001-patch-00000001.brch", NULL);
+            unlink(pair);
+            g_free(pair);
+        }
+        unlink(metadata_path);
+        g_free(metadata_path);
+        rmdir(directory);
+        g_free(directory);
+    }
+    g_ptr_array_free(coordinator.families, TRUE);
+    g_ptr_array_free(coordinator.staged, TRUE);
+    symbolic_configure(SNAPSHOT_SYMBOLIC_OFF);
+}
+
+/* The pair claims to describe one real child.  A member materialized from a
+ * cached vector has no child of its own, so publication must be impossible for
+ * it -- in both places that could produce one. */
+static void test_feedback_requires_representative_child(void)
+{
+    GError *error = NULL;
+    char *directory = g_dir_make_tmp("binradar-rep-feedback-XXXXXX", &error);
+    BinradarManager manager = {0};
+    GArray *branches = g_array_new(FALSE, FALSE, sizeof(int));
+    char *pair_path = NULL;
+    int branch = 1;
+
+    CHECK(directory != NULL && error == NULL,
+          "representative fixture creates a temporary directory");
+    if (directory == NULL) {
+        g_array_free(branches, TRUE);
+        return;
+    }
+    manager.patch_max_id = 2;
+    manager.current = binradar_manager_alloc_one_iter(&manager);
+    manager.feedback_dir = directory;
+    manager.poc_fault_addr = 0x1234;
+    manager.cache_bytes = g_byte_array_new();
+    g_array_append_val(branches, branch);
+    for (uint32_t patch = 1; patch <= 2; patch++) {
+        PatchedResult *result = &manager.current->patch_results[patch];
+        result->patch_id = patch;
+        result->representative = patch;
+        result->is_crash = false;
+    }
+    /* Materialize patch 2 from patch 1's cached vector exactly as the
+     * forkserver parent does: same branch vector, representative = patch 1. */
+    manager.current->patch_results[1].br_taken =
+        binradar_clone_branch_vector(branches);
+    binradar_materialize_cache_hit(&manager, 2, 1, branches);
+    CHECK(manager.current->patch_results[2].representative == 1,
+          "cache hit records the representative that produced its vector");
+    CHECK(binradar_branch_vectors_equal(
+              manager.current->patch_results[2].br_taken, branches),
+          "cache hit carries the representative's observed vector");
+
+    /* The writer refuses a non-representative request outright: a cache hit
+     * must never publish a sidecar pretending to be a real child. */
+    CHECK(!binradar_feedback_write(&manager, 4, 2, branches),
+          "cache-materialized member is rejected by the feedback writer");
+    pair_path = g_build_filename(
+        directory, "iteration-00000004-patch-00000002.sbsv", NULL);
+    CHECK(!g_file_test(pair_path, G_FILE_TEST_EXISTS),
+          "cache-materialized member emits no feedback pair");
+    g_free(pair_path);
+
+    g_array_free(branches, TRUE);
+    g_byte_array_free(manager.cache_bytes, TRUE);
+    binradar_clear_current(&manager);
+    g_free(manager.current->patch_results);
+    g_free(manager.current);
+    rmdir(directory);
+    g_free(directory);
+}
+
+/* Malformed BRCH bytes must not be publishable.  The writer copies whatever
+ * the capture holds, so the guard lives in the cache vector: a representative
+ * whose captured snapshot cannot reproduce the observed branches disables
+ * publication instead of emitting a pair no consumer can trust. */
+static void test_feedback_rejects_malformed_brch(void)
+{
+    BinradarManager manager = {0};
+    GArray *vector = NULL;
+    const uint8_t truncated[] = {'B', 'R', 'C', 'H'};
+    const uint8_t short_header[] = {0x42, 0x52, 0x43, 0x48, 0x01, 0x00};
+
+    manager.cache_family = BRCACHE_FAMILY_GENERIC;
+    manager.cache_bytes = g_byte_array_new();
+    /* Fewer bytes than one header: the record walk must fail closed. */
+    g_byte_array_append(manager.cache_bytes, truncated, sizeof(truncated));
+    CHECK(!binradar_cache_vector(&manager, 1, 1, &vector) && vector == NULL,
+          "a truncated snapshot stream rejects cache evaluation");
+    g_byte_array_set_size(manager.cache_bytes, 0);
+    g_byte_array_append(manager.cache_bytes, short_header,
+                        sizeof(short_header));
+    CHECK(!binradar_cache_vector(&manager, 1, 1, &vector) && vector == NULL,
+          "a sub-header snapshot stream rejects cache evaluation");
+    /* Wrong magic with a complete-looking header must also fail closed. */
+    g_byte_array_set_size(manager.cache_bytes, 0);
+    {
+        BinradarSnapshotHeader header = {
+            .magic = 0xdeadbeefu,
+            .version = BRCACHE_SNAPSHOT_VERSION,
+            .patch_id = 1,
+            .branch = 0,
+            .stack_size = 0,
+            .flags = 0,
+        };
+        uint8_t zero_payload[16 * sizeof(uint64_t)] = {0};
+        g_byte_array_append(manager.cache_bytes, (const uint8_t *)&header,
+                            sizeof(header));
+        g_byte_array_append(manager.cache_bytes, zero_payload,
+                            sizeof(zero_payload));
+    }
+    CHECK(!binradar_cache_vector(&manager, 1, 1, &vector) && vector == NULL,
+          "a bad-magic snapshot stream rejects cache evaluation");
+    g_byte_array_free(manager.cache_bytes, TRUE);
+}
+
+/* The canonical case: a 4-byte symbolic read compared against a constant with
+ * an unsigned less-than.  The advisor must propose exactly the constant, as a
+ * single 4-byte OBSERVED_READ write, and nothing else. */
+static void test_symbolic_boundary_unsigned(void)
+{
+    SymbolicFixture fx;
+    SnapshotMutationCoordinator coordinator;
+    SnapshotMutationProposalSink sink;
+    uintptr_t cell = TEST_GUEST_BASE + 0xe000;
+    uint32_t leaf, zext;
+    uint32_t accepted;
+    uint32_t value = 0x0010;
+
+    reset_runtime();
+    fixture_init(&fx);
+    leaf = fixture_leaf(&fx);
+    zext = fixture_push(&fx, ZEXT, &fx.arena[leaf], false, 0, NULL, true, 32);
+    fixture_source(&fx, cell, value, (int64_t)zext, 0);
+    fixture_bind(&fx, zext, cell, value);
+    /* if (v < 0x1000) */
+    fixture_branch(&fx, LTU, &fx.arena[zext], false, 0, NULL, true, 0x1000, 8);
+    fixture_seal(&fx, 0, 0);
+
+    coordinator = fixture_coordinator(&fx);
+    symbolic_configure(SNAPSHOT_SYMBOLIC_BOUNDARY);
+    accepted = symbolic_run_fixture(&fx, &coordinator, &sink);
+    CHECK(accepted == 1 && coordinator.families->len == 1,
+          "advisor accepts exactly one boundary family");
+    if (coordinator.families->len == 1) {
+        const SnapshotMutationProposalFamily *family =
+            g_ptr_array_index(coordinator.families, 0);
+        const SnapshotMutationProposalWrite *write;
+        uint32_t lowered = 0;
+        CHECK(family->advisor_id == SNAPSHOT_SYMBOLIC_ADVISOR_ID &&
+                  family->advisor_priority ==
+                      SNAPSHOT_SYMBOLIC_ADVISOR_PRIORITY,
+              "family carries the advisor identity and priority");
+        CHECK(family->seed_semantics == SNAPSHOT_MUTATION_SEED_OBSERVED_READ &&
+                  family->primary_seed.source_ordinal == 0,
+              "family is an observed-read family for the source ordinal");
+        CHECK(family->variant_count >= 1 && family->variant_count <= 3 &&
+                  family->variants[0].write_count == 1,
+              "bounded variants each carry one primary write");
+        write = &family->variants[0].writes[0];
+        memcpy(&lowered, write->value, sizeof(lowered));
+        CHECK(write->kind == SNAPSHOT_MUTATION_BYTES && write->size == 4 &&
+                  lowered == 0x1000,
+              "proposed value is the comparison constant at the source width");
+    }
+    g_ptr_array_free(coordinator.families, TRUE);
+    g_ptr_array_free(coordinator.staged, TRUE);
+    symbolic_configure(SNAPSHOT_SYMBOLIC_OFF);
+}
+
+/* The observed value already sits on the false side of the branch: no flip is
+ * reachable at this width, so the advisor must abstain instead of proposing a
+ * value that changes nothing. */
+static void test_symbolic_no_false_side(void)
+{
+    SymbolicFixture fx;
+    SnapshotMutationCoordinator coordinator;
+    SnapshotMutationProposalSink sink;
+    uintptr_t cell = TEST_GUEST_BASE + 0xe100;
+    uint32_t leaf, zext;
+
+    reset_runtime();
+    fixture_init(&fx);
+    leaf = fixture_leaf(&fx);
+    zext = fixture_push(&fx, ZEXT, &fx.arena[leaf], false, 0, NULL, true, 32);
+    /* Observed 0x10: ">= 0" is satisfied for every representable value, so no
+     * value at this width can make the branch false. */
+    fixture_source(&fx, cell, 0x10, (int64_t)zext, 0);
+    fixture_bind(&fx, zext, cell, 0x10);
+    fixture_branch(&fx, GEU, &fx.arena[zext], false, 0, NULL, true, 0, 8);
+    fixture_seal(&fx, 0, 0);
+
+    coordinator = fixture_coordinator(&fx);
+    symbolic_configure(SNAPSHOT_SYMBOLIC_BOUNDARY);
+    CHECK(symbolic_run_fixture(&fx, &coordinator, &sink) == 0 &&
+              coordinator.families->len == 0,
+          "advisor abstains when no false value exists at the width");
+    g_ptr_array_free(coordinator.families, TRUE);
+    g_ptr_array_free(coordinator.staged, TRUE);
+    symbolic_configure(SNAPSHOT_SYMBOLIC_OFF);
+}
+
+/* Arithmetic and masking chains must invert exactly.  v is read as 4 bytes and
+ * the branch is ((v & 0xffff) + 0x100) == 0x1234.  The nearest value on the
+ * false side of the equality is 0x1235, so the required operand is 0x1235 and
+ * the source bytes are 0x1135. */
+static void test_symbolic_transform_chain(void)
+{
+    SymbolicFixture fx;
+    SnapshotMutationCoordinator coordinator;
+    SnapshotMutationProposalSink sink;
+    uintptr_t cell = TEST_GUEST_BASE + 0xe200;
+    uint32_t leaf, zext, and_node, add_node;
+
+    reset_runtime();
+    fixture_init(&fx);
+    leaf = fixture_leaf(&fx);
+    zext = fixture_push(&fx, ZEXT, &fx.arena[leaf], false, 0, NULL, true, 32);
+    /* and_node = zext & 0xffff ; add_node = and_node + 0x100 */
+    and_node = fixture_push(&fx, AND, &fx.arena[zext], false, 0, NULL, true,
+                            0xffff);
+    add_node = fixture_push(&fx, ADD, &fx.arena[and_node], false, 0, NULL, true,
+                            0x100);
+    /* The recorded predicate is the one the baseline satisfied, so the
+     * observed bytes must themselves reach the equality: 0x1134 & 0xffff +
+     * 0x100 == 0x1234. */
+    fixture_source(&fx, cell, 0x1134, (int64_t)zext, 0);
+    fixture_bind(&fx, zext, cell, 0x1134);
+    fixture_branch(&fx, EQ, &fx.arena[add_node], false, 0, NULL, true, 0x1234,
+                   8);
+    fixture_seal(&fx, 0, 0);
+
+    coordinator = fixture_coordinator(&fx);
+    symbolic_configure(SNAPSHOT_SYMBOLIC_BOUNDARY);
+    CHECK(symbolic_run_fixture(&fx, &coordinator, &sink) == 1,
+          "advisor accepts an invertible and/add chain");
+    if (coordinator.families->len == 1) {
+        const SnapshotMutationProposalFamily *family =
+            g_ptr_array_index(coordinator.families, 0);
+        const SnapshotMutationProposalWrite *write =
+            &family->variants[0].writes[0];
+        uint32_t lowered = 0;
+        memcpy(&lowered, write->value, sizeof(lowered));
+        CHECK(lowered == 0x1135,
+              "chain inversion recovers the required source bytes");
+    }
+    g_ptr_array_free(coordinator.families, TRUE);
+    g_ptr_array_free(coordinator.staged, TRUE);
+    symbolic_configure(SNAPSHOT_SYMBOLIC_OFF);
+}
+
+/* A later extension must propagate a label from op1.  The encoded source
+ * width lives in op2 and is not itself an expression operand. */
+static void test_symbolic_nested_extension(void)
+{
+    SymbolicFixture fx;
+    SnapshotMutationCoordinator coordinator;
+    SnapshotMutationProposalSink sink;
+    uintptr_t cell = TEST_GUEST_BASE + 0xe280;
+    uint32_t leaf, root, nested;
+
+    reset_runtime();
+    fixture_init(&fx);
+    leaf = fixture_leaf(&fx);
+    root = fixture_push(&fx, ZEXT, &fx.arena[leaf], false, 0, NULL, true, 32);
+    nested = fixture_push(&fx, ZEXT, &fx.arena[root], false, 0,
+                          (Expr *)(uintptr_t)32, false, 0);
+    fixture_source(&fx, cell, 0x10, (int64_t)root, 0);
+    fixture_bind(&fx, root, cell, 0x10);
+    fixture_branch(&fx, LTU, &fx.arena[nested], false, 0, NULL, true, 0x1000,
+                   8);
+    fixture_seal(&fx, 0, 0);
+
+    coordinator = fixture_coordinator(&fx);
+    symbolic_configure(SNAPSHOT_SYMBOLIC_BOUNDARY);
+    CHECK(symbolic_run_fixture(&fx, &coordinator, &sink) == 1,
+          "label propagates through a non-root extension");
+    g_ptr_array_free(coordinator.families, TRUE);
+    g_ptr_array_free(coordinator.staged, TRUE);
+    symbolic_configure(SNAPSHOT_SYMBOLIC_OFF);
+}
+
+/* Forward verification must start from the lowered source, not from the
+ * required comparison operand.  For 32-bit arithmetic, 0x101 + 0xffffffff is
+ * 0x100.  The 0x101 false-side operand lowers to source 0x102 and must survive
+ * verification even though reapplying the transform to operand 0x101 would
+ * incorrectly reconstruct the original true value. */
+static void test_symbolic_reevaluates_lowered_source(void)
+{
+    SymbolicFixture fx;
+    SnapshotMutationCoordinator coordinator;
+    SnapshotMutationProposalSink sink;
+    uintptr_t cell = TEST_GUEST_BASE + 0xe2a0;
+    uint32_t leaf, root, add_node;
+    bool found = false;
+
+    reset_runtime();
+    fixture_init(&fx);
+    leaf = fixture_leaf(&fx);
+    root = fixture_push(&fx, ZEXT, &fx.arena[leaf], false, 0, NULL, true, 32);
+    add_node = fixture_push(&fx, ADD, &fx.arena[root], false, 0, NULL, true,
+                            0xffffffffu);
+    fx.arena[add_node].op3 = (Expr *)(uintptr_t)4;
+    fx.arena[add_node].op3_is_const = 1;
+    fixture_source(&fx, cell, 0x101, (int64_t)root, 0);
+    fixture_bind(&fx, root, cell, 0x101);
+    fixture_branch(&fx, EQ, &fx.arena[add_node], false, 0, NULL, true, 0x100,
+                   4);
+    fixture_seal(&fx, 0, 0);
+
+    coordinator = fixture_coordinator(&fx);
+    symbolic_configure(SNAPSHOT_SYMBOLIC_BOUNDARY);
+    CHECK(symbolic_run_fixture(&fx, &coordinator, &sink) == 1,
+          "modular add candidate survives lowered-source reevaluation");
+    if (coordinator.families->len == 1) {
+        const SnapshotMutationProposalFamily *family =
+            g_ptr_array_index(coordinator.families, 0);
+        for (uint32_t i = 0; i < family->variant_count; i++) {
+            uint32_t lowered = 0;
+            memcpy(&lowered, family->variants[i].writes[0].value,
+                   sizeof(lowered));
+            if (lowered == 0x102) found = true;
+        }
+    }
+    CHECK(found, "verified family retains the 0x102 lowered source value");
+    g_ptr_array_free(coordinator.families, TRUE);
+    g_ptr_array_free(coordinator.staged, TRUE);
+    symbolic_configure(SNAPSHOT_SYMBOLIC_OFF);
+}
+
+/* Repeated dynamic instances of one branch produce repeated query records.
+ * They must not consume the three source slots with duplicate child plans. */
+static void test_symbolic_candidate_deduplication(void)
+{
+    SymbolicFixture fx;
+    SnapshotMutationCoordinator coordinator;
+    SnapshotMutationProposalSink sink;
+    uintptr_t cell = TEST_GUEST_BASE + 0xe2c0;
+    uint32_t leaf, root;
+
+    reset_runtime();
+    fixture_init(&fx);
+    leaf = fixture_leaf(&fx);
+    root = fixture_push(&fx, ZEXT, &fx.arena[leaf], false, 0, NULL, true, 32);
+    fixture_source(&fx, cell, 0x10, (int64_t)root, 0);
+    fixture_bind(&fx, root, cell, 0x10);
+    for (uint32_t i = 0; i < 3; i++) {
+        fixture_branch(&fx, LTU, &fx.arena[root], false, 0, NULL, true,
+                       0x1000, 8);
+    }
+    fixture_seal(&fx, 0, 0);
+
+    coordinator = fixture_coordinator(&fx);
+    symbolic_configure(SNAPSHOT_SYMBOLIC_BOUNDARY);
+    CHECK(symbolic_run_fixture(&fx, &coordinator, &sink) == 1,
+          "repeated branch queries still produce one family");
+    if (coordinator.families->len == 1) {
+        const SnapshotMutationProposalFamily *family =
+            g_ptr_array_index(coordinator.families, 0);
+        uint32_t first = 0, second = 0;
+        CHECK(family->variant_count == 2,
+              "exact and adjacent values occupy two unique slots");
+        if (family->variant_count >= 2) {
+            memcpy(&first, family->variants[0].writes[0].value,
+                   sizeof(first));
+            memcpy(&second, family->variants[1].writes[0].value,
+                   sizeof(second));
+            CHECK(first == 0x1000 && second == 0x1001,
+                  "deduplicated variants retain deterministic boundary order");
+        }
+    }
+    g_ptr_array_free(coordinator.families, TRUE);
+    g_ptr_array_free(coordinator.staged, TRUE);
+    symbolic_configure(SNAPSHOT_SYMBOLIC_OFF);
+}
+
+/* A masked operand can only ever hold bits inside its mask.  When the branch
+ * boundary lies outside that image the advisor must abstain rather than
+ * propose a value the guest can never reach: (v & 0xff) < 0x140 is satisfied
+ * by the observed 0x40, but no masked value is >= 0x140. */
+static void test_symbolic_mask_no_preimage(void)
+{
+    SymbolicFixture fx;
+    SnapshotMutationCoordinator coordinator;
+    SnapshotMutationProposalSink sink;
+    uintptr_t cell = TEST_GUEST_BASE + 0xe300;
+    uint32_t leaf, zext, and_node;
+
+    reset_runtime();
+    fixture_init(&fx);
+    leaf = fixture_leaf(&fx);
+    zext = fixture_push(&fx, ZEXT, &fx.arena[leaf], false, 0, NULL, true, 32);
+    and_node = fixture_push(&fx, AND, &fx.arena[zext], false, 0, NULL, true,
+                            0x00ff);
+    fixture_source(&fx, cell, 0x0040, (int64_t)zext, 0);
+    fixture_bind(&fx, zext, cell, 0x0040);
+    fixture_branch(&fx, LTU, &fx.arena[and_node], false, 0, NULL, true, 0x140,
+                   8);
+    fixture_seal(&fx, 0, 0);
+
+    coordinator = fixture_coordinator(&fx);
+    symbolic_configure(SNAPSHOT_SYMBOLIC_BOUNDARY);
+    CHECK(symbolic_run_fixture(&fx, &coordinator, &sink) == 0,
+          "advisor abstains when the mask target has no preimage");
+    g_ptr_array_free(coordinator.families, TRUE);
+    g_ptr_array_free(coordinator.staged, TRUE);
+    symbolic_configure(SNAPSHOT_SYMBOLIC_OFF);
+}
+
+/* When the boundary does have a preimage the advisor must find it: with the
+ * same mask, (v & 0xff) < 0x40 is satisfied by 0x40 and the opposite boundary
+ * 0x40 is reachable, so the source becomes 0x40. */
+static void test_symbolic_mask_preimage_found(void)
+{
+    SymbolicFixture fx;
+    SnapshotMutationCoordinator coordinator;
+    SnapshotMutationProposalSink sink;
+    uintptr_t cell = TEST_GUEST_BASE + 0xe380;
+    uint32_t leaf, zext, and_node;
+
+    reset_runtime();
+    fixture_init(&fx);
+    leaf = fixture_leaf(&fx);
+    zext = fixture_push(&fx, ZEXT, &fx.arena[leaf], false, 0, NULL, true, 32);
+    and_node = fixture_push(&fx, AND, &fx.arena[zext], false, 0, NULL, true,
+                            0x00ff);
+    fixture_source(&fx, cell, 0x0120, (int64_t)zext, 0);
+    fixture_bind(&fx, zext, cell, 0x0120);
+    fixture_branch(&fx, LTU, &fx.arena[and_node], false, 0, NULL, true, 0x40,
+                   8);
+    fixture_seal(&fx, 0, 0);
+
+    coordinator = fixture_coordinator(&fx);
+    symbolic_configure(SNAPSHOT_SYMBOLIC_BOUNDARY);
+    CHECK(symbolic_run_fixture(&fx, &coordinator, &sink) == 1,
+          "advisor finds a masked preimage when one exists");
+    if (coordinator.families->len == 1) {
+        const SnapshotMutationProposalFamily *family =
+            g_ptr_array_index(coordinator.families, 0);
+        const SnapshotMutationProposalWrite *write =
+            &family->variants[0].writes[0];
+        uint32_t lowered = 0;
+        memcpy(&lowered, write->value, sizeof(lowered));
+        CHECK((lowered & 0xff) == 0x40,
+              "masked candidate takes the required low bits");
+    }
+    g_ptr_array_free(coordinator.families, TRUE);
+    g_ptr_array_free(coordinator.staged, TRUE);
+    symbolic_configure(SNAPSHOT_SYMBOLIC_OFF);
+}
+
+/* Shadow mode must do all the analysis and submit nothing. */
+static void test_symbolic_shadow_submits_nothing(void)
+{
+    SymbolicFixture fx;
+    SnapshotMutationCoordinator coordinator;
+    SnapshotMutationProposalSink sink;
+    uintptr_t cell = TEST_GUEST_BASE + 0xe400;
+    uint32_t leaf, zext;
+
+    reset_runtime();
+    fixture_init(&fx);
+    leaf = fixture_leaf(&fx);
+    zext = fixture_push(&fx, ZEXT, &fx.arena[leaf], false, 0, NULL, true, 32);
+    fixture_source(&fx, cell, 0x0010, (int64_t)zext, 0);
+    fixture_bind(&fx, zext, cell, 0x0010);
+    fixture_branch(&fx, LTU, &fx.arena[zext], false, 0, NULL, true, 0x1000, 8);
+    fixture_seal(&fx, 0, 0);
+
+    coordinator = fixture_coordinator(&fx);
+    symbolic_configure(SNAPSHOT_SYMBOLIC_SHADOW);
+    CHECK(symbolic_run_fixture(&fx, &coordinator, &sink) == 0 &&
+              coordinator.families->len == 0,
+          "shadow mode never submits a family");
+    g_ptr_array_free(coordinator.families, TRUE);
+    g_ptr_array_free(coordinator.staged, TRUE);
+    symbolic_configure(SNAPSHOT_SYMBOLIC_OFF);
+}
+
+/* Off mode must not even traverse: no families and no state change. */
+static void test_symbolic_off_is_inert(void)
+{
+    SymbolicFixture fx;
+    SnapshotMutationCoordinator coordinator;
+    SnapshotMutationProposalSink sink;
+    uintptr_t cell = TEST_GUEST_BASE + 0xe500;
+    uint32_t leaf, zext;
+
+    reset_runtime();
+    fixture_init(&fx);
+    leaf = fixture_leaf(&fx);
+    zext = fixture_push(&fx, ZEXT, &fx.arena[leaf], false, 0, NULL, true, 32);
+    fixture_source(&fx, cell, 0x0010, (int64_t)zext, 0);
+    fixture_bind(&fx, zext, cell, 0x0010);
+    fixture_branch(&fx, LTU, &fx.arena[zext], false, 0, NULL, true, 0x1000, 8);
+    fixture_seal(&fx, 0, 0);
+
+    coordinator = fixture_coordinator(&fx);
+    symbolic_configure(SNAPSHOT_SYMBOLIC_OFF);
+    CHECK(symbolic_run_fixture(&fx, &coordinator, &sink) == 0 &&
+              coordinator.families->len == 0,
+          "off mode submits nothing");
+    g_ptr_array_free(coordinator.families, TRUE);
+    g_ptr_array_free(coordinator.staged, TRUE);
+}
+
+/* The constant side may be the left operand.  The advisor must mirror the
+ * operator before deriving the boundary: 0x1000 > v is v < 0x1000, so the
+ * boundary is still exactly 0x1000. */
+static void test_symbolic_mirrored_constant(void)
+{
+    SymbolicFixture fx;
+    SnapshotMutationCoordinator coordinator;
+    SnapshotMutationProposalSink sink;
+    uintptr_t cell = TEST_GUEST_BASE + 0xe600;
+    uint32_t leaf, zext;
+
+    reset_runtime();
+    fixture_init(&fx);
+    leaf = fixture_leaf(&fx);
+    zext = fixture_push(&fx, ZEXT, &fx.arena[leaf], false, 0, NULL, true, 32);
+    fixture_source(&fx, cell, 0x0010, (int64_t)zext, 0);
+    fixture_bind(&fx, zext, cell, 0x0010);
+    /* 0x1000 > v  <=>  v < 0x1000 */
+    fixture_branch(&fx, GTU, NULL, true, 0x1000, &fx.arena[zext], false, 0, 8);
+    fixture_seal(&fx, 0, 0);
+
+    coordinator = fixture_coordinator(&fx);
+    symbolic_configure(SNAPSHOT_SYMBOLIC_BOUNDARY);
+    CHECK(symbolic_run_fixture(&fx, &coordinator, &sink) == 1,
+          "advisor accepts a comparison with the constant on the left");
+    if (coordinator.families->len == 1) {
+        const SnapshotMutationProposalFamily *family =
+            g_ptr_array_index(coordinator.families, 0);
+        const SnapshotMutationProposalWrite *write =
+            &family->variants[0].writes[0];
+        uint32_t lowered = 0;
+        memcpy(&lowered, write->value, sizeof(lowered));
+        CHECK(lowered == 0x1000,
+              "mirrored operator yields the same boundary value");
+    }
+    g_ptr_array_free(coordinator.families, TRUE);
+    g_ptr_array_free(coordinator.staged, TRUE);
+    symbolic_configure(SNAPSHOT_SYMBOLIC_OFF);
+}
+
+/* A source whose retained read was never finalized (no observed bytes) must be
+ * skipped even though its root and a matching branch exist. */
+static void test_symbolic_unobserved_source_skipped(void)
+{
+    SymbolicFixture fx;
+    SnapshotMutationCoordinator coordinator;
+    SnapshotMutationProposalSink sink;
+    uintptr_t cell = TEST_GUEST_BASE + 0xe700;
+    uint32_t leaf, zext;
+
+    reset_runtime();
+    fixture_init(&fx);
+    leaf = fixture_leaf(&fx);
+    zext = fixture_push(&fx, ZEXT, &fx.arena[leaf], false, 0, NULL, true, 32);
+    fixture_source(&fx, cell, 0x0010, (int64_t)zext, 0);
+    fx.entries[0].observed_read_valid = false;
+    fixture_branch(&fx, LTU, &fx.arena[zext], false, 0, NULL, true, 0x1000, 8);
+    fixture_seal(&fx, 0, 0);
+
+    coordinator = fixture_coordinator(&fx);
+    symbolic_configure(SNAPSHOT_SYMBOLIC_BOUNDARY);
+    CHECK(symbolic_run_fixture(&fx, &coordinator, &sink) == 0,
+          "advisor skips a source without a finalized observation");
+    g_ptr_array_free(coordinator.families, TRUE);
+    g_ptr_array_free(coordinator.staged, TRUE);
+    symbolic_configure(SNAPSHOT_SYMBOLIC_OFF);
+}
+
+/* The work budget is a hard bound: a single unit of work cannot admit the
+ * forward pass, so the advisor abstains without touching the sink. */
+static void test_symbolic_work_budget_abstains(void)
+{
+    SymbolicFixture fx;
+    SnapshotMutationCoordinator coordinator;
+    SnapshotMutationProposalSink sink;
+    uintptr_t cell = TEST_GUEST_BASE + 0xe800;
+    uint32_t leaf, zext;
+
+    reset_runtime();
+    fixture_init(&fx);
+    leaf = fixture_leaf(&fx);
+    zext = fixture_push(&fx, ZEXT, &fx.arena[leaf], false, 0, NULL, true, 32);
+    fixture_source(&fx, cell, 0x0010, (int64_t)zext, 0);
+    fixture_bind(&fx, zext, cell, 0x0010);
+    fixture_branch(&fx, LTU, &fx.arena[zext], false, 0, NULL, true, 0x1000, 8);
+    fixture_seal(&fx, 0, 0);
+
+    coordinator = fixture_coordinator(&fx);
+    symbolic_configure(SNAPSHOT_SYMBOLIC_BOUNDARY);
+    s_symbolic_config.max_work = 1;
+    CHECK(symbolic_run_fixture(&fx, &coordinator, &sink) == 0,
+          "exhausted work budget abstains locally");
+    s_symbolic_config.max_work = SNAPSHOT_SYMBOLIC_DEFAULT_MAX_WORK;
+
+    /* The same fixture with a restored budget still succeeds, proving the
+     * abstention was the budget and not a traversal failure. */
+    CHECK(symbolic_run_fixture(&fx, &coordinator, &sink) == 1,
+          "restored budget admits the same fixture");
+    g_ptr_array_free(coordinator.families, TRUE);
+    g_ptr_array_free(coordinator.staged, TRUE);
+    symbolic_configure(SNAPSHOT_SYMBOLIC_OFF);
+}
+
+/* The byte budget is reserved before every advisor-owned allocation.  A limit
+ * below the fixed tables must abstain without allocating candidates or
+ * publishing a family prefix. */
+static void test_symbolic_byte_budget_abstains(void)
+{
+    SymbolicFixture fx;
+    SnapshotMutationCoordinator coordinator;
+    SnapshotMutationProposalSink sink;
+    uintptr_t cell = TEST_GUEST_BASE + 0xe880;
+    uint32_t leaf, root;
+
+    reset_runtime();
+    fixture_init(&fx);
+    leaf = fixture_leaf(&fx);
+    root = fixture_push(&fx, ZEXT, &fx.arena[leaf], false, 0, NULL, true, 32);
+    fixture_source(&fx, cell, 0x10, (int64_t)root, 0);
+    fixture_bind(&fx, root, cell, 0x10);
+    fixture_branch(&fx, LTU, &fx.arena[root], false, 0, NULL, true, 0x1000,
+                   8);
+    fixture_seal(&fx, 0, 0);
+
+    coordinator = fixture_coordinator(&fx);
+    symbolic_configure(SNAPSHOT_SYMBOLIC_BOUNDARY);
+    s_symbolic_config.max_bytes = 1;
+    CHECK(symbolic_run_fixture(&fx, &coordinator, &sink) == 0 &&
+              coordinator.families->len == 0,
+          "byte budget exhaustion publishes no family prefix");
+    s_symbolic_config.max_bytes = SNAPSHOT_SYMBOLIC_DEFAULT_MAX_BYTES;
+    CHECK(symbolic_run_fixture(&fx, &coordinator, &sink) == 1,
+          "restored byte budget admits the same fixture");
+    g_ptr_array_free(coordinator.families, TRUE);
+    g_ptr_array_free(coordinator.staged, TRUE);
+    symbolic_configure(SNAPSHOT_SYMBOLIC_OFF);
+}
+
+/* A retained primitive record is keyed by address, so a later load of the same
+ * bytes replaces the record and its finalized root.  The branch under analysis
+ * may consume the *earlier* load's root, which then sits in the frozen prefix
+ * and is unreachable from the replacement's root.  The advisor must still bind
+ * that earlier root from the child suffix's concretization wrapper for the
+ * record, which is the evidence that those bytes flowed through it.  Without
+ * this, every real guest whose compared value is reloaded before the branch
+ * silently abstains. */
+static void test_symbolic_replaced_record_binds_alias(void)
+{
+    SymbolicFixture fx;
+    SnapshotMutationCoordinator coordinator;
+    SnapshotMutationProposalSink sink;
+    uintptr_t cell = TEST_GUEST_BASE + 0xe900;
+    uint32_t leaf, first_root, later_root;
+
+    reset_runtime();
+    fixture_init(&fx);
+    leaf = fixture_leaf(&fx);
+    /* The load the branch consumes. */
+    first_root = fixture_push(&fx, ZEXT, &fx.arena[leaf], false, 0, NULL, true,
+                              32);
+    fixture_source(&fx, cell, 0x0010, (int64_t)first_root, 0);
+    fixture_bind(&fx, first_root, cell, 0x0010);
+    /* A later load of the same bytes: the record now points at this root, so a
+     * naive seed would label only here and never reach the comparison. */
+    later_root = fixture_push(&fx, ZEXT, &fx.arena[leaf], false, 0, NULL, true,
+                              32);
+    fx.entries[0].expr_index = (int64_t)later_root;
+    fixture_bind(&fx, later_root, cell, 0x0010);
+    fixture_branch(&fx, LTU, &fx.arena[first_root], false, 0, NULL, true,
+                   0x1000, 8);
+    fixture_seal(&fx, 0, 0);
+
+    coordinator = fixture_coordinator(&fx);
+    symbolic_configure(SNAPSHOT_SYMBOLIC_BOUNDARY);
+    CHECK(symbolic_run_fixture(&fx, &coordinator, &sink) == 1,
+          "advisor binds the earlier load root of a replaced record");
+    if (coordinator.families->len == 1) {
+        const SnapshotMutationProposalFamily *family =
+            g_ptr_array_index(coordinator.families, 0);
+        const SnapshotMutationProposalWrite *write =
+            &family->variants[0].writes[0];
+        uint32_t lowered = 0;
+        memcpy(&lowered, write->value, sizeof(lowered));
+        CHECK(lowered == 0x1000 && write->size == 4,
+              "aliased root still yields the boundary at the record width");
+    }
+    g_ptr_array_free(coordinator.families, TRUE);
+    g_ptr_array_free(coordinator.staged, TRUE);
+    symbolic_configure(SNAPSHOT_SYMBOLIC_OFF);
+}
+
+/* A wrapper whose copied bytes or address disagree with every retained record
+ * proves nothing about that record, so it must not bind a root. */
+static void test_symbolic_mismatched_wrapper_not_bound(void)
+{
+    SymbolicFixture fx;
+    SnapshotMutationCoordinator coordinator;
+    SnapshotMutationProposalSink sink;
+    uintptr_t cell = TEST_GUEST_BASE + 0xea00;
+    uint32_t leaf, root;
+
+    reset_runtime();
+    fixture_init(&fx);
+    leaf = fixture_leaf(&fx);
+    root = fixture_push(&fx, ZEXT, &fx.arena[leaf], false, 0, NULL, true, 32);
+    fixture_source(&fx, cell, 0x0010, (int64_t)root, 0);
+    /* Same width, different bytes: the evidence does not describe this
+     * record's value, so nothing may be proposed from it. */
+    fixture_bind(&fx, root, cell, 0x0099);
+    fixture_branch(&fx, LTU, &fx.arena[root], false, 0, NULL, true, 0x1000, 8);
+    fixture_seal(&fx, 0, 0);
+
+    coordinator = fixture_coordinator(&fx);
+    symbolic_configure(SNAPSHOT_SYMBOLIC_BOUNDARY);
+    CHECK(symbolic_run_fixture(&fx, &coordinator, &sink) == 0 &&
+              coordinator.families->len == 0,
+          "advisor ignores a wrapper that disagrees with the record bytes");
+    g_ptr_array_free(coordinator.families, TRUE);
+    g_ptr_array_free(coordinator.staged, TRUE);
+    symbolic_configure(SNAPSHOT_SYMBOLIC_OFF);
+}
+
+/* ------------------------------------------------------------------ */
+
 int main(void)
 {
     /* The at-cap matrix records thousands of accesses; diagnostics are
@@ -2395,6 +3711,7 @@ int main(void)
     test_capture_matrix();
 
     test_record_width_replacement();
+    test_read_token_identity();
     test_pointer_over_primitive();
     test_at_cap_sticky();
     test_generic_without_locator();
@@ -2412,8 +3729,28 @@ int main(void)
     test_mutation_coordinator_contract();
     test_manager_fifo_and_cleanup();
     test_child_multiwrite_atomicity();
+    test_variant_multiwrite_child_observation();
     test_child_application_does_not_mutate_plan();
     test_cached_feedback_writer();
+    test_symbolic_feedback_matches_applied_plan();
+    test_feedback_requires_representative_child();
+    test_feedback_rejects_malformed_brch();
+    test_symbolic_boundary_unsigned();
+    test_symbolic_no_false_side();
+    test_symbolic_transform_chain();
+    test_symbolic_nested_extension();
+    test_symbolic_reevaluates_lowered_source();
+    test_symbolic_candidate_deduplication();
+    test_symbolic_mask_no_preimage();
+    test_symbolic_mask_preimage_found();
+    test_symbolic_shadow_submits_nothing();
+    test_symbolic_off_is_inert();
+    test_symbolic_mirrored_constant();
+    test_symbolic_unobserved_source_skipped();
+    test_symbolic_work_budget_abstains();
+    test_symbolic_byte_budget_abstains();
+    test_symbolic_replaced_record_binds_alias();
+    test_symbolic_mismatched_wrapper_not_bound();
 
     osprey_free_runtime_regions();
     teardown_guest_memory();

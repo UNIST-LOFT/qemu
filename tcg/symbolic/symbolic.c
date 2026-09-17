@@ -533,14 +533,22 @@ static bool query_slot_available(void)
     return true;
 }
 
-void add_query(Expr *q, uintptr_t address, uintptr_t pc, const char *msg) {
+/* Append one query to the bounded queue.  Returns the exact admitted raw pool
+ * index, or -1 when the bounded queue dropped it.  The symbolic mutation
+ * advisor needs the admitted index to bind a retained read to its
+ * BINRADAR_CONCRETIZATION query; callers that do not care may ignore it. */
+int64_t add_query(Expr *q, uintptr_t address, uintptr_t pc, const char *msg) {
+    int64_t admitted_index;
+
     if (!query_slot_available()) {
-        return;
+        return -1;
     }
+    admitted_index = (int64_t)(next_query - query_queue);
     next_query->query = q;
     next_query->address = address;
     print_query_loc(next_query, pc, msg);
     next_query++;
+    return admitted_index;
 }
 
 void load_image(char* name, uintptr_t addr)
@@ -3616,10 +3624,15 @@ static inline void qemu_load_helper(CPUArchState *env, uintptr_t orig_addr,
     }
     target_ulong val = 0;
     bool is_ptr = false;
+    /* Event token for the retained read at this address, finalized below once
+     * the machine-width root and its concretization query are known. */
+    SnapshotReadToken read_token = {0};
+    SnapshotRootExtension root_extension = SNAPSHOT_ROOT_IDENTITY;
     if (size <= 8) {
         SnapshotMemAccess mem_access = {
             .symbolic_addr = (addr_idx < TCG_MAX_TEMPS && s_temps[addr_idx] != NULL),
             .symbolic_value = (!early_exit),
+            .observed_valid = false,
             .addr = addr,
             .pc = current_tb_pc,
             .target = {0},
@@ -3629,9 +3642,10 @@ static inline void qemu_load_helper(CPUArchState *env, uintptr_t orig_addr,
         if (is_valid_address(addr, false)) {
             void *addr_h = g2h(addr);
             memcpy(mem_access.target, addr_h, size);
+            mem_access.observed_valid = true;
         }
         if (is_valid_address(addr, true)) {
-            snapshot_read_access(env, &mem_access);
+            read_token = snapshot_read_access(env, &mem_access);
         }
         if (size == sizeof(target_ulong)) {
             memcpy(&val, mem_access.target, size);
@@ -3827,6 +3841,13 @@ static inline void qemu_load_helper(CPUArchState *env, uintptr_t orig_addr,
 
         uintptr_t opkind = get_mem_op_signextend(mem_op) ? SEXT : ZEXT;
 
+        /* The machine-width root extends the size-byte memory value the way
+         * the load's mem_op says.  Record that decision here, where the mem_op
+         * is still available, so the parent never infers signedness from an
+         * optimized expression shape. */
+        root_extension = (opkind == SEXT) ? SNAPSHOT_ROOT_SEXT
+                                          : SNAPSHOT_ROOT_ZEXT;
+
         if (e->opkind == ZEXT && opkind == SEXT && CONST(e->op2) == (8 * size)) {
             e = e->op1;
         }
@@ -3851,7 +3872,6 @@ static inline void qemu_load_helper(CPUArchState *env, uintptr_t orig_addr,
     }
 
     if (size <= 8 && e != NULL && is_valid_address(addr, true)) {
-        // snapshot_bind_read_expr(addr, size, e);
         // Add query BINRADAR_CONCRETIZATION
         Expr *binradar_e = new_expr();
         binradar_e->opkind = BINRADAR_CONCRETIZATION;
@@ -3861,7 +3881,16 @@ static inline void qemu_load_helper(CPUArchState *env, uintptr_t orig_addr,
         memcpy(concrete_bytes, (void*)g2h(addr), size);
         binradar_e->op2_is_const = 1;
         SET_EXPR_CONST_OP(binradar_e->op3, binradar_e->op3_is_const, size);
-        add_query(binradar_e, addr, current_tb_pc, "BINRADAR_CONCRETIZATION");
+        int64_t query_index =
+            add_query(binradar_e, addr, current_tb_pc, "BINRADAR_CONCRETIZATION");
+        /* Publish the read observation only after the complete wrapper is
+         * admitted: the root must precede the wrapper and both indexes must be
+         * real pool indexes. */
+        if (query_index >= 0 && GET_EXPR_IDX(e) >= 0 &&
+            (uint64_t)GET_EXPR_IDX(e) < (uint64_t)GET_EXPR_IDX(binradar_e)) {
+            (void)snapshot_finalize_read_token(read_token, GET_EXPR_IDX(e),
+                                               query_index, root_extension);
+        }
     }
     // if (e != NULL) {
     //     trace_mem("[tmplog] load symbolic [pc 0x%lx] [addr 0x%lx] [size 0x%lx] %p\n", current_tb_pc, addr, size, e);

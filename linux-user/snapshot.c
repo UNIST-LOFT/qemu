@@ -3,6 +3,8 @@
 #include "sem-events.h"
 #include "osprey.h"
 #include "osprey-internal.h"
+#include "snapshot-mutation.h"
+#include "snapshot-mutation-symbolic.h"
 #include "e9-ranges.h"
 #include "../tcg/symbolic/symbolic-struct.h"
 #include "sbsv.h"
@@ -141,142 +143,18 @@ typedef struct SnapshotExitInfo {
     target_ulong fault_addr;
     uintptr_t host_fault_addr;
     uint64_t guest_last_translation_block;
-    Expr *next_free_expr;
-    Query *next_query;
+    /* Half-open pool cursors published by the child as raw pointer
+     * differences: query_cursor counts entries after the reserved slot 0 and
+     * expr_cursor counts expression-pool entries.  Scalar indexes survive the
+     * parent's post-waitpid read; the child-written pointers they replace did
+     * not.  -1 means "not published". */
+    int64_t query_cursor;
+    int64_t expr_cursor;
     // uint32_t bt_depth;
     // uintptr_t bt[SNAPSHOT_BT_DEPTH];
     char description[SNAPSHOT_EXIT_DESC_LEN];
 } SnapshotExitInfo;
 
-typedef enum SnapshotMutationKind {
-    SNAPSHOT_MUTATION_BYTES = 0,
-    SNAPSHOT_MUTATION_POINTER_NULL = 1,
-    SNAPSHOT_MUTATION_POINTER_OOB = 2,
-    SNAPSHOT_MUTATION_POINTER_FRESH = 3,
-} SnapshotMutationKind;
-
-typedef struct SnapshotMutationTarget {
-    uint64_t extent;
-    uint8_t *bytes;             /* owned; only valid for FRESH */
-    /* Baseline target interval retained only for Stage 7.5's child
-     * observation.  These are zero for fresh/null writes and are not part of
-     * the solver/shared mutation ABI. */
-    uint64_t resolved_raw;
-    uint64_t resolved_end;
-} SnapshotMutationTarget;
-
-/* Parent-owned immutable mutation write.  Expression and query identity are
- * scalar pool indexes; the executor never dereferences either pool.  Every
- * byte used after enqueue is private plan ownership. */
-typedef struct SnapshotMutationWrite {
-    SnapshotMutationKind kind;
-    target_ulong addr;
-    uint32_t size;
-    int64_t expr_index;
-    int64_t query_index;
-    uint8_t value[sizeof(target_ulong)];
-    SnapshotMutationTarget target;
-} SnapshotMutationWrite;
-
-_Static_assert(sizeof(target_ulong) <= sizeof(((MutationCandidate *)0)->value),
-               "target_ulong does not fit MutationCandidate value");
-
-typedef struct SnapshotMutationPlan {
-    uint32_t num_mods;
-    SnapshotMutationWrite *mods;
-} SnapshotMutationPlan;
-
-typedef enum SnapshotMutationLane {
-    SNAPSHOT_MUTATION_LANE_PRIMITIVE = 0,
-    SNAPSHOT_MUTATION_LANE_POINTER = 1,
-    SNAPSHOT_MUTATION_LANE_ARGUMENT = 2,
-} SnapshotMutationLane;
-
-typedef enum SnapshotMutationSourceKind {
-    SNAPSHOT_MUTATION_SOURCE_PRIMITIVE = 0,
-    SNAPSHOT_MUTATION_SOURCE_POINTER = 1,
-    SNAPSHOT_MUTATION_SOURCE_ARGUMENT_PRIMITIVE = 2,
-    SNAPSHOT_MUTATION_SOURCE_ARGUMENT_POINTER = 3,
-} SnapshotMutationSourceKind;
-
-typedef struct SnapshotMutationSourceToken {
-    uint64_t run_epoch;
-    uint32_t source_ordinal;
-} SnapshotMutationSourceToken;
-
-typedef struct SnapshotMutationBaselineEntry {
-    SnapshotMutationSourceToken token;
-    SnapshotMutationLane lane;
-    SnapshotMutationSourceKind source_kind;
-    uint64_t access_id;
-    uintptr_t pc;
-    target_ulong addr;
-    uint32_t size;
-    bool eligible;
-    bool typed_eligible;
-    bool protected_addr;
-    bool target_ref_valid;
-    int64_t expr_index;
-    int64_t query_index;
-    uint8_t planner_bytes[sizeof(target_ulong)];
-    OspreyRuntimeChunkRef cell;
-    OspreyRuntimeAddressRef target_ref;
-} SnapshotMutationBaselineEntry;
-
-typedef struct SnapshotMutationBaseline {
-    uint64_t run_epoch;
-    uint32_t entry_count;
-    bool counts_valid;
-    int64_t query_start;
-    int64_t query_end;
-    int64_t expr_start;
-    int64_t expr_end;
-    SnapshotMutationBaselineEntry *entries;
-} SnapshotMutationBaseline;
-
-typedef enum SnapshotMutationSeedSemantics {
-    SNAPSHOT_MUTATION_SEED_SNAPSHOT_STATE = 0,
-    SNAPSHOT_MUTATION_SEED_OBSERVED_READ = 1,
-} SnapshotMutationSeedSemantics;
-
-typedef struct SnapshotMutationProposalWrite {
-    SnapshotMutationSourceToken destination;
-    SnapshotMutationKind kind;
-    uint32_t size;
-    uint8_t value[sizeof(target_ulong)];
-    uint64_t target_extent;
-    const uint8_t *target_bytes;
-    uint64_t resolved_raw;
-    uint64_t resolved_end;
-} SnapshotMutationProposalWrite;
-
-typedef struct SnapshotMutationProposalVariant {
-    uint32_t variant_id;
-    uint32_t write_count;
-    SnapshotMutationProposalWrite *writes;
-} SnapshotMutationProposalVariant;
-
-typedef struct SnapshotMutationProposalFamily {
-    uint32_t advisor_id;
-    uint32_t advisor_priority;
-    uint64_t family_id;
-    SnapshotMutationSourceToken primary_seed;
-    SnapshotMutationSeedSemantics seed_semantics;
-    uint32_t variant_count;
-    SnapshotMutationProposalVariant *variants;
-} SnapshotMutationProposalFamily;
-
-typedef struct SnapshotMutationCoordinator {
-    const SnapshotMutationBaseline *baseline;
-    GPtrArray *families; /* owns accepted family copies */
-    GPtrArray *staged;   /* owns SnapshotMutationPlan values */
-} SnapshotMutationCoordinator;
-
-typedef struct SnapshotMutationProposalSink {
-    SnapshotMutationCoordinator *coordinator;
-    uint32_t advisor_id;
-    uint32_t advisor_priority;
-} SnapshotMutationProposalSink;
 
 typedef struct ModificationManager {
     GQueue *modifications; // Queue<SnapshotMutationPlan *>
@@ -367,6 +245,16 @@ typedef struct PrimitiveAccess {
      * canonical identity was not capturable; the record then stays
      * generic-eligible. */
     OspreyRuntimeChunkRef cell;
+    /* Symbolic-observation metadata.  observed_read_valid is set when
+     * the successful child load wrote 1..8 bytes into observed bytes;
+     * root_extension and the scalar pool indexes are filled only by the
+     * token finalizer after the final load root and its concretization
+     * query are admitted.  Every writer resets all three. */
+    uint8_t observed_read_bytes[sizeof(target_ulong)];
+    uint8_t observed_read_valid;
+    uint8_t root_extension;
+    int64_t expr_index;
+    int64_t query_index;
 } PrimitiveAccess;
 
 typedef struct PointerAccess {
@@ -381,6 +269,12 @@ typedef struct PointerAccess {
      * itself. */
     OspreyRuntimeChunkRef cell;
     OspreyRuntimeAddressRef target_ref;
+    /* Symbolic-observation metadata; see PrimitiveAccess. */
+    uint8_t observed_read_bytes[sizeof(target_ulong)];
+    uint8_t observed_read_valid;
+    uint8_t root_extension;
+    int64_t expr_index;
+    int64_t query_index;
 } PointerAccess;
 
 typedef struct SharedTraceData {
@@ -889,6 +783,12 @@ void check_all_env_var(void) {
     check_env_var("QUERY_SHM_KEY");
     check_env_var("BITMAP_SHM_KEY");
     check_env_var("BINRADAR_PATCH_SHM_KEY");
+    // Symbolic boundary advisor (BinRadar only)
+    check_env_var("BINRADAR_SYMBOLIC_MUTATION_MODE");
+    check_env_var("BINRADAR_SYMBOLIC_MAX_WORK");
+    check_env_var("BINRADAR_SYMBOLIC_MAX_BYTES");
+    check_env_var("BINRADAR_SYMBOLIC_DEADLINE_MS");
+    check_env_var("BINRADAR_SYMBOLIC_TEST_DETAIL");
 }
 
 void add_exclude_regions(uintptr_t load_bias) {
@@ -1534,6 +1434,9 @@ static void snapshot_dump_query_window(Query* q, Expr *e) {
     if (binradar_query_window_dumped || binradar_query_window_file == NULL) {
         return;
     }
+    if (q == NULL || e == NULL) {
+        return;
+    }
 
     int64_t start_index = GET_QUERY_IDX(next_query);
     int64_t end_index = GET_QUERY_IDX(q);
@@ -1759,18 +1662,29 @@ static void snapshot_exit_info_capture(SnapshotExitInfo *info, CPUArchState *env
     info->guest_pc = pc;
     info->guest_cs_base = cs_base;
     info->guest_last_translation_block = last_translation_block;
-    info->next_free_expr = next_free_expr;
-    info->next_query = next_query;
+    info->query_cursor = (next_query != NULL && query_queue != NULL)
+        ? (int64_t)(next_query - query_queue) : -1;
+    info->expr_cursor = (next_free_expr != NULL && pool != NULL)
+        ? (int64_t)(next_free_expr - pool) : -1;
 }
 
 static int64_t snapshot_query_cursor_index(const SnapshotExitInfo *info) {
-    return info != NULL && info->next_query != NULL && query_queue != NULL
-        ? (int64_t)(info->next_query - query_queue) : -1;
+    return info != NULL ? info->query_cursor : -1;
 }
 
 static int64_t snapshot_expr_cursor_index(const SnapshotExitInfo *info) {
-    return info != NULL && info->next_free_expr != NULL && pool != NULL
-        ? (int64_t)(info->next_free_expr - pool) : -1;
+    return info != NULL ? info->expr_cursor : -1;
+}
+
+/* Validate a child-published pool cursor once in the parent.  Cursors are raw
+ * pointer differences into the shared pools, so they must be non-negative and
+ * within the fixed capacity before any pointer is reconstructed from them. */
+static bool snapshot_query_cursor_valid(int64_t cursor) {
+    return cursor >= 0 && (uint64_t)cursor <= (uint64_t)EXPR_QUERY_CAPACITY;
+}
+
+static bool snapshot_expr_cursor_valid(int64_t cursor) {
+    return cursor >= 0 && (uint64_t)cursor <= (uint64_t)EXPR_POOL_CAPACITY;
 }
 
 static void snapshot_log_cursor_indices(const SnapshotExitInfo *info) {
@@ -1975,9 +1889,14 @@ static void remove_read_access_primitive(uintptr_t addr) {
     g_hash_table_remove(g_read_access_tainted_primitives->table, GSIZE_TO_POINTER(addr));
 }
 
-static void add_read_access_pointer(CPUArchState *env, uintptr_t addr,
-                                    uintptr_t target, uintptr_t pc) {
-    if (shared_trace_data == NULL) return;
+static SnapshotReadToken add_read_access_pointer(CPUArchState *env,
+                                                 uintptr_t addr,
+                                                 uintptr_t target,
+                                                 uintptr_t pc,
+                                                 const uint8_t *observed,
+                                                 uint32_t observed_size) {
+    SnapshotReadToken token = {0};
+    if (shared_trace_data == NULL) return token;
     if (g_read_access_pointers == NULL) g_read_access_pointers = ordered_map_init(MAX_POINTER_ACCESS);
     OrderedMapEntry *entry = ordered_map_insert(g_read_access_pointers, addr, NULL);
     PointerAccess *ptr = NULL;
@@ -2005,6 +1924,21 @@ static void add_read_access_pointer(CPUArchState *env, uintptr_t addr,
     ptr->access_id = __atomic_fetch_add(&shared_trace_data->ptr_access_cnt, 1, __ATOMIC_RELAXED);
     ptr->run_epoch = shared_trace_data->run_epoch;
     ptr->expr = NULL;
+    /* A replaced record never carries symbolic metadata from the
+     * previous occupant: the event token that named it is invalid. */
+    memset(ptr->observed_read_bytes, 0, sizeof(ptr->observed_read_bytes));
+    ptr->observed_read_valid = 0;
+    ptr->root_extension = SNAPSHOT_MUTATION_ROOT_IDENTITY;
+    ptr->expr_index = -1;
+    ptr->query_index = -1;
+    /* The successful child load supplies the physical bytes.  They are copied
+     * here, at record-write time, so a later finalization cannot be confused
+     * by a rewritten cell. */
+    if (observed != NULL && observed_size >= 1 &&
+        observed_size <= sizeof(ptr->observed_read_bytes)) {
+        memcpy(ptr->observed_read_bytes, observed, observed_size);
+        ptr->observed_read_valid = 1;
+    }
     /* Stage 7.1: refresh locators on every write so a replaced record
      * never carries a stale identity.  Capture failure leaves the
      * locator zeroed (valid == 0); the record stays generic-eligible. */
@@ -2022,17 +1956,27 @@ static void add_read_access_pointer(CPUArchState *env, uintptr_t addr,
     entry->data = ptr;
     trace_mem("[rpo] [addr %lx] [target %lx] [pc %lx] [index %d] [id %ld]\n",
               addr, target, pc, entry->shared_index, ptr->access_id);
+    token.run_epoch = ptr->run_epoch;
+    token.access_id = ptr->access_id;
+    token.slot = (uint32_t)entry->shared_index;
+    token.lane = SNAPSHOT_READ_LANE_POINTER;
+    token.valid = 1;
+    return token;
 }
 
-static void add_read_access_primitive(CPUArchState *env, uintptr_t addr,
-                                      int size, uintptr_t pc) {
-    if (shared_trace_data == NULL) return;
+static SnapshotReadToken add_read_access_primitive(CPUArchState *env,
+                                                   uintptr_t addr,
+                                                   int size, uintptr_t pc,
+                                                   const uint8_t *observed,
+                                                   uint32_t observed_size) {
+    SnapshotReadToken token = {0};
+    if (shared_trace_data == NULL) return token;
     if (g_read_access_pointers) {
         uintptr_t aligned_addr = addr & ~(uintptr_t)0x07;
         OrderedMapEntry *ptr_entry = ordered_map_lookup(g_read_access_pointers, aligned_addr);
         if (ptr_entry != NULL) {
             remove_read_access_primitive(addr);
-            return;
+            return token;
         }
     }
     if (g_read_access_tainted_primitives == NULL) g_read_access_tainted_primitives = ordered_map_init(MAX_PRIMITIVE_ACCESS);
@@ -2060,6 +2004,21 @@ static void add_read_access_primitive(CPUArchState *env, uintptr_t addr,
     prim->access_id = __atomic_fetch_add(&shared_trace_data->prim_access_cnt, 1, __ATOMIC_RELAXED);
     prim->run_epoch = shared_trace_data->run_epoch;
     prim->expr = NULL;
+    /* See add_read_access_pointer: a replaced record carries no symbolic
+     * metadata, so a token captured from the previous occupant cannot be
+     * finalized against it. */
+    memset(prim->observed_read_bytes, 0, sizeof(prim->observed_read_bytes));
+    prim->observed_read_valid = 0;
+    prim->root_extension = SNAPSHOT_MUTATION_ROOT_IDENTITY;
+    prim->expr_index = -1;
+    prim->query_index = -1;
+    /* See add_read_access_pointer: the successful child load supplies the
+     * physical bytes at record-write time. */
+    if (observed != NULL && observed_size >= 1 &&
+        observed_size <= sizeof(prim->observed_read_bytes)) {
+        memcpy(prim->observed_read_bytes, observed, observed_size);
+        prim->observed_read_valid = 1;
+    }
     /* Stage 7.1: refresh the cell locator (see add_read_access_pointer). */
     memset(&prim->cell, 0, sizeof(prim->cell));
     if (osprey_collect_enabled && g_osprey_ctx != NULL) {
@@ -2069,30 +2028,57 @@ static void add_read_access_primitive(CPUArchState *env, uintptr_t addr,
     entry->data = prim;
     trace_mem("[rpi] [addr %lx] [size %d] [pc %lx] [index %d] [id %ld]\n",
               addr, size, pc, entry->shared_index, prim->access_id);
+    token.run_epoch = prim->run_epoch;
+    token.access_id = prim->access_id;
+    token.slot = (uint32_t)entry->shared_index;
+    token.lane = SNAPSHOT_READ_LANE_PRIMITIVE;
+    token.valid = 1;
+    return token;
 }
 
-void snapshot_bind_read_expr(uintptr_t addr, uintptr_t size, Expr *expr) {
-    if (!forkserver_installed || expr == NULL) {
-        return;
+/* Finalize a retained read once the load's machine-width root expression and
+ * the admitted BINRADAR_CONCRETIZATION query are both known.  Every field of
+ * the token must still name the same record: a replacement, a lane change, an
+ * LRU slot move, or a new run epoch makes the token stale and the caller
+ * abstains.  The observed bytes stay as captured by the record writer. */
+bool snapshot_finalize_read_token(SnapshotReadToken token,
+                                  int64_t expr_index, int64_t query_index,
+                                  SnapshotRootExtension root_extension) {
+    if (!forkserver_installed || shared_trace_data == NULL || !token.valid ||
+        expr_index < 0 || query_index < 0 ||
+        (query_queue != NULL && next_query != NULL &&
+         query_index >= (int64_t)(next_query - query_queue)) ||
+        (root_extension != SNAPSHOT_ROOT_IDENTITY &&
+         root_extension != SNAPSHOT_ROOT_ZEXT &&
+         root_extension != SNAPSHOT_ROOT_SEXT)) {
+        return false;
     }
+    if (token.run_epoch != shared_trace_data->run_epoch) return false;
 
-    if (size == sizeof(target_ulong) && g_read_access_pointers != NULL) {
-        uintptr_t aligned_addr = addr & ~(uintptr_t)0x07;
-        OrderedMapEntry *ptr_entry = ordered_map_lookup(g_read_access_pointers, aligned_addr);
-        if (ptr_entry != NULL && ptr_entry->data != NULL) {
-            PointerAccess *ptr = (PointerAccess *)ptr_entry->data;
-            ptr->expr = expr;
-            return;
+    if (token.lane == SNAPSHOT_READ_LANE_POINTER &&
+        token.slot < MAX_POINTER_ACCESS) {
+        PointerAccess *ptr = &shared_trace_data->pointers[token.slot];
+        if (ptr->access_id == token.access_id &&
+            ptr->run_epoch == token.run_epoch) {
+            ptr->expr_index = expr_index;
+            ptr->query_index = query_index;
+            ptr->root_extension = (uint8_t)root_extension;
+            return true;
+        }
+        return false;
+    }
+    if (token.lane == SNAPSHOT_READ_LANE_PRIMITIVE &&
+        token.slot < MAX_PRIMITIVE_ACCESS) {
+        PrimitiveAccess *prim = &shared_trace_data->primitives[token.slot];
+        if (prim->access_id == token.access_id &&
+            prim->run_epoch == token.run_epoch) {
+            prim->expr_index = expr_index;
+            prim->query_index = query_index;
+            prim->root_extension = (uint8_t)root_extension;
+            return true;
         }
     }
-
-    if (g_read_access_tainted_primitives != NULL) {
-        OrderedMapEntry *entry = ordered_map_lookup(g_read_access_tainted_primitives, addr);
-        if (entry != NULL && entry->data != NULL) {
-            PrimitiveAccess *prim = (PrimitiveAccess *)entry->data;
-            prim->expr = expr;
-        }
-    }
+    return false;
 }
 
 bool is_valid_address(target_ulong addr, bool for_snapshot) {
@@ -2939,37 +2925,49 @@ void snapshot_write_access(SnapshotMemAccess *mem_access) {
     trace_mem("[snapshot] [waccess] [mem] [addr %lx] [size %ld]\n", addr, size);
 }
 
-void snapshot_read_access(CPUArchState *env, SnapshotMemAccess *mem_access) {
-    if (!forkserver_installed) return;
+SnapshotReadToken snapshot_read_access(CPUArchState *env, SnapshotMemAccess *mem_access) {
+    SnapshotReadToken none = {0};
+    if (!forkserver_installed) return none;
     uintptr_t addr = mem_access->addr;
     uintptr_t size = mem_access->size;
-    // target_ulong start = addr & SNAPSHOT_PAGE_MASK;
-    // target_ulong end = (addr + size - 1) & SNAPSHOT_PAGE_MASK;
-    bool is_value_pointer = false;
+    /* The successful child load supplies the physical bytes.  A caller that
+     * did not populate them (out-of-range or oversized access) leaves the
+     * observation invalid rather than reporting stale target bytes. */
+    const uint8_t *observed = NULL;
+    uint32_t observed_size = 0;
+    if (mem_access->observed_valid && size >= 1 &&
+        size <= sizeof(mem_access->target)) {
+        observed = mem_access->target;
+        observed_size = (uint32_t)size;
+    }
     if (size == sizeof(target_ulong)) {
         target_ulong target;
         memcpy(&target, mem_access->target, sizeof(target_ulong));
         if (is_valid_address(target, true)) {
             // Add to pointer
-            add_read_access_pointer(env, addr, target, mem_access->pc);
-            is_value_pointer = true;
+            SnapshotReadToken token = add_read_access_pointer(
+                env, addr, target, mem_access->pc, observed, observed_size);
             trace_mem("[snapshot] [raccess] [pointer] [addr %lx] [target %lx] [pc %lx]\n", addr, target, mem_access->pc);
+            return token;
         } else if (target == 0) {
             // It may be a null pointer
-            add_read_access_primitive(env, addr, size, mem_access->pc);
+            SnapshotReadToken token = add_read_access_primitive(
+                env, addr, size, mem_access->pc, observed, observed_size);
             trace_mem("[snapshot] [raccess] [null-pointer] [addr %lx] [pc %lx]\n", addr, mem_access->pc);
-            is_value_pointer = true; // Do not add it twice
+            return token; // Do not add it twice
         } else {
             trace_mem("[snapshot] [raccess] [primitive] [addr %lx] [value %lx] [pc %lx]\n", addr, target, mem_access->pc);
         }
     }
-    if (!is_value_pointer) {
-        if (mem_access->symbolic_value) {
-            // Tainted value
-            add_read_access_primitive(env, addr, size, mem_access->pc);
-        }
+    if (mem_access->symbolic_value) {
+        // Tainted value
+        SnapshotReadToken token = add_read_access_primitive(
+            env, addr, size, mem_access->pc, observed, observed_size);
+        trace_mem("[snapshot] [raccess] [mem] [addr %lx] [size %ld]\n", addr, size);
+        return token;
     }
     trace_mem("[snapshot] [raccess] [mem] [addr %lx] [size %ld]\n", addr, size);
+    return none;
 }
 
 // Unused: replaced by fork server
@@ -3073,6 +3071,7 @@ void snapshot_syscall(CPUArchState *env, uintptr_t syscall_no,
             SnapshotMemAccess mem_access = {
                 .symbolic_addr = false,
                 .symbolic_value = false,
+                .observed_valid = false,
                 .addr = syscall_arg1,
                 .pc = 0,
                 .target = {0},
@@ -3082,8 +3081,9 @@ void snapshot_syscall(CPUArchState *env, uintptr_t syscall_no,
             if (ret_val <= 8) {
                 void *buf = g2h(syscall_arg1);
                 memcpy(mem_access.target, buf, ret_val);
+                mem_access.observed_valid = true;
             }
-            snapshot_read_access(env, &mem_access);
+            (void)snapshot_read_access(env, &mem_access);
         }
         break;
 #if defined(TARGET_NR_futex)
@@ -3800,9 +3800,30 @@ static bool snapshot_mutation_enqueue_one(GQueue *queue,
     return snapshot_mutation_enqueue_batch(queue, batch, 1);
 }
 
+/* Per-advisor family quota.  Advisor 1 is compact OSPREY and advisor 2 is
+ * symbolic boundary advice; each gets its own 4,096 slots so an advisor can
+ * never consume another advisor's allocation.  The combined cap is the sum,
+ * which keeps mode `off` byte-identical for OSPREY: a disabled advisor
+ * reserves nothing and the OSPREY quota is unchanged. */
 #define SNAPSHOT_MUTATION_MAX_SPECIALIZED_FAMILIES 4096u
+#define SNAPSHOT_MUTATION_MAX_COMBINED_FAMILIES 8192u
 #define SNAPSHOT_MUTATION_MAX_SPECIALIZED_VARIANTS 64u
 #define SNAPSHOT_MUTATION_MAX_SPECIALIZED_WRITES 64u
+
+/* Families already admitted for one advisor, counted over accepted copies.
+ * Duplicate descriptors are not counted because they are not admitted. */
+static uint32_t snapshot_mutation_advisor_family_count(
+    const SnapshotMutationCoordinator *coordinator, uint32_t advisor_id)
+{
+    uint32_t count = 0;
+    if (coordinator == NULL || coordinator->families == NULL) return 0;
+    for (guint i = 0; i < coordinator->families->len; i++) {
+        const SnapshotMutationProposalFamily *family =
+            g_ptr_array_index(coordinator->families, i);
+        if (family->advisor_id == advisor_id) count++;
+    }
+    return count;
+}
 
 static bool snapshot_mutation_token_equal(
     SnapshotMutationSourceToken a, SnapshotMutationSourceToken b)
@@ -3865,17 +3886,32 @@ static bool snapshot_mutation_proposal_validate(
     const SnapshotMutationProposalFamily *family)
 {
     const SnapshotMutationBaselineEntry *primary;
+    const bool observed_read =
+        family != NULL &&
+        family->seed_semantics == SNAPSHOT_MUTATION_SEED_OBSERVED_READ;
 
     if (coordinator == NULL || coordinator->baseline == NULL ||
         family == NULL || family->advisor_id == 0 ||
         family->variants == NULL || family->variant_count == 0 ||
         family->variant_count > SNAPSHOT_MUTATION_MAX_SPECIALIZED_VARIANTS ||
-        family->seed_semantics != SNAPSHOT_MUTATION_SEED_SNAPSHOT_STATE) {
+        (family->seed_semantics != SNAPSHOT_MUTATION_SEED_SNAPSHOT_STATE &&
+         !observed_read)) {
         return false;
     }
     primary = snapshot_mutation_lookup_entry(coordinator->baseline,
                                              family->primary_seed);
     if (primary == NULL || !primary->typed_eligible || primary->protected_addr) {
+        return false;
+    }
+    /* An observed-read family proposes values synthesized from the bytes the
+     * baseline child actually loaded.  Without a finalized observation there
+     * is no source of truth to lower a candidate through, so the whole family
+     * is rejected rather than silently falling back to generic semantics. */
+    if (observed_read &&
+        (!primary->observed_read_valid ||
+         (primary->size != 1 && primary->size != 2 &&
+          primary->size != 4 && primary->size != sizeof(target_ulong)) ||
+         primary->lane != SNAPSHOT_MUTATION_LANE_PRIMITIVE)) {
         return false;
     }
 
@@ -3905,6 +3941,9 @@ static bool snapshot_mutation_proposal_validate(
                                                     &end_a))) {
                 return false;
             }
+            if (observed_read && write->kind != SNAPSHOT_MUTATION_BYTES) {
+                return false;
+            }
             if (wi > 0 &&
                 variant->writes[wi - 1].destination.source_ordinal >=
                     write->destination.source_ordinal) {
@@ -3914,6 +3953,19 @@ static bool snapshot_mutation_proposal_validate(
                                               family->primary_seed)) {
                 primary_count++;
                 if (write->size != primary->size) return false;
+                if (observed_read) {
+                    /* Boundary advice rewrites observed scalar memory with a
+                     * synthesized scalar.  A pointer-family write would
+                     * replace compact OSPREY's ownership of pointer
+                     * alternatives, and the value must differ from both the
+                     * physical baseline bytes and the bytes the child
+                     * actually read, or the child would observe no change. */
+                    if (write->kind != SNAPSHOT_MUTATION_BYTES) return false;
+                    if (memcmp(write->value, primary->observed_read_bytes,
+                               write->size) == 0) {
+                        return false;
+                    }
+                }
                 if (write->kind != SNAPSHOT_MUTATION_POINTER_FRESH &&
                     memcmp(write->value, primary->planner_bytes,
                            write->size) == 0) {
@@ -4081,7 +4133,7 @@ static bool snapshot_mutation_proposal_same_descriptor(
     return true;
 }
 
-static bool snapshot_mutation_sink_submit(
+bool snapshot_mutation_sink_submit(
     SnapshotMutationProposalSink *sink,
     const SnapshotMutationProposalFamily *family)
 {
@@ -4091,6 +4143,9 @@ static bool snapshot_mutation_sink_submit(
         family->advisor_priority != sink->advisor_priority ||
         sink->coordinator->families == NULL ||
         sink->coordinator->families->len >=
+            SNAPSHOT_MUTATION_MAX_COMBINED_FAMILIES ||
+        snapshot_mutation_advisor_family_count(sink->coordinator,
+                                               sink->advisor_id) >=
             SNAPSHOT_MUTATION_MAX_SPECIALIZED_FAMILIES ||
         !snapshot_mutation_proposal_validate(sink->coordinator, family)) {
         return false;
@@ -4139,8 +4194,22 @@ static void mod_manager_init(SnapshotExitInfo *exit_info)
         mod_manager->modifications = g_queue_new();
         mod_manager->current = NULL;
         mutation_analysis_started = true;
-        snapshot_dump_query_window(exit_info->next_query,
-                                   exit_info->next_free_expr);
+        /* Directed-mode query-window preservation is the only consumer that
+         * needs pool pointers.  Reconstruct them from the child's scalar
+         * cursors after validating both indexes; an unusable cursor drops the
+         * window request instead of publishing a partially valid range. */
+        int64_t query_cursor = snapshot_query_cursor_index(exit_info);
+        int64_t expr_cursor = snapshot_expr_cursor_index(exit_info);
+        if (query_queue != NULL && pool != NULL &&
+            snapshot_query_cursor_valid(query_cursor) &&
+            snapshot_expr_cursor_valid(expr_cursor)) {
+            snapshot_dump_query_window(query_queue + query_cursor,
+                                       pool + expr_cursor);
+        } else if (binradar_query_window_file != NULL) {
+            log_msg("[snapshot] [query-window] [skip] [query-cursor %lld] "
+                    "[expr-cursor %lld]\n", (long long)query_cursor,
+                    (long long)expr_cursor);
+        }
     }
 }
 
@@ -4202,8 +4271,8 @@ static void snapshot_modification_manager_reset(bool analysis_started)
 }
 
 
-static bool snapshot_mutation_writable_span(target_ulong addr,
-                                             uint32_t size)
+bool snapshot_mutation_writable_span(target_ulong addr,
+                                     uint32_t size)
 {
     uint64_t end;
     target_ulong page;
@@ -4833,7 +4902,8 @@ static void snapshot_mutation_baseline_fill_common(
     SnapshotMutationBaselineEntry *entry, uint64_t epoch,
     uint32_t ordinal, SnapshotMutationLane lane,
     SnapshotMutationSourceKind source_kind, uintptr_t addr, uint32_t size,
-    uintptr_t pc, uint64_t access_id, Expr *expr)
+    uintptr_t pc, uint64_t access_id, int64_t expr_index,
+    int64_t query_index)
 {
     memset(entry, 0, sizeof(*entry));
     entry->token.run_epoch = epoch;
@@ -4847,8 +4917,8 @@ static void snapshot_mutation_baseline_fill_common(
     entry->eligible = true;
     entry->typed_eligible = true;
     entry->protected_addr = snapshot_addr_is_protected(entry->addr);
-    entry->expr_index = snapshot_expr_index_from_ptr(expr);
-    entry->query_index = -1;
+    entry->expr_index = expr_index;
+    entry->query_index = query_index;
 }
 
 static SnapshotMutationBaseline *snapshot_mutation_baseline_build(
@@ -4877,20 +4947,23 @@ static SnapshotMutationBaseline *snapshot_mutation_baseline_build(
     baseline->entry_count = (uint32_t)total;
     baseline->counts_valid = counts_valid;
     baseline->query_start = snapshot_mutation_query_start;
-    baseline->query_end = (exit_info != NULL &&
-                           exit_info->next_query != NULL &&
-                           query_queue != NULL)
-        ? GET_QUERY_IDX(exit_info->next_query) : -1;
+    baseline->query_end = (exit_info != NULL)
+        ? snapshot_query_cursor_index(exit_info) : -1;
     baseline->expr_start = snapshot_mutation_expr_start;
-    baseline->expr_end = (exit_info != NULL &&
-                          exit_info->next_free_expr != NULL &&
-                          pool != NULL)
-        ? GET_EXPR_IDX(exit_info->next_free_expr) : -1;
-    if (baseline->query_start > baseline->query_end) {
+    baseline->expr_end = (exit_info != NULL)
+        ? snapshot_expr_cursor_index(exit_info) : -1;
+    /* Half-open [start, end) windows over raw pool differences.  An entry
+     * beyond the exit or an unpublished cursor makes the window unusable, so
+     * the advisor sees no window rather than a reversed or unbounded one. */
+    if (baseline->query_start < 0 || baseline->query_end < 0 ||
+        baseline->query_start > baseline->query_end ||
+        !snapshot_query_cursor_valid(baseline->query_end)) {
         baseline->query_start = -1;
         baseline->query_end = -1;
     }
-    if (baseline->expr_start > baseline->expr_end) {
+    if (baseline->expr_start < 0 || baseline->expr_end < 0 ||
+        baseline->expr_start > baseline->expr_end ||
+        !snapshot_expr_cursor_valid(baseline->expr_end)) {
         baseline->expr_start = -1;
         baseline->expr_end = -1;
     }
@@ -4917,7 +4990,7 @@ static SnapshotMutationBaseline *snapshot_mutation_baseline_build(
             entry, epoch, ordinal, SNAPSHOT_MUTATION_LANE_PRIMITIVE,
             SNAPSHOT_MUTATION_SOURCE_PRIMITIVE, source->addr,
             source->size > 0 ? (uint32_t)source->size : 0, source->pc,
-            source->access_id, source->expr);
+            source->access_id, source->expr_index, source->query_index);
         if (source->size <= 0 ||
             (uint32_t)source->size > sizeof(entry->planner_bytes)) {
             entry->eligible = false;
@@ -4928,8 +5001,32 @@ static SnapshotMutationBaseline *snapshot_mutation_baseline_build(
         }
         if (epoch_valid && counts_valid) {
             entry->cell = source->cell;
+            /* Symbolic metadata is trustworthy only inside the epoch that
+             * produced it; the indexes were validated by the finalizer. */
+            if (source->observed_read_valid &&
+                source->expr_index >= 0 && source->query_index >= 0 &&
+                source->expr_index < baseline->expr_end &&
+                source->query_index >= baseline->query_start &&
+                source->query_index < baseline->query_end &&
+                snapshot_expr_cursor_valid(source->expr_index) &&
+                snapshot_query_cursor_valid(source->query_index) &&
+                source->root_extension <= SNAPSHOT_MUTATION_ROOT_SEXT) {
+                memcpy(entry->observed_read_bytes,
+                       source->observed_read_bytes,
+                       sizeof(entry->observed_read_bytes));
+                entry->observed_read_valid = true;
+                entry->root_extension =
+                    (SnapshotMutationRootExtension)source->root_extension;
+            } else {
+                entry->observed_read_valid = false;
+                entry->expr_index = -1;
+                entry->query_index = -1;
+            }
         } else {
             memset(&entry->cell, 0, sizeof(entry->cell));
+            entry->observed_read_valid = false;
+            entry->expr_index = -1;
+            entry->query_index = -1;
             entry->typed_eligible = false;
         }
         log_msg("[analyze] [primitive] [index %u] [addr %lx] [size %d] [id %llu]\n",
@@ -4943,7 +5040,8 @@ static SnapshotMutationBaseline *snapshot_mutation_baseline_build(
         snapshot_mutation_baseline_fill_common(
             entry, epoch, ordinal, SNAPSHOT_MUTATION_LANE_POINTER,
             SNAPSHOT_MUTATION_SOURCE_POINTER, source->addr,
-            sizeof(target_ulong), source->pc, source->access_id, source->expr);
+            sizeof(target_ulong), source->pc, source->access_id,
+            source->expr_index, source->query_index);
         memcpy(entry->planner_bytes, &source->target,
                sizeof(target_ulong));
         if (epoch_valid && counts_valid) {
@@ -4951,10 +5049,32 @@ static SnapshotMutationBaseline *snapshot_mutation_baseline_build(
             entry->target_ref = source->target_ref;
             entry->target_ref_valid = source->target != 0 &&
                                       source->target_ref.valid == 1;
+            if (source->observed_read_valid &&
+                source->expr_index >= 0 && source->query_index >= 0 &&
+                source->expr_index < baseline->expr_end &&
+                source->query_index >= baseline->query_start &&
+                source->query_index < baseline->query_end &&
+                snapshot_expr_cursor_valid(source->expr_index) &&
+                snapshot_query_cursor_valid(source->query_index) &&
+                source->root_extension <= SNAPSHOT_MUTATION_ROOT_SEXT) {
+                memcpy(entry->observed_read_bytes,
+                       source->observed_read_bytes,
+                       sizeof(entry->observed_read_bytes));
+                entry->observed_read_valid = true;
+                entry->root_extension =
+                    (SnapshotMutationRootExtension)source->root_extension;
+            } else {
+                entry->observed_read_valid = false;
+                entry->expr_index = -1;
+                entry->query_index = -1;
+            }
         } else {
             memset(&entry->cell, 0, sizeof(entry->cell));
             memset(&entry->target_ref, 0, sizeof(entry->target_ref));
             entry->target_ref_valid = false;
+            entry->observed_read_valid = false;
+            entry->expr_index = -1;
+            entry->query_index = -1;
             entry->typed_eligible = false;
         }
         log_msg("[analyze] [pointer] [index %u] [addr %lx] [target %lx] [id %llu]\n",
@@ -4971,7 +5091,8 @@ static SnapshotMutationBaseline *snapshot_mutation_baseline_build(
             entry, epoch, ordinal, SNAPSHOT_MUTATION_LANE_ARGUMENT,
             pointer ? SNAPSHOT_MUTATION_SOURCE_ARGUMENT_POINTER
                     : SNAPSHOT_MUTATION_SOURCE_ARGUMENT_PRIMITIVE,
-            source->reg, sizeof(target_ulong), 0, i, source->expr);
+            source->reg, sizeof(target_ulong), 0, i,
+            snapshot_expr_index_from_ptr(source->expr), -1);
         memcpy(entry->planner_bytes, &source->value,
                sizeof(target_ulong));
         entry->eligible = !pointer;
@@ -5028,6 +5149,78 @@ static gint snapshot_mutation_family_compare(gconstpointer left,
     return 0;
 }
 
+/* Build one owned plan for one complete proposal variant.  Every write in a
+ * variant is applied by a single disposable child, so the plan must carry the
+ * whole write set atomically: num_mods equals write_count and no partial plan
+ * is ever published.  Fresh payloads are deep-copied into plan ownership so
+ * the child never reads proponent-owned bytes. */
+static SnapshotMutationPlan *snapshot_mutation_new_variant(
+    const SnapshotMutationBaseline *baseline,
+    const SnapshotMutationProposalVariant *variant)
+{
+    SnapshotMutationPlan *plan;
+
+    if (baseline == NULL || variant == NULL || variant->writes == NULL ||
+        variant->write_count == 0 ||
+        variant->write_count > SNAPSHOT_MUTATION_MAX_SPECIALIZED_WRITES) {
+        return NULL;
+    }
+    plan = snapshot_mutation_try_malloc0(sizeof(*plan));
+    if (plan == NULL) return NULL;
+    plan->num_mods = variant->write_count;
+    plan->mods = snapshot_mutation_try_malloc0(
+        (size_t)variant->write_count * sizeof(*plan->mods));
+    if (plan->mods == NULL) {
+        snapshot_mutation_free(plan);
+        return NULL;
+    }
+
+    for (uint32_t wi = 0; wi < variant->write_count; wi++) {
+        const SnapshotMutationProposalWrite *write = &variant->writes[wi];
+        const SnapshotMutationBaselineEntry *entry =
+            snapshot_mutation_lookup_entry(baseline, write->destination);
+        SnapshotMutationWrite *mod = &plan->mods[wi];
+
+        if (entry == NULL || write->size == 0 ||
+            write->size > sizeof(mod->value)) {
+            snapshot_mutation_free(plan);
+            return NULL;
+        }
+        if (write->kind == SNAPSHOT_MUTATION_POINTER_FRESH) {
+            if (write->target_extent == 0 ||
+                write->target_extent > SNAPSHOT_PAGE_SIZE ||
+                write->target_bytes == NULL ||
+                write->target_extent > SIZE_MAX) {
+                snapshot_mutation_free(plan);
+                return NULL;
+            }
+            mod->target.bytes = snapshot_mutation_try_malloc(
+                (size_t)write->target_extent);
+            if (mod->target.bytes == NULL) {
+                snapshot_mutation_free(plan);
+                return NULL;
+            }
+            memcpy(mod->target.bytes, write->target_bytes,
+                   (size_t)write->target_extent);
+        } else if (write->kind != SNAPSHOT_MUTATION_BYTES &&
+                   write->kind != SNAPSHOT_MUTATION_POINTER_NULL &&
+                   write->kind != SNAPSHOT_MUTATION_POINTER_OOB) {
+            snapshot_mutation_free(plan);
+            return NULL;
+        }
+        mod->kind = write->kind;
+        mod->addr = entry->addr;
+        mod->size = write->size;
+        mod->expr_index = entry->expr_index;
+        mod->query_index = entry->query_index;
+        memcpy(mod->value, write->value, sizeof(mod->value));
+        mod->target.extent = write->target_extent;
+        mod->target.resolved_raw = write->resolved_raw;
+        mod->target.resolved_end = write->resolved_end;
+    }
+    return plan;
+}
+
 static bool snapshot_mutation_stage_family(
     SnapshotMutationCoordinator *coordinator,
     const SnapshotMutationProposalFamily *family)
@@ -5038,29 +5231,13 @@ static bool snapshot_mutation_stage_family(
         (GDestroyNotify)snapshot_mutation_free);
     if (local == NULL) return false;
     for (uint32_t vi = 0; vi < family->variant_count; vi++) {
-        const SnapshotMutationProposalVariant *variant = &family->variants[vi];
-        for (uint32_t wi = 0; wi < variant->write_count; wi++) {
-            const SnapshotMutationProposalWrite *write = &variant->writes[wi];
-            const SnapshotMutationBaselineEntry *entry =
-                snapshot_mutation_lookup_entry(coordinator->baseline,
-                                               write->destination);
-            SnapshotMutationPlan *plan;
-            if (entry == NULL) {
-                g_ptr_array_free(local, TRUE);
-                return false;
-            }
-            plan = snapshot_mutation_new_descriptor(
-                entry->addr, write->size, entry->expr_index,
-                entry->query_index, write->kind, write->value,
-                write->target_extent, write->target_bytes);
-            if (plan == NULL) {
-                g_ptr_array_free(local, TRUE);
-                return false;
-            }
-            plan->mods[0].target.resolved_raw = write->resolved_raw;
-            plan->mods[0].target.resolved_end = write->resolved_end;
-            g_ptr_array_add(local, plan);
+        SnapshotMutationPlan *plan = snapshot_mutation_new_variant(
+            coordinator->baseline, &family->variants[vi]);
+        if (plan == NULL) {
+            g_ptr_array_free(local, TRUE);
+            return false;
         }
+        g_ptr_array_add(local, plan);
     }
     for (guint i = 0; i < local->len; i++) {
         SnapshotMutationPlan *plan = g_ptr_array_index(local, i);
@@ -5145,6 +5322,38 @@ static bool snapshot_mutation_coordinator_build(
         (void)osprey_runtime_mutation_prepare(g_osprey_ctx);
     }
     snapshot_mutation_legacy_advisor(baseline, &sink);
+
+    /* Symbolic boundary advice runs after compact OSPREY preparation and
+     * before family sorting.  Capacity is decided by the per-advisor quotas,
+     * not by invocation order, so a disabled advisor cannot change OSPREY's
+     * accepted set. */
+    if (snapshot_symbolic_mode() != SNAPSHOT_SYMBOLIC_OFF) {
+        SnapshotSymbolicView view;
+        SnapshotMutationProposalSink symbolic_sink;
+
+        memset(&view, 0, sizeof(view));
+        view.expr_base = pool;
+        view.query_base = query_queue;
+        view.expr_entry = baseline->expr_start;
+        view.expr_exit = baseline->expr_end;
+        view.query_entry = baseline->query_start;
+        view.query_exit = baseline->query_end;
+        view.baseline = baseline;
+        view.run_epoch = baseline->run_epoch;
+        symbolic_sink.coordinator = &coordinator;
+        symbolic_sink.advisor_id = SNAPSHOT_SYMBOLIC_ADVISOR_ID;
+        symbolic_sink.advisor_priority = SNAPSHOT_SYMBOLIC_ADVISOR_PRIORITY;
+        if (view.expr_entry < 0 || view.expr_exit < 0 ||
+            view.query_entry < 0 || view.query_exit < 0) {
+            log_msg("[symbolic-advisor] [summary] [mode skip] "
+                    "[reason invalid-window]\n");
+        } else {
+            (void)snapshot_symbolic_run(
+                &view,
+                snapshot_symbolic_mode() == SNAPSHOT_SYMBOLIC_BOUNDARY
+                    ? &symbolic_sink : NULL);
+        }
+    }
 
     g_ptr_array_sort_with_data(coordinator.families,
                                snapshot_mutation_family_compare, baseline);
@@ -6008,12 +6217,14 @@ static void snapshot_prepare_mutation_epoch(void)
 {
     uint64_t epoch;
     if (shared_trace_data == NULL) return;
+    /* Half-open raw pool cursors: the baseline child's query suffix and
+     * expression arena start here. */
     snapshot_mutation_query_start =
         (query_queue != NULL && next_query != NULL)
-            ? GET_QUERY_IDX(next_query) : -1;
+            ? (int64_t)(next_query - query_queue) : -1;
     snapshot_mutation_expr_start =
         (pool != NULL && next_free_expr != NULL)
-            ? GET_EXPR_IDX(next_free_expr) : -1;
+            ? (int64_t)(next_free_expr - pool) : -1;
     epoch = ++next_snapshot_mutation_epoch;
     if (epoch == 0) epoch = ++next_snapshot_mutation_epoch;
     shared_trace_data->run_epoch = epoch;
@@ -6082,10 +6293,18 @@ static bool report_shared_prov_finding(uint32_t *status_out) {
         info->fault_addr = f->access_pc;
         info->host_fault_addr = 0;
         info->guest_last_translation_block = last_translation_block;
-        info->next_query = (fault.finding_query_idx >= 0 && query_queue)
-            ? query_queue + fault.finding_query_idx : next_query;
-        info->next_free_expr = (fault.finding_expr_idx >= 0 && pool)
-            ? pool + fault.finding_expr_idx : next_free_expr;
+        info->query_cursor = (fault.finding_query_idx >= 0 &&
+                              snapshot_query_cursor_valid(
+                                  fault.finding_query_idx))
+            ? fault.finding_query_idx
+            : ((next_query != NULL && query_queue != NULL)
+               ? (int64_t)(next_query - query_queue) : -1);
+        info->expr_cursor = (fault.finding_expr_idx >= 0 &&
+                             snapshot_expr_cursor_valid(
+                                 fault.finding_expr_idx))
+            ? fault.finding_expr_idx
+            : ((next_free_expr != NULL && pool != NULL)
+               ? (int64_t)(next_free_expr - pool) : -1);
         const char *pf_reason = provenance_fault_reason();
         g_strlcpy(info->description,
                   pf_reason ? pf_reason : "memcheck: provenance finding",

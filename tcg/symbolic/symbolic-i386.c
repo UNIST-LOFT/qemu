@@ -601,20 +601,27 @@ static inline void qemu_memmove(CPUArchState *cpu_env, uintptr_t src, uintptr_t 
     SnapshotMemAccess mem_access = {
         .symbolic_addr = false,
         .symbolic_value = (src_exprs != NULL),
+        .observed_valid = false,
         .addr = src,
         .target = {0},
         .ptr = NULL,
         .size = size
     };
+    SnapshotReadToken read_token = {0};
     if (size <= 8) {
         if (is_valid_address(src, false)) {
             void *addr_h = g2h(src);
             memcpy(mem_access.target, addr_h, size);
+            mem_access.observed_valid = true;
         }
         if (is_valid_address(src, true)) {
-            snapshot_read_access(cpu_env, &mem_access);
+            read_token = snapshot_read_access(cpu_env, &mem_access);
         }
     }
+    /* This path copies expressions without building the load's machine-width
+     * root, so there is no token finalizer here; the token exists only to keep
+     * the call contract explicit. */
+    (void)read_token;
     // static char buf[4096];
     // size_t len = 0;
     // for (int i = 0; i < CPU_NB_REGS; i++) {

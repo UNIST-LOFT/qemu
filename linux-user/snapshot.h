@@ -75,12 +75,43 @@ typedef struct {
 typedef struct {
     bool symbolic_addr;
     bool symbolic_value;
+    /* Set by the caller when it copied `size` physical bytes into target[]. */
+    bool observed_valid;
     uintptr_t addr;
     uintptr_t pc;
     uint8_t target[8];
     uint8_t *ptr;
     uintptr_t size;
 } SnapshotMemAccess;
+
+/* How the finalized machine-width load root extends the retained memory
+ * bytes.  The concrete read-event token below carries this so the parent can
+ * lower a synthesized value back to memory width without guessing signedness
+ * from an optimized expression shape. */
+typedef enum SnapshotRootExtension {
+    SNAPSHOT_ROOT_IDENTITY = 0,
+    SNAPSHOT_ROOT_ZEXT = 1,
+    SNAPSHOT_ROOT_SEXT = 2,
+} SnapshotRootExtension;
+
+/* Event token for one retained read record.  It names the record by
+ * epoch/lane/slot/access id, never by raw address: the address is application
+ * data.  Finalizing a token requires all four fields to still name the same
+ * record, so replacement, LRU slot reuse, lane replacement, or an epoch change
+ * invalidates the token.  valid == 0 means the read was not retained. */
+typedef struct SnapshotReadToken {
+    uint64_t run_epoch;
+    uint64_t access_id;
+    uint32_t slot;
+    uint8_t lane;
+    uint8_t valid;
+    uint16_t reserved;
+} SnapshotReadToken;
+
+typedef enum SnapshotReadLane {
+    SNAPSHOT_READ_LANE_PRIMITIVE = 0,
+    SNAPSHOT_READ_LANE_POINTER = 1,
+} SnapshotReadLane;
 
 typedef struct {
     uintptr_t base;
@@ -146,8 +177,16 @@ void snapshot_save(void);
 // void snapshot_restore(CPUArchState *cpu);
 
 void snapshot_write_access(SnapshotMemAccess *mem_access);
-void snapshot_read_access(CPUArchState *env, SnapshotMemAccess *mem_access);
-void snapshot_bind_read_expr(uintptr_t addr, uintptr_t size, Expr *expr);
+SnapshotReadToken snapshot_read_access(CPUArchState *env,
+                                       SnapshotMemAccess *mem_access);
+/* Finalize the read token once the load's machine-width root expression and
+ * its admitted BINRADAR_CONCRETIZATION query are known.  Returns false (and
+ * changes nothing) when the token no longer names the retained record, when
+ * the indexes are unusable, or when the load's width disagrees with the
+ * record. */
+bool snapshot_finalize_read_token(SnapshotReadToken token,
+                                  int64_t expr_index, int64_t query_index,
+                                  SnapshotRootExtension root_extension);
 
 void snapshot_trace_pending_allocs(target_ulong size, target_ulong pc);
 PendingAlloc snapshot_trace_get_pending_allocs(target_ulong pc);

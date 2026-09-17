@@ -945,6 +945,68 @@ TESTS = [
         timeout=120,
     ),
     dict(
+        # Shadow mode is the analysis without the advice: the same sources,
+        # consumers and candidates are computed and summarised, but nothing is
+        # submitted, so no child can ever observe a synthesized value and the
+        # queue is exactly the off-mode queue.  Both halves matter -- the
+        # summary row proves the analysis ran, the absent row proves it had no
+        # effect on the guest.
+        name="t16_symbolic_shadow",
+        guest="t16_symbolic_boundary",
+        mode="binradar",
+        memcheck=0,
+        entrypoint_symbol="t16_check",
+        env={"BINRADAR_OSPREY_ANALYSIS_MODE": "mutation",
+             "BINRADAR_SYMBOLIC_MUTATION_MODE": "shadow"},
+        symbolic_observation=True,
+        drain_queue=True,
+        patch_count=0,
+        rc=(2,),
+        expect_log_rows=[
+            ("symbolic-advisor", "[mode shadow]"),
+            ("t16", "[tag low] [value 00000041]"),
+        ],
+        # The advisor must submit nothing, and the guest must therefore never
+        # observe the synthesized threshold.  The generic families are still
+        # enabled here (patch_count=0 disables the patch list, not the generic
+        # scalar policy), and their bitwise-not value 0xffffffbe does flip the
+        # branch -- so the discriminator is the *specific* synthesized value,
+        # not the mere absence of a high-side observation.
+        absent_log_rows=[
+            ("symbolic-advisor", "[detail]"),
+            ("t16", "[tag high] [value 00001000]"),
+        ],
+        expect_symbolic_families_max=0,
+        timeout=120,
+    ),
+    dict(
+        # Package 4 real-child proof.  The guest loads a 4-byte scalar from the
+        # injected input, compares it against 0x1000, and appends the side it
+        # observed to BINRADAR_SYMBOLIC_OBSERVATION_FILE.  The observed input
+        # byte ('A' = 0x41) sits on the "low" side, so the boundary advisor must
+        # propose the comparison constant and a later mutation child must
+        # actually take the "high" side.  patch_count=0 disables the generic
+        # patch families so the only source of mutation is the advisor, and the
+        # queue is drained so every proposed plan runs in a real child.
+        name="t16_symbolic_boundary",
+        mode="binradar",
+        memcheck=0,
+        entrypoint_symbol="t16_check",
+        env={"BINRADAR_OSPREY_ANALYSIS_MODE": "mutation",
+             "BINRADAR_SYMBOLIC_MUTATION_MODE": "boundary"},
+        symbolic_observation=True,
+        drain_queue=True,
+        patch_count=0,
+        rc=(2,),
+        expect_log_rows=[
+            ("symbolic-advisor", "[mode boundary]"),
+            ("t16", "[tag low] [value 00000041]"),
+            ("t16", "[tag high] [value 00001000]"),
+        ],
+        expect_symbolic_families_min=1,
+        timeout=120,
+    ),
+    dict(
         name="t15_huft_build",
         mode="dump_compare",
         entrypoint_symbol="huft_build",
@@ -1135,6 +1197,13 @@ def run_binradar(test, guest, qemu, workdir):
     if test.get("observe_applied"):
         observation_path = os.path.join(run_dir, "stage7-observation.ssv")
         env["BINRADAR_OSPREY_TEST_OBSERVATION_FILE"] = observation_path
+    symbol_observation_path = None
+    if test.get("symbolic_observation"):
+        # The guest reports the branch it actually observed, once per real
+        # mutation child, so the advisor's proposal is proven by guest
+        # behavior rather than by the plan the parent built.
+        symbol_observation_path = os.path.join(run_dir, "symbolic-observed.txt")
+        env["BINRADAR_SYMBOLIC_OBSERVATION_FILE"] = symbol_observation_path
     ctrl_r = ctrl_w = stat_r = stat_w = None
     try:
         prepare_symbolic_env(env, run_dir)
@@ -1233,12 +1302,29 @@ def run_binradar(test, guest, qemu, workdir):
         if observation_path is not None and os.path.exists(observation_path):
             with open(observation_path, "r", errors="replace") as f:
                 stderr_text += "\n" + f.read()
+        if (symbol_observation_path is not None and
+                os.path.exists(symbol_observation_path)):
+            with open(symbol_observation_path, "r", errors="replace") as f:
+                stderr_text += "\n" + f.read()
         evidence = list(binradar_evidence.read_binradar(
             env["BINRADAR_EVIDENCE_FILE"]))
-        if len(evidence) != expected_iteration:
+        # A mutation child that is killed by the per-child timeout is discarded
+        # by the tracer: it commits nothing and publishes no evidence pair.  The
+        # invariant is therefore one record per *committed* iteration, and every
+        # requested iteration must either commit or be explicitly discarded.
+        commits = len(re.findall(
+            r"\[binradar\] \[commit\] \[iter \d+\]", stderr_text))
+        discards = len(re.findall(
+            r"\[binradar\] \[iteration-discarded\] \[iter \d+\]",
+            stderr_text))
+        if commits + discards != expected_iteration:
             raise RuntimeError(
-                f"BINRADAR evidence has {len(evidence)} iteration(s), "
-                f"expected {expected_iteration}")
+                f"BINRADAR iteration accounting: {commits} commit(s) + "
+                f"{discards} discard(s) != {expected_iteration} iteration(s)")
+        if len(evidence) != commits:
+            raise RuntimeError(
+                f"BINRADAR evidence has {len(evidence)} record(s), expected "
+                f"one per committed iteration ({commits})")
         patch_count = int(env["BINRADAR_PATCH_CNT"])
         for record in evidence:
             members = {
@@ -2623,6 +2709,11 @@ def check(test, rc, out):
     for tag, needle in test.get("expect_log_rows", []):
         if not has_log_row(out, tag, needle):
             problems.append(f"missing log row [{tag}] {needle}")
+    # Negative assertions matter here: a mode that must not propose has to be
+    # distinguished from a mode whose proposal happened to produce no result.
+    for tag, needle in test.get("absent_log_rows", []):
+        if has_log_row(out, tag, needle):
+            problems.append(f"unexpected log row [{tag}] {needle}")
     want = test.get("expect_inferred", 0)
     got = count_inferred(out)
     if got < want:
@@ -2640,6 +2731,20 @@ def check(test, rc, out):
                 f"< {queue_min}")
     if test.get("applied_assert"):
         problems.extend(check_applied_state(test, out))
+    families_min = test.get("expect_symbolic_families_min")
+    families_max = test.get("expect_symbolic_families_max")
+    if families_min is not None or families_max is not None:
+        counts = [int(n) for n in re.findall(
+            r"\[symbolic-advisor\] \[summary\] \[mode (?:boundary|shadow)\]"
+            r"[^\n]*\[families (\d+)\]", out)]
+        if not counts:
+            problems.append("symbolic advisor summary row missing")
+        elif families_min is not None and max(counts) < families_min:
+            problems.append(
+                f"symbolic advisor families {max(counts)} < {families_min}")
+        elif families_max is not None and max(counts) > families_max:
+            problems.append(
+                f"symbolic advisor families {max(counts)} > {families_max}")
     return problems
 
 

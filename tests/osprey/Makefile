@@ -79,7 +79,7 @@ CC        ?= gcc
 CFLAGS    := -O0 -g -fno-pie -no-pie -fno-stack-protector -U_FORTIFY_SOURCE -fno-builtin
 LDFLAGS   := -no-pie
 
-TESTS := osprey_deref t01_regions t01_clone t02_chunk_widths t04_mpx t05_enter_fault t06_control_reject t07_legacy_width_reject t08_bound_reject t09_address_origins t10_value_origins t11_modeled_copies t12_allocator_facts t13_rule_graph t14_typed_mutation t15_huft_build
+TESTS := osprey_deref t01_regions t01_clone t02_chunk_widths t04_mpx t05_enter_fault t06_control_reject t07_legacy_width_reject t08_bound_reject t09_address_origins t10_value_origins t11_modeled_copies t12_allocator_facts t13_rule_graph t14_typed_mutation t15_huft_build t16_symbolic_boundary
 
 GUEST_BINS := $(addprefix $(WORK)/,$(TESTS))
 PLT_FILES  := $(addprefix $(WORK)/,$(addsuffix .plt,$(TESTS)))
@@ -186,6 +186,14 @@ $(WORK)/t14_typed_mutation: $(GUESTS)/t14_typed_mutation.c | $(WORK)
 # t15_huft_build: Stage-9 ranking fixture.  The debug twin and stripped PIE
 # are produced from the same source and compiler flags; the tracer executes
 # the stripped file while evaluation reads DWARF from the twin.
+# t16_symbolic_boundary: Stage-7 symbolic boundary-advisor fixture.  Keep it
+# PIE-free (fixed address) so the observed global cell and the branch are
+# identical across runs, and keep the threshold constant visible in the
+# instruction stream so the recorded comparison is the one under test.
+$(WORK)/t16_symbolic_boundary: $(GUESTS)/t16_symbolic_boundary.c | $(WORK)
+	$(CC) -O0 -g -fno-pie -no-pie -fno-omit-frame-pointer \
+		-fno-stack-protector -U_FORTIFY_SOURCE -fno-builtin -o $@ $<
+
 $(WORK)/t15_huft_build: $(GUESTS)/t15_huft_build.c | $(WORK)
 	$(CC) -O0 -g -fPIE -pie -fomit-frame-pointer -fno-stack-protector \
 		-U_FORTIFY_SOURCE -fno-builtin -o $@.debug $<
@@ -341,6 +349,14 @@ E9_RANGES_SRC := ../../linux-user/e9-ranges.c
 E9_RANGES_HDR := ../../linux-user/e9-ranges.h
 MUTATION_INCLUDED_SRCS := ../../linux-user/snapshot.c \
                           ../../linux-user/snapshot.h
+# The symbolic boundary advisor is compiled into the test translation unit
+# (stage7_mutation_test.c includes snapshot-mutation-symbolic.c) so the focused
+# runner can drive its static configuration and budgets directly.  It is still
+# listed as a prerequisite so edits rebuild the runner.  The tracer build
+# compiles the same source as a standalone object (linux-user/Makefile.objs).
+MUTATION_ADVISOR_SRC := ../../linux-user/snapshot-mutation-symbolic.c
+MUTATION_ADVISOR_HDRS := ../../linux-user/snapshot-mutation.h \
+                         ../../linux-user/snapshot-mutation-symbolic.h
 
 # GQueue frees links through GLib's slice allocator. Debug blocks makes an
 # allocator-family mismatch fail at the first queue pop instead of corrupting
@@ -350,6 +366,7 @@ unit-stage7-mutation: $(MUTATION_UNIT_BIN)
 
 $(MUTATION_UNIT_BIN): stage7_mutation_test.c stage7_mutation_reference.c \
 		stage7_mutation_reference.h $(MUTATION_INCLUDED_SRCS) \
+		$(MUTATION_ADVISOR_SRC) $(MUTATION_ADVISOR_HDRS) \
 		$(E9_RANGES_SRC) $(E9_RANGES_HDR) \
 		$(OSPREY_OBJS) $(SBSV_OBJS) $(OSPREY_HEADERS) | $(WORK)
 	$(CC) $(UNIT_CFLAGS) -o $@ stage7_mutation_test.c \
@@ -366,6 +383,7 @@ SBSV_ASAN_OBJS := $(addprefix $(WORK)/,sbsv.asan.o sbsv_parser.asan.o)
 
 $(MUTATION_ASAN_BIN): stage7_mutation_test.c stage7_mutation_reference.c \
 		stage7_mutation_reference.h $(MUTATION_INCLUDED_SRCS) \
+		$(MUTATION_ADVISOR_SRC) $(MUTATION_ADVISOR_HDRS) \
 		$(E9_RANGES_SRC) $(E9_RANGES_HDR) \
 		$(OSPREY_ASAN_OBJS) $(SBSV_ASAN_OBJS) $(OSPREY_HEADERS) | $(WORK)
 	$(CC) $(ASAN_CFLAGS) -o $@ stage7_mutation_test.c \
