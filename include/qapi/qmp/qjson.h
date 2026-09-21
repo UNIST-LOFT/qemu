@@ -15,6 +15,9 @@
 #define QJSON_H
 
 QObject *qobject_from_json(const char *string, Error **errp);
+QObject *qobject_from_json_with_token_limit(const char *string,
+                                            uint64_t token_limit,
+                                            Error **errp);
 
 QObject *qobject_from_vjsonf_nofail(const char *string, va_list ap)
     GCC_FMT_ATTR(1, 0);

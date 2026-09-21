@@ -70,7 +70,7 @@ void json_message_process_token(JSONLexer *lexer, GString *input,
         error_setg(&err, "JSON token size limit exceeded");
         goto out_emit;
     }
-    if (g_queue_get_length(&parser->tokens) + 1 > MAX_TOKEN_COUNT) {
+    if (g_queue_get_length(&parser->tokens) + 1 > parser->token_limit) {
         error_setg(&err, "JSON token count limit exceeded");
         goto out_emit;
     }
@@ -111,6 +111,7 @@ void json_message_parser_init(JSONMessageParser *parser,
     parser->bracket_count = 0;
     g_queue_init(&parser->tokens);
     parser->token_size = 0;
+    parser->token_limit = MAX_TOKEN_COUNT;
 
     json_lexer_init(&parser->lexer, !!ap);
 }

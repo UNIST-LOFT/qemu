@@ -1433,6 +1433,24 @@ static char *make_nest(char *buf, size_t cnt)
     return buf;
 }
 
+static void limits_token_override(void)
+{
+    Error *err = NULL;
+    QObject *obj;
+
+    obj = qobject_from_json("[0,0]", &error_abort);
+    g_assert(obj != NULL);
+    qobject_unref(obj);
+
+    obj = qobject_from_json_with_token_limit("[0,0]", 4, &err);
+    error_free_or_abort(&err);
+    g_assert(obj == NULL);
+
+    obj = qobject_from_json_with_token_limit("[0,0]", 5, &error_abort);
+    g_assert(obj != NULL);
+    qobject_unref(obj);
+}
+
 static void limits_nesting(void)
 {
     Error *err = NULL;
@@ -1502,6 +1520,7 @@ int main(int argc, char **argv)
     g_test_add_func("/errors/invalid_dict_comma", invalid_dict_comma);
     g_test_add_func("/errors/unterminated/literal", unterminated_literal);
     g_test_add_func("/errors/limits/nesting", limits_nesting);
+    g_test_add_func("/errors/limits/token-override", limits_token_override);
     g_test_add_func("/errors/multiple_values", multiple_values);
 
     return g_test_run();

@@ -321,6 +321,7 @@ typedef struct BinradarResult {
 #define BRCACHE_FLAG_CWE805 2u
 #define BRCACHE_FLAG_INVALID 4u
 #define BRCACHE_MAX_CAPTURE_BYTES (64u * 1024u * 1024u)
+#define BRCACHE_MAX_MANIFEST_TOKENS (4ULL << 20)
 #define BRCACHE_MAX_DESCRIPTOR 4095u
 #define BRCACHE_MAX_EXPR_DEPTH 256u
 
@@ -1013,8 +1014,12 @@ static bool binradar_manager_load_manifest(BinradarManager *manager,
                 file_error != NULL ? file_error->message : "read failed");
         goto out;
     }
-    root = qobject_from_json(content, &json_error);
-    QDict *dict = root != NULL ? qobject_to(QDict, root) : NULL;
+    root = qobject_from_json_with_token_limit(
+        content, BRCACHE_MAX_MANIFEST_TOKENS, &json_error);
+    if (root == NULL) {
+        goto out;
+    }
+    QDict *dict = qobject_to(QDict, root);
     if (dict == NULL || qdict_get_try_int(dict, "version", -1) != 1) {
         log_msg("[binradar] [cache-manifest] [error invalid-version]\n");
         goto out;
@@ -1292,12 +1297,37 @@ void snapshot_init_binradar_patch_shm(uintptr_t key) {
         }
         binradar_manager->cache_fd_r = atoi(cache_fd);
         if (binradar_manager->cache_family == BRCACHE_FAMILY_CWE805) {
+            uint64_t required = 0;
+            for (uint32_t i = 0; i < binradar_manager->patch_cnt; i++) {
+                uint32_t id = binradar_manager->patch_list != NULL
+                    ? binradar_manager->patch_list[i] : i + 1u;
+                BinradarCachePredicate *predicate =
+                    &binradar_manager->cache_predicates[id];
+                uint64_t width;
+                switch (predicate->cell_kind) {
+                case BRCACHE_CELL_REGISTER: width = 0; break;
+                case BRCACHE_CELL_STACK8: width = 1; break;
+                case BRCACHE_CELL_STACK16: width = 2; break;
+                case BRCACHE_CELL_STACK32: width = 4; break;
+                case BRCACHE_CELL_STACK64: width = 8; break;
+                default: width = UINT64_MAX; break;
+                }
+                uint64_t bytes = width == UINT64_MAX ? UINT64_MAX :
+                    (width == 0 ? 0 :
+                     ((uint64_t)predicate->cell_index + 1u) * width);
+                required = MAX(required, bytes);
+            }
             const char *stack_size = getenv("BRCACHE_STACK_SIZE");
+            char *end = NULL;
+            errno = 0;
             uint64_t parsed = stack_size != NULL
-                ? strtoull(stack_size, NULL, 0) : 0;
-            if (parsed == 0 || parsed > (1u << 20)) {
+                ? strtoull(stack_size, &end, 0) : 0;
+            if (stack_size == NULL || stack_size[0] == '\0' || errno != 0 ||
+                end == stack_size || *end != '\0' || parsed < required ||
+                parsed > (1u << 20)) {
                 log_msg("[binradar] [cache-manifest] "
-                        "[error invalid-stack-size]\n");
+                        "[error invalid-stack-size] [required %" PRIu64 "]\n",
+                        required);
                 exit_with_status(1);
             }
             binradar_manager->cache_stack_size = (uint32_t)parsed;

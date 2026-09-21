@@ -61,11 +61,14 @@ static void consume_json(void *opaque, QObject *json, Error *err)
  * &error_abort.
  */
 static QObject *qobject_from_jsonv(const char *string, va_list *ap,
-                                   Error **errp)
+                                   uint64_t token_limit, Error **errp)
 {
     JSONParsingState state = {};
 
     json_message_parser_init(&state.parser, consume_json, &state, ap);
+    if (token_limit != 0) {
+        state.parser.token_limit = token_limit;
+    }
     json_message_parser_feed(&state.parser, string, strlen(string));
     json_message_parser_flush(&state.parser);
     json_message_parser_destroy(&state.parser);
@@ -80,7 +83,14 @@ static QObject *qobject_from_jsonv(const char *string, va_list *ap,
 
 QObject *qobject_from_json(const char *string, Error **errp)
 {
-    return qobject_from_jsonv(string, NULL, errp);
+    return qobject_from_jsonv(string, NULL, 0, errp);
+}
+
+QObject *qobject_from_json_with_token_limit(const char *string,
+                                            uint64_t token_limit,
+                                            Error **errp)
+{
+    return qobject_from_jsonv(string, NULL, token_limit, errp);
 }
 
 /*
@@ -95,7 +105,7 @@ QObject *qobject_from_vjsonf_nofail(const char *string, va_list ap)
 
     /* va_copy() is needed when va_list is an array type */
     va_copy(ap_copy, ap);
-    obj = qobject_from_jsonv(string, &ap_copy, &error_abort);
+    obj = qobject_from_jsonv(string, &ap_copy, 0, &error_abort);
     va_end(ap_copy);
 
     assert(obj);

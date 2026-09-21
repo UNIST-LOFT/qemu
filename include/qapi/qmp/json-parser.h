@@ -29,6 +29,7 @@ typedef struct JSONMessageParser {
     int bracket_count;
     GQueue tokens;
     uint64_t token_size;
+    uint64_t token_limit;
 } JSONMessageParser;
 
 void json_message_parser_init(JSONMessageParser *parser,
