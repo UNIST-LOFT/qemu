@@ -12,6 +12,7 @@
 #include "symbolic.h"
 #include "config.h"
 #include "symbolic-instrumentation.h"
+#include "symbolic-transport.h"
 #include "../../linux-user/snapshot.h"
 #include "../../linux-user/provenance.h"
 #include "../../linux-user/sem-events.h"
@@ -188,6 +189,9 @@ static inline SymbolicHeapAlloc* symbolic_lookup_alloc(target_ulong base)
     return g_hash_table_lookup(symbolic_heap_allocs, (gpointer)(uintptr_t)base);
 }
 
+static int64_t publish_ordinary_query(Expr *expression, uintptr_t address,
+                                      uintptr_t pc, const char *message);
+
 static inline void add_symbolic_heap_bounds_query(uintptr_t addr_idx,
                                                    target_ulong base,
                                                    uintptr_t offset,
@@ -238,7 +242,7 @@ static inline void add_symbolic_heap_bounds_query(uintptr_t addr_idx,
     q->opkind = BINRADAR_HEAP_BOUND_CHECK;
     q->op1 = offset_expr;
     q->op2 = alloc->size_expr;
-    add_query(q, 0, current_tb_pc, "heap_bounds");
+    publish_ordinary_query(q, 0, current_tb_pc, "heap_bounds");
 }
 
 GHashTable* coverage_log_bb_ht = NULL;
@@ -261,6 +265,7 @@ Expr* last_expr      = NULL; // ToDo: unsafe
 // query pool
 Query* query_queue = NULL;
 Query* next_query  = NULL;
+static SymbolicTransport symbolic_transport;
 
 static size_t page_size            = 0;
 pthread_t     main_thread          = 0;
@@ -533,22 +538,60 @@ static bool query_slot_available(void)
     return true;
 }
 
-/* Append one query to the bounded queue.  Returns the exact admitted raw pool
- * index, or -1 when the bounded queue dropped it.  The symbolic mutation
- * advisor needs the admitted index to bind a retained read to its
- * BINRADAR_CONCRETIZATION query; callers that do not care may ignore it. */
-int64_t add_query(Expr *q, uintptr_t address, uintptr_t pc, const char *msg) {
-    int64_t admitted_index;
+/* Reserve and commit are the only ordinary queue cursor mutation.  Typed
+ * publishers fill the shared record in place, avoiding a heap wrapper while
+ * preserving the exact admitted index needed by S1 observations. */
+static Query *query_reserve(void)
+{
+    if (!query_slot_available()) return NULL;
+    memset(next_query, 0, sizeof(*next_query));
+    return next_query;
+}
 
-    if (!query_slot_available()) {
-        return -1;
-    }
-    admitted_index = (int64_t)(next_query - query_queue);
-    next_query->query = q;
-    next_query->address = address;
-    print_query_loc(next_query, pc, msg);
+static int64_t query_commit(Query *slot, uintptr_t pc, const char *msg,
+                            bool log_location)
+{
+    assert(slot == next_query);
+    int64_t admitted_index = (int64_t)(slot - query_queue);
+    if (log_location) print_query_loc(slot, pc, msg);
     next_query++;
     return admitted_index;
+}
+
+static int64_t publish_ordinary_query(Expr *expression, uintptr_t address,
+                                      uintptr_t pc, const char *message)
+{
+    Query *slot = query_reserve();
+    if (slot == NULL) return -1;
+    slot->query = expression;
+    slot->address = address;
+    return query_commit(slot, pc, message, true);
+}
+
+static int64_t publish_model_query(Expr *expression, uintptr_t address,
+                                   MODEL_T model, const char *message)
+{
+    Query *slot = query_reserve();
+    if (slot == NULL) return -1;
+    slot->query = expression;
+    slot->address = address;
+    slot->model = model;
+    if (symbolic_start_code > 0 && address >= symbolic_start_code) {
+        printf("[query] [mod-k] [idx %ld] [pc 0x%lx] [msg %s] "
+               "[syms 0x%lx] [syme 0x%lx]\n",
+               GET_QUERY_IDX(slot), address, message,
+               symbolic_start_code, symbolic_end_code);
+    } else {
+        printf("[query] [mod-u] [idx %ld] [pc 0x%lx] [msg %s]\n",
+               GET_QUERY_IDX(slot), address, message);
+    }
+    return query_commit(slot, address, message, false);
+}
+
+static void G_GNUC_UNUSED publish_debug_query_placeholder(void)
+{
+    Query *slot = query_reserve();
+    if (slot != NULL) (void)query_commit(slot, 0, NULL, false);
 }
 
 void load_image(char* name, uintptr_t addr)
@@ -800,17 +843,6 @@ static inline void save_coverage_bitmap(const char* path, uint8_t* data,
     fclose(fp);
 }
 
-static void *alloc_local_solver_mapping(size_t size)
-{
-    void *mapping = mmap(NULL, size, PROT_READ | PROT_WRITE,
-                         MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-    if (mapping == MAP_FAILED) {
-        perror("mmap local solver transport");
-        exit(EXIT_FAILURE);
-    }
-    return mapping;
-}
-
 static inline void save_coverage_log(const char*  path,
                                      GHashTable** coverage_log)
 {
@@ -849,75 +881,18 @@ void init_symbolic_mode(void)
         return;
     }
 
-    if (s_config.no_external_solver) {
-        /* Match the external solver transport's fork visibility. Forkserver
-         * children publish expressions and queries for their parent through
-         * these mappings; private heap allocations lose those writes. A fixed
-         * address is unnecessary because no independent process attaches. */
-        pool = alloc_local_solver_mapping(
-            sizeof(Expr) * EXPR_POOL_CAPACITY);
-        query_queue = alloc_local_solver_mapping(
-            sizeof(Query) * EXPR_QUERY_CAPACITY);
+    if (!symbolic_transport_open(&symbolic_transport, &s_config)) {
+        perror("symbolic transport initialization");
+        exit(EXIT_FAILURE);
+    }
+    pool = symbolic_transport.expression_pool;
+    query_queue = symbolic_transport.query_queue;
 #if BRANCH_COVERAGE == FUZZOLIC
-        bitmap = alloc_local_solver_mapping(
-            sizeof(uint8_t) * BRANCH_BITMAP_SIZE);
+    bitmap = symbolic_transport.branch_bitmap;
 #endif
+    if (!symbolic_transport.external_solver) {
         printf("\nTRACER in NO_EXTERNAL_SOLVER mode\n");
-    } else {
-
-    struct timespec polling_time;
-    polling_time.tv_sec  = 0;
-    polling_time.tv_nsec = 50;
-
-    int expr_pool_shm_id;
-    do {
-        // printf("[TRACER] Waiting for shared memory #1 (key=%lu)...\n", s_config.expr_pool_shm_key);
-        expr_pool_shm_id = shmget(s_config.expr_pool_shm_key, // IPC_PRIVATE,
-                                  sizeof(Expr) * EXPR_POOL_CAPACITY, 0666 | IPC_CREAT);
-        if (expr_pool_shm_id >= 0) {
-            break;
-        }
-        nanosleep(&polling_time, NULL);
-    } while (1);
-    assert(expr_pool_shm_id >= 0);
-
-    int query_shm_id;
-    do {
-        // printf("[TRACER] Waiting for shared memory #2...\n");
-        query_shm_id = shmget(s_config.query_shm_key, // IPC_PRIVATE,
-                              sizeof(Query) * EXPR_QUERY_CAPACITY, 0666 | IPC_CREAT);
-        if (query_shm_id >= 0) {
-            break;
-        }
-        nanosleep(&polling_time, NULL);
-    } while (1);
-    assert(query_shm_id >= 0);
-
-#if BRANCH_COVERAGE == FUZZOLIC
-    int bitmap_shm_id;
-    do {
-        // printf("[TRACER] Waiting for shared memory #3...\n");
-        bitmap_shm_id = shmget(s_config.bitmap_shm_key, // IPC_PRIVATE,
-                               sizeof(uint8_t) * BRANCH_BITMAP_SIZE, 0666 | IPC_CREAT);
-        if (bitmap_shm_id >= 0) {
-            break;
-        }
-        nanosleep(&polling_time, NULL);
-    } while (1);
-    assert(bitmap_shm_id > 0);
-#endif
-
-    pool = shmat(expr_pool_shm_id, EXPR_POOL_ADDR, 0);
-    assert(pool);
-
-    query_queue = shmat(query_shm_id, NULL, 0);
-    assert(query_queue);
-#if BRANCH_COVERAGE == FUZZOLIC
-    bitmap = shmat(bitmap_shm_id, NULL, 0);
-    assert(bitmap);
-#endif
-
-    } /* end solver-shm branch */
+    }
 
     // printf("POOL_ADDR=%p\n", pool);
 
@@ -929,13 +904,8 @@ void init_symbolic_mode(void)
     next_free_expr = pool;
     next_query     = query_queue;
 
-    if (!s_config.no_external_solver) {
-        struct timespec polling_time;
-        polling_time.tv_sec  = 0;
-        polling_time.tv_nsec = 50;
-        while (next_query[0].query != (void*)SHM_READY) {
-            nanosleep(&polling_time, NULL);
-        }
+    if (!symbolic_transport_wait_ready(&symbolic_transport)) {
+        exit(EXIT_FAILURE);
     }
 
     MEM_BARRIER();
@@ -2147,7 +2117,7 @@ static void add_consistency_check(Expr* e, uintptr_t value, size_t size, OPKIND 
             if (debug_abort) tcg_abort();
             else exit(0);
         }
-        next_query++;
+        publish_debug_query_placeholder();
         return;
     }
 #if 0
@@ -2177,7 +2147,7 @@ static void add_consistency_check(Expr* e, uintptr_t value, size_t size, OPKIND 
     consistency_expr->op1      = e;
     SET_EXPR_CONST_OP(consistency_expr->op2, consistency_expr->op2_is_const, value);
     //
-    add_query(consistency_expr, current_tb_pc, current_tb_pc, "add_consistency_check");
+    publish_ordinary_query(consistency_expr, current_tb_pc, current_tb_pc, "add_consistency_check");
     // next_query[0].query   = consistency_expr;
     // next_query[0].address = current_tb_pc;
     // next_query++;
@@ -3291,7 +3261,7 @@ static inline void load_concretization(Expr* addr_expr, uintptr_t addr)
 
         // printf("\nSymbolic Load (base_expr=%lu)\n", GET_EXPR_IDX(base_expr));
         // print_expr(addr_expr);
-        add_query(e, 0, current_tb_pc, "load_concretization");
+        publish_ordinary_query(e, 0, current_tb_pc, "load_concretization");
         // next_query[0].query   = e;
         // next_query[0].address = 0;
         // next_query++;
@@ -3316,7 +3286,7 @@ static inline void store_concretization(Expr* addr_expr, uintptr_t addr)
         // printf("\nSymbolic Store (base_expr=%lu)\n",
         // GET_EXPR_IDX(base_expr)); print_expr(addr_expr);
 
-        add_query(e, 0, current_tb_pc, "store_concretization");
+        publish_ordinary_query(e, 0, current_tb_pc, "store_concretization");
         // next_query[0].query   = e;
         // next_query[0].address = 0;
         // next_query++;
@@ -3518,7 +3488,7 @@ static inline void qemu_load_helper(CPUArchState *env, uintptr_t orig_addr,
                 symbolic_access_id += 1;
                 s_temps[val_idx] = e;
                 
-                add_query(q, 0, current_tb_pc, "qemu_load_helper_1");
+                publish_ordinary_query(q, 0, current_tb_pc, "qemu_load_helper_1");
                 // next_query[0].query   = q;
                 // next_query[0].address = 0;
                 // next_query++;
@@ -3575,7 +3545,7 @@ static inline void qemu_load_helper(CPUArchState *env, uintptr_t orig_addr,
                     symbolic_access_id += 1;
                     s_temps[val_idx] = e;
 
-                    add_query(q, 0, current_tb_pc, "qemu_load_helper_2");
+                    publish_ordinary_query(q, 0, current_tb_pc, "qemu_load_helper_2");
                     // next_query[0].query   = q;
                     // next_query[0].address = 0;
                     // next_query++;
@@ -3882,7 +3852,7 @@ static inline void qemu_load_helper(CPUArchState *env, uintptr_t orig_addr,
         binradar_e->op2_is_const = 1;
         SET_EXPR_CONST_OP(binradar_e->op3, binradar_e->op3_is_const, size);
         int64_t query_index =
-            add_query(binradar_e, addr, current_tb_pc, "BINRADAR_CONCRETIZATION");
+            publish_ordinary_query(binradar_e, addr, current_tb_pc, "BINRADAR_CONCRETIZATION");
         /* Publish the read observation only after the complete wrapper is
          * admitted: the root must precede the wrapper and both indexes must be
          * real pool indexes. */
@@ -4982,9 +4952,8 @@ static inline void branch_helper_internal(uintptr_t a, uintptr_t b,
     }
 #endif
 
-    if (!query_slot_available()) {
-        return;
-    }
+    Query *branch_query = query_reserve();
+    if (branch_query == NULL) return;
 
     Expr*   branch_expr = new_expr();
     TCGCond sat_cond    = check_branch_cond_helper(a, b, cond);
@@ -4994,13 +4963,13 @@ static inline void branch_helper_internal(uintptr_t a, uintptr_t b,
     branch_expr->op3 = (Expr*)size;
 
 #if 1
-    next_query[0].query   = branch_expr;
-    next_query[0].address = pc;
+    branch_query->query = branch_expr;
+    branch_query->address = pc;
 #if BRANCH_COVERAGE == QSYM
-    next_query[0].args8.arg0 = cond == sat_cond; // taken?
-    next_query[0].args8.arg1 = (pc > symbolic_end_code || pc < symbolic_start_code); // library?
+    branch_query->args8.arg0 = cond == sat_cond; // taken?
+    branch_query->args8.arg1 = (pc > symbolic_end_code || pc < symbolic_start_code); // library?
 #elif BRANCH_COVERAGE == AFL
-    next_query[0].args64 = addr_to;
+    branch_query->args64 = addr_to;
 #elif BRANCH_COVERAGE == FUZZOLIC
 
     uintptr_t addr_to_jump = cond == sat_cond ? pc : addr_to;
@@ -5014,8 +4983,8 @@ static inline void branch_helper_internal(uintptr_t a, uintptr_t b,
     );
     index &= BRANCH_BITMAP_SIZE - 1;
 
-    next_query[0].args16.index = index;
-    next_query[0].args16.count = virgin_bitmap[index];
+    branch_query->args16.index = index;
+    branch_query->args16.count = virgin_bitmap[index];
 
     // inverse branch direction (the one that is taken)
 
@@ -5030,13 +4999,12 @@ static inline void branch_helper_internal(uintptr_t a, uintptr_t b,
     );
     index &= BRANCH_BITMAP_SIZE - 1;
 
-    next_query[0].args16.index_inv = index;
-    next_query[0].args16.count_inv = virgin_bitmap[index];
+    branch_query->args16.index_inv = index;
+    branch_query->args16.count_inv = virgin_bitmap[index];
 #endif
-    print_query_loc(next_query, current_tb_pc, "branch_helper_internal");
-    next_query++;
+    (void)query_commit(branch_query, current_tb_pc,
+                       "branch_helper_internal", true);
 #endif
-    // assert(next_query[0].query == 0);
     assert(next_query < query_queue + EXPR_QUERY_CAPACITY);
 
     // printf("Submitted a query\n");
@@ -6379,7 +6347,7 @@ static inline void concretize_mem(uintptr_t addr, uintptr_t size)
                     e->op1    = bytes_expr;
                     SET_EXPR_CONST_OP(e->op2, e->op2_is_const, bytes_value);
                     //
-                    add_query(e, 0, current_tb_pc, "concretize_mem_1");
+                    publish_ordinary_query(e, 0, current_tb_pc, "concretize_mem_1");
                     // next_query[0].query   = e;
                     // next_query[0].address = 0;
                     // next_query++;
@@ -6399,7 +6367,7 @@ static inline void concretize_mem(uintptr_t addr, uintptr_t size)
         e->op1    = bytes_expr;
         SET_EXPR_CONST_OP(e->op2, e->op2_is_const, bytes_value);
         //
-        add_query(e, 0, current_tb_pc, "concretize_mem_2");
+        publish_ordinary_query(e, 0, current_tb_pc, "concretize_mem_2");
         // next_query[0].query   = e;
         // next_query[0].address = 0;
         // next_query++;
@@ -9329,6 +9297,59 @@ int        parse_translation_block(TranslationBlock* tb, uintptr_t tb_pc,
 #include "models.c"
 
 static uintptr_t model_caller_addr = 0;
+
+static bool model_memory_copy_preflight(target_ulong src, target_ulong dst,
+                                        target_ulong size)
+{
+    return size == 0 ||
+        (prov_range_readable(src, size) && prov_range_writable(dst, size));
+}
+
+static bool model_memory_fill_preflight(target_ulong dst, target_ulong size)
+{
+    return size == 0 || prov_range_writable(dst, size);
+}
+
+/* Successful modeled writes use one ordering everywhere: preflight in the
+ * caller, update symbolic shadow, then publish the semantic effect. */
+static void model_memory_copy_commit(CPUArchState *env, target_ulong src,
+                                     target_ulong dst, target_ulong size)
+{
+    if (size == 0) return;
+    qemu_memmove(env, (uintptr_t)src, (uintptr_t)dst, size);
+    sem_mem_copy(env, src, dst, size, SEM_OP_LIBC_MODEL);
+}
+
+static void model_memory_fill_commit(CPUArchState *env, Expr *value,
+                                     target_ulong dst, target_ulong size)
+{
+    if (size == 0) return;
+    qemu_memset(value, (uintptr_t)dst, size);
+    sem_mem_overwrite(env, dst, size, SEM_OP_LIBC_MODEL);
+}
+
+static void model_memory_strncpy_commit(CPUArchState *env, target_ulong src,
+                                        target_ulong dst, target_ulong copied,
+                                        target_ulong size)
+{
+    qemu_memmove(env, (uintptr_t)src, (uintptr_t)dst, copied);
+    qemu_memset(NULL, (uintptr_t)(dst + copied), size - copied);
+    sem_mem_copy(env, src, dst, copied, SEM_OP_LIBC_MODEL);
+    if (copied < size) {
+        sem_mem_overwrite(env, dst + copied, size - copied,
+                          SEM_OP_LIBC_MODEL);
+    }
+}
+
+static void model_memory_check(CPUArchState *env, target_ulong addr,
+                               target_ulong size, int ea_reg)
+{
+    if (size != 0 && binradar_memcheck_enabled) {
+        provenance_model_check_access(env, addr, size, model_caller_addr,
+                                      ea_reg);
+    }
+}
+
 int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
     if ((symbolic_mode == 0 && !binradar_memcheck_enabled) || plt_addrs == NULL) {
         return 0;
@@ -9509,13 +9530,10 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
              * are the shadow invalidation and access checks legitimate;
              * an unreachable copy keeps the real libc fault instead. */
             target_ulong len = (target_ulong)env->regs[R_EDX];
-            if (len == 0 ||
-                (prov_range_readable((target_ulong)env->regs[R_ESI], len) &&
-                 prov_range_writable((target_ulong)env->regs[R_EDI], len))) {
-                if (len != 0) {
-                    qemu_memmove(env, (uintptr_t)env->regs[R_ESI],
-                                 (uintptr_t)env->regs[R_EDI], len);
-                }
+            target_ulong src = (target_ulong)env->regs[R_ESI];
+            target_ulong dst = (target_ulong)env->regs[R_EDI];
+            if (model_memory_copy_preflight(src, dst, len)) {
+                model_memory_copy_commit(env, src, dst, len);
                 /* memcheck: libc bodies are outside the symbolic window,
                  * so per-instruction checks can't see this range. Validate
                  * the full copy interval here (access pc = caller),
@@ -9523,19 +9541,8 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
                  * underruns/overruns are detected.  OSPREY (Stage 2.4):
                  * the combined copy event snapshots source shadow before
                  * destination invalidation and records exact F03. */
-                if (len != 0) {
-                    sem_mem_copy(env, (target_ulong)env->regs[R_ESI],
-                                 (target_ulong)env->regs[R_EDI], len,
-                                 SEM_OP_LIBC_MODEL);
-                    if (binradar_memcheck_enabled) {
-                        provenance_model_check_access(
-                            env, (target_ulong)env->regs[R_EDI], len,
-                            model_caller_addr, R_EDI);
-                        provenance_model_check_access(
-                            env, (target_ulong)env->regs[R_ESI], len,
-                            model_caller_addr, R_ESI);
-                    }
-                }
+                model_memory_check(env, dst, len, R_EDI);
+                model_memory_check(env, src, len, R_ESI);
                 mode = 2;
                 clear_call_args_temps();
                 clear_xmm_regs(env);
@@ -9544,24 +9551,14 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
             // printf("[0x%lx] memset(%p, %lx, %lu)\n", model_caller_addr, (char *)(uintptr_t)env->regs[R_EDI], (uintptr_t)env->regs[R_ESI], (uintptr_t)env->regs[R_EDX]);
             /* Phase 3 ordering: probe the full fill interval first. */
             target_ulong len = (target_ulong)env->regs[R_EDX];
-            if (len == 0 ||
-                prov_range_writable((target_ulong)env->regs[R_EDI], len)) {
-                if (len != 0) {
-                    Expr* value = s_temps[temp_idx(
-                        tcg_find_temp_arch_reg(tcg_ctx, "rsi"))];
-                    qemu_memset(value, (uintptr_t)env->regs[R_EDI], len);
-                }
+            target_ulong dst = (target_ulong)env->regs[R_EDI];
+            if (model_memory_fill_preflight(dst, len)) {
+                Expr* value = len == 0 ? NULL : s_temps[temp_idx(
+                    tcg_find_temp_arch_reg(tcg_ctx, "rsi"))];
+                model_memory_fill_commit(env, value, dst, len);
                 /* memcheck-only: validate the full fill interval (see
                  * above). */
-                if (len != 0) {
-                    sem_mem_overwrite(env, (target_ulong)env->regs[R_EDI], len,
-                                      SEM_OP_LIBC_MODEL);
-                    if (binradar_memcheck_enabled) {
-                        provenance_model_check_access(
-                            env, (target_ulong)env->regs[R_EDI], len,
-                            model_caller_addr, R_EDI);
-                    }
-                }
+                model_memory_check(env, dst, len, R_EDI);
                 mode = 2;
                 clear_call_args_temps();
                 clear_xmm_regs(env);
@@ -9576,25 +9573,18 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
                 prov_str_scan((const char *)(uintptr_t)env->regs[R_ESI],
                               0, false, &src_ok);
             target_ulong len = (target_ulong)src_len + 1;
-            if (src_ok &&
-                prov_range_writable((target_ulong)env->regs[R_EDI], len)) {
+            target_ulong src = (target_ulong)env->regs[R_ESI];
+            target_ulong dst = (target_ulong)env->regs[R_EDI];
+            if (src_ok && model_memory_fill_preflight(dst, len)) {
                 mode = model_strlen(env, model_caller_addr, 0, false, R_ESI);
                 if (mode != 0) {
-                    qemu_memmove(env, (uintptr_t)env->regs[R_ESI],
-                                 (uintptr_t)env->regs[R_EDI], len);
+                    model_memory_copy_commit(env, src, dst, len);
                     /* The full successful destination write invalidates
                      * stale pointer shadow; the length model checks the
                      * source with its actual RSI provenance.  OSPREY
                      * (Stage 2.4) records the exact
                      * scanned-length-plus-NUL F03. */
-                    sem_mem_copy(env, (target_ulong)env->regs[R_ESI],
-                                 (target_ulong)env->regs[R_EDI], len,
-                                 SEM_OP_LIBC_MODEL);
-                    if (binradar_memcheck_enabled) {
-                        provenance_model_check_access(
-                            env, (target_ulong)env->regs[R_EDI], len,
-                            model_caller_addr, R_EDI);
-                    }
+                    model_memory_check(env, dst, len, R_EDI);
                     clear_call_args_temps();
                     clear_xmm_regs(env);
                 }
@@ -9609,39 +9599,20 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
                     (const char *)(uintptr_t)env->regs[R_ESI], n, true,
                     &src_ok);
             }
-            if (src_ok &&
-                (n == 0 || prov_range_writable(
-                    (target_ulong)env->regs[R_EDI], n))) {
+            target_ulong src = (target_ulong)env->regs[R_ESI];
+            target_ulong dst = (target_ulong)env->regs[R_EDI];
+            if (src_ok && model_memory_fill_preflight(dst, n)) {
                 mode = model_strlen(env, model_caller_addr, n, true, R_ESI);
                 if (mode != 0 && n != 0) {
                     target_ulong copied = src_len < n ? src_len + 1 : n;
-                    qemu_memmove(env, (uintptr_t)env->regs[R_ESI],
-                                 (uintptr_t)env->regs[R_EDI], copied);
-                    if (copied < n) {
-                        qemu_memset(NULL,
-                                   (uintptr_t)env->regs[R_EDI] + copied,
-                                   n - copied);
-                    }
+                    model_memory_strncpy_commit(env, src, dst, copied, n);
                     /* strncpy always writes exactly n bytes, including
                      * zero padding after an early source terminator.
                      * OSPREY (Stage 2.4): the copied prefix is one exact
                      * F03 (source_length+1 including NUL when padded);
                      * the zero-padding tail is an overwrite, not a copy,
                      * and invalidates the exact destination bytes. */
-                    sem_mem_copy(env, (target_ulong)env->regs[R_ESI],
-                                 (target_ulong)env->regs[R_EDI], copied,
-                                 SEM_OP_LIBC_MODEL);
-                    if (copied < n) {
-                        sem_mem_overwrite(env,
-                                          (target_ulong)env->regs[R_EDI] +
-                                              copied,
-                                          n - copied, SEM_OP_LIBC_MODEL);
-                    }
-                    if (binradar_memcheck_enabled) {
-                        provenance_model_check_access(
-                            env, (target_ulong)env->regs[R_EDI], n,
-                            model_caller_addr, R_EDI);
-                    }
+                    model_memory_check(env, dst, n, R_EDI);
                 }
                 if (mode != 0) {
                     clear_call_args_temps();

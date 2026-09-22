@@ -322,6 +322,38 @@ void osprey_on_mem_access_class(CPUArchState *env, target_ulong addr,
                                 uint64_t size, uint64_t pc,
                                 uint32_t is_store, uint32_t op_class);
 
+/* Ordered helper intervals remain private OSPREY origin state.  The semantic
+ * event layer stages a complete family and commits it only after the helper's
+ * architectural operation succeeds. */
+typedef enum OspreyHelperIntervalResult {
+    OSPREY_HELPER_INTERVAL_OK = 0,
+    OSPREY_HELPER_INTERVAL_CONTRACT_MISMATCH,
+    OSPREY_HELPER_INTERVAL_FULL,
+} OspreyHelperIntervalResult;
+
+void osprey_helper_intervals_reset(CPUArchState *env);
+OspreyHelperIntervalResult osprey_helper_interval_stage(
+    CPUArchState *env, target_ulong addr, target_ulong size, target_ulong pc,
+    bool is_store, uint32_t op_class, uint32_t interval_policy,
+    uint32_t producer_id);
+void osprey_helper_intervals_commit(CPUArchState *env);
+
+/* Semantic-event adapters own no OSPREY origin representation.  These calls
+ * stage and consume the transient EA/producer-PC state around successful
+ * architectural effects. */
+void osprey_sem_ea_begin(CPUArchState *env, uint32_t base_reg,
+                         uint32_t index_reg, uint32_t scale,
+                         target_ulong disp, uint32_t mode, bool eligible);
+void osprey_sem_ea_set_mode(CPUArchState *env, uint32_t mode, bool eligible);
+void osprey_sem_ea_set_values(CPUArchState *env, target_ulong base_value,
+                              target_ulong index_value);
+uint32_t osprey_sem_ea_peek_mode(CPUArchState *env);
+uint32_t osprey_sem_ea_take_mode(CPUArchState *env);
+void osprey_sem_ea_clear(CPUArchState *env, bool clear_mode);
+void osprey_sem_transfer_set(CPUArchState *env, target_ulong pc);
+target_ulong osprey_sem_transfer_take(CPUArchState *env);
+void osprey_sem_transfer_clear(CPUArchState *env);
+
 /* ------------------------------------------------------------------ */
 /* Allocator observation (Stage 2.5)                                   */
 /* ------------------------------------------------------------------ */

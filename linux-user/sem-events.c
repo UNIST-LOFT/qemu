@@ -22,7 +22,6 @@
 #include "sem-events.h"
 #include "provenance.h"
 #include "osprey.h"
-#include "osprey-internal.h"
 #include "snapshot.h"
 #include "tcg/symbolic/symbolic-instrumentation.h"
 
@@ -344,11 +343,21 @@ static bool sem_op_class_is_valid(SemOpClass cls) {
            sem_op_class_valid[(unsigned int)cls];
 }
 
-static void osprey_clear_ea(OspreyCpuOriginState *st, bool clear_mode);
-static void osprey_clear_transfer_pc(OspreyCpuOriginState *st);
+/* Store attempts and successful architectural effects have deliberately
+ * different consumer boundaries.  Provenance invalidates before a helper
+ * store; OSPREY commits only after the complete guest operation succeeds. */
+static void sem_memory_attempt_invalidate(target_ulong addr,
+                                          target_ulong size)
+{
+    if (binradar_memcheck_enabled) provenance_on_modify_mem(addr, size);
+}
 
-static void osprey_clear_pending_helper(OspreyCpuOriginState *st) {
-    st->pending_helper_count = 0;
+static void sem_memory_success_commit(CPUArchState *env, target_ulong addr,
+                                      target_ulong size)
+{
+    if (osprey_collect_enabled && env != NULL) {
+        osprey_on_mem_overwrite(env, addr, size);
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -363,16 +372,12 @@ void sem_mem_overwrite(CPUArchState *env, target_ulong addr,
     bool valid_class = sem_op_class_is_valid(cls);
     /* Invalid classes still invalidate active consumer state, but can
      * never authorize an OSPREY fact or a more precise transfer. */
-    if (binradar_memcheck_enabled) {
-        provenance_on_modify_mem(addr, size);
-    }
+    sem_memory_attempt_invalidate(addr, size);
     /* OSPREY consumer (Stage 2.4): exact sparse overlap invalidation
      * of the address shadow whenever OSPREY collection is enabled,
      * regardless of class validity.  No fact or replacement is allowed
      * for an invalid class. */
-    if (osprey_collect_enabled && env != NULL) {
-        osprey_on_mem_overwrite(env, addr, size);
-    }
+    sem_memory_success_commit(env, addr, size);
     (void)valid_class;
 }
 
@@ -385,9 +390,7 @@ void sem_mem_helper_write_attempt(CPUArchState *env, target_ulong addr,
      * store.  Preserve provenance's accepted partial-commit behavior,
      * but do not touch OSPREY until the helper publishes its complete
      * post-success interval set. */
-    if (binradar_memcheck_enabled) {
-        provenance_on_modify_mem(addr, size);
-    }
+    sem_memory_attempt_invalidate(addr, size);
     (void)env;
     (void)cls;
 }
@@ -405,9 +408,7 @@ void sem_mem_copy(CPUArchState *env, target_ulong src, target_ulong dst,
         return;
     }
     bool valid_class = sem_op_class_is_valid(cls);
-    if (binradar_memcheck_enabled) {
-        provenance_on_modify_mem(dst, size);
-    }
+    sem_memory_attempt_invalidate(dst, size);
     if (osprey_collect_enabled && env != NULL) {
         if (valid_class) {
             osprey_on_mem_copy(env, src, dst, size);
@@ -448,13 +449,12 @@ void sem_context_replace(CPUArchState *env) {
         provenance_invalidate_all_regs(env);
     }
     if (osprey_collect_enabled) {
-        OspreyCpuOriginState *st = osprey_cpu_origin(env);
-        osprey_clear_pending_helper(st);
+        osprey_helper_intervals_reset(env);
         /* A fault can leave pre-access EA metadata unconsumed.  A signal
          * or restored context is a hard boundary; no later access may
          * reuse that record. */
-        osprey_clear_transfer_pc(st);
-        osprey_clear_ea(st, true);
+        osprey_sem_transfer_clear(env);
+        osprey_sem_ea_clear(env, true);
         for (int i = 0; i < CPU_NB_REGS; i++) {
             osprey_on_reg_invalidate(env, (uint32_t)i);
         }
@@ -770,21 +770,6 @@ static inline bool osprey_mode_ok(uint32_t mode) {
     return aflags == MO_64 && override < 0;
 }
 
-/* Drop every pending EA field without touching register or memory origins.
- * Keep the mode optionally: plain F01 events use it for their mode gate
- * while deliberately discarding any decomposed EA record. */
-static void osprey_clear_ea(OspreyCpuOriginState *st, bool clear_mode) {
-    memset(&st->ea, 0, sizeof(st->ea));
-    if (clear_mode) {
-        st->ea_mode = 0;
-    }
-}
-
-static void osprey_clear_transfer_pc(OspreyCpuOriginState *st) {
-    st->pending_transfer_pc = 0;
-    st->pending_transfer_pc_valid = 0;
-}
-
 void helper_sem_set_ea(CPUArchState *env, uint32_t base_reg,
                        uint32_t index_reg, uint32_t scale,
                        target_ulong disp, uint32_t mode) {
@@ -794,33 +779,11 @@ void helper_sem_set_ea(CPUArchState *env, uint32_t base_reg,
         sem_prov_set_ea(env, base_reg, index_reg, scale, disp, mode);
     }
     if (osprey_collect_enabled) {
-        OspreyCpuOriginState *st = osprey_cpu_origin(env);
-        osprey_clear_pending_helper(st);
-        osprey_clear_transfer_pc(st);
-        st->ea_mode = mode;
-        if (!osprey_mode_ok(mode)) {
-            /* Not an F01-eligible mode: record nothing (stale record
-             * protection). */
-            osprey_clear_ea(st, true);
-            return;
-        }
-        /* Register numbers are kept explicit: -1 (absent) and -2
-         * (RIP-relative) are cast directly from the incoming i32
-         * values, never repacked into bytes, so RIP-relative metadata
-         * can never decode as register 254. */
-        st->ea.valid = 1;
-        st->ea.base_reg = (int32_t)base_reg;
-        st->ea.index_reg = (int32_t)index_reg;
-        st->ea.scale = (int32_t)scale;
-        st->ea.disp = (int64_t)(int32_t)disp;
-        st->ea.base_val = 0;
-        st->ea.index_val = 0;
-        memset(&st->ea.base_origin, 0, sizeof(st->ea.base_origin));
-        memset(&st->ea.index_origin, 0, sizeof(st->ea.index_origin));
-        /* Values + origin snapshots arrive in helper_sem_set_ea_vals
-         * (emitted immediately after by the gen_sem_set_ea wrapper):
-         * env->regs may be stale inside helpers, so the base/index
-         * concrete values must ride as explicit TCG args. */
+        /* Register numbers stay explicit: signed -1/-2 sentinels are
+         * preserved by the OSPREY owner rather than packed into bytes.
+         * Concrete values and origin snapshots arrive in the next helper. */
+        osprey_sem_ea_begin(env, base_reg, index_reg, scale, disp, mode,
+                            osprey_mode_ok(mode));
     }
 }
 
@@ -828,13 +791,7 @@ void helper_sem_set_ea_mode(CPUArchState *env, uint32_t mode) {
     if (!osprey_collect_enabled) {
         return;
     }
-    OspreyCpuOriginState *st = osprey_cpu_origin(env);
-    osprey_clear_pending_helper(st);
-    osprey_clear_transfer_pc(st);
-    st->ea_mode = mode;
-    if (!osprey_mode_ok(mode)) {
-        osprey_clear_ea(st, true);
-    }
+    osprey_sem_ea_set_mode(env, mode, osprey_mode_ok(mode));
 }
 
 void helper_sem_set_ea_vals(CPUArchState *env, target_ulong base_val,
@@ -842,23 +799,9 @@ void helper_sem_set_ea_vals(CPUArchState *env, target_ulong base_val,
     if (!osprey_collect_enabled) {
         return;
     }
-    OspreyCpuOriginState *st = osprey_cpu_origin(env);
-    if (!st->ea.valid) {
-        return; /* mode-ineligible or no EA record: nothing to fill */
-    }
-    st->ea.base_val = base_val;
-    st->ea.index_val = index_val;
-    /* Snapshot the base/index ADDRESS origins NOW: the registers may be
-     * killed by the access itself before the mem-access event consumes
-     * the EA (e.g. mov (%rax),%rax). */
-    memset(&st->ea.base_origin, 0, sizeof(st->ea.base_origin));
-    memset(&st->ea.index_origin, 0, sizeof(st->ea.index_origin));
-    if (st->ea.base_reg >= 0 && st->ea.base_reg < CPU_NB_REGS) {
-        st->ea.base_origin = st->regs[st->ea.base_reg].address;
-    }
-    if (st->ea.index_reg >= 0 && st->ea.index_reg < CPU_NB_REGS) {
-        st->ea.index_origin = st->regs[st->ea.index_reg].address;
-    }
+    /* OSPREY snapshots base/index origins now because the access may kill
+     * either architectural register before the success event consumes EA. */
+    osprey_sem_ea_set_values(env, base_val, index_val);
 }
 
 void sem_mem_access(CPUArchState *env, target_ulong addr,
@@ -881,19 +824,18 @@ void sem_mem_access(CPUArchState *env, target_ulong addr,
     if (!osprey_collect_enabled) {
         return;
     }
-    OspreyCpuOriginState *st = osprey_cpu_origin(env);
     /* Any memory event is a later semantic boundary than a LEA scratch;
      * it must not leave an unconsumed producer PC for another instruction. */
-    osprey_clear_transfer_pc(st);
+    osprey_sem_transfer_clear(env);
     if (flags & SEM_MEM_F_NO_EA) {
         /* Plain producer events have no EA decomposition.  Discard a
          * fault-left record before recording the successful interval. */
-        osprey_clear_pending_helper(st);
-        osprey_clear_ea(st, false);
+        osprey_helper_intervals_reset(env);
+        osprey_sem_ea_clear(env, false);
     }
     if (!valid_class || (flags & SEM_MEM_F_OSPREY_SKIP_F01)) {
-        osprey_clear_pending_helper(st);
-        osprey_clear_ea(st, true);
+        osprey_helper_intervals_reset(env);
+        osprey_sem_ea_clear(env, true);
         if (!valid_class) {
             /* A successfully dispatched access with no declared class makes
              * F01 incomplete.  Suppression alone would accept a known-bad
@@ -903,8 +845,8 @@ void sem_mem_access(CPUArchState *env, target_ulong addr,
         return;
     }
     if (!valid_policy) {
-        osprey_clear_pending_helper(st);
-        osprey_clear_ea(st, true);
+        osprey_helper_intervals_reset(env);
+        osprey_sem_ea_clear(env, true);
         sem_mark_unsupported_execution();
         return;
     }
@@ -913,10 +855,9 @@ void sem_mem_access(CPUArchState *env, target_ulong addr,
      * when no set_ea ran (push/pop), ea_mode carries the instruction's
      * mode so F01 is still gated correctly.  The mode is consumed here:
      * a stale record can never gate a later instruction's access. */
-    uint32_t mode = st->ea_mode;
-    st->ea_mode = 0; /* consumed */
+    uint32_t mode = osprey_sem_ea_take_mode(env);
     if (!osprey_mode_ok(mode)) {
-        osprey_clear_ea(st, true);
+        osprey_sem_ea_clear(env, true);
         return;
     }
     /* Successful interval: consume the OSPREY EA snapshot once inside
@@ -946,7 +887,7 @@ void helper_sem_mem_overwrite(CPUArchState *env, target_ulong addr,
             provenance_get_reg_shadow(env)->ea_meta.valid = false;
         }
         if (osprey_collect_enabled) {
-            osprey_clear_ea(osprey_cpu_origin(env), true);
+            osprey_sem_ea_clear(env, true);
         }
     }
 }
@@ -959,10 +900,9 @@ void helper_sem_mem_unsupported(CPUArchState *env, target_ulong pc,
         provenance_get_reg_shadow(env)->ea_meta.valid = false;
     }
     if (osprey_collect_enabled) {
-        OspreyCpuOriginState *st = osprey_cpu_origin(env);
-        osprey_clear_pending_helper(st);
-        osprey_clear_transfer_pc(st);
-        osprey_clear_ea(st, true);
+        osprey_helper_intervals_reset(env);
+        osprey_sem_transfer_clear(env);
+        osprey_sem_ea_clear(env, true);
         /* An explicitly unsupported guest-memory producer makes the sample
          * incomplete.  Clearing EA state alone would silently accept a fact
          * set known to omit architectural accesses. */
@@ -1001,67 +941,43 @@ void sem_mem_helper_access_part(CPUArchState *env, target_ulong addr,
     if (!osprey_collect_enabled) {
         return;
     }
-    OspreyCpuOriginState *st = osprey_cpu_origin(env);
-    uint32_t mode = st->ea_mode;
+    uint32_t mode = osprey_sem_ea_peek_mode(env);
     /* Current callers publish constituent intervals only after the
      * complete helper returned successfully.  Commit OSPREY shadow
      * invalidation here, never at the pre-store write-attempt boundary. */
     if (is_store) {
-        osprey_on_mem_overwrite(env, addr, size);
+        sem_memory_success_commit(env, addr, size);
     }
     /* Helper-backed producers publish only after their complete operation
      * succeeds.  Clear decomposed EA fields after each part, but retain the
      * instruction mode until the final ordered interval. */
-    osprey_clear_ea(st, false);
+    osprey_sem_ea_clear(env, false);
     if (!valid_class || !osprey_mode_ok(mode)) {
-        osprey_clear_pending_helper(st);
-        osprey_clear_ea(st, true);
+        osprey_helper_intervals_reset(env);
+        osprey_sem_ea_clear(env, true);
         if (!valid_class) {
             sem_mark_unsupported_execution();
         }
         return;
     }
-    if (!valid_policy ||
-        (st->pending_helper_count != 0 &&
-         (st->pending_helper[0].interval_policy != (uint32_t)policy ||
-          st->pending_helper[0].producer_id != (uint32_t)producer))) {
-        /* A helper that lies about its class/policy/family, or mixes
-         * contracts in one ordered aggregate, would otherwise publish a fact
-         * with no manifest contract.  Reject the whole sample rather than
-         * retaining a partial footprint. */
-        osprey_clear_pending_helper(st);
-        osprey_clear_ea(st, true);
+    if (!valid_policy) {
+        osprey_helper_intervals_reset(env);
+        osprey_sem_ea_clear(env, true);
         sem_mark_unsupported_execution();
         return;
     }
-    if (st->pending_helper_count >= OSPREY_MAX_PENDING_HELPER_INTERVALS) {
-        /* No supported producer currently needs this many intervals.  A
-         * future helper must not wrap the fixed pending array or let an
-         * incomplete fact set reach merge as a supported sample. */
-        osprey_clear_pending_helper(st);
-        osprey_clear_ea(st, true);
+    OspreyHelperIntervalResult stage = osprey_helper_interval_stage(
+        env, addr, size, pc, is_store, (uint32_t)cls, (uint32_t)policy,
+        (uint32_t)producer);
+    if (stage != OSPREY_HELPER_INTERVAL_OK) {
+        /* A mixed family or full pending set must not publish a partial fact
+         * sequence as a supported sample. */
+        osprey_helper_intervals_reset(env);
+        osprey_sem_ea_clear(env, true);
         sem_mark_unsupported_execution();
         return;
     }
-    OspreyPendingHelperInterval *pending =
-        &st->pending_helper[st->pending_helper_count++];
-    pending->addr = addr;
-    pending->size = size;
-    pending->pc = pc;
-    pending->op_class = (uint32_t)cls;
-    pending->interval_policy = (uint32_t)policy;
-    pending->producer_id = (uint32_t)producer;
-    pending->is_store = is_store;
-    if (final_part) {
-        for (uint32_t i = 0; i < st->pending_helper_count; i++) {
-            pending = &st->pending_helper[i];
-            osprey_on_mem_access_class(env, pending->addr, pending->size,
-                                       pending->pc, pending->is_store,
-                                       pending->op_class);
-        }
-        osprey_clear_pending_helper(st);
-        st->ea_mode = 0;
-    }
+    if (final_part) osprey_helper_intervals_commit(env);
 }
 
 void sem_mem_maskmov(CPUArchState *env, target_ulong addr,
@@ -1080,8 +996,7 @@ void sem_mem_maskmov(CPUArchState *env, target_ulong addr,
     if (!osprey_collect_enabled) {
         return;
     }
-    OspreyCpuOriginState *st = osprey_cpu_origin(env);
-    uint32_t mode = st->ea_mode;
+    uint32_t mode = osprey_sem_ea_peek_mode(env);
     bool valid_width = width == 8 || width == 16;
     /* The helper reached this boundary only after every selected byte
      * store succeeded.  Commit sparse OSPREY invalidation now; the
@@ -1095,8 +1010,8 @@ void sem_mem_maskmov(CPUArchState *env, target_ulong addr,
     }
     /* MASKMOV has no decomposed EA transfer.  Consume all pending state
      * before publishing selected-byte intervals. */
-    osprey_clear_pending_helper(st);
-    osprey_clear_ea(st, true);
+    osprey_helper_intervals_reset(env);
+    osprey_sem_ea_clear(env, true);
     if (!valid_class || !valid_policy || !valid_width ||
         !osprey_mode_ok(mode)) {
         if (!valid_class || !valid_policy || !valid_width) {
@@ -1123,7 +1038,7 @@ void helper_sem_on_load(CPUArchState *env, uint32_t dst_idx,
             osprey_on_reg_invalidate(env, dst_idx);
         }
         if (osprey_collect_enabled) {
-            osprey_clear_ea(osprey_cpu_origin(env), true);
+            osprey_sem_ea_clear(env, true);
         }
         return;
     }
@@ -1149,14 +1064,8 @@ void helper_sem_on_store(CPUArchState *env, uint32_t src_idx,
      * gate.  Consume it here: a stale PC must never leak to a later
      * instruction, and an out-of-image store (libc internals) must
      * still invalidate overlap but publish nothing. */
-    target_ulong transfer_pc = 0;
-    OspreyCpuOriginState *st = NULL;
-    if (osprey_collect_enabled) {
-        st = osprey_cpu_origin(env);
-        transfer_pc = st->pending_transfer_pc_valid
-            ? st->pending_transfer_pc : 0;
-        osprey_clear_transfer_pc(st);
-    }
+    target_ulong transfer_pc = osprey_collect_enabled
+        ? osprey_sem_transfer_take(env) : 0;
     if (!sem_op_class_is_valid((SemOpClass)cls)) {
         if (binradar_memcheck_enabled) {
             provenance_mem_invalidate(addr, size);
@@ -1168,7 +1077,7 @@ void helper_sem_on_store(CPUArchState *env, uint32_t src_idx,
              * retaining stale metadata. */
             osprey_on_mem_store(env, CPU_NB_REGS, addr, size, src_val,
                                 transfer_pc);
-            osprey_clear_ea(osprey_cpu_origin(env), true);
+            osprey_sem_ea_clear(env, true);
         }
         return;
     }
@@ -1221,13 +1130,10 @@ void helper_sem_reg_lea(CPUArchState *env, uint32_t dst_idx,
                          dst_val, base_val);
     }
     if (osprey_collect_enabled) {
-        OspreyCpuOriginState *st = osprey_cpu_origin(env);
         /* Consume the pending raw transfer PC recorded by
          * helper_sem_set_pc immediately before this helper; a stranded
          * producer PC must never be consumed by a later instruction. */
-        target_ulong transfer_pc = st->pending_transfer_pc_valid
-            ? st->pending_transfer_pc : 0;
-        osprey_clear_transfer_pc(st);
+        target_ulong transfer_pc = osprey_sem_transfer_take(env);
         osprey_on_reg_lea(env, dst_idx, base_idx, (int64_t)disp,
                           dst_val, base_val, transfer_pc);
     }
@@ -1244,8 +1150,7 @@ void helper_sem_reg_lea_dyn(CPUArchState *env, uint32_t dst_idx,
      * constant origin can be inferred from a scaled/indexed LEA whose
      * index origin/scale are not present in this transfer event. */
     if (osprey_collect_enabled) {
-        OspreyCpuOriginState *st = osprey_cpu_origin(env);
-        osprey_clear_transfer_pc(st);
+        osprey_sem_transfer_clear(env);
         osprey_on_reg_invalidate(env, dst_idx);
     }
 }
@@ -1297,9 +1202,7 @@ void helper_sem_set_pc(CPUArchState *env, target_ulong pc) {
         shadow->cur_pc = pc;
     }
     if (osprey_collect_enabled) {
-        OspreyCpuOriginState *st = osprey_cpu_origin(env);
-        st->pending_transfer_pc = pc;
-        st->pending_transfer_pc_valid = 1;
+        osprey_sem_transfer_set(env, pc);
     }
 }
 

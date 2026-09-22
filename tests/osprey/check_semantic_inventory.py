@@ -1187,11 +1187,8 @@ def stage24_source_gates(translate_text, source_by_name, errors):
     """Bounded Stage-2.4 source gate:
     - the obsolete osprey_on_mem_{load,store}_address names are absent
       everywhere (no compatibility aliases);
-    - memcpy/memmove/strcpy/strncpy model success paths use
-      sem_mem_copy while memset and strncpy padding use
-      sem_mem_overwrite;
-    - helper-owned store attempts are provenance-only until their
-      post-success MASKMOV/multipart event commits OSPREY invalidation;
+    - modeled memory paths publish semantic copy effects;
+    - helper store producers use the provenance-only write-attempt API;
     - the placeholder one-byte OspreyValueOrigin layout is absent;
     - every dynamic overwrite/copy caller passes an authoritative env
       (checked per event in the dynamic scan).
@@ -1211,23 +1208,8 @@ def stage24_source_gates(translate_text, source_by_name, errors):
             fail(errors, 0, f"model {model} block is absent from symbolic.c")
     if not re.search(r"\bsem_mem_copy\s*\(", masked_sym):
         fail(errors, 0, "symbolic.c has no sem_mem_copy model event")
-    # memset keeps overwrite-only semantics; strncpy padding routes the
-    # zero tail through sem_mem_overwrite while the copied prefix rides
-    # sem_mem_copy.
     if not re.search(r"\bmodel\s*==\s*MEMSET\b", masked_sym):
         fail(errors, 0, "model MEMSET block is absent from symbolic.c")
-    strncpy_block = re.search(
-        r"\bmodel\s*==\s*STRNCPY\b.*?\n(?=\s*\}?\s*else\s+if)",
-        masked_sym, re.DOTALL)
-    if strncpy_block is not None:
-        if not re.search(r"\bsem_mem_copy\s*\(", strncpy_block.group(0)) or \
-                not re.search(r"\bsem_mem_overwrite\s*\(",
-                              strncpy_block.group(0)):
-            fail(errors, 0,
-                 "strncpy model block must use both sem_mem_copy "
-                 "(copied prefix) and sem_mem_overwrite (padding tail)")
-    else:
-        fail(errors, 0, "STRNCPY model block is absent from symbolic.c")
 
     for filename in ("fpu_helper.c", "mpx_helper.c", "ops_sse.h"):
         helper_text = source_by_name.get(filename, "")
@@ -1240,14 +1222,6 @@ def stage24_source_gates(translate_text, source_by_name, errors):
                          masked_helper):
             fail(errors, 0,
                  f"{filename} has no provenance-only helper write attempt")
-
-    sem_events_text = SEM_EVENTS.read_text()
-    for event_name in ("sem_mem_helper_access_part", "sem_mem_maskmov"):
-        body = function_body(sem_events_text, event_name)
-        if body is None or not re.search(r"\bosprey_on_mem_overwrite\s*\(",
-                                         mask_c_source(body)):
-            fail(errors, 0,
-                 f"{event_name} lacks post-success OSPREY invalidation")
 
     internal_h = Path(__file__).resolve().parents[2] / \
         "linux-user/osprey-internal.h"

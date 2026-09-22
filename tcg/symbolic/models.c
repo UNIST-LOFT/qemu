@@ -97,19 +97,10 @@ static inline void clear_call_args_temps(void)
     s_temps[temp_idx(tcg_find_temp_arch_reg(tcg_ctx, "r9"))] = 0;
 }
 
-static void add_query_with_model(Expr *q, uintptr_t address, MODEL_T model, const char *msg) {
-    if (!query_slot_available()) {
-        return;
-    }
-    next_query->query = q;
-    next_query->address = address;
-    next_query->model = model;
-    if (symbolic_start_code > 0 && address >= symbolic_start_code) {
-        printf("[query] [mod-k] [idx %ld] [pc 0x%lx] [msg %s] [syms 0x%lx] [syme 0x%lx]\n", GET_QUERY_IDX(next_query), address, msg, symbolic_start_code, symbolic_end_code);
-    } else {
-        printf("[query] [mod-u] [idx %ld] [pc 0x%lx] [msg %s]\n", GET_QUERY_IDX(next_query), address, msg);
-    }
-    next_query++;
+static void add_query_with_model(Expr *q, uintptr_t address, MODEL_T model,
+                                 const char *msg)
+{
+    (void)publish_model_query(q, address, model, msg);
 }
 
 // clear xmm registers

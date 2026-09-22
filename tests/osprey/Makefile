@@ -349,6 +349,16 @@ E9_RANGES_SRC := ../../linux-user/e9-ranges.c
 E9_RANGES_HDR := ../../linux-user/e9-ranges.h
 MUTATION_INCLUDED_SRCS := ../../linux-user/snapshot.c \
                           ../../linux-user/snapshot.h
+MUTATION_CORE_SRC := ../../linux-user/snapshot-mutation.c
+MUTATION_CORE_HDR := ../../linux-user/snapshot-mutation-internal.h
+OBSERVATION_SRC := ../../linux-user/snapshot-observation.c
+OBSERVATION_HDR := ../../linux-user/snapshot-observation.h
+OSPREY_ADAPTER_SRC := ../../linux-user/snapshot-osprey-adapter.c
+OSPREY_ADAPTER_HDR := ../../linux-user/snapshot-osprey-adapter.h
+CACHE_SESSION_SRC := ../../linux-user/binradar-cache.c
+CACHE_SESSION_HDR := ../../linux-user/binradar-cache.h
+FORKSERVER_SRC := ../../linux-user/binradar-forkserver.c
+FORKSERVER_HDR := ../../linux-user/binradar-forkserver.h
 # The symbolic boundary advisor is compiled into the test translation unit
 # (stage7_mutation_test.c includes snapshot-mutation-symbolic.c) so the focused
 # runner can drive its static configuration and budgets directly.  It is still
@@ -366,11 +376,18 @@ unit-stage7-mutation: $(MUTATION_UNIT_BIN)
 
 $(MUTATION_UNIT_BIN): stage7_mutation_test.c stage7_mutation_reference.c \
 		stage7_mutation_reference.h $(MUTATION_INCLUDED_SRCS) \
+		$(MUTATION_CORE_SRC) $(MUTATION_CORE_HDR) \
+		$(OBSERVATION_SRC) $(OBSERVATION_HDR) \
+		$(OSPREY_ADAPTER_SRC) $(OSPREY_ADAPTER_HDR) \
+		$(CACHE_SESSION_SRC) $(CACHE_SESSION_HDR) \
+		$(FORKSERVER_SRC) $(FORKSERVER_HDR) \
 		$(MUTATION_ADVISOR_SRC) $(MUTATION_ADVISOR_HDRS) \
 		$(E9_RANGES_SRC) $(E9_RANGES_HDR) \
 		$(OSPREY_OBJS) $(SBSV_OBJS) $(OSPREY_HEADERS) | $(WORK)
 	$(CC) $(UNIT_CFLAGS) -o $@ stage7_mutation_test.c \
-		stage7_mutation_reference.c $(E9_RANGES_SRC) \
+		stage7_mutation_reference.c $(MUTATION_CORE_SRC) \
+		$(OBSERVATION_SRC) $(OSPREY_ADAPTER_SRC) $(CACHE_SESSION_SRC) \
+		$(FORKSERVER_SRC) $(E9_RANGES_SRC) \
 		$(OSPREY_OBJS) $(SBSV_OBJS) -lglib-2.0 -lpthread -lm
 
 unit-stage7-mutation-asan: $(MUTATION_ASAN_BIN)
@@ -383,11 +400,18 @@ SBSV_ASAN_OBJS := $(addprefix $(WORK)/,sbsv.asan.o sbsv_parser.asan.o)
 
 $(MUTATION_ASAN_BIN): stage7_mutation_test.c stage7_mutation_reference.c \
 		stage7_mutation_reference.h $(MUTATION_INCLUDED_SRCS) \
+		$(MUTATION_CORE_SRC) $(MUTATION_CORE_HDR) \
+		$(OBSERVATION_SRC) $(OBSERVATION_HDR) \
+		$(OSPREY_ADAPTER_SRC) $(OSPREY_ADAPTER_HDR) \
+		$(CACHE_SESSION_SRC) $(CACHE_SESSION_HDR) \
+		$(FORKSERVER_SRC) $(FORKSERVER_HDR) \
 		$(MUTATION_ADVISOR_SRC) $(MUTATION_ADVISOR_HDRS) \
 		$(E9_RANGES_SRC) $(E9_RANGES_HDR) \
 		$(OSPREY_ASAN_OBJS) $(SBSV_ASAN_OBJS) $(OSPREY_HEADERS) | $(WORK)
 	$(CC) $(ASAN_CFLAGS) -o $@ stage7_mutation_test.c \
-		stage7_mutation_reference.c $(E9_RANGES_SRC) \
+		stage7_mutation_reference.c $(MUTATION_CORE_SRC) \
+		$(OBSERVATION_SRC) $(OSPREY_ADAPTER_SRC) $(CACHE_SESSION_SRC) \
+		$(FORKSERVER_SRC) $(E9_RANGES_SRC) \
 		$(OSPREY_ASAN_OBJS) $(SBSV_ASAN_OBJS) -lglib-2.0 -lpthread -lm
 
 $(WORK)/sbsv.asan.o: ../../linux-user/sbsv.c | $(WORK)

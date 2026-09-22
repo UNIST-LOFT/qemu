@@ -51,7 +51,9 @@
 #include <unistd.h>
 #include <sys/wait.h>
 
-/* snapshot.c compiled in: full access to its statics. */
+/* snapshot.c is compiled in for record/forkserver integration statics.  The
+ * mutation owner itself is linked from snapshot-mutation.c as a separate
+ * translation unit by the focused Makefile. */
 #include "../../linux-user/snapshot.c"
 
 /* The symbolic boundary advisor is compiled into this TU for the same reason:
@@ -106,8 +108,10 @@ bool qnum_get_try_uint(const QNum *qn, uint64_t *value) {
     (void)qn; (void)value;
     return false;
 }
-QObject *qobject_from_json(const char *text, Error **errp) {
-    (void)text; (void)errp;
+QObject *qobject_from_json_with_token_limit(const char *text,
+                                            uint64_t token_limit,
+                                            Error **errp) {
+    (void)text; (void)token_limit; (void)errp;
     return NULL;
 }
 int64_t qdict_get_try_int(const QDict *dict, const char *key,
@@ -1063,6 +1067,14 @@ static void test_generic_without_locator(void)
  * candidates from zeroed/unpublished slots. */
 static void test_parent_count_clamp(void)
 {
+    pid_t pid = fork();
+    if (pid == 0) {
+        _exit(snapshot_mutation_baseline_build(NULL, NULL, 0) == NULL ? 0 : 2);
+    }
+    int status = 0;
+    CHECK(pid > 0 && waitpid(pid, &status, 0) == pid &&
+              WIFEXITED(status) && WEXITSTATUS(status) == 0,
+          "missing observation view is rejected without a crash");
     reset_runtime();
     CPUArchState *env = g_malloc0(sizeof(CPUArchState));
     reset_shared_records();
@@ -2470,6 +2482,39 @@ static void test_child_application_does_not_mutate_plan(void)
     g_free(env);
 }
 
+static void test_invalid_patch_result(void)
+{
+    int fds[2];
+    int status = pipe(fds);
+    CHECK(status == 0, "create patch-result stream");
+    if (status != 0) return;
+    const char row[] = "[patch] [id 1] [br 1] [v 1]\n";
+    CHECK(write(fds[1], row, sizeof(row) - 1) == sizeof(row) - 1,
+          "write out-of-range patch result");
+    close(fds[1]);
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        uint32_t iteration = 1;
+        BinradarManager manager = {0};
+        manager.cur_iter = &iteration;
+        manager.patch_fd_r = fds[0];
+        manager.current = binradar_cache_new_iteration(&manager);
+        manager.patch_result_parser = sbsv_parser_new(SBSV_PARSER_DEFAULT);
+        if (sbsv_parser_add_schema(manager.patch_result_parser,
+                "[patch] [id: int] [br: int] [v: int]") != SBSV_OK) {
+            _exit(2);
+        }
+        binradar_cache_drain_patch(&manager);
+        _exit(0);
+    }
+    close(fds[0]);
+    status = 0;
+    CHECK(pid > 0 && waitpid(pid, &status, 0) == pid &&
+              WIFEXITED(status) && WEXITSTATUS(status) == 1,
+          "out-of-range patch result is fatal rather than silently discarded");
+}
+
 static void test_cached_feedback_writer(void)
 {
     GError *error = NULL;
@@ -2483,7 +2528,7 @@ static void test_cached_feedback_writer(void)
 
     BinradarManager manager = {0};
     manager.patch_max_id = 3;
-    manager.current = binradar_manager_alloc_one_iter(&manager);
+    manager.current = binradar_cache_new_iteration(&manager);
     manager.feedback_dir = directory;
     manager.poc_fault_addr = 0x1234;
     manager.cache_bytes = g_byte_array_new();
@@ -2507,10 +2552,10 @@ static void test_cached_feedback_writer(void)
     writes[1].size = sizeof(target_ulong);
     writes[1].value[0] = 0xcc;
     writes[1].value[1] = 0xdd;
-    SnapshotMutationPlan plan = {.num_mods = 2, .mods = writes};
-    ModificationManager local_mod_manager = {.current = &plan};
-    ModificationManager *saved_mod_manager = mod_manager;
-    mod_manager = &local_mod_manager;
+    const BinradarMutationFeedbackView mutation = {
+        .writes = writes,
+        .write_count = G_N_ELEMENTS(writes),
+    };
 
     const char *expected_results[] = {"benign", "ignored", "malicious"};
     const bool crashes[] = {false, true, true};
@@ -2521,7 +2566,8 @@ static void test_cached_feedback_writer(void)
         result->representative = patch;
         result->is_crash = crashes[patch - 1];
         result->fault_loc = faults[patch - 1];
-        CHECK(binradar_feedback_write(&manager, 2, patch, branches),
+        CHECK(binradar_cache_feedback_write(
+                  &manager, 2, patch, branches, &mutation),
               "feedback writer commits representative pair");
 
         char *metadata_name = g_strdup_printf(
@@ -2595,7 +2641,6 @@ static void test_cached_feedback_writer(void)
     g_free(snapshot_data);
     g_free(snapshot_path);
 
-    mod_manager = saved_mod_manager;
     for (uint32_t patch = 1; patch <= 3; patch++) {
         char *stem = g_strdup_printf(
             "iteration-00000002-patch-%08u", patch);
@@ -2853,14 +2898,12 @@ static void test_symbolic_feedback_matches_applied_plan(void)
     CHECK(directory != NULL && error == NULL,
           "symbolic feedback fixture creates a temporary directory");
     if (directory != NULL) {
-        ModificationManager local_mod_manager = {0};
-        ModificationManager *saved_mod_manager = mod_manager;
         const uint8_t snapshot[] = {'B', 'R', 'C', 'H'};
         GArray *branches = g_array_new(FALSE, FALSE, sizeof(int));
         int branch = 1;
 
         manager.patch_max_id = 2;
-        manager.current = binradar_manager_alloc_one_iter(&manager);
+        manager.current = binradar_cache_new_iteration(&manager);
         manager.feedback_dir = directory;
         manager.poc_fault_addr = 0x1234;
         manager.cache_bytes = g_byte_array_new();
@@ -2873,10 +2916,14 @@ static void test_symbolic_feedback_matches_applied_plan(void)
             result->is_crash = patch == 2;
             result->fault_loc = patch == 2 ? 0x1234u : 0u;
         }
-        local_mod_manager.current =
+        const SnapshotMutationPlan *feedback_plan =
             g_ptr_array_index(coordinator.staged, 0);
-        mod_manager = &local_mod_manager;
-        CHECK(binradar_feedback_write(&manager, 4, 1, branches),
+        const BinradarMutationFeedbackView mutation = {
+            .writes = feedback_plan->mods,
+            .write_count = feedback_plan->num_mods,
+        };
+        CHECK(binradar_cache_feedback_write(
+                  &manager, 4, 1, branches, &mutation),
               "feedback writer commits the representative child pair");
 
         metadata_path = g_build_filename(
@@ -2932,7 +2979,8 @@ static void test_symbolic_feedback_matches_applied_plan(void)
 
         /* Iteration 1 is the baseline: no pair, because no mutation child
          * ran.  The writer must refuse rather than publish a stale plan. */
-        CHECK(binradar_feedback_write(&manager, 1, 1, branches),
+        CHECK(binradar_cache_feedback_write(
+                  &manager, 1, 1, branches, &mutation),
               "iteration 1 is a no-op for the feedback writer");
         {
             char *iter1 = g_build_filename(
@@ -2942,10 +2990,9 @@ static void test_symbolic_feedback_matches_applied_plan(void)
             g_free(iter1);
         }
 
-        mod_manager = saved_mod_manager;
         g_array_free(branches, TRUE);
         g_byte_array_free(manager.cache_bytes, TRUE);
-        binradar_clear_current(&manager);
+        binradar_cache_clear_iteration(&manager);
         g_free(manager.current->patch_results);
         g_free(manager.current);
         {
@@ -2991,7 +3038,7 @@ static void test_feedback_requires_representative_child(void)
         return;
     }
     manager.patch_max_id = 2;
-    manager.current = binradar_manager_alloc_one_iter(&manager);
+    manager.current = binradar_cache_new_iteration(&manager);
     manager.feedback_dir = directory;
     manager.poc_fault_addr = 0x1234;
     manager.cache_bytes = g_byte_array_new();
@@ -3005,17 +3052,21 @@ static void test_feedback_requires_representative_child(void)
     /* Materialize patch 2 from patch 1's cached vector exactly as the
      * forkserver parent does: same branch vector, representative = patch 1. */
     manager.current->patch_results[1].br_taken =
-        binradar_clone_branch_vector(branches);
-    binradar_materialize_cache_hit(&manager, 2, 1, branches);
+        g_array_sized_new(FALSE, FALSE, sizeof(int), branches->len);
+    g_array_append_vals(manager.current->patch_results[1].br_taken,
+                        branches->data, branches->len);
+    const SnapshotExitInfo outcome = {.valid = 1};
+    binradar_cache_materialize(&manager, 2, 1, branches, &outcome);
     CHECK(manager.current->patch_results[2].representative == 1,
           "cache hit records the representative that produced its vector");
-    CHECK(binradar_branch_vectors_equal(
+    CHECK(binradar_cache_vectors_equal(
               manager.current->patch_results[2].br_taken, branches),
           "cache hit carries the representative's observed vector");
 
     /* The writer refuses a non-representative request outright: a cache hit
      * must never publish a sidecar pretending to be a real child. */
-    CHECK(!binradar_feedback_write(&manager, 4, 2, branches),
+    CHECK(!binradar_cache_feedback_write(
+              &manager, 4, 2, branches, NULL),
           "cache-materialized member is rejected by the feedback writer");
     pair_path = g_build_filename(
         directory, "iteration-00000004-patch-00000002.sbsv", NULL);
@@ -3025,7 +3076,7 @@ static void test_feedback_requires_representative_child(void)
 
     g_array_free(branches, TRUE);
     g_byte_array_free(manager.cache_bytes, TRUE);
-    binradar_clear_current(&manager);
+    binradar_cache_clear_iteration(&manager);
     g_free(manager.current->patch_results);
     g_free(manager.current);
     rmdir(directory);
@@ -3731,6 +3782,7 @@ int main(void)
     test_child_multiwrite_atomicity();
     test_variant_multiwrite_child_observation();
     test_child_application_does_not_mutate_plan();
+    test_invalid_patch_result();
     test_cached_feedback_writer();
     test_symbolic_feedback_matches_applied_plan();
     test_feedback_requires_representative_child();

@@ -4,7 +4,12 @@
 #include "osprey.h"
 #include "osprey-internal.h"
 #include "snapshot-mutation.h"
+#include "snapshot-mutation-internal.h"
 #include "snapshot-mutation-symbolic.h"
+#include "snapshot-observation.h"
+#include "snapshot-osprey-adapter.h"
+#include "binradar-cache.h"
+#include "binradar-forkserver.h"
 #include "e9-ranges.h"
 #include "../tcg/symbolic/symbolic-struct.h"
 #include "sbsv.h"
@@ -21,9 +26,7 @@
 #include <stdint.h>
 #include <limits.h>
 
-#define SNAPSHOT_EXIT_DESC_LEN 256
 #define SNAPSHOT_BT_DEPTH 64
-#define BINRADAR_FORKSERVER_PROTOCOL_V3 0x41464c02u
 // #define SNAPSHOT_DEBUG
 
 #ifdef SNAPSHOT_DEBUG
@@ -130,308 +133,16 @@ int binradar_memcheck_enabled = 0;
 static GQueue *heap_quarantine = NULL;
 static size_t heap_quarantine_bytes = 0;
 
-// TODO: add trace or coverage info
-typedef struct SnapshotExitInfo {
-    uint32_t valid;
-    uint32_t crashed;
-    int32_t target_signal;
-    int32_t host_signal;
-    int32_t si_code;
-    int32_t exit_code;
-    target_ulong guest_pc;
-    target_ulong guest_cs_base;
-    target_ulong fault_addr;
-    uintptr_t host_fault_addr;
-    uint64_t guest_last_translation_block;
-    /* Half-open pool cursors published by the child as raw pointer
-     * differences: query_cursor counts entries after the reserved slot 0 and
-     * expr_cursor counts expression-pool entries.  Scalar indexes survive the
-     * parent's post-waitpid read; the child-written pointers they replace did
-     * not.  -1 means "not published". */
-    int64_t query_cursor;
-    int64_t expr_cursor;
-    // uint32_t bt_depth;
-    // uintptr_t bt[SNAPSHOT_BT_DEPTH];
-    char description[SNAPSHOT_EXIT_DESC_LEN];
-} SnapshotExitInfo;
-
 
 typedef struct ModificationManager {
     GQueue *modifications; // Queue<SnapshotMutationPlan *>
     SnapshotMutationPlan *current;
 } ModificationManager;
 
-/* Focused Stage-7 allocation-failure hook.  The production default is
- * disabled; tests set N to fail the Nth owned allocation (zero-based). */
-static int64_t snapshot_mutation_alloc_fail_after = -1;
-
-static void snapshot_mutation_test_set_alloc_fail_after(int64_t fail_after)
-    G_GNUC_UNUSED;
-static void snapshot_mutation_test_set_alloc_fail_after(int64_t fail_after)
-{
-    snapshot_mutation_alloc_fail_after = fail_after;
-}
-
-static void *snapshot_mutation_try_malloc(size_t size)
-{
-    if (size == 0 || snapshot_mutation_alloc_fail_after == 0) {
-        return NULL;
-    }
-    if (snapshot_mutation_alloc_fail_after > 0) {
-        snapshot_mutation_alloc_fail_after--;
-    }
-    return g_try_malloc(size);
-}
-
-static void *snapshot_mutation_try_malloc0(size_t size)
-{
-    if (size == 0 || snapshot_mutation_alloc_fail_after == 0) {
-        return NULL;
-    }
-    if (snapshot_mutation_alloc_fail_after > 0) {
-        snapshot_mutation_alloc_fail_after--;
-    }
-    return g_try_malloc0(size);
-}
-
-/* g_queue_pop_head() and g_queue_free_full() release links through GLib's
- * list allocator.  Links passed to g_queue_push_tail_link() must therefore
- * come from g_list_alloc(), never g_malloc(). */
-static GList *snapshot_mutation_try_list_alloc(void)
-{
-    if (snapshot_mutation_alloc_fail_after == 0) {
-        return NULL;
-    }
-    if (snapshot_mutation_alloc_fail_after > 0) {
-        snapshot_mutation_alloc_fail_after--;
-    }
-    return g_list_alloc();
-}
-
-static void snapshot_mutation_free(SnapshotMutationPlan *mod)
-{
-    if (mod == NULL) {
-        return;
-    }
-    if (mod->mods != NULL) {
-        for (uint32_t i = 0; i < mod->num_mods; i++) {
-            g_free(mod->mods[i].target.bytes);
-        }
-        g_free(mod->mods);
-    }
-    g_free(mod);
-}
-
-static void snapshot_mutation_free_batch(SnapshotMutationPlan **mods,
-                                         size_t count)
-{
-    if (mods == NULL) {
-        return;
-    }
-    for (uint32_t i = 0; i < count; i++) {
-        snapshot_mutation_free(mods[i]);
-        mods[i] = NULL;
-    }
-}
-
-typedef struct PrimitiveAccess {
-    int size;
-    uintptr_t addr;
-    uintptr_t pc;
-    uint64_t access_id;
-    uint64_t run_epoch;
-    Expr *expr;
-    /* Stage 7.1: fixed-layout runtime locator.  valid == 0 when the
-     * canonical identity was not capturable; the record then stays
-     * generic-eligible. */
-    OspreyRuntimeChunkRef cell;
-    /* Symbolic-observation metadata.  observed_read_valid is set when
-     * the successful child load wrote 1..8 bytes into observed bytes;
-     * root_extension and the scalar pool indexes are filled only by the
-     * token finalizer after the final load root and its concretization
-     * query are admitted.  Every writer resets all three. */
-    uint8_t observed_read_bytes[sizeof(target_ulong)];
-    uint8_t observed_read_valid;
-    uint8_t root_extension;
-    int64_t expr_index;
-    int64_t query_index;
-} PrimitiveAccess;
-
-typedef struct PointerAccess {
-    uintptr_t addr;
-    uintptr_t target;
-    uintptr_t pc;
-    uint64_t access_id;
-    uint64_t run_epoch;
-    Expr *expr;
-    /* Stage 7.1: locator for the pointer cell and, when the loaded
-     * target is a valid non-zero address, for the target address
-     * itself. */
-    OspreyRuntimeChunkRef cell;
-    OspreyRuntimeAddressRef target_ref;
-    /* Symbolic-observation metadata; see PrimitiveAccess. */
-    uint8_t observed_read_bytes[sizeof(target_ulong)];
-    uint8_t observed_read_valid;
-    uint8_t root_extension;
-    int64_t expr_index;
-    int64_t query_index;
-} PointerAccess;
-
-typedef struct SharedTraceData {
-    /* Parent publishes this before each baseline child.  Every retained
-     * access copies it, making stale records locally rejectable. */
-    uint64_t run_epoch;
-    uint32_t prim_idx;
-    uint32_t ptr_idx;
-    uint64_t prim_access_cnt;
-    uint64_t ptr_access_cnt;
-    /* Stage 7.1: sticky overflow flags.  Set when a record insertion
-     * exceeds the fixed record capacity (or the record array is found
-     * inconsistent); the parent then treats typed consumption as
-     * unavailable and bounds its loops at the capacity.  Never reset in
-     * the child: the parent reads them after waitpid. */
-    uint32_t prim_overflow;
-    uint32_t ptr_overflow;
-    SnapshotExitInfo exit_info;
-    /* Deferred provenance finding.  Lives in the shared mmap so the
-     * parent can read it after waitpid even when the child was killed or
-     * timed out (timeout-safe transport; see Step 5). */
-    PendingProvenanceFault prov_pending_fault;
-    PrimitiveAccess primitives[MAX_PRIMITIVE_ACCESS];
-    PointerAccess pointers[MAX_POINTER_ACCESS];
-} SharedTraceData;
 
 
-typedef struct PatchedResult {
-    uint32_t patch_id;
-    uint32_t representative;
-    GArray *br_taken; // Array<int> (0 = not taken, 1 = taken, 2 = patch crashed)
-    bool is_crash;
-    uint64_t fault_loc;
-} PatchedResult;
 
-typedef struct BinradarResult {
-    uint32_t iter;
-    PatchedResult *patch_results; // Array<PatchedResult *>, length = patch_cnt + 1
-} BinradarResult;
 
-#define BRCACHE_SNAPSHOT_MAGIC 0x48435242u
-#define BRCACHE_SNAPSHOT_VERSION 1u
-#define BRCACHE_FLAG_TRUNCATED 1u
-#define BRCACHE_FLAG_CWE805 2u
-#define BRCACHE_FLAG_INVALID 4u
-#define BRCACHE_MAX_CAPTURE_BYTES (64u * 1024u * 1024u)
-#define BRCACHE_MAX_MANIFEST_TOKENS (4ULL << 20)
-#define BRCACHE_MAX_DESCRIPTOR 4095u
-#define BRCACHE_MAX_EXPR_DEPTH 256u
-
-typedef enum BinradarCacheFamily {
-    BRCACHE_FAMILY_NONE,
-    BRCACHE_FAMILY_GENERIC,
-    BRCACHE_FAMILY_CWE805,
-} BinradarCacheFamily;
-
-typedef enum BinradarExprOp {
-    BRCACHE_EXPR_LITERAL,
-    BRCACHE_EXPR_VARIABLE,
-    BRCACHE_EXPR_NOT,
-    BRCACHE_EXPR_EQ,
-    BRCACHE_EXPR_NE,
-    BRCACHE_EXPR_GT,
-    BRCACHE_EXPR_GE,
-    BRCACHE_EXPR_LT,
-    BRCACHE_EXPR_LE,
-    BRCACHE_EXPR_ADD,
-    BRCACHE_EXPR_SUB,
-    BRCACHE_EXPR_MUL,
-    BRCACHE_EXPR_DIV,
-    BRCACHE_EXPR_REM,
-    BRCACHE_EXPR_AND,
-    BRCACHE_EXPR_OR,
-    BRCACHE_EXPR_XOR,
-    BRCACHE_EXPR_SHL,
-    BRCACHE_EXPR_SHR,
-} BinradarExprOp;
-
-typedef struct BinradarExprNode {
-    BinradarExprOp op;
-    uint32_t left;
-    uint32_t right;
-    uint16_t variable;
-    int64_t literal;
-} BinradarExprNode;
-
-typedef enum BinradarCacheCellKind {
-    BRCACHE_CELL_REGISTER,
-    BRCACHE_CELL_STACK8,
-    BRCACHE_CELL_STACK16,
-    BRCACHE_CELL_STACK32,
-    BRCACHE_CELL_STACK64,
-} BinradarCacheCellKind;
-
-typedef struct BinradarCachePredicate {
-    char *descriptor;
-    GArray *expr_nodes;
-    uint32_t expr_root;
-    uint8_t cwe_kind;
-    BinradarCacheCellKind cell_kind;
-    uint32_t cell_index;
-    uint8_t scale;
-} BinradarCachePredicate;
-
-typedef struct BinradarPatchSelector {
-    uint32_t patch_id;
-    uint32_t iteration;
-    uint32_t descriptor_length;
-    uint32_t descriptor_capacity;
-    char descriptor[];
-} BinradarPatchSelector;
-
-typedef struct BinradarSnapshotHeader {
-    uint32_t magic;
-    uint32_t version;
-    uint32_t patch_id;
-    uint32_t branch;
-    uint64_t stack_size;
-    uint64_t flags;
-} BinradarSnapshotHeader;
-
-_Static_assert(sizeof(BinradarSnapshotHeader) == 32,
-               "cached snapshot header layout changed");
-_Static_assert(offsetof(BinradarPatchSelector, descriptor) == 16,
-               "cached selector prefix changed");
-
-typedef struct BinradarManager {
-    uint32_t patch_cnt;
-    int patch_fd_r;
-    uint32_t *cur_patch_id; // Shared memory
-    uint32_t *cur_iter; // Shared memory
-    sbsv_parser *patch_result_parser;
-    BinradarResult *current; // Current iteration before evidence commit
-    FILE *evidence_file;
-    size_t line_idx;
-    char line_buf[4096];
-    // Candidate patch ids (survivors from filter.br or legacy SBSV), length patch_cnt.
-    // NULL means candidates are 1..patch_cnt.
-    uint32_t *patch_list;
-    // Max patch id that can be indexed in patch_results (allocated size = patch_max_id + 1).
-    uint32_t patch_max_id;
-    bool cache_enabled;
-    bool cache_inference_enabled;
-    BinradarCacheFamily cache_family;
-    BinradarCachePredicate *cache_predicates;
-    uint32_t cache_predicate_count;
-    uint32_t cache_stack_size;
-    int cache_fd_r;
-    GByteArray *cache_bytes;
-    bool cache_capture_overflow;
-    BinradarPatchSelector *selector;
-    size_t selector_size;
-    /* Optional per-representative feedback.  Only .brcached provides the
-     * complete BRCH snapshots needed by this contract. */
-    char *feedback_dir;
-    target_ulong poc_fault_addr;
-} BinradarManager;
 
 static SharedTraceData *shared_trace_data = NULL;
 /* OSPREY in-process structural type analysis (Stage 1: shared-run fact
@@ -464,182 +175,11 @@ static SnapshotExitInfo original_exit_info;
 
 static BinradarManager *binradar_manager = NULL;
 
-static BinradarResult *binradar_manager_alloc_one_iter(BinradarManager *manager) {
-    if (manager == NULL) return NULL;
-    BinradarResult *result = g_new0(BinradarResult, 1);
-    result->iter = 0;
-    result->patch_results = g_new0(PatchedResult, manager->patch_max_id + 1);
-    return result;
-}
-
 static void trace_mem_flush(void);
 static void snapshot_modification_manager_reset(bool analysis_started);
 static void exit_with_status(int status);
-static int binradar_manager_cur_patch_id(BinradarManager *manager, int new_patch_id);
-static int binradar_manager_cur_iter(BinradarManager *manager, int new_iter);
-static PatchedResult *get_patched_result_tmp(BinradarManager *manager,
-                                             uint32_t patch_id);
 bool is_e9_relocated_call(target_ulong pc, target_ulong *call_site,
                           target_ulong *ret_addr);
-
-static int read_exact(int fd, void *buf, size_t len) {
-    uint8_t *p = buf;
-    size_t total = 0;
-
-    while (total < len) {
-        ssize_t n = read(fd, p + total, len - total);
-        if (n == 0) {
-            return -1;
-        }
-        if (n < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            return -1;
-        }
-        total += (size_t)n;
-    }
-
-    return 0;
-}
-
-static int write_exact(int fd, const void *buf, size_t len) {
-    const uint8_t *p = buf;
-    size_t total = 0;
-
-    while (total < len) {
-        ssize_t n = write(fd, p + total, len - total);
-        if (n < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            return -1;
-        }
-        if (n == 0) {
-            return -1;
-        }
-        total += (size_t)n;
-    }
-
-    return 0;
-}
-
-#define BR_EVIDENCE_HEADER_SIZE 16u
-#define BR_EVIDENCE_FRAME_HEADER_SIZE 8u
-#define BR_EVIDENCE_MAGIC "BRDATAB1"
-#define BR_EVIDENCE_VERSION 1u
-#define BR_EVIDENCE_KIND_FILTER 1u
-#define BR_EVIDENCE_KIND_BINRADAR 3u
-#define BR_EVIDENCE_RECORD_FILTER 1u
-#define BR_EVIDENCE_RECORD_BINRADAR_ITERATION 4u
-#define BR_EVIDENCE_MAX_FRAME (256u * 1024u * 1024u)
-#define BR_EVIDENCE_GROUP_BRANCH_NULL 1u
-#define BR_EVIDENCE_OUTCOME_NORMAL 1u
-#define BR_EVIDENCE_OUTCOME_CRASH 2u
-
-static uint16_t br_evidence_read_u16(const uint8_t *p)
-{
-    return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
-}
-
-static uint32_t br_evidence_read_u32(const uint8_t *p)
-{
-    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
-           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-}
-
-static void br_evidence_append_u16(GByteArray *out, uint16_t value)
-{
-    uint8_t bytes[2] = {(uint8_t)value, (uint8_t)(value >> 8)};
-    g_byte_array_append(out, bytes, sizeof(bytes));
-}
-
-static void br_evidence_append_u32(GByteArray *out, uint32_t value)
-{
-    uint8_t bytes[4] = {
-        (uint8_t)value, (uint8_t)(value >> 8),
-        (uint8_t)(value >> 16), (uint8_t)(value >> 24),
-    };
-    g_byte_array_append(out, bytes, sizeof(bytes));
-}
-
-static void br_evidence_append_u64(GByteArray *out, uint64_t value)
-{
-    uint8_t bytes[8];
-    for (unsigned i = 0; i < sizeof(bytes); i++) {
-        bytes[i] = (uint8_t)(value >> (i * 8u));
-    }
-    g_byte_array_append(out, bytes, sizeof(bytes));
-}
-
-static void br_evidence_append_uleb32(GByteArray *out, uint32_t value)
-{
-    do {
-        uint8_t byte = (uint8_t)(value & 0x7fu);
-        value >>= 7;
-        if (value != 0) byte |= 0x80u;
-        g_byte_array_append(out, &byte, 1);
-    } while (value != 0);
-}
-
-static uint32_t br_evidence_crc32_update(uint32_t crc,
-                                         const uint8_t *data, size_t len)
-{
-    crc = ~crc;
-    for (size_t i = 0; i < len; i++) {
-        crc ^= data[i];
-        for (unsigned bit = 0; bit < 8; bit++) {
-            uint32_t mask = (uint32_t)-(int32_t)(crc & 1u);
-            crc = (crc >> 1) ^ (0xedb88320u & mask);
-        }
-    }
-    return ~crc;
-}
-
-static uint32_t br_evidence_frame_crc(uint16_t type, uint16_t flags,
-                                      const uint8_t *payload, size_t len)
-{
-    uint8_t prefix[4] = {
-        (uint8_t)type, (uint8_t)(type >> 8),
-        (uint8_t)flags, (uint8_t)(flags >> 8),
-    };
-    uint32_t crc = br_evidence_crc32_update(0, prefix, sizeof(prefix));
-    return br_evidence_crc32_update(crc, payload, len);
-}
-
-static bool br_evidence_write_header(FILE *fp, uint16_t kind)
-{
-    GByteArray *header = g_byte_array_sized_new(BR_EVIDENCE_HEADER_SIZE);
-    g_byte_array_append(header, (const uint8_t *)BR_EVIDENCE_MAGIC, 8);
-    br_evidence_append_u16(header, BR_EVIDENCE_VERSION);
-    br_evidence_append_u16(header, kind);
-    br_evidence_append_u32(header, 0);
-    bool ok = fwrite(header->data, 1, header->len, fp) == header->len;
-    g_byte_array_free(header, TRUE);
-    return ok;
-}
-
-static bool br_evidence_write_frame(FILE *fp, uint16_t type,
-                                    const GByteArray *payload)
-{
-    if (payload->len > BR_EVIDENCE_MAX_FRAME) return false;
-    GByteArray *header = g_byte_array_sized_new(
-        BR_EVIDENCE_FRAME_HEADER_SIZE);
-    br_evidence_append_u32(header, payload->len);
-    br_evidence_append_u16(header, type);
-    br_evidence_append_u16(header, 0);
-    uint32_t crc = br_evidence_frame_crc(type, 0, payload->data, payload->len);
-    uint8_t checksum[4] = {
-        (uint8_t)crc, (uint8_t)(crc >> 8),
-        (uint8_t)(crc >> 16), (uint8_t)(crc >> 24),
-    };
-    bool ok = fwrite(header->data, 1, header->len, fp) == header->len &&
-              fwrite(payload->data, 1, payload->len, fp) == payload->len &&
-              fwrite(checksum, 1, sizeof(checksum), fp) == sizeof(checksum) &&
-              fflush(fp) == 0;
-    g_byte_array_free(header, TRUE);
-    return ok;
-}
 
 /* Parse E9_EXCLUDE_RANGES: a canonical comma-separated list of half-open
  * intervals.  Missing or empty initializes an empty collection.  A
@@ -830,423 +370,6 @@ static void exit_with_status(int status) {
     exit(status);
 }
 
-typedef struct BinradarExprParser {
-    const char *cursor;
-    GArray *nodes;
-    uint32_t depth;
-} BinradarExprParser;
-
-static bool binradar_parse_u64(const char **cursor, uint64_t *value)
-{
-    const char *p = *cursor;
-    uint64_t result = 0;
-    if (*p < '0' || *p > '9') return false;
-    do {
-        uint32_t digit = (uint32_t)(*p - '0');
-        if (result > (UINT64_MAX - digit) / 10u) return false;
-        result = result * 10u + digit;
-        p++;
-    } while (*p >= '0' && *p <= '9');
-    *cursor = p;
-    *value = result;
-    return true;
-}
-
-static bool binradar_parse_expr(BinradarExprParser *parser,
-                                uint32_t *index_out)
-{
-    BinradarExprNode node = {0};
-    uint64_t number;
-    char op;
-    if (parser->depth++ >= BRCACHE_MAX_EXPR_DEPTH ||
-        *parser->cursor == '\0') {
-        parser->depth--;
-        return false;
-    }
-    op = *parser->cursor++;
-    if (op == 'p' || op == 'n' || op == 'v') {
-        if (!binradar_parse_u64(&parser->cursor, &number)) goto invalid;
-        if (op == 'v') {
-            if (number > 15) goto invalid;
-            node.op = BRCACHE_EXPR_VARIABLE;
-            node.variable = (uint16_t)number;
-        } else {
-            node.op = BRCACHE_EXPR_LITERAL;
-            node.literal = (int64_t)(op == 'n' ? 0u - number : number);
-        }
-    } else if (op == '~') {
-        node.op = BRCACHE_EXPR_NOT;
-        if (!binradar_parse_expr(parser, &node.left)) goto invalid;
-    } else {
-        switch (op) {
-        case '=': node.op = BRCACHE_EXPR_EQ; break;
-        case '!': node.op = BRCACHE_EXPR_NE; break;
-        case '>':
-            node.op = *parser->cursor == '=' ? BRCACHE_EXPR_GE
-                                              : BRCACHE_EXPR_GT;
-            if (*parser->cursor == '=') parser->cursor++;
-            break;
-        case '<':
-            node.op = *parser->cursor == '=' ? BRCACHE_EXPR_LE
-                                              : BRCACHE_EXPR_LT;
-            if (*parser->cursor == '=') parser->cursor++;
-            break;
-        case '+': node.op = BRCACHE_EXPR_ADD; break;
-        case '-': node.op = BRCACHE_EXPR_SUB; break;
-        case '*': node.op = BRCACHE_EXPR_MUL; break;
-        case '/': node.op = BRCACHE_EXPR_DIV; break;
-        case '%': node.op = BRCACHE_EXPR_REM; break;
-        case '&': node.op = BRCACHE_EXPR_AND; break;
-        case '|': node.op = BRCACHE_EXPR_OR; break;
-        case '^': node.op = BRCACHE_EXPR_XOR; break;
-        case 'l': node.op = BRCACHE_EXPR_SHL; break;
-        case 'r': node.op = BRCACHE_EXPR_SHR; break;
-        default: goto invalid;
-        }
-        if (!binradar_parse_expr(parser, &node.left) ||
-            !binradar_parse_expr(parser, &node.right)) goto invalid;
-    }
-    g_array_append_val(parser->nodes, node);
-    *index_out = parser->nodes->len - 1;
-    parser->depth--;
-    return true;
-invalid:
-    parser->depth--;
-    return false;
-}
-
-static bool binradar_parse_generic_predicate(BinradarCachePredicate *predicate,
-                                             const char *descriptor)
-{
-    BinradarExprParser parser = {0};
-    parser.cursor = descriptor;
-    parser.nodes = g_array_new(FALSE, FALSE, sizeof(BinradarExprNode));
-    if (!binradar_parse_expr(&parser, &predicate->expr_root) ||
-        *parser.cursor != '\0') {
-        g_array_free(parser.nodes, TRUE);
-        return false;
-    }
-    predicate->expr_nodes = parser.nodes;
-    return true;
-}
-
-static bool binradar_parse_decimal_u32(const char **cursor, uint32_t *value)
-{
-    uint64_t parsed;
-    if (!binradar_parse_u64(cursor, &parsed) || parsed > UINT32_MAX) {
-        return false;
-    }
-    *value = (uint32_t)parsed;
-    return true;
-}
-
-static bool binradar_parse_cwe_predicate(BinradarCachePredicate *predicate,
-                                         const char *descriptor)
-{
-    const char *p = descriptor;
-    uint32_t value;
-    if (p[0] != 'c' || (p[1] != '1' && p[1] != '2')) return false;
-    predicate->cwe_kind = (uint8_t)(p[1] - '0');
-    p += 2;
-    if (*p == 'p') {
-        p++;
-        predicate->cell_kind = BRCACHE_CELL_REGISTER;
-        if (!binradar_parse_decimal_u32(&p, &value) || value > 15) {
-            return false;
-        }
-        predicate->cell_index = value;
-    } else if (*p == 's') {
-        p++;
-        if (!binradar_parse_decimal_u32(&p, &value) || *p++ != 'i') {
-            return false;
-        }
-        switch (value) {
-        case 8: predicate->cell_kind = BRCACHE_CELL_STACK8; break;
-        case 16: predicate->cell_kind = BRCACHE_CELL_STACK16; break;
-        case 32: predicate->cell_kind = BRCACHE_CELL_STACK32; break;
-        case 64: predicate->cell_kind = BRCACHE_CELL_STACK64; break;
-        default: return false;
-        }
-        if (!binradar_parse_decimal_u32(&p, &predicate->cell_index)) {
-            return false;
-        }
-    } else {
-        return false;
-    }
-    if (predicate->cwe_kind == 1) {
-        if (predicate->cell_kind != BRCACHE_CELL_REGISTER &&
-            predicate->cell_kind != BRCACHE_CELL_STACK64) return false;
-        predicate->scale = 1;
-    } else {
-        if (predicate->cell_kind == BRCACHE_CELL_STACK64 || *p++ != 'q' ||
-            !binradar_parse_decimal_u32(&p, &value) ||
-            (value != 1 && value != 2 && value != 4 && value != 8)) {
-            return false;
-        }
-        predicate->scale = (uint8_t)value;
-    }
-    return *p == '\0';
-}
-
-static bool binradar_qnum_positive_u32(QObject *obj, uint32_t *value)
-{
-    QNum *number = qobject_to(QNum, obj);
-    uint64_t parsed;
-    if (number == NULL || !qnum_get_try_uint(number, &parsed) ||
-        parsed == 0 || parsed > UINT32_MAX) return false;
-    *value = (uint32_t)parsed;
-    return true;
-}
-
-static bool binradar_manager_load_manifest(BinradarManager *manager,
-                                           const char *path)
-{
-    gchar *content = NULL;
-    gsize content_len = 0;
-    GError *file_error = NULL;
-    Error *json_error = NULL;
-    QObject *root = NULL;
-    bool ok = false;
-    size_t max_descriptor = 0;
-
-    if (!g_file_get_contents(path, &content, &content_len, &file_error)) {
-        log_msg("[binradar] [cache-manifest] [error %s]\n",
-                file_error != NULL ? file_error->message : "read failed");
-        goto out;
-    }
-    root = qobject_from_json_with_token_limit(
-        content, BRCACHE_MAX_MANIFEST_TOKENS, &json_error);
-    if (root == NULL) {
-        goto out;
-    }
-    QDict *dict = qobject_to(QDict, root);
-    if (dict == NULL || qdict_get_try_int(dict, "version", -1) != 1) {
-        log_msg("[binradar] [cache-manifest] [error invalid-version]\n");
-        goto out;
-    }
-    const char *kind = qdict_get_try_str(dict, "kind");
-    if (kind != NULL && strcmp(kind, "generic-erm") == 0) {
-        manager->cache_family = BRCACHE_FAMILY_GENERIC;
-    } else if (kind != NULL && strcmp(kind, "CWE805-erm") == 0) {
-        manager->cache_family = BRCACHE_FAMILY_CWE805;
-    } else {
-        log_msg("[binradar] [cache-manifest] [error invalid-family]\n");
-        goto out;
-    }
-    QList *rows = qobject_to(QList, qdict_get(dict, "predicates"));
-    if (rows == NULL || qlist_size(rows) > UINT32_MAX - 1u) {
-        log_msg("[binradar] [cache-manifest] [error invalid-predicates]\n");
-        goto out;
-    }
-    manager->cache_predicate_count = (uint32_t)qlist_size(rows);
-    manager->cache_predicates = g_new0(BinradarCachePredicate,
-                                       manager->cache_predicate_count + 1u);
-    const QListEntry *entry;
-    uint32_t expected_id = 1;
-    QLIST_FOREACH_ENTRY(rows, entry) {
-        QDict *row = qobject_to(QDict, qlist_entry_obj(entry));
-        uint32_t id, source_line;
-        if (row == NULL ||
-            !binradar_qnum_positive_u32(qdict_get(row, "id"), &id) ||
-            id != expected_id ||
-            !binradar_qnum_positive_u32(qdict_get(row, "source_line"),
-                                        &source_line)) {
-            log_msg("[binradar] [cache-manifest] [error invalid-row] "
-                    "[index %u]\n", expected_id);
-            goto out;
-        }
-        const char *descriptor = qdict_get_try_str(row, "descriptor");
-        size_t descriptor_len = descriptor != NULL ? strlen(descriptor) : 0;
-        if (descriptor_len == 0 || descriptor_len > BRCACHE_MAX_DESCRIPTOR) {
-            log_msg("[binradar] [cache-manifest] [error descriptor-size] "
-                    "[id %u]\n", id);
-            goto out;
-        }
-        BinradarCachePredicate *predicate = &manager->cache_predicates[id];
-        predicate->descriptor = g_strdup(descriptor);
-        bool parsed = manager->cache_family == BRCACHE_FAMILY_GENERIC
-            ? binradar_parse_generic_predicate(predicate, descriptor)
-            : binradar_parse_cwe_predicate(predicate, descriptor);
-        if (!parsed) {
-            log_msg("[binradar] [cache-manifest] [error descriptor-grammar] "
-                    "[id %u]\n", id);
-            goto out;
-        }
-        max_descriptor = MAX(max_descriptor, descriptor_len);
-        expected_id++;
-    }
-    for (uint32_t i = 0; i < manager->patch_cnt; i++) {
-        uint32_t id = manager->patch_list != NULL ? manager->patch_list[i]
-                                                  : i + 1u;
-        if (id == 0 || id > manager->cache_predicate_count ||
-            manager->cache_predicates[id].descriptor == NULL) {
-            log_msg("[binradar] [cache-manifest] [error missing-active-id] "
-                    "[id %u]\n", id);
-            goto out;
-        }
-    }
-    manager->selector_size = offsetof(BinradarPatchSelector, descriptor) +
-                             max_descriptor + 1u;
-    if (manager->selector_size < sizeof(BinradarPatchSelector)) {
-        manager->selector_size = sizeof(BinradarPatchSelector);
-    }
-    ok = true;
-    log_msg("[binradar] [cache-manifest] [loaded] [family %s] "
-            "[predicates %u] [selector-size %zu]\n", kind,
-            manager->cache_predicate_count, manager->selector_size);
-out:
-    if (json_error != NULL) {
-        log_msg("[binradar] [cache-manifest] [json-error %s]\n",
-                error_get_pretty(json_error));
-        error_free(json_error);
-    }
-    if (file_error != NULL) g_error_free(file_error);
-    qobject_unref(root);
-    g_free(content);
-    return ok;
-}
-
-static void binradar_manager_install_filter(BinradarManager *manager,
-                                             GArray *ids,
-                                             const char *path)
-{
-    if (ids->len == 0) {
-        log_msg("[binradar] [patch-filter] [no-survivors] [file %s]\n", path);
-        manager->patch_cnt = 0;
-        manager->patch_max_id = 0;
-        return;
-    }
-    manager->patch_list = g_new(uint32_t, ids->len);
-    uint32_t max_id = 0;
-    for (guint i = 0; i < ids->len; i++) {
-        uint32_t patch = g_array_index(ids, uint32_t, i);
-        manager->patch_list[i] = patch;
-        max_id = MAX(max_id, patch);
-    }
-    manager->patch_cnt = ids->len;
-    manager->patch_max_id = max_id;
-    log_msg("[binradar] [patch-filter] [file %s] [cnt %u] [max-id %u]\n",
-            path, manager->patch_cnt, manager->patch_max_id);
-}
-
-static bool binradar_manager_load_filter_binary(BinradarManager *manager,
-                                                 const char *path,
-                                                 const uint8_t *data,
-                                                 size_t size)
-{
-    if (size < BR_EVIDENCE_HEADER_SIZE + BR_EVIDENCE_FRAME_HEADER_SIZE + 4u ||
-        memcmp(data, BR_EVIDENCE_MAGIC, 8) != 0 ||
-        br_evidence_read_u16(data + 8) != BR_EVIDENCE_VERSION ||
-        br_evidence_read_u16(data + 10) != BR_EVIDENCE_KIND_FILTER ||
-        br_evidence_read_u32(data + 12) != 0) {
-        return false;
-    }
-    const uint8_t *frame = data + BR_EVIDENCE_HEADER_SIZE;
-    uint32_t length = br_evidence_read_u32(frame);
-    uint16_t type = br_evidence_read_u16(frame + 4);
-    uint16_t flags = br_evidence_read_u16(frame + 6);
-    size_t expected_size = BR_EVIDENCE_HEADER_SIZE +
-        BR_EVIDENCE_FRAME_HEADER_SIZE + (size_t)length + 4u;
-    if (length > BR_EVIDENCE_MAX_FRAME || expected_size != size ||
-        type != BR_EVIDENCE_RECORD_FILTER || flags != 0 || length < 12u) {
-        return false;
-    }
-    const uint8_t *payload = frame + BR_EVIDENCE_FRAME_HEADER_SIZE;
-    uint32_t expected_crc = br_evidence_read_u32(payload + length);
-    if (br_evidence_frame_crc(type, flags, payload, length) != expected_crc) {
-        return false;
-    }
-    uint32_t total = br_evidence_read_u32(payload);
-    uint32_t passed = br_evidence_read_u32(payload + 4);
-    uint32_t bitmap_size = br_evidence_read_u32(payload + 8);
-    if (total == UINT32_MAX ||
-        (uint64_t)bitmap_size != ((uint64_t)total + 7u) / 8u ||
-        length != 12u + bitmap_size) {
-        return false;
-    }
-    const uint8_t *bitmap = payload + 12;
-    if (total % 8u != 0 && bitmap_size > 0 &&
-        (bitmap[bitmap_size - 1u] >> (total % 8u)) != 0) {
-        return false;
-    }
-    GArray *ids = g_array_sized_new(FALSE, FALSE, sizeof(uint32_t), passed);
-    for (uint32_t patch = 1; patch <= total; patch++) {
-        if (bitmap[(patch - 1u) / 8u] & (1u << ((patch - 1u) % 8u))) {
-            g_array_append_val(ids, patch);
-        }
-    }
-    if (ids->len != passed || passed != manager->patch_cnt) {
-        g_array_free(ids, TRUE);
-        return false;
-    }
-    binradar_manager_install_filter(manager, ids, path);
-    g_array_free(ids, TRUE);
-    return true;
-}
-
-static void binradar_manager_load_filter(BinradarManager *manager,
-                                         const char *path)
-{
-    gchar *contents = NULL;
-    gsize size = 0;
-    if (!g_file_get_contents(path, &contents, &size, NULL)) {
-        log_msg("[binradar] [patch-filter] [error read] [file %s]\n", path);
-        exit_with_status(1);
-    }
-    if (size >= 8 && memcmp(contents, BR_EVIDENCE_MAGIC, 8) == 0) {
-        bool ok = binradar_manager_load_filter_binary(
-            manager, path, (const uint8_t *)contents, size);
-        g_free(contents);
-        if (!ok) {
-            log_msg("[binradar] [patch-filter] [error binary] [file %s]\n",
-                    path);
-            exit_with_status(1);
-        }
-        return;
-    }
-    g_free(contents);
-
-    FILE *fp = fopen(path, "r");
-    if (fp == NULL) {
-        log_msg("[binradar] [patch-filter] [error open] [file %s]\n", path);
-        exit_with_status(1);
-    }
-    sbsv_parser *parser = sbsv_parser_new(SBSV_PARSER_DEFAULT);
-    sbsv_parser_add_schema(parser, "[patch] [id: int] [pass: bool]");
-    sbsv_status status = sbsv_parser_load_file(parser, fp);
-    fclose(fp);
-    if (status != SBSV_OK) {
-        log_msg("[binradar] [patch-filter] [error parse] [file %s] "
-                "[status %s]\n", path, sbsv_status_str(status));
-        sbsv_parser_free(parser);
-        exit_with_status(1);
-    }
-    const sbsv_row **rows = NULL;
-    size_t count = 0;
-    if (sbsv_parser_get_rows(parser, "patch", &rows, &count) != SBSV_OK) {
-        sbsv_parser_free(parser);
-        exit_with_status(1);
-    }
-    GArray *ids = g_array_new(FALSE, FALSE, sizeof(uint32_t));
-    for (size_t i = 0; i < count; i++) {
-        long long id = sbsv_row_get_int(rows[i], "id", NULL);
-        int pass = sbsv_row_get_bool(rows[i], "pass", NULL);
-        if (pass && id > 0 && (uint64_t)id <= UINT32_MAX) {
-            uint32_t patch = (uint32_t)id;
-            g_array_append_val(ids, patch);
-        }
-    }
-    sbsv_free_row_ref_array(rows);
-    sbsv_parser_free(parser);
-    if (ids->len != manager->patch_cnt) {
-        g_array_free(ids, TRUE);
-        log_msg("[binradar] [patch-filter] [error count] [file %s]\n", path);
-        exit_with_status(1);
-    }
-    binradar_manager_install_filter(manager, ids, path);
-    g_array_free(ids, TRUE);
-}
-
 void snapshot_init_binradar_patch_shm(uintptr_t key) {
     const char *var;
     size_t shm_size = sizeof(uint32_t) * 2u;
@@ -1263,8 +386,9 @@ void snapshot_init_binradar_patch_shm(uintptr_t key) {
     binradar_manager->patch_cnt = (uint32_t)atoi(var);
     binradar_manager->patch_max_id = binradar_manager->patch_cnt;
     var = getenv("BINRADAR_PATCH_FILTER_FILE");
-    if (var != NULL && var[0] != '\0') {
-        binradar_manager_load_filter(binradar_manager, var);
+    if (var != NULL && var[0] != '\0' &&
+        !binradar_cache_load_filter(binradar_manager, var)) {
+        exit_with_status(1);
     }
 
     var = getenv("BINRADAR_EVIDENCE_FILE");
@@ -1291,7 +415,7 @@ void snapshot_init_binradar_patch_shm(uintptr_t key) {
         const char *cache_fd = getenv("BINRADAR_PATCH_CACHED_FD_R");
         if (manifest == NULL || manifest[0] == '\0' || cache_fd == NULL ||
             atoi(cache_fd) <= 2 ||
-            !binradar_manager_load_manifest(binradar_manager, manifest)) {
+            !binradar_cache_load_manifest(binradar_manager, manifest)) {
             log_msg("[binradar] [cache-manifest] [fatal configuration]\n");
             exit_with_status(1);
         }
@@ -1395,7 +519,7 @@ void snapshot_init_binradar_patch_shm(uintptr_t key) {
         exit_with_status(1);
     }
     binradar_manager->patch_fd_r = atoi(var);
-    binradar_manager->current = binradar_manager_alloc_one_iter(
+    binradar_manager->current = binradar_cache_new_iteration(
         binradar_manager);
     binradar_manager->patch_result_parser = sbsv_parser_new(
         SBSV_PARSER_DEFAULT);
@@ -1803,8 +927,8 @@ void snapshot_record_guest_normal_exit(CPUArchState *cpu_env, int exit_code, con
 	        binradar_entrypoint_hit_count);
 	snapshot_log_cursor_indices(info);
     if (binradar_manager) {
-        int patch_id = binradar_manager_cur_patch_id(binradar_manager, -1);
-        int iter = binradar_manager_cur_iter(binradar_manager, -1);
+        int patch_id = binradar_cache_patch_id(binradar_manager, -1);
+        int iter = binradar_cache_iteration(binradar_manager, -1);
         log_msg("[binradar] [normal] [iter %d] [patch %d] [guest_pc %lx] [guest_cs_base %lx] [reason %s]\n",
                   iter, patch_id, info->guest_pc, info->guest_cs_base, reason ? reason : "normal_exit");
     }
@@ -1843,8 +967,8 @@ void snapshot_record_guest_crash(CPUArchState *cpu_env, int target_signal, int h
 	log_msg("[snapshot] [crash] [hit-count %lu] [reason %s] [guest_pc %lx] [guest_cs_base %lx] [fault_addr %lx] [host_fault_addr %lx]\n",
 	            binradar_entrypoint_hit_count, buffer, info->guest_pc, info->guest_cs_base, info->fault_addr, info->host_fault_addr);
     if (binradar_manager) {
-        int patch_id = binradar_manager_cur_patch_id(binradar_manager, -1);
-        int iter = binradar_manager_cur_iter(binradar_manager, -1);
+        int patch_id = binradar_cache_patch_id(binradar_manager, -1);
+        int iter = binradar_cache_iteration(binradar_manager, -1);
         log_msg("[binradar] [crash] [iter %d] [patch %d] [guest_pc %lx] [guest_cs_base %lx] [fault_addr %lx] [host_fault_addr %lx] [reason %s]\n",
                   iter, patch_id, info->guest_pc, info->guest_cs_base, info->fault_addr, info->host_fault_addr, buffer);
     }
@@ -2842,13 +1966,11 @@ void snapshot_init(void) {
     g_snapshot.is_snapshot_taken = false;
     // g_snapshot.cpu_state = malloc(sizeof(CPUArchState));
     // memset(g_snapshot.cpu_state, 0, sizeof(CPUArchState));
-    size_t shm_size = sizeof(SharedTraceData);
-    shared_trace_data = mmap(NULL, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-    if (shared_trace_data == MAP_FAILED) {
+    shared_trace_data = snapshot_observation_create_shared();
+    if (shared_trace_data == NULL) {
         log_msg("mmap shared memory failed");
         exit_with_status(1);
     }
-    memset(shared_trace_data, 0, shm_size);
     /* Load binradar env vars early so binradar_memcheck_enabled is set
      * before any memory access instrumentation runs. */
     snapshot_load_binradar_env();
@@ -3695,72 +2817,6 @@ static int64_t snapshot_expr_index_from_ptr(const Expr *expr)
     return (int64_t)((value - base) / sizeof(Expr));
 }
 
-static SnapshotMutationPlan *snapshot_mutation_new_descriptor(
-    target_ulong addr, uint32_t size, int64_t expr_index,
-    int64_t query_index, SnapshotMutationKind kind, const uint8_t *value,
-    uint64_t target_extent, const uint8_t *target_bytes)
-{
-    if (size == 0 || size > sizeof(((SnapshotMutationWrite *)0)->value)) {
-        return NULL;
-    }
-    switch (kind) {
-    case SNAPSHOT_MUTATION_BYTES:
-    case SNAPSHOT_MUTATION_POINTER_NULL:
-    case SNAPSHOT_MUTATION_POINTER_OOB:
-    case SNAPSHOT_MUTATION_POINTER_FRESH:
-        break;
-    default:
-        return NULL;
-    }
-    if (addr < SNAPSHOT_PAGE_SIZE && addr >= CPU_NB_REGS) {
-        return NULL;
-    }
-    if (kind != SNAPSHOT_MUTATION_BYTES && size != sizeof(target_ulong)) {
-        return NULL;
-    }
-    if (kind == SNAPSHOT_MUTATION_POINTER_FRESH) {
-        if (target_extent == 0 || target_extent > SNAPSHOT_PAGE_SIZE ||
-            target_bytes == NULL || target_extent > SIZE_MAX) {
-            return NULL;
-        }
-    } else if (target_extent != 0 || target_bytes != NULL) {
-        return NULL;
-    }
-
-    SnapshotMutationPlan *plan = snapshot_mutation_try_malloc0(sizeof(*plan));
-    if (plan == NULL) {
-        return NULL;
-    }
-    plan->num_mods = 1;
-    plan->mods = snapshot_mutation_try_malloc0(sizeof(*plan->mods));
-    if (plan->mods == NULL) {
-        snapshot_mutation_free(plan);
-        return NULL;
-    }
-
-    SnapshotMutationWrite *write = &plan->mods[0];
-    write->kind = kind;
-    write->addr = addr;
-    write->size = size;
-    write->expr_index = expr_index;
-    write->query_index = query_index;
-    if (value != NULL) {
-        memcpy(write->value, value, sizeof(write->value));
-    }
-
-    if (kind == SNAPSHOT_MUTATION_POINTER_FRESH) {
-        write->target.extent = target_extent;
-        write->target.bytes = snapshot_mutation_try_malloc(
-            (size_t)target_extent);
-        if (write->target.bytes == NULL) {
-            snapshot_mutation_free(plan);
-            return NULL;
-        }
-        memcpy(write->target.bytes, target_bytes, (size_t)target_extent);
-    }
-    return plan;
-}
-
 static SnapshotMutationPlan *snapshot_mutation_new(
     const MutationCandidate *candidate, SnapshotMutationKind kind,
     const uint8_t *value, uint32_t size, uint64_t target_extent,
@@ -3774,446 +2830,6 @@ static SnapshotMutationPlan *snapshot_mutation_new(
         (target_ulong)candidate->addr, size,
         snapshot_expr_index_from_ptr(candidate->expr), -1, kind,
         source_value, target_extent, target_bytes);
-}
-
-static bool snapshot_mutation_enqueue_plan_array(
-    GQueue *queue, SnapshotMutationPlan **plans, size_t count)
-{
-    if (queue == NULL || plans == NULL || count == 0 ||
-        count > SIZE_MAX / sizeof(GList *)) {
-        snapshot_mutation_free_batch(plans, count);
-        return false;
-    }
-
-    GList **links = snapshot_mutation_try_malloc0(count * sizeof(*links));
-    if (links == NULL) {
-        snapshot_mutation_free_batch(plans, count);
-        return false;
-    }
-    for (size_t i = 0; i < count; i++) {
-        if (plans[i] == NULL) {
-            for (size_t j = 0; j < i; j++) g_list_free_1(links[j]);
-            g_free(links);
-            snapshot_mutation_free_batch(plans, count);
-            return false;
-        }
-        links[i] = snapshot_mutation_try_list_alloc();
-        if (links[i] == NULL) {
-            for (size_t j = 0; j < i; j++) g_list_free_1(links[j]);
-            g_free(links);
-            snapshot_mutation_free_batch(plans, count);
-            return false;
-        }
-        links[i]->data = plans[i];
-    }
-
-    /* All links and plan ownership are complete before queue mutation. */
-    for (size_t i = 0; i < count; i++) {
-        g_queue_push_tail_link(queue, links[i]);
-        plans[i] = NULL;
-    }
-    g_free(links);
-    return true;
-}
-
-static bool snapshot_mutation_enqueue_batch(GQueue *queue,
-                                             SnapshotMutationPlan **plans,
-                                             uint32_t count)
-{
-    return snapshot_mutation_enqueue_plan_array(queue, plans, count);
-}
-
-static bool snapshot_mutation_enqueue_one(GQueue *queue,
-                                           SnapshotMutationPlan *plan)
-{
-    SnapshotMutationPlan *batch[] = {plan};
-    return snapshot_mutation_enqueue_batch(queue, batch, 1);
-}
-
-/* Per-advisor family quota.  Advisor 1 is compact OSPREY and advisor 2 is
- * symbolic boundary advice; each gets its own 4,096 slots so an advisor can
- * never consume another advisor's allocation.  The combined cap is the sum,
- * which keeps mode `off` byte-identical for OSPREY: a disabled advisor
- * reserves nothing and the OSPREY quota is unchanged. */
-#define SNAPSHOT_MUTATION_MAX_SPECIALIZED_FAMILIES 4096u
-#define SNAPSHOT_MUTATION_MAX_COMBINED_FAMILIES 8192u
-#define SNAPSHOT_MUTATION_MAX_SPECIALIZED_VARIANTS 64u
-#define SNAPSHOT_MUTATION_MAX_SPECIALIZED_WRITES 64u
-
-/* Families already admitted for one advisor, counted over accepted copies.
- * Duplicate descriptors are not counted because they are not admitted. */
-static uint32_t snapshot_mutation_advisor_family_count(
-    const SnapshotMutationCoordinator *coordinator, uint32_t advisor_id)
-{
-    uint32_t count = 0;
-    if (coordinator == NULL || coordinator->families == NULL) return 0;
-    for (guint i = 0; i < coordinator->families->len; i++) {
-        const SnapshotMutationProposalFamily *family =
-            g_ptr_array_index(coordinator->families, i);
-        if (family->advisor_id == advisor_id) count++;
-    }
-    return count;
-}
-
-static bool snapshot_mutation_token_equal(
-    SnapshotMutationSourceToken a, SnapshotMutationSourceToken b)
-{
-    return a.run_epoch == b.run_epoch &&
-           a.source_ordinal == b.source_ordinal;
-}
-
-static const SnapshotMutationBaselineEntry *snapshot_mutation_lookup_entry(
-    const SnapshotMutationBaseline *baseline,
-    SnapshotMutationSourceToken token)
-{
-    const SnapshotMutationBaselineEntry *entry;
-
-    if (baseline == NULL || baseline->entries == NULL ||
-        token.run_epoch != baseline->run_epoch ||
-        token.source_ordinal >= baseline->entry_count) {
-        return NULL;
-    }
-    entry = &baseline->entries[token.source_ordinal];
-    return snapshot_mutation_token_equal(entry->token, token) ? entry : NULL;
-}
-
-static void snapshot_mutation_proposal_family_free(gpointer data)
-{
-    SnapshotMutationProposalFamily *family = data;
-    if (family == NULL) return;
-    if (family->variants != NULL) {
-        for (uint32_t vi = 0; vi < family->variant_count; vi++) {
-            SnapshotMutationProposalVariant *variant = &family->variants[vi];
-            if (variant->writes != NULL) {
-                for (uint32_t wi = 0; wi < variant->write_count; wi++) {
-                    g_free((void *)variant->writes[wi].target_bytes);
-                }
-                g_free(variant->writes);
-            }
-        }
-        g_free(family->variants);
-    }
-    g_free(family);
-}
-
-static bool snapshot_mutation_memory_interval(
-    const SnapshotMutationBaselineEntry *entry, uint32_t size,
-    uint64_t *end_out)
-{
-    uint64_t end;
-    if (entry == NULL || size == 0 || entry->addr < SNAPSHOT_PAGE_SIZE) {
-        return false;
-    }
-    if ((uint64_t)entry->addr > UINT64_MAX - size) return false;
-    end = (uint64_t)entry->addr + size;
-    if (end <= (uint64_t)entry->addr) return false;
-    if (end_out != NULL) *end_out = end;
-    return true;
-}
-
-static bool snapshot_mutation_proposal_validate(
-    const SnapshotMutationCoordinator *coordinator,
-    const SnapshotMutationProposalFamily *family)
-{
-    const SnapshotMutationBaselineEntry *primary;
-    const bool observed_read =
-        family != NULL &&
-        family->seed_semantics == SNAPSHOT_MUTATION_SEED_OBSERVED_READ;
-
-    if (coordinator == NULL || coordinator->baseline == NULL ||
-        family == NULL || family->advisor_id == 0 ||
-        family->variants == NULL || family->variant_count == 0 ||
-        family->variant_count > SNAPSHOT_MUTATION_MAX_SPECIALIZED_VARIANTS ||
-        (family->seed_semantics != SNAPSHOT_MUTATION_SEED_SNAPSHOT_STATE &&
-         !observed_read)) {
-        return false;
-    }
-    primary = snapshot_mutation_lookup_entry(coordinator->baseline,
-                                             family->primary_seed);
-    if (primary == NULL || !primary->typed_eligible || primary->protected_addr) {
-        return false;
-    }
-    /* An observed-read family proposes values synthesized from the bytes the
-     * baseline child actually loaded.  Without a finalized observation there
-     * is no source of truth to lower a candidate through, so the whole family
-     * is rejected rather than silently falling back to generic semantics. */
-    if (observed_read &&
-        (!primary->observed_read_valid ||
-         (primary->size != 1 && primary->size != 2 &&
-          primary->size != 4 && primary->size != sizeof(target_ulong)) ||
-         primary->lane != SNAPSHOT_MUTATION_LANE_PRIMITIVE)) {
-        return false;
-    }
-
-    for (uint32_t vi = 0; vi < family->variant_count; vi++) {
-        const SnapshotMutationProposalVariant *variant = &family->variants[vi];
-        uint32_t primary_count = 0;
-        if (variant->writes == NULL || variant->write_count == 0 ||
-            variant->write_count > SNAPSHOT_MUTATION_MAX_SPECIALIZED_WRITES) {
-            return false;
-        }
-        for (uint32_t prior_vi = 0; prior_vi < vi; prior_vi++) {
-            if (family->variants[prior_vi].variant_id == variant->variant_id) {
-                return false;
-            }
-        }
-        for (uint32_t wi = 0; wi < variant->write_count; wi++) {
-            const SnapshotMutationProposalWrite *write = &variant->writes[wi];
-            const SnapshotMutationBaselineEntry *entry =
-                snapshot_mutation_lookup_entry(coordinator->baseline,
-                                               write->destination);
-            uint64_t begin_a = 0, end_a = 0;
-            if (entry == NULL || !entry->typed_eligible || entry->protected_addr ||
-                write->size == 0 ||
-                write->size > sizeof(write->value) ||
-                (entry->addr >= SNAPSHOT_PAGE_SIZE &&
-                 !snapshot_mutation_memory_interval(entry, write->size,
-                                                    &end_a))) {
-                return false;
-            }
-            if (observed_read && write->kind != SNAPSHOT_MUTATION_BYTES) {
-                return false;
-            }
-            if (wi > 0 &&
-                variant->writes[wi - 1].destination.source_ordinal >=
-                    write->destination.source_ordinal) {
-                return false;
-            }
-            if (snapshot_mutation_token_equal(write->destination,
-                                              family->primary_seed)) {
-                primary_count++;
-                if (write->size != primary->size) return false;
-                if (observed_read) {
-                    /* Boundary advice rewrites observed scalar memory with a
-                     * synthesized scalar.  A pointer-family write would
-                     * replace compact OSPREY's ownership of pointer
-                     * alternatives, and the value must differ from both the
-                     * physical baseline bytes and the bytes the child
-                     * actually read, or the child would observe no change. */
-                    if (write->kind != SNAPSHOT_MUTATION_BYTES) return false;
-                    if (memcmp(write->value, primary->observed_read_bytes,
-                               write->size) == 0) {
-                        return false;
-                    }
-                }
-                if (write->kind != SNAPSHOT_MUTATION_POINTER_FRESH &&
-                    memcmp(write->value, primary->planner_bytes,
-                           write->size) == 0) {
-                    return false;
-                }
-                if (write->kind == SNAPSHOT_MUTATION_POINTER_FRESH) {
-                    for (uint32_t bi = 0; bi < primary->size; bi++) {
-                        if (primary->planner_bytes[bi] != 0) return false;
-                    }
-                }
-            }
-            switch (write->kind) {
-            case SNAPSHOT_MUTATION_BYTES:
-                if (write->target_extent != 0 || write->target_bytes != NULL ||
-                    memcmp(write->value, entry->planner_bytes,
-                           write->size) == 0) {
-                    return false;
-                }
-                break;
-            case SNAPSHOT_MUTATION_POINTER_NULL:
-            case SNAPSHOT_MUTATION_POINTER_OOB:
-                if (entry->size != sizeof(target_ulong) ||
-                    write->size != sizeof(target_ulong) ||
-                    write->target_extent != 0 || write->target_bytes != NULL ||
-                    memcmp(write->value, entry->planner_bytes,
-                           write->size) == 0) {
-                    return false;
-                }
-                break;
-            case SNAPSHOT_MUTATION_POINTER_FRESH:
-                if (entry->size != sizeof(target_ulong) ||
-                    write->size != sizeof(target_ulong) ||
-                    write->target_extent == 0 ||
-                    write->target_extent > SNAPSHOT_PAGE_SIZE ||
-                    write->target_bytes == NULL) {
-                    return false;
-                }
-                break;
-            default:
-                return false;
-            }
-            if (entry->addr < SNAPSHOT_PAGE_SIZE) {
-                if (entry->addr >= CPU_NB_REGS) return false;
-                for (uint32_t other = 0; other < wi; other++) {
-                    const SnapshotMutationProposalWrite *previous =
-                        &variant->writes[other];
-                    const SnapshotMutationBaselineEntry *previous_entry =
-                        snapshot_mutation_lookup_entry(
-                            coordinator->baseline, previous->destination);
-                    if (previous_entry != NULL &&
-                        previous_entry->addr == entry->addr) {
-                        return false;
-                    }
-                }
-            } else {
-                for (uint32_t other = 0; other < wi; other++) {
-                    const SnapshotMutationProposalWrite *previous =
-                        &variant->writes[other];
-                    const SnapshotMutationBaselineEntry *previous_entry =
-                        snapshot_mutation_lookup_entry(
-                            coordinator->baseline, previous->destination);
-                    uint64_t begin_b, end_b;
-                    if (previous_entry == NULL ||
-                        previous_entry->addr < SNAPSHOT_PAGE_SIZE ||
-                        !snapshot_mutation_memory_interval(previous_entry,
-                                                          previous->size,
-                                                          &end_b)) {
-                        continue;
-                    }
-                    begin_a = (uint64_t)entry->addr;
-                    begin_b = (uint64_t)previous_entry->addr;
-                    if (begin_a < end_b && begin_b < end_a) return false;
-                }
-            }
-        }
-        if (primary_count != 1) return false;
-    }
-    return true;
-}
-
-static SnapshotMutationProposalFamily *snapshot_mutation_proposal_copy(
-    const SnapshotMutationProposalFamily *source)
-{
-    SnapshotMutationProposalFamily *copy;
-
-    if (source == NULL) return NULL;
-    copy = snapshot_mutation_try_malloc0(sizeof(*copy));
-    if (copy == NULL) return NULL;
-    *copy = *source;
-    copy->variants = snapshot_mutation_try_malloc0(
-        (size_t)source->variant_count * sizeof(*copy->variants));
-    if (copy->variants == NULL) {
-        snapshot_mutation_proposal_family_free(copy);
-        return NULL;
-    }
-    for (uint32_t vi = 0; vi < source->variant_count; vi++) {
-        const SnapshotMutationProposalVariant *src = &source->variants[vi];
-        SnapshotMutationProposalVariant *dst = &copy->variants[vi];
-        *dst = *src;
-        dst->writes = snapshot_mutation_try_malloc0(
-            (size_t)src->write_count * sizeof(*dst->writes));
-        if (dst->writes == NULL) {
-            snapshot_mutation_proposal_family_free(copy);
-            return NULL;
-        }
-        for (uint32_t wi = 0; wi < src->write_count; wi++) {
-            const SnapshotMutationProposalWrite *src_write = &src->writes[wi];
-            SnapshotMutationProposalWrite *dst_write = &dst->writes[wi];
-            *dst_write = *src_write;
-            dst_write->target_bytes = NULL;
-            if (src_write->kind == SNAPSHOT_MUTATION_POINTER_FRESH) {
-                if (src_write->target_bytes == NULL ||
-                    src_write->target_extent == 0 ||
-                    src_write->target_extent > SIZE_MAX) {
-                    snapshot_mutation_proposal_family_free(copy);
-                    return NULL;
-                }
-                uint8_t *payload = snapshot_mutation_try_malloc(
-                    (size_t)src_write->target_extent);
-                if (payload == NULL) {
-                    snapshot_mutation_proposal_family_free(copy);
-                    return NULL;
-                }
-                memcpy(payload, src_write->target_bytes,
-                       (size_t)src_write->target_extent);
-                dst_write->target_bytes = payload;
-            }
-        }
-    }
-    return copy;
-}
-
-static bool snapshot_mutation_proposal_same_descriptor(
-    const SnapshotMutationProposalFamily *a,
-    const SnapshotMutationProposalFamily *b)
-{
-    if (a == NULL || b == NULL || a->advisor_id != b->advisor_id ||
-        a->family_id != b->family_id ||
-        !snapshot_mutation_token_equal(a->primary_seed, b->primary_seed) ||
-        a->seed_semantics != b->seed_semantics ||
-        a->variant_count != b->variant_count) {
-        return false;
-    }
-    for (uint32_t vi = 0; vi < a->variant_count; vi++) {
-        const SnapshotMutationProposalVariant *av = &a->variants[vi];
-        const SnapshotMutationProposalVariant *bv = &b->variants[vi];
-        if (av->variant_id != bv->variant_id ||
-            av->write_count != bv->write_count) return false;
-        for (uint32_t wi = 0; wi < av->write_count; wi++) {
-            const SnapshotMutationProposalWrite *aw = &av->writes[wi];
-            const SnapshotMutationProposalWrite *bw = &bv->writes[wi];
-            if (!snapshot_mutation_token_equal(aw->destination,
-                                               bw->destination) ||
-                aw->kind != bw->kind || aw->size != bw->size ||
-                memcmp(aw->value, bw->value, sizeof(aw->value)) != 0 ||
-                aw->target_extent != bw->target_extent ||
-                aw->resolved_raw != bw->resolved_raw ||
-                aw->resolved_end != bw->resolved_end) return false;
-            if (aw->target_extent != 0 &&
-                (aw->target_bytes == NULL || bw->target_bytes == NULL ||
-                 memcmp(aw->target_bytes, bw->target_bytes,
-                        (size_t)aw->target_extent) != 0)) return false;
-        }
-    }
-    return true;
-}
-
-bool snapshot_mutation_sink_submit(
-    SnapshotMutationProposalSink *sink,
-    const SnapshotMutationProposalFamily *family)
-{
-    SnapshotMutationProposalFamily *copy;
-    if (sink == NULL || sink->coordinator == NULL || family == NULL ||
-        family->advisor_id != sink->advisor_id ||
-        family->advisor_priority != sink->advisor_priority ||
-        sink->coordinator->families == NULL ||
-        sink->coordinator->families->len >=
-            SNAPSHOT_MUTATION_MAX_COMBINED_FAMILIES ||
-        snapshot_mutation_advisor_family_count(sink->coordinator,
-                                               sink->advisor_id) >=
-            SNAPSHOT_MUTATION_MAX_SPECIALIZED_FAMILIES ||
-        !snapshot_mutation_proposal_validate(sink->coordinator, family)) {
-        return false;
-    }
-    for (guint i = 0; i < sink->coordinator->families->len; i++) {
-        SnapshotMutationProposalFamily *existing =
-            g_ptr_array_index(sink->coordinator->families, i);
-        if (snapshot_mutation_proposal_same_descriptor(existing, family)) {
-            return true;
-        }
-    }
-    copy = snapshot_mutation_proposal_copy(family);
-    if (copy == NULL) return false;
-    g_ptr_array_add(sink->coordinator->families, copy);
-    return true;
-}
-
-static void snapshot_mutation_baseline_free(
-    SnapshotMutationBaseline *baseline)
-{
-    if (baseline == NULL) return;
-    g_free(baseline->entries);
-    g_free(baseline);
-}
-
-static void snapshot_mutation_coordinator_clear(
-    SnapshotMutationCoordinator *coordinator)
-{
-    if (coordinator == NULL) return;
-    if (coordinator->families != NULL) {
-        g_ptr_array_free(coordinator->families, TRUE);
-        coordinator->families = NULL;
-    }
-    if (coordinator->staged != NULL) {
-        g_ptr_array_free(coordinator->staged, TRUE);
-        coordinator->staged = NULL;
-    }
-    coordinator->baseline = NULL;
 }
 
 /* Modify guest program's state based on mod_manager. */
@@ -4321,158 +2937,114 @@ bool snapshot_mutation_writable_span(target_ulong addr,
     return true;
 }
 
-typedef struct SnapshotMutationChildWrite {
-    SnapshotMutationWrite local;
-    target_ulong before_value;
-    target_ulong fresh_target;
-} SnapshotMutationChildWrite;
+typedef struct SnapshotMutationApplyContext {
+    CPUArchState *cpu_env;
+    int remaining;
+} SnapshotMutationApplyContext;
 
-/* Called after fork to keep clean initial state.  All destination and target
- * checks happen before a register or cell is published.  Fresh mappings may
- * exist in a child that is about to terminate, but no partially applied plan
- * can resume guest execution. */
+static bool snapshot_mutation_child_read_cell(void *opaque,
+                                              target_ulong addr,
+                                              uint32_t size,
+                                              target_ulong *value_out)
+{
+    SnapshotMutationApplyContext *context = opaque;
+    if (context == NULL || context->cpu_env == NULL || value_out == NULL) {
+        return false;
+    }
+    *value_out = 0;
+    if (addr < SNAPSHOT_PAGE_SIZE) {
+        if (addr >= CPU_NB_REGS) return false;
+        *value_out = context->cpu_env->regs[(size_t)addr];
+        return true;
+    }
+    if (!snapshot_mutation_writable_span(addr, size)) return false;
+    memcpy(value_out, g2h(addr), size);
+    return true;
+}
+
+static target_ulong snapshot_mutation_child_allocate_target(
+    void *opaque, uint64_t extent)
+{
+    SnapshotMutationApplyContext *context = opaque;
+    return snapshot_alloc_pointer_target(context->cpu_env, extent);
+}
+
+static bool snapshot_mutation_child_initialize_target(
+    void *opaque, target_ulong target, const uint8_t *bytes, uint64_t extent)
+{
+    SnapshotMutationApplyContext *context = opaque;
+    return snapshot_apply_fresh_target(context->cpu_env, target, bytes, extent);
+}
+
+static bool snapshot_mutation_child_publish_cell(
+    void *opaque, const SnapshotMutationWrite *write, const uint8_t *value)
+{
+    SnapshotMutationApplyContext *context = opaque;
+    CPUArchState *cpu_env = context->cpu_env;
+    if (write->addr < SNAPSHOT_PAGE_SIZE) {
+        target_ulong reg_value = 0;
+        memcpy(&reg_value, value, sizeof(reg_value));
+        cpu_env->regs[(size_t)write->addr] = reg_value;
+        sem_reg_overwrite(cpu_env, (int)write->addr, SEM_OP_SNAPSHOT);
+        log_msg("[mod-reg] [register %ld] [size %ld] [total %d]\n",
+                write->addr, write->size, context->remaining);
+    } else {
+        memcpy(g2h(write->addr), value, write->size);
+        sem_mem_overwrite(cpu_env, write->addr, write->size,
+                          SEM_OP_SNAPSHOT);
+        log_msg("[mod] [addr %lx] [size %ld] [total %d]\n",
+                write->addr, write->size, context->remaining);
+    }
+    return true;
+}
+
+static void snapshot_mutation_child_observe(
+    void *opaque, const SnapshotMutationWrite *write,
+    target_ulong fresh_target, target_ulong before_value, bool applied)
+{
+    (void)opaque;
+    snapshot_test_observe_write(write, fresh_target, before_value, applied);
+}
+
+static const SnapshotMutationApplyHost snapshot_mutation_child_host = {
+    .read_cell = snapshot_mutation_child_read_cell,
+    .allocate_target = snapshot_mutation_child_allocate_target,
+    .initialize_target = snapshot_mutation_child_initialize_target,
+    .publish_cell = snapshot_mutation_child_publish_cell,
+    .observe_write = snapshot_mutation_child_observe,
+};
+
+/* Called after fork to apply the immutable current plan to the child's view. */
 static void snapshot_modify_memory(CPUArchState *cpu_env)
 {
-    SnapshotMutationPlan *plan;
-    SnapshotMutationChildWrite *writes;
+    SnapshotMutationApplyContext context;
+    SnapshotMutationApplyResult result;
 
-    if (mod_manager == NULL) {
-        /* Initial run: no modification. */
-        return;
-    }
-    plan = mod_manager->current;
-    if (plan == NULL || plan->mods == NULL || plan->num_mods == 0) {
-        log_msg("ERROR: empty mutation plan\n");
-        exit_with_status(1);
-    }
-    writes = g_try_malloc0((size_t)plan->num_mods * sizeof(*writes));
-    if (writes == NULL) {
-        log_msg("[mod] [apply-error] child write staging allocation failed\n");
-        exit_with_status(1);
-    }
+    if (mod_manager == NULL) return;
+    context.cpu_env = cpu_env;
+    context.remaining = g_queue_get_length(mod_manager->modifications);
+    result = snapshot_mutation_apply(mod_manager->current,
+                                     &snapshot_mutation_child_host,
+                                     &context);
+    if (result == SNAPSHOT_MUTATION_APPLY_OK) return;
 
-    /* Phase 1: validate every write and the complete destination tuple. */
-    for (uint32_t i = 0; i < plan->num_mods; i++) {
-        const SnapshotMutationWrite *write = &plan->mods[i];
-        SnapshotMutationChildWrite *prepared = &writes[i];
-        if (write->kind != SNAPSHOT_MUTATION_BYTES &&
-            write->kind != SNAPSHOT_MUTATION_POINTER_NULL &&
-            write->kind != SNAPSHOT_MUTATION_POINTER_OOB &&
-            write->kind != SNAPSHOT_MUTATION_POINTER_FRESH) {
-            log_msg("[mod] [apply-error] invalid mutation kind\n");
-            g_free(writes);
-            exit_with_status(1);
-        }
-        if (write->size == 0 || write->size > sizeof(write->value) ||
-            (write->kind != SNAPSHOT_MUTATION_BYTES &&
-             write->size != sizeof(target_ulong))) {
-            log_msg("[mod] [apply-error] invalid mutation width\n");
-            g_free(writes);
-            exit_with_status(1);
-        }
-        if (write->kind == SNAPSHOT_MUTATION_POINTER_FRESH) {
-            if (write->target.extent == 0 ||
-                write->target.extent > SNAPSHOT_PAGE_SIZE ||
-                write->target.bytes == NULL) {
-                log_msg("[mod] [apply-error] invalid fresh target\n");
-                g_free(writes);
-                exit_with_status(1);
-            }
-        } else if (write->target.extent != 0 ||
-                   write->target.bytes != NULL) {
-            log_msg("[mod] [apply-error] inactive target is populated\n");
-            g_free(writes);
-            exit_with_status(1);
-        }
-        if (write->addr < SNAPSHOT_PAGE_SIZE) {
-            if (write->addr >= CPU_NB_REGS) {
-                log_msg("[mod] [apply-error] invalid mutation register\n");
-                g_free(writes);
-                exit_with_status(1);
-            }
-            for (uint32_t prior = 0; prior < i; prior++) {
-                if (writes[prior].local.addr == write->addr &&
-                    writes[prior].local.addr < SNAPSHOT_PAGE_SIZE) {
-                    log_msg("[mod] [apply-error] duplicate register\n");
-                    g_free(writes);
-                    exit_with_status(1);
-                }
-            }
-        } else if (!snapshot_mutation_writable_span(write->addr,
-                                                    write->size)) {
-            log_msg("[mod] [apply-error] unwritable destination\n");
-            g_free(writes);
-            exit_with_status(1);
-        }
-        for (uint32_t prior = 0; prior < i; prior++) {
-            const SnapshotMutationWrite *previous = &writes[prior].local;
-            uint64_t previous_end;
-            uint64_t current_end;
-            if (previous->addr < SNAPSHOT_PAGE_SIZE ||
-                write->addr < SNAPSHOT_PAGE_SIZE) continue;
-            previous_end = (uint64_t)previous->addr + previous->size;
-            current_end = (uint64_t)write->addr + write->size;
-            if ((uint64_t)write->addr < previous_end &&
-                (uint64_t)previous->addr < current_end) {
-                log_msg("[mod] [apply-error] overlapping destinations\n");
-                g_free(writes);
-                exit_with_status(1);
-            }
-        }
-        prepared->local = *write;
-        if (write->addr < SNAPSHOT_PAGE_SIZE) {
-            prepared->before_value = cpu_env->regs[(size_t)write->addr];
-        } else {
-            memcpy(&prepared->before_value, g2h(write->addr), write->size);
-        }
-    }
-
-    /* Phase 2: allocate and initialize every fresh target while all cells
-     * still have their baseline values. */
-    for (uint32_t i = 0; i < plan->num_mods; i++) {
-        SnapshotMutationChildWrite *prepared = &writes[i];
-        if (prepared->local.kind != SNAPSHOT_MUTATION_POINTER_FRESH) continue;
-        prepared->fresh_target = snapshot_alloc_pointer_target(
-            cpu_env, prepared->local.target.extent);
-        if (prepared->fresh_target == (target_ulong)-1 ||
-            !snapshot_apply_fresh_target(
-                cpu_env, prepared->fresh_target,
-                prepared->local.target.bytes,
-                prepared->local.target.extent)) {
-            snapshot_test_observe_write(&prepared->local, 0,
-                                        prepared->before_value, false);
-            log_msg("[mod-pointer] [apply-error] fresh target failed\n");
-            g_free(writes);
-            exit_with_status(1);
-        }
-        memcpy(prepared->local.value, &prepared->fresh_target,
-               sizeof(prepared->fresh_target));
-    }
-
-    /* Phase 3: publish the complete tuple in canonical plan order. */
-    for (uint32_t i = 0; i < plan->num_mods; i++) {
-        SnapshotMutationChildWrite *prepared = &writes[i];
-        SnapshotMutationWrite *write = &prepared->local;
-        if (write->addr < SNAPSHOT_PAGE_SIZE) {
-            target_ulong reg_value = 0;
-            memcpy(&reg_value, write->value, sizeof(reg_value));
-            cpu_env->regs[(size_t)write->addr] = reg_value;
-            sem_reg_overwrite(cpu_env, (int)write->addr, SEM_OP_SNAPSHOT);
-            log_msg("[mod-reg] [register %ld] [size %ld] [total %d]\n",
-                    write->addr, write->size,
-                    g_queue_get_length(mod_manager->modifications));
-        } else {
-            memcpy(g2h(write->addr), write->value, write->size);
-            sem_mem_overwrite(cpu_env, write->addr, write->size,
-                              SEM_OP_SNAPSHOT);
-            log_msg("[mod] [addr %lx] [size %ld] [total %d]\n",
-                    write->addr, write->size,
-                    g_queue_get_length(mod_manager->modifications));
-        }
-        snapshot_test_observe_write(write, prepared->fresh_target,
-                                    prepared->before_value, true);
-    }
-    g_free(writes);
+    static const char *const errors[] = {
+        [SNAPSHOT_MUTATION_APPLY_EMPTY] = "empty mutation plan",
+        [SNAPSHOT_MUTATION_APPLY_ALLOCATION] =
+            "child write staging allocation failed",
+        [SNAPSHOT_MUTATION_APPLY_KIND] = "invalid mutation kind",
+        [SNAPSHOT_MUTATION_APPLY_WIDTH] = "invalid mutation width",
+        [SNAPSHOT_MUTATION_APPLY_TARGET] = "invalid fresh target",
+        [SNAPSHOT_MUTATION_APPLY_REGISTER] = "invalid mutation register",
+        [SNAPSHOT_MUTATION_APPLY_DUPLICATE_REGISTER] = "duplicate register",
+        [SNAPSHOT_MUTATION_APPLY_DESTINATION] = "unwritable destination",
+        [SNAPSHOT_MUTATION_APPLY_OVERLAP] = "overlapping destinations",
+        [SNAPSHOT_MUTATION_APPLY_FRESH_TARGET] = "fresh target failed",
+        [SNAPSHOT_MUTATION_APPLY_PUBLISH] = "mutation publication failed",
+    };
+    const char *message = result < G_N_ELEMENTS(errors) ? errors[result] : NULL;
+    log_msg("[mod] [apply-error] %s\n", message != NULL ? message : "unknown");
+    exit_with_status(1);
 }
 
 #ifdef SNAPSHOT_DEBUG
@@ -4498,24 +3070,6 @@ static void snapshot_install_crash_handler(void) {
     sigaction(SIGABRT, &sa, NULL);
 }
 #endif
-
-static int compare_prim_id_desc(const void *a, const void *b) {
-    const PrimitiveAccess *pa = (const PrimitiveAccess *)a;
-    const PrimitiveAccess *pb = (const PrimitiveAccess *)b;
-    
-    if (pa->access_id > pb->access_id) return -1;
-    if (pa->access_id < pb->access_id) return 1;
-    return 0;
-}
-
-static int compare_ptr_id_desc(const void *a, const void *b) {
-    const PointerAccess *pa = (const PointerAccess *)a;
-    const PointerAccess *pb = (const PointerAccess *)b;
-    
-    if (pa->access_id > pb->access_id) return -1;
-    if (pa->access_id < pb->access_id) return 1;
-    return 0;
-}
 
 static void flip_bits(uint8_t *target, int size) {
     for (int i = 0; i < size; i++) {
@@ -4746,10 +3300,10 @@ generic:
 }
 
 static bool snapshot_mutation_legacy_emit_family(
+    SnapshotOspreyAdapter *adapter,
     const SnapshotMutationBaselineEntry *entry,
     SnapshotMutationProposalSink *sink)
 {
-    const OspreyMutationModel *model;
     OspreyRuntimePointerResolution resolution;
     OspreyRuntimeResolveStatus status;
     SnapshotMutationProposalFamily family;
@@ -4759,23 +3313,14 @@ static bool snapshot_mutation_legacy_emit_family(
     target_ulong concrete_value;
     uint32_t count;
 
-    if (entry == NULL || sink == NULL || !entry->typed_eligible ||
+    if (entry == NULL || sink == NULL ||
         (entry->source_kind != SNAPSHOT_MUTATION_SOURCE_PRIMITIVE &&
-         entry->source_kind != SNAPSHOT_MUTATION_SOURCE_POINTER) ||
-        entry->size != sizeof(target_ulong) || entry->cell.start.valid != 1 ||
-        entry->cell.size != entry->size ||
-        entry->cell.start.raw != (uint64_t)entry->addr ||
-        g_osprey_ctx == NULL || !g_osprey_ctx->config.enabled ||
-        !osprey_collect_enabled ||
-        !osprey_runtime_mutation_prepare(g_osprey_ctx)) {
+         entry->source_kind != SNAPSHOT_MUTATION_SOURCE_POINTER)) {
         return false;
     }
-    model = osprey_runtime_mutation_model(g_osprey_ctx);
-    if (model == NULL) return false;
     memcpy(&concrete_value, entry->planner_bytes, sizeof(concrete_value));
-    status = osprey_runtime_resolve_pointer(
-        g_osprey_ctx, model, &entry->cell, concrete_value,
-        entry->target_ref_valid ? &entry->target_ref : NULL, &resolution);
+    status = snapshot_osprey_adapter_resolve_pointer(
+        adapter, entry, concrete_value, &resolution);
     if (getenv("BINRADAR_OSPREY_TEST_APPLIED_STATE") != NULL) {
         log_msg("[osprey] [test-plan] [addr %lx] [value %lx] [status %d] "
                 "[extent %llu] [target-valid %u] [runtime-target %u]\n",
@@ -4857,12 +3402,14 @@ static bool snapshot_mutation_legacy_emit_family(
 }
 
 static void snapshot_mutation_legacy_advisor(
+    SnapshotOspreyAdapter *adapter,
     const SnapshotMutationBaseline *baseline,
     SnapshotMutationProposalSink *sink)
 {
-    if (baseline == NULL || sink == NULL) return;
+    if (adapter == NULL || baseline == NULL || sink == NULL) return;
     for (uint32_t i = 0; i < baseline->entry_count; i++) {
-        (void)snapshot_mutation_legacy_emit_family(&baseline->entries[i], sink);
+        (void)snapshot_mutation_legacy_emit_family(
+            adapter, &baseline->entries[i], sink);
     }
 }
 
@@ -4895,8 +3442,10 @@ static int select_next_modification(SnapshotExitInfo *exit_info) {
 }
 
 static bool snapshot_mutation_baseline_add_history(
-    uint32_t prim_count, uint32_t ptr_count)
+    const SnapshotObservationView *observations)
 {
+    const uint32_t prim_count = observations->primitive_count;
+    const uint32_t ptr_count = observations->pointer_count;
     if (g_read_access_tainted_primitives_original == NULL) {
         g_read_access_tainted_primitives_original =
             g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, NULL);
@@ -4910,7 +3459,7 @@ static bool snapshot_mutation_baseline_add_history(
     for (uint32_t i = 0; i < prim_count; i++) {
         PrimitiveAccess *copy = g_try_malloc(sizeof(*copy));
         if (copy == NULL) return false;
-        *copy = shared_trace_data->primitives[i];
+        *copy = observations->primitives[i];
         g_hash_table_insert(g_read_access_tainted_primitives_original,
                             GSIZE_TO_POINTER(copy->addr), copy);
         g_hash_table_insert(g_read_access_tainted_primitives_all,
@@ -4919,7 +3468,7 @@ static bool snapshot_mutation_baseline_add_history(
     for (uint32_t i = 0; i < ptr_count; i++) {
         PointerAccess *copy = g_try_malloc(sizeof(*copy));
         if (copy == NULL) return false;
-        *copy = shared_trace_data->pointers[i];
+        *copy = observations->pointers[i];
         g_hash_table_insert(g_read_access_pointers_original,
                             GSIZE_TO_POINTER(copy->addr), copy);
         g_hash_table_insert(g_read_access_pointers_all,
@@ -4952,17 +3501,20 @@ static void snapshot_mutation_baseline_fill_common(
 }
 
 static SnapshotMutationBaseline *snapshot_mutation_baseline_build(
-    const SnapshotExitInfo *exit_info, uint32_t prim_count,
-    uint32_t ptr_count, bool counts_valid, const ArgumentInfo *arg_info,
-    size_t num_arg_regs)
+    const SnapshotObservationView *observations,
+    const ArgumentInfo *arg_info, size_t num_arg_regs)
 {
+    if (observations == NULL) return NULL;
+    const SnapshotExitInfo *exit_info = &observations->exit_info;
+    const uint32_t prim_count = observations->primitive_count;
+    const uint32_t ptr_count = observations->pointer_count;
+    const bool counts_valid = observations->counts_valid;
     size_t argument_count = 0;
     size_t total;
     uint64_t epoch;
     SnapshotMutationBaseline *baseline;
     uint32_t ordinal = 0;
 
-    if (shared_trace_data == NULL) return NULL;
     for (size_t i = 0; i < num_arg_regs; i++) {
         if (arg_info != NULL && arg_info[i].expr != NULL) argument_count++;
     }
@@ -4972,16 +3524,14 @@ static SnapshotMutationBaseline *snapshot_mutation_baseline_build(
     }
     baseline = snapshot_mutation_try_malloc0(sizeof(*baseline));
     if (baseline == NULL) return NULL;
-    epoch = shared_trace_data->run_epoch;
+    epoch = observations->run_epoch;
     baseline->run_epoch = epoch;
     baseline->entry_count = (uint32_t)total;
     baseline->counts_valid = counts_valid;
     baseline->query_start = snapshot_mutation_query_start;
-    baseline->query_end = (exit_info != NULL)
-        ? snapshot_query_cursor_index(exit_info) : -1;
+    baseline->query_end = snapshot_query_cursor_index(exit_info);
     baseline->expr_start = snapshot_mutation_expr_start;
-    baseline->expr_end = (exit_info != NULL)
-        ? snapshot_expr_cursor_index(exit_info) : -1;
+    baseline->expr_end = snapshot_expr_cursor_index(exit_info);
     /* Half-open [start, end) windows over raw pool differences.  An entry
      * beyond the exit or an unpublished cursor makes the window unusable, so
      * the advisor sees no window rather than a reversed or unbounded one. */
@@ -5006,14 +3556,14 @@ static SnapshotMutationBaseline *snapshot_mutation_baseline_build(
         }
     }
 
-    if (!snapshot_mutation_baseline_add_history(prim_count, ptr_count)) {
+    if (!snapshot_mutation_baseline_add_history(observations)) {
         snapshot_mutation_baseline_free(baseline);
         snapshot_mutation_history_free();
         return NULL;
     }
 
     for (uint32_t i = 0; i < prim_count; i++, ordinal++) {
-        const PrimitiveAccess *source = &shared_trace_data->primitives[i];
+        const PrimitiveAccess *source = &observations->primitives[i];
         SnapshotMutationBaselineEntry *entry = &baseline->entries[ordinal];
         bool epoch_valid = source->run_epoch == epoch;
         snapshot_mutation_baseline_fill_common(
@@ -5064,7 +3614,7 @@ static SnapshotMutationBaseline *snapshot_mutation_baseline_build(
                 (unsigned long long)source->access_id);
     }
     for (uint32_t i = 0; i < ptr_count; i++, ordinal++) {
-        const PointerAccess *source = &shared_trace_data->pointers[i];
+        const PointerAccess *source = &observations->pointers[i];
         SnapshotMutationBaselineEntry *entry = &baseline->entries[ordinal];
         bool epoch_valid = source->run_epoch == epoch;
         snapshot_mutation_baseline_fill_common(
@@ -5153,132 +3703,6 @@ static void snapshot_mutation_candidate_from_entry(
            sizeof(candidate->value));
 }
 
-static gint snapshot_mutation_family_compare(gconstpointer left,
-                                             gconstpointer right,
-                                             gpointer user_data)
-{
-    const SnapshotMutationProposalFamily *a =
-        *(const SnapshotMutationProposalFamily * const *)left;
-    const SnapshotMutationProposalFamily *b =
-        *(const SnapshotMutationProposalFamily * const *)right;
-    const SnapshotMutationBaseline *baseline = user_data;
-    const SnapshotMutationBaselineEntry *ae =
-        snapshot_mutation_lookup_entry(baseline, a->primary_seed);
-    const SnapshotMutationBaselineEntry *be =
-        snapshot_mutation_lookup_entry(baseline, b->primary_seed);
-    if (ae != NULL && be != NULL && ae->token.source_ordinal !=
-                                      be->token.source_ordinal) {
-        return ae->token.source_ordinal < be->token.source_ordinal ? -1 : 1;
-    }
-    if (a->advisor_priority != b->advisor_priority)
-        return a->advisor_priority < b->advisor_priority ? -1 : 1;
-    if (a->family_id != b->family_id)
-        return a->family_id < b->family_id ? -1 : 1;
-    if (a->advisor_id != b->advisor_id)
-        return a->advisor_id < b->advisor_id ? -1 : 1;
-    return 0;
-}
-
-/* Build one owned plan for one complete proposal variant.  Every write in a
- * variant is applied by a single disposable child, so the plan must carry the
- * whole write set atomically: num_mods equals write_count and no partial plan
- * is ever published.  Fresh payloads are deep-copied into plan ownership so
- * the child never reads proponent-owned bytes. */
-static SnapshotMutationPlan *snapshot_mutation_new_variant(
-    const SnapshotMutationBaseline *baseline,
-    const SnapshotMutationProposalVariant *variant)
-{
-    SnapshotMutationPlan *plan;
-
-    if (baseline == NULL || variant == NULL || variant->writes == NULL ||
-        variant->write_count == 0 ||
-        variant->write_count > SNAPSHOT_MUTATION_MAX_SPECIALIZED_WRITES) {
-        return NULL;
-    }
-    plan = snapshot_mutation_try_malloc0(sizeof(*plan));
-    if (plan == NULL) return NULL;
-    plan->num_mods = variant->write_count;
-    plan->mods = snapshot_mutation_try_malloc0(
-        (size_t)variant->write_count * sizeof(*plan->mods));
-    if (plan->mods == NULL) {
-        snapshot_mutation_free(plan);
-        return NULL;
-    }
-
-    for (uint32_t wi = 0; wi < variant->write_count; wi++) {
-        const SnapshotMutationProposalWrite *write = &variant->writes[wi];
-        const SnapshotMutationBaselineEntry *entry =
-            snapshot_mutation_lookup_entry(baseline, write->destination);
-        SnapshotMutationWrite *mod = &plan->mods[wi];
-
-        if (entry == NULL || write->size == 0 ||
-            write->size > sizeof(mod->value)) {
-            snapshot_mutation_free(plan);
-            return NULL;
-        }
-        if (write->kind == SNAPSHOT_MUTATION_POINTER_FRESH) {
-            if (write->target_extent == 0 ||
-                write->target_extent > SNAPSHOT_PAGE_SIZE ||
-                write->target_bytes == NULL ||
-                write->target_extent > SIZE_MAX) {
-                snapshot_mutation_free(plan);
-                return NULL;
-            }
-            mod->target.bytes = snapshot_mutation_try_malloc(
-                (size_t)write->target_extent);
-            if (mod->target.bytes == NULL) {
-                snapshot_mutation_free(plan);
-                return NULL;
-            }
-            memcpy(mod->target.bytes, write->target_bytes,
-                   (size_t)write->target_extent);
-        } else if (write->kind != SNAPSHOT_MUTATION_BYTES &&
-                   write->kind != SNAPSHOT_MUTATION_POINTER_NULL &&
-                   write->kind != SNAPSHOT_MUTATION_POINTER_OOB) {
-            snapshot_mutation_free(plan);
-            return NULL;
-        }
-        mod->kind = write->kind;
-        mod->addr = entry->addr;
-        mod->size = write->size;
-        mod->expr_index = entry->expr_index;
-        mod->query_index = entry->query_index;
-        memcpy(mod->value, write->value, sizeof(mod->value));
-        mod->target.extent = write->target_extent;
-        mod->target.resolved_raw = write->resolved_raw;
-        mod->target.resolved_end = write->resolved_end;
-    }
-    return plan;
-}
-
-static bool snapshot_mutation_stage_family(
-    SnapshotMutationCoordinator *coordinator,
-    const SnapshotMutationProposalFamily *family)
-{
-    GPtrArray *local;
-    if (coordinator == NULL || family == NULL) return false;
-    local = g_ptr_array_new_with_free_func(
-        (GDestroyNotify)snapshot_mutation_free);
-    if (local == NULL) return false;
-    for (uint32_t vi = 0; vi < family->variant_count; vi++) {
-        SnapshotMutationPlan *plan = snapshot_mutation_new_variant(
-            coordinator->baseline, &family->variants[vi]);
-        if (plan == NULL) {
-            g_ptr_array_free(local, TRUE);
-            return false;
-        }
-        g_ptr_array_add(local, plan);
-    }
-    for (guint i = 0; i < local->len; i++) {
-        SnapshotMutationPlan *plan = g_ptr_array_index(local, i);
-        g_ptr_array_index(local, i) = NULL;
-        g_ptr_array_add(coordinator->staged, plan);
-    }
-    g_ptr_array_set_size(local, 0);
-    g_ptr_array_free(local, TRUE);
-    return true;
-}
-
 static bool snapshot_mutation_stage_generic(
     SnapshotMutationCoordinator *coordinator,
     const SnapshotMutationBaselineEntry *entry)
@@ -5312,46 +3736,31 @@ static bool snapshot_mutation_stage_generic(
     return true;
 }
 
-static bool snapshot_mutation_coordinator_publish(
-    SnapshotMutationCoordinator *coordinator, GQueue *queue)
-{
-    if (coordinator == NULL || coordinator->baseline == NULL ||
-        coordinator->staged == NULL || queue == NULL) return false;
-    if (coordinator->staged->len == 0) return true;
-    SnapshotMutationPlan **plans = (SnapshotMutationPlan **)
-        coordinator->staged->pdata;
-    size_t count = coordinator->staged->len;
-    bool ok = snapshot_mutation_enqueue_plan_array(queue, plans, count);
-    g_ptr_array_set_size(coordinator->staged, 0);
-    return ok;
-}
-
 static bool snapshot_mutation_coordinator_build(
     SnapshotMutationBaseline *baseline, GQueue *queue)
 {
     SnapshotMutationCoordinator coordinator;
     SnapshotMutationProposalSink sink;
+    SnapshotOspreyAdapter osprey_adapter;
     bool *specialized;
 
     if (baseline == NULL || queue == NULL) return false;
-    memset(&coordinator, 0, sizeof(coordinator));
-    coordinator.baseline = baseline;
-    coordinator.families = g_ptr_array_new_with_free_func(
-        snapshot_mutation_proposal_family_free);
-    coordinator.staged = g_ptr_array_new_with_free_func(
-        (GDestroyNotify)snapshot_mutation_free);
-    if (coordinator.families == NULL || coordinator.staged == NULL) {
-        snapshot_mutation_coordinator_clear(&coordinator);
+    if (!snapshot_mutation_coordinator_init(&coordinator, baseline)) {
         return false;
     }
     sink.coordinator = &coordinator;
     sink.advisor_id = 1;
     sink.advisor_priority = 0;
-    if (g_osprey_ctx != NULL && g_osprey_ctx->config.analysis_mode ==
-            OSPREY_ANALYSIS_MODE_MUTATION) {
-        (void)osprey_runtime_mutation_prepare(g_osprey_ctx);
+    snapshot_osprey_adapter_init(
+        &osprey_adapter, g_osprey_ctx,
+        g_osprey_ctx != NULL && g_osprey_ctx->config.enabled &&
+            osprey_collect_enabled,
+        g_osprey_ctx != NULL && g_osprey_ctx->config.analysis_mode ==
+            OSPREY_ANALYSIS_MODE_MUTATION);
+    if (snapshot_osprey_adapter_is_mutation_mode(&osprey_adapter)) {
+        (void)snapshot_osprey_adapter_prepare(&osprey_adapter);
     }
-    snapshot_mutation_legacy_advisor(baseline, &sink);
+    snapshot_mutation_legacy_advisor(&osprey_adapter, baseline, &sink);
 
     /* Symbolic boundary advice runs after compact OSPREY preparation and
      * before family sorting.  Capacity is decided by the per-advisor quotas,
@@ -5385,8 +3794,7 @@ static bool snapshot_mutation_coordinator_build(
         }
     }
 
-    g_ptr_array_sort_with_data(coordinator.families,
-                               snapshot_mutation_family_compare, baseline);
+    snapshot_mutation_coordinator_sort(&coordinator);
     specialized = g_try_malloc0((size_t)baseline->entry_count *
                                 sizeof(*specialized));
     if (specialized == NULL && baseline->entry_count != 0) {
@@ -5419,72 +3827,71 @@ static bool snapshot_mutation_coordinator_build(
     return published;
 }
 
-static int analyze_collected_data(const ArgumentInfo *arg_info, size_t num_arg_regs) {
-    if (shared_trace_data == NULL) {
-        log_msg("Snapshot init error: shared_trace_data is null\n");
+static int analyze_collected_data(const ArgumentInfo *arg_info,
+                                  size_t num_arg_regs)
+{
+    SnapshotObservationView observations;
+    SnapshotExitInfo *exit_info;
+    int remaining;
+
+    if (!snapshot_observation_capture(shared_trace_data, &observations)) {
+        log_msg("[analyze] [observation-error] capture failed\n");
         exit_with_status(1);
     }
-    // Analyze exit reason
-    SnapshotExitInfo *exit_info = snapshot_exit_info_ptr();
-    if (!exit_info || !exit_info->valid) {
+    exit_info = &observations.exit_info;
+    if (!exit_info->valid) {
         log_msg("[analyze] [exit-error] no exit info!!!\n");
+        snapshot_observation_view_clear(&observations);
         return 0;
     }
-    bool is_crash = exit_info->crashed;
-    if (is_crash) {
-        const char *host_name =
-                    (exit_info->host_signal > 0) ? strsignal(exit_info->host_signal) : NULL;
+    if (exit_info->crashed) {
+        const char *host_name = exit_info->host_signal > 0
+            ? strsignal(exit_info->host_signal) : NULL;
         if (exit_info->target_signal == 0) {
-            log_msg("[analyze] [host-crash] [exit %d] [addr %lx] [reason %s] [name %s] [last %lx] Host crashed!!!\n", exit_info->host_signal, exit_info->host_fault_addr, exit_info->description, host_name ? host_name : "unknown", exit_info->guest_last_translation_block);
+            log_msg("[analyze] [host-crash] [exit %d] [addr %lx] "
+                    "[reason %s] [name %s] [last %lx] Host crashed!!!\n",
+                    exit_info->host_signal, exit_info->host_fault_addr,
+                    exit_info->description,
+                    host_name != NULL ? host_name : "unknown",
+                    exit_info->guest_last_translation_block);
             exit_with_status(1);
         }
-        log_msg("[analyze] [crash] [exit %d] [target %d] [host %d] [name %s] [fault-addr %lx] [guest-pc %lx] [guest-cs %lx] [si-code %d] [last %lx]\n", exit_info->exit_code, exit_info->target_signal, exit_info->host_signal, host_name ? host_name : "unknown", exit_info->fault_addr, exit_info->guest_pc, exit_info->guest_cs_base, exit_info->si_code, exit_info->guest_last_translation_block);
+        log_msg("[analyze] [crash] [exit %d] [target %d] [host %d] "
+                "[name %s] [fault-addr %lx] [guest-pc %lx] [guest-cs %lx] "
+                "[si-code %d] [last %lx]\n",
+                exit_info->exit_code, exit_info->target_signal,
+                exit_info->host_signal,
+                host_name != NULL ? host_name : "unknown",
+                exit_info->fault_addr, exit_info->guest_pc,
+                exit_info->guest_cs_base, exit_info->si_code,
+                exit_info->guest_last_translation_block);
     } else {
-        log_msg("[analyze] [normal] [exit %d] [guest-pc %lx] [guest-cs %lx] [reason %s] [last %lx]\n", exit_info->exit_code, exit_info->guest_pc, exit_info->guest_cs_base, exit_info->description, exit_info->guest_last_translation_block);
+        log_msg("[analyze] [normal] [exit %d] [guest-pc %lx] "
+                "[guest-cs %lx] [reason %s] [last %lx]\n",
+                exit_info->exit_code, exit_info->guest_pc,
+                exit_info->guest_cs_base, exit_info->description,
+                exit_info->guest_last_translation_block);
     }
 
-    // Analyze shared_trace_data
-    /* Stage 7.1: bound the parent's consumption.  prim_idx/ptr_idx are
-     * child-written counters that normally stay at or below the record
-     * capacity (LRU replacement), but a defensive-path increment or an
-     * inconsistent removal can push them past it; consuming an
-     * out-of-range count would sort and read past the fixed record
-     * arrays.  Snapshot the counts once, clamp, and disable typed
-     * consumption when the counts or the sticky overflow flags say the
-     * record set is not trustworthy. */
-    uint32_t raw_prim_count = shared_trace_data->prim_idx;
-    uint32_t raw_ptr_count = shared_trace_data->ptr_idx;
-    bool prim_count_valid = raw_prim_count <= MAX_PRIMITIVE_ACCESS;
-    bool ptr_count_valid = raw_ptr_count <= MAX_POINTER_ACCESS;
-    bool counts_valid =
-        shared_trace_data->prim_overflow == 0 &&
-        shared_trace_data->ptr_overflow == 0 &&
-        prim_count_valid && ptr_count_valid;
-    /* An over-cap count does not identify a safe initialized prefix: do
-     * not sort or traverse that array.  A sticky writer flag with an
-     * in-range count retains the known bounded prefix for the generic
-     * path, while typed lookup remains disabled for the baseline. */
-    uint32_t prim_count = prim_count_valid ? raw_prim_count : 0;
-    uint32_t ptr_count = ptr_count_valid ? raw_ptr_count : 0;
-    if (!counts_valid) {
-        log_msg("[analyze] [count-clamp] [prim %u->%u] [ptr %u->%u] [prim-ovf %u] [ptr-ovf %u] typed-unavailable\n",
-                raw_prim_count, prim_count, raw_ptr_count, ptr_count,
-                shared_trace_data->prim_overflow,
-                shared_trace_data->ptr_overflow);
+    if (!observations.counts_valid) {
+        log_msg("[analyze] [count-clamp] [prim %u->%u] [ptr %u->%u] "
+                "[prim-ovf %u] [ptr-ovf %u] typed-unavailable\n",
+                observations.raw_primitive_count,
+                observations.primitive_count,
+                observations.raw_pointer_count,
+                observations.pointer_count,
+                observations.primitive_overflow,
+                observations.pointer_overflow);
     }
-    // Sort by access_id
-    qsort(shared_trace_data->primitives, prim_count, sizeof(PrimitiveAccess), compare_prim_id_desc);
-    qsort(shared_trace_data->pointers, ptr_count, sizeof(PointerAccess), compare_ptr_id_desc);
-    /* First run: freeze the validated baseline and publish one complete
-     * coordinator plan.  Later iterations only retire the current plan. */
+
+    /* First run freezes the copied view.  Later iterations only retire the
+     * current immutable plan; they never revisit the child-writable arrays. */
     if (!mutation_analysis_started) {
         SnapshotMutationBaseline *baseline;
         mod_manager_init(exit_info);
-        memcpy(&original_exit_info, exit_info, sizeof(SnapshotExitInfo));
-
+        original_exit_info = *exit_info;
         baseline = snapshot_mutation_baseline_build(
-            exit_info, prim_count, ptr_count, counts_valid, arg_info,
-            num_arg_regs);
+            &observations, arg_info, num_arg_regs);
         if (baseline == NULL) {
             log_msg("[analyze] [mutation-error] baseline allocation failed\n");
             exit_with_status(1);
@@ -5499,748 +3906,16 @@ static int analyze_collected_data(const ArgumentInfo *arg_info, size_t num_arg_r
         log_msg("[analyze] [baseline] [epoch %llu] [entries %u] "
                 "[counts-valid %s] [query-end %lld] [expr-end %lld]\n",
                 (unsigned long long)baseline->run_epoch,
-                baseline->entry_count, baseline->counts_valid ? "true" : "false",
+                baseline->entry_count,
+                baseline->counts_valid ? "true" : "false",
                 (long long)baseline->query_end,
                 (long long)baseline->expr_end);
         log_msg("[analyze] [queue] [len %d]\n",
                 g_queue_get_length(mod_manager->modifications));
-        return select_next_modification(exit_info);
     }
-    return select_next_modification(exit_info);
-}
-
-static int binradar_manager_cur_patch_id(BinradarManager *manager, int new_patch_id) {
-    if (manager == NULL) return -1;
-    if (manager->current == NULL) return -1;
-    if (new_patch_id >= 0) {
-        *manager->cur_patch_id = new_patch_id;
-    }
-    return *manager->cur_patch_id;
-}
-
-static int binradar_manager_cur_iter(BinradarManager *manager, int new_iter) {
-    if (manager == NULL) return -1;
-    if (manager->current == NULL) return -1;
-    if (new_iter >= 0) {
-        *manager->cur_iter = new_iter;
-    }
-    return *manager->cur_iter;
-}
-
-// Actual patch id for iteration index (0 = original program, then candidates)
-static int binradar_manager_patch_id_at(BinradarManager *manager, uint32_t index) {
-    if (manager == NULL) return 0;
-    if (index == 0) return 0;
-    if (index > manager->patch_cnt) return 0;
-    if (manager->patch_list == NULL) return (int)index;
-    return (int)manager->patch_list[index - 1];
-}
-
-static int64_t binradar_shift_right(int64_t value, int64_t amount)
-{
-    if (amount >= 64) return value < 0 ? -1 : 0;
-    if (amount <= -64) return 0;
-    if (amount < 0) return (int64_t)((uint64_t)value << (uint64_t)-amount);
-    if (amount == 0) return value;
-    uint64_t bits = (uint64_t)value >> (uint64_t)amount;
-    if (value < 0) bits |= ~(uint64_t)0 << (64u - (uint64_t)amount);
-    return (int64_t)bits;
-}
-
-static int64_t binradar_shift_left(int64_t value, int64_t amount)
-{
-    if (amount >= 64) return 0;
-    if (amount <= -64) return value < 0 ? -1 : 0;
-    if (amount < 0) return binradar_shift_right(value, -amount);
-    return (int64_t)((uint64_t)value << (uint64_t)amount);
-}
-
-static bool binradar_eval_expr(const BinradarCachePredicate *predicate,
-                               uint32_t index, const uint64_t regs[16],
-                               int64_t *value, bool *crashed)
-{
-    if (predicate->expr_nodes == NULL ||
-        index >= predicate->expr_nodes->len) return false;
-    const BinradarExprNode *node = &g_array_index(
-        predicate->expr_nodes, BinradarExprNode, index);
-    int64_t left = 0, right = 0;
-    if (node->op == BRCACHE_EXPR_LITERAL) {
-        *value = node->literal;
-        return true;
-    }
-    if (node->op == BRCACHE_EXPR_VARIABLE) {
-        *value = (int64_t)regs[node->variable];
-        return true;
-    }
-    if (!binradar_eval_expr(predicate, node->left, regs, &left, crashed)) {
-        return false;
-    }
-    if (node->op == BRCACHE_EXPR_NOT) {
-        *value = ~left;
-        return true;
-    }
-    if (!binradar_eval_expr(predicate, node->right, regs, &right, crashed)) {
-        return false;
-    }
-    switch (node->op) {
-    case BRCACHE_EXPR_EQ: *value = left == right; break;
-    case BRCACHE_EXPR_NE: *value = left != right; break;
-    case BRCACHE_EXPR_GT: *value = left > right; break;
-    case BRCACHE_EXPR_GE: *value = left >= right; break;
-    case BRCACHE_EXPR_LT: *value = left < right; break;
-    case BRCACHE_EXPR_LE: *value = left <= right; break;
-    case BRCACHE_EXPR_ADD:
-        *value = (int64_t)((uint64_t)left + (uint64_t)right); break;
-    case BRCACHE_EXPR_SUB:
-        *value = (int64_t)((uint64_t)left - (uint64_t)right); break;
-    case BRCACHE_EXPR_MUL:
-        *value = (int64_t)((uint64_t)left * (uint64_t)right); break;
-    case BRCACHE_EXPR_DIV:
-        if (right == 0 || (left == INT64_MIN && right == -1)) {
-            *crashed = true;
-            *value = 0;
-        } else {
-            *value = left / right;
-        }
-        break;
-    case BRCACHE_EXPR_REM:
-        if (right == 0 || (left == INT64_MIN && right == -1)) {
-            *crashed = true;
-            *value = 0;
-        } else {
-            *value = left % right;
-        }
-        break;
-    case BRCACHE_EXPR_AND: *value = left & right; break;
-    case BRCACHE_EXPR_OR: *value = left | right; break;
-    case BRCACHE_EXPR_XOR: *value = left ^ right; break;
-    case BRCACHE_EXPR_SHL: *value = binradar_shift_left(left, right); break;
-    case BRCACHE_EXPR_SHR: *value = binradar_shift_right(left, right); break;
-    default: return false;
-    }
-    return true;
-}
-
-typedef struct BinradarCacheClamp {
-    uint64_t begin;
-    uint64_t end;
-} BinradarCacheClamp;
-
-static bool binradar_cache_read_cell(const BinradarCachePredicate *predicate,
-                                     const uint64_t regs[16],
-                                     const uint8_t *stack, size_t stack_size,
-                                     uint64_t *value)
-{
-    if (predicate->cell_kind == BRCACHE_CELL_REGISTER) {
-        *value = regs[predicate->cell_index];
-        return true;
-    }
-    size_t width = predicate->cell_kind == BRCACHE_CELL_STACK8 ? 1u :
-                   predicate->cell_kind == BRCACHE_CELL_STACK16 ? 2u :
-                   predicate->cell_kind == BRCACHE_CELL_STACK32 ? 4u : 8u;
-    if (predicate->cell_index > SIZE_MAX / width) return false;
-    size_t offset = (size_t)predicate->cell_index * width;
-    if (offset > stack_size || width > stack_size - offset) return false;
-    *value = 0;
-    memcpy(value, stack + offset, width);
-    return true;
-}
-
-static bool binradar_eval_cache_predicate(
-        const BinradarManager *manager, uint32_t patch_id,
-        const uint64_t regs[16], const BinradarCacheClamp *clamps,
-        const uint8_t *stack, size_t stack_size, int *branch)
-{
-    if (patch_id == 0) {
-        *branch = 0;
-        return true;
-    }
-    if (patch_id > manager->cache_predicate_count) return false;
-    const BinradarCachePredicate *predicate =
-        &manager->cache_predicates[patch_id];
-    if (manager->cache_family == BRCACHE_FAMILY_GENERIC) {
-        int64_t value = 0;
-        bool crashed = false;
-        if (!binradar_eval_expr(predicate, predicate->expr_root, regs,
-                                &value, &crashed)) return false;
-        *branch = crashed ? 2 : value != 0;
-        return true;
-    }
-    uint64_t value;
-    if (clamps == NULL ||
-        !binradar_cache_read_cell(predicate, regs, stack, stack_size,
-                                  &value)) return false;
-    if (predicate->cwe_kind == 2) {
-        if (value > UINT64_MAX / predicate->scale) {
-            *branch = 2;
-            return true;
-        }
-        value *= predicate->scale;
-    }
-    for (size_t i = 256; i-- > 0;) {
-        if (predicate->cwe_kind == 1) {
-            if (value >= clamps[i].begin && value < clamps[i].end) {
-                *branch = 0;
-                return true;
-            }
-        } else if (value < clamps[i].end - clamps[i].begin) {
-            *branch = 0;
-            return true;
-        }
-    }
-    *branch = 1;
-    return true;
-}
-
-static bool binradar_cache_vector(BinradarManager *manager,
-                                  uint32_t selected_patch,
-                                  uint32_t evaluated_patch,
-                                  GArray **vector_out)
-{
-    GArray *vector = g_array_new(FALSE, FALSE, sizeof(int));
-    size_t offset = 0;
-    uint64_t expected_flags = manager->cache_family == BRCACHE_FAMILY_CWE805
-        ? BRCACHE_FLAG_CWE805 : 0;
-    size_t expected_record = sizeof(BinradarSnapshotHeader) +
-                             16u * sizeof(uint64_t);
-    if (manager->cache_family == BRCACHE_FAMILY_CWE805) {
-        expected_record += 256u * sizeof(BinradarCacheClamp) +
-                           manager->cache_stack_size;
-    }
-    while (offset < manager->cache_bytes->len) {
-        if (manager->cache_bytes->len - offset <
-            sizeof(BinradarSnapshotHeader)) goto invalid;
-        BinradarSnapshotHeader header;
-        memcpy(&header, manager->cache_bytes->data + offset, sizeof(header));
-        if (header.magic != BRCACHE_SNAPSHOT_MAGIC ||
-            header.version != BRCACHE_SNAPSHOT_VERSION ||
-            header.patch_id != selected_patch || header.branch > 2 ||
-            header.flags != expected_flags ||
-            header.stack_size !=
-                (manager->cache_family == BRCACHE_FAMILY_CWE805
-                    ? manager->cache_stack_size : 0) ||
-            expected_record > manager->cache_bytes->len - offset) {
-            goto invalid;
-        }
-        const uint8_t *payload = manager->cache_bytes->data + offset +
-                                 sizeof(header);
-        BinradarCacheClamp clamps_storage[256];
-        const BinradarCacheClamp *clamps = NULL;
-        if (manager->cache_family == BRCACHE_FAMILY_CWE805) {
-            memcpy(clamps_storage, payload, sizeof(clamps_storage));
-            clamps = clamps_storage;
-            payload += sizeof(clamps_storage);
-        }
-        uint64_t regs[16];
-        memcpy(regs, payload, sizeof(regs));
-        payload += sizeof(regs);
-        int evaluated;
-        if (!binradar_eval_cache_predicate(
-                manager, evaluated_patch, regs, clamps, payload,
-                manager->cache_family == BRCACHE_FAMILY_CWE805
-                    ? manager->cache_stack_size : 0,
-                &evaluated)) goto invalid;
-        if (evaluated_patch == selected_patch &&
-            evaluated != (int)header.branch) goto invalid;
-        g_array_append_val(vector, evaluated);
-        offset += expected_record;
-    }
-    *vector_out = vector;
-    return true;
-invalid:
-    g_array_free(vector, TRUE);
-    return false;
-}
-
-static bool binradar_branch_vectors_equal(const GArray *left,
-                                          const GArray *right)
-{
-    if (left == NULL || right == NULL || left->len != right->len) return false;
-    for (guint i = 0; i < left->len; i++) {
-        if (g_array_index(left, int, i) != g_array_index(right, int, i)) {
-            return false;
-        }
-    }
-    return true;
-}
-
-/* A child normally replays from the entry of the function containing
- * PATCH_LOC and reaches the cached dest() action.  A mutation can still divert
- * control before PATCH_LOC; then no text row is written and br_taken remains
- * NULL.  The corresponding capture vector is empty because neither channel
- * observed a patch-site branch.  Keep the committed value NULL -- .brpatched
- * and FINAL encode that honest no-observation state as `[br null]`; publishing
- * an empty array would produce the invalid SBSV token `[br ]`. */
-static bool binradar_observed_vector_matches(const GArray *observed,
-                                             const GArray *other)
-{
-    if (observed == NULL) return other != NULL && other->len == 0;
-    return binradar_branch_vectors_equal(observed, other);
-}
-
-static const char *binradar_feedback_mutation_kind(SnapshotMutationKind kind)
-{
-    switch (kind) {
-    case SNAPSHOT_MUTATION_BYTES: return "bytes";
-    case SNAPSHOT_MUTATION_POINTER_NULL: return "pointer-null";
-    case SNAPSHOT_MUTATION_POINTER_OOB: return "pointer-oob";
-    case SNAPSHOT_MUTATION_POINTER_FRESH: return "pointer-fresh";
-    }
-    return "invalid";
-}
-
-static bool binradar_feedback_write_atomic(const char *path,
-                                           const void *data, size_t size)
-{
-    bool ok = false;
-    char *temporary = g_strdup_printf("%s.tmp-%ld", path, (long)getpid());
-    int fd = open(temporary, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-    if (fd >= 0) {
-        bool complete = write_exact(fd, data, size) == 0 && fsync(fd) == 0;
-        int close_status = close(fd);
-        fd = -1;
-        if (complete && close_status == 0 && rename(temporary, path) == 0) {
-            ok = true;
-        }
-    }
-    if (!ok) unlink(temporary);
-    g_free(temporary);
-    return ok;
-}
-
-/* Commit one pair for one real child execution.  Cache-materialized members
- * never call this function: they have no child-local snapshot of their own. */
-static bool binradar_feedback_write(BinradarManager *manager,
-                                    uint32_t iteration, uint32_t patch_id,
-                                    const GArray *branches)
-{
-    if (manager == NULL || manager->feedback_dir == NULL || iteration <= 1 ||
-        manager->cache_bytes == NULL || branches == NULL) return true;
-    PatchedResult *run = get_patched_result_tmp(manager, patch_id);
-    if (run->patch_id != patch_id || run->representative != patch_id) {
-        return false;
-    }
-
-    char *stem = g_strdup_printf("iteration-%08u-patch-%08u",
-                                 iteration, patch_id);
-    char *snapshot_name = g_strconcat(stem, ".brch", NULL);
-    char *metadata_name = g_strconcat(stem, ".sbsv", NULL);
-    char *snapshot_path = g_build_filename(manager->feedback_dir,
-                                           snapshot_name, NULL);
-    char *metadata_path = g_build_filename(manager->feedback_dir,
-                                           metadata_name, NULL);
-    GString *metadata = g_string_new(NULL);
-    const bool same_fault = run->is_crash &&
-        run->fault_loc == manager->poc_fault_addr;
-    const char *result = !run->is_crash ? "benign" :
-        same_fault ? "malicious" : "ignored";
-    const SnapshotMutationPlan *plan = mod_manager != NULL
-        ? mod_manager->current : NULL;
-    const uint32_t mutation_writes = plan != NULL ? plan->num_mods : 0;
-
-    GString *branch_text = g_string_new(NULL);
-    if (branches->len == 0) {
-        g_string_append(branch_text, "none");
-    } else {
-        for (guint i = 0; i < branches->len; i++) {
-            if (i != 0) g_string_append_c(branch_text, ',');
-            g_string_append_printf(branch_text, "%d",
-                g_array_index(branches, int, i));
-        }
-    }
-    g_string_append_printf(metadata,
-        "[binradar-feedback] [version 1] [iteration %u] [patch %u] "
-        "[snapshot-file %s] [snapshot-count %u] [branches %s] "
-        "[outcome %s] [fault-addr %lx] [poc-fault-addr %lx] "
-        "[same-fault %s] [result %s] [mutation-writes %u]\n",
-        iteration, patch_id, snapshot_name, branches->len, branch_text->str,
-        run->is_crash ? "crash" : "normal", run->fault_loc,
-        manager->poc_fault_addr, same_fault ? "true" : "false", result,
-        mutation_writes);
-    g_string_free(branch_text, TRUE);
-
-    for (uint32_t i = 0; plan != NULL && i < plan->num_mods; i++) {
-        const SnapshotMutationWrite *write = &plan->mods[i];
-        g_string_append_printf(metadata,
-            "[binradar-mutation] [index %u] [kind %s] "
-            "[addr %lx] [size %u] [value ", i,
-            binradar_feedback_mutation_kind(write->kind), write->addr,
-            write->size);
-        if (write->kind == SNAPSHOT_MUTATION_POINTER_FRESH) {
-            g_string_append(metadata, "dynamic");
-        } else {
-            for (uint32_t byte = 0; byte < write->size; byte++) {
-                g_string_append_printf(metadata, "%02x", write->value[byte]);
-            }
-        }
-        g_string_append_printf(metadata, "] [target-extent %llu]\n",
-            (unsigned long long)write->target.extent);
-    }
-
-    bool ok = binradar_feedback_write_atomic(
-        snapshot_path, manager->cache_bytes->data, manager->cache_bytes->len);
-    if (ok) {
-        ok = binradar_feedback_write_atomic(metadata_path, metadata->str,
-                                            metadata->len);
-    }
-    if (!ok) {
-        unlink(snapshot_path);
-        unlink(metadata_path);
-        log_msg("[binradar] [feedback] [error write] [iter %u] [patch %u]\n",
-                iteration, patch_id);
-    } else {
-        log_msg("[binradar] [feedback] [commit] [iter %u] [patch %u] "
-                "[snapshots %u] [bytes %u] [result %s]\n",
-                iteration, patch_id, branches->len, manager->cache_bytes->len,
-                result);
-    }
-    g_string_free(metadata, TRUE);
-    g_free(metadata_path);
-    g_free(snapshot_path);
-    g_free(metadata_name);
-    g_free(snapshot_name);
-    g_free(stem);
-    return ok;
-}
-
-static void binradar_cache_disable(BinradarManager *manager,
-                                   const char *reason)
-{
-    if (!manager->cache_inference_enabled) return;
-    manager->cache_inference_enabled = false;
-    log_msg("[binradar] [cache-disabled] [reason %s]\n", reason);
-}
-
-static bool binradar_publish_selector(BinradarManager *manager,
-                                      uint32_t patch_id, uint32_t iteration)
-{
-    if (!manager->cache_enabled) {
-        binradar_manager_cur_patch_id(manager, (int)patch_id);
-        binradar_manager_cur_iter(manager, (int)iteration);
-        return true;
-    }
-    const char *descriptor = patch_id == 0 ? "p0" :
-        manager->cache_predicates[patch_id].descriptor;
-    size_t length = descriptor != NULL ? strlen(descriptor) : 0;
-    if (length >= manager->selector->descriptor_capacity) return false;
-
-    /* Iteration is the publication flag.  Keep it at the unpublished value
-     * until the complete descriptor and patch id are visible. */
-    binradar_manager_cur_iter(manager, 0);
-    __sync_synchronize();
-    memcpy(manager->selector->descriptor, descriptor, length + 1u);
-    manager->selector->descriptor_length = (uint32_t)length;
-    binradar_manager_cur_patch_id(manager, (int)patch_id);
-    __sync_synchronize();
-    binradar_manager_cur_iter(manager, (int)iteration);
-    return true;
-}
-
-static void binradar_clear_current(BinradarManager *manager)
-{
-    if (manager == NULL || manager->current == NULL) return;
-    for (uint32_t patch = 0; patch <= manager->patch_max_id; patch++) {
-        PatchedResult *result = &manager->current->patch_results[patch];
-        if (result->br_taken != NULL) {
-            g_array_free(result->br_taken, TRUE);
-        }
-    }
-    memset(manager->current->patch_results, 0,
-           sizeof(PatchedResult) * (manager->patch_max_id + 1u));
-}
-
-static void binradar_restore_uncached_candidates(BinradarManager *manager,
-                                                  bool *uncovered,
-                                                  const bool *executed)
-{
-    if (manager == NULL || uncovered == NULL || executed == NULL) return;
-    for (uint32_t i = 0; i < manager->patch_cnt; i++) {
-        uint32_t patch = (uint32_t)binradar_manager_patch_id_at(manager,
-                                                                i + 1u);
-        if (executed[patch]) continue;
-        PatchedResult *result = get_patched_result_tmp(manager, patch);
-        if (result->br_taken != NULL) {
-            g_array_free(result->br_taken, TRUE);
-        }
-        memset(result, 0, sizeof(*result));
-        uncovered[patch] = true;
-    }
-}
-
-static GArray *binradar_clone_branch_vector(const GArray *source)
-{
-    GArray *clone = g_array_sized_new(FALSE, FALSE, sizeof(int), source->len);
-    if (source->len != 0) {
-        g_array_append_vals(clone, source->data, source->len);
-    }
-    return clone;
-}
-
-static void binradar_record_outcome(BinradarManager *manager,
-                                    uint32_t patch_id)
-{
-    SnapshotExitInfo *info = snapshot_exit_info_ptr();
-    PatchedResult *result = get_patched_result_tmp(manager, patch_id);
-    if (info == NULL || !info->valid) return;
-    result->patch_id = patch_id;
-    result->representative = patch_id;
-    result->is_crash = info->crashed;
-    result->fault_loc = info->fault_addr;
-}
-
-static void binradar_materialize_cache_hit(BinradarManager *manager,
-                                           uint32_t patch_id,
-                                           uint32_t representative,
-                                           const GArray *branches)
-{
-    SnapshotExitInfo *info = snapshot_exit_info_ptr();
-    PatchedResult *result = get_patched_result_tmp(manager, patch_id);
-    result->patch_id = patch_id;
-    result->representative = representative;
-    result->br_taken = branches->len == 0
-        ? NULL : binradar_clone_branch_vector(branches);
-    if (info != NULL && info->valid) {
-        result->is_crash = info->crashed;
-        result->fault_loc = info->fault_addr;
-    }
-}
-
-static gint binradar_compare_u32(gconstpointer left, gconstpointer right)
-{
-    uint32_t a = *(const uint32_t *)left;
-    uint32_t b = *(const uint32_t *)right;
-    return a < b ? -1 : a > b;
-}
-
-static void binradar_commit(BinradarManager *manager)
-{
-    if (manager == NULL || manager->current == NULL ||
-        manager->evidence_file == NULL) return;
-    int cur_iter = binradar_manager_cur_iter(manager, -1);
-    if (cur_iter < 1) return;
-
-    GArray **members = g_new0(GArray *, manager->patch_max_id + 1u);
-    uint32_t result_count = cur_iter == 1 ? 1u : manager->patch_cnt + 1u;
-    uint32_t group_count = 0;
-    for (uint32_t i = 0; i < result_count; i++) {
-        uint32_t patch = (uint32_t)binradar_manager_patch_id_at(manager, i);
-        PatchedResult *result = &manager->current->patch_results[patch];
-        uint32_t representative = result->representative;
-        if (result->patch_id != patch || representative > manager->patch_max_id) {
-            log_msg("[binradar] [evidence] [error incomplete-result] "
-                    "[iter %d] [patch %u]\n", cur_iter, patch);
-            exit_with_status(1);
-        }
-        if (members[representative] == NULL) {
-            members[representative] = g_array_new(FALSE, FALSE,
-                                                   sizeof(uint32_t));
-            group_count++;
-        }
-        g_array_append_val(members[representative], patch);
-    }
-
-    GByteArray *payload = g_byte_array_new();
-    br_evidence_append_u32(payload, (uint32_t)cur_iter);
-    br_evidence_append_u32(payload, group_count);
-    for (uint32_t i = 0; i < result_count; i++) {
-        uint32_t representative =
-            (uint32_t)binradar_manager_patch_id_at(manager, i);
-        GArray *group = members[representative];
-        if (group == NULL) continue;
-        g_array_sort(group, binradar_compare_u32);
-        PatchedResult *result =
-            &manager->current->patch_results[representative];
-        uint8_t outcome = result->is_crash
-            ? BR_EVIDENCE_OUTCOME_CRASH : BR_EVIDENCE_OUTCOME_NORMAL;
-        uint8_t flags = result->br_taken == NULL
-            ? BR_EVIDENCE_GROUP_BRANCH_NULL : 0;
-        uint32_t branch_count = result->br_taken != NULL
-            ? result->br_taken->len : 0;
-
-        br_evidence_append_u32(payload, representative);
-        g_byte_array_append(payload, &outcome, 1);
-        g_byte_array_append(payload, &flags, 1);
-        br_evidence_append_u16(payload, 0);
-        br_evidence_append_u64(payload, result->fault_loc);
-        br_evidence_append_u32(payload, branch_count);
-        br_evidence_append_u32(payload, group->len);
-
-        uint8_t packed = 0;
-        for (uint32_t branch = 0; branch < branch_count; branch++) {
-            int value = g_array_index(result->br_taken, int, branch);
-            if (value < 0 || value > 2) {
-                log_msg("[binradar] [evidence] [error branch] "
-                        "[iter %d] [patch %u]\n", cur_iter,
-                        representative);
-                exit_with_status(1);
-            }
-            packed |= (uint8_t)value << ((branch % 4u) * 2u);
-            if (branch % 4u == 3u || branch + 1u == branch_count) {
-                g_byte_array_append(payload, &packed, 1);
-                packed = 0;
-            }
-        }
-
-        uint32_t previous = 0;
-        for (guint member_index = 0; member_index < group->len;
-             member_index++) {
-            uint32_t member = g_array_index(group, uint32_t, member_index);
-            uint32_t delta = member_index == 0 ? member : member - previous;
-            br_evidence_append_uleb32(payload, delta);
-            previous = member;
-        }
-    }
-
-    if (!br_evidence_write_frame(manager->evidence_file,
-                                  BR_EVIDENCE_RECORD_BINRADAR_ITERATION,
-                                  payload)) {
-        log_msg("[binradar] [evidence] [error write] [iter %d]\n", cur_iter);
-        exit_with_status(1);
-    }
-    log_msg("[binradar] [commit] [iter %d] [groups %u] [patches %u] "
-            "[bytes %u]\n", cur_iter, group_count, result_count,
-            payload->len);
-    g_byte_array_free(payload, TRUE);
-    for (uint32_t patch = 0; patch <= manager->patch_max_id; patch++) {
-        if (members[patch] != NULL) g_array_free(members[patch], TRUE);
-    }
-    g_free(members);
-    binradar_clear_current(manager);
-}
-
-static void set_nonblock(int fd) {
-    int flags = fcntl(fd, F_GETFL);
-    if (flags < 0) {
-        log_msg("fcntl(F_GETFL)");
-        exit_with_status(1);
-    }
-    if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
-        log_msg("fcntl(F_SETFL)");
-        exit_with_status(1);
-    }
-}
-
-static PatchedResult *get_patched_result_tmp(BinradarManager *manager, uint32_t patch_id) {
-    if (manager == NULL) {
-        log_msg("Manager not initialized");
-        exit_with_status(1);
-    }
-    if (manager->current == NULL) {
-        log_msg("Current result not initialized");
-        exit_with_status(1);
-    }
-    if (patch_id > manager->patch_max_id) {
-        log_msg("Invalid patch ID: %u", patch_id);
-        exit_with_status(1);
-    }
-    return &manager->current->patch_results[patch_id];
-}
-
-static void binradar_manager_handle_patch_line(BinradarManager *manager, const char *line) {
-    sbsv_row *row = NULL;
-    log_msg("[binradar] [patch-res] %s\n", line);
-    sbsv_parser_parse_line_detached(manager->patch_result_parser, line, 0, &row);
-    int cur_iter = binradar_manager_cur_iter(manager, -1);
-    if (row != NULL) {
-        if (strcmp(sbsv_row_schema_name(row), "patch") == 0) {
-            // Process patch row
-            long long patch_id = sbsv_row_get_int(row, "id", NULL);
-            long long br = sbsv_row_get_int(row, "br", NULL);
-            long long iter = sbsv_row_get_int(row, "v", NULL);
-            if (iter != cur_iter) {
-                log_msg("[binradar] [iter-mismatch] [v %lld] [iter %d] [id %lld] [br %lld]\n", iter, cur_iter, patch_id, br);
-                sbsv_row_free(row);
-                return;
-            }
-            if (patch_id < 0 || patch_id > UINT32_MAX) {
-                log_msg("[binradar] [invalid-patch-id] [id %lld]\n", patch_id);
-                sbsv_row_free(row);
-                return;
-            }
-            PatchedResult *result = get_patched_result_tmp(manager, patch_id);
-            if (result->br_taken == NULL) {
-                result->br_taken = g_array_new(FALSE, FALSE, sizeof(int));
-            }
-            int br_taken = (int)br;
-            g_array_append_val(result->br_taken, br_taken);
-        }
-        sbsv_row_free(row);
-    }
-}
-
-static void binradar_manager_handle_patch_bytes(BinradarManager *manager, const char *buf, size_t len) {
-    for (size_t i = 0; i < len; i++) {
-        char c = buf[i];
-
-        if (manager->line_idx + 1 >= sizeof(manager->line_buf)) {
-            // Line too long, reset buffer
-            manager->line_buf[manager->line_idx] = '\0';
-            binradar_manager_handle_patch_line(manager, manager->line_buf);
-            manager->line_idx = 0;
-        }
-
-        manager->line_buf[manager->line_idx++] = c;
-
-        if (c == '\n') {
-            manager->line_buf[manager->line_idx - 1] = '\0';
-            binradar_manager_handle_patch_line(manager, manager->line_buf);
-            manager->line_idx = 0;
-        }
-    }
-}
-
-static void binradar_manager_drain_patch_fd_once(BinradarManager *manager) {
-    char buf[4096];
-    for (;;) {
-        ssize_t n = read(manager->patch_fd_r, buf, sizeof(buf));
-        if (n > 0) {
-            binradar_manager_handle_patch_bytes(manager, buf, (size_t)n);
-            continue;
-        }
-        if (n == 0) {
-            // write end closed
-            break;
-        }
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            break;
-        }
-        if (errno == EINTR) {
-            continue;
-        }
-        break;
-    }
-}
-
-static void binradar_manager_drain_cache_fd_once(BinradarManager *manager) {
-    uint8_t buf[8192];
-    if (manager == NULL || manager->cache_fd_r < 0) return;
-    for (;;) {
-        ssize_t n = read(manager->cache_fd_r, buf, sizeof(buf));
-        if (n > 0) {
-            if (!manager->cache_capture_overflow &&
-                (size_t)n <= BRCACHE_MAX_CAPTURE_BYTES -
-                             manager->cache_bytes->len) {
-                g_byte_array_append(manager->cache_bytes, buf, (guint)n);
-            } else {
-                manager->cache_capture_overflow = true;
-            }
-            continue;
-        }
-        if (n == 0 || errno == EAGAIN || errno == EWOULDBLOCK) break;
-        if (errno == EINTR) continue;
-        manager->cache_capture_overflow = true;
-        break;
-    }
-}
-
-static void binradar_manager_reset_capture(BinradarManager *manager) {
-    if (manager == NULL) return;
-    manager->line_idx = 0;
-    memset(manager->line_buf, 0, sizeof(manager->line_buf));
-    if (manager->cache_bytes != NULL) {
-        g_byte_array_set_size(manager->cache_bytes, 0);
-    }
-    manager->cache_capture_overflow = false;
+    remaining = select_next_modification(exit_info);
+    snapshot_observation_view_clear(&observations);
+    return remaining;
 }
 
 static void snapshot_prepare_mutation_epoch(void)
@@ -6260,35 +3935,11 @@ static void snapshot_prepare_mutation_epoch(void)
     shared_trace_data->run_epoch = epoch;
 }
 
-static int64_t forkserver_child_timeout_ms(void) {
-    const char *var = getenv("BINRADAR_FORKSERVER_CHILD_TIMEOUT");
-    if (var == NULL) return -1;
-    int64_t secs = atoll(var);
-    if (secs <= 0 || secs > INT64_MAX / 1000) return -1;
-    return secs * 1000;
-}
-
-static int64_t forkserver_iteration_deadline_us(void) {
-    const char *var = getenv("BINRADAR_FORKSERVER_ITERATION_TIMEOUT");
-    if (var == NULL) return -1;
-    int64_t secs = atoll(var);
-    if (secs <= 0 || secs > INT64_MAX / G_USEC_PER_SEC) return -1;
-    return g_get_monotonic_time() + secs * G_USEC_PER_SEC;
-}
-
-/* Abort an always-hanging mutation plan after this many consecutive
- * child-timeout kills (binradar mode only).  0 disables the abort. */
-#define FORKSERVER_ABORT_DEFAULT 10
-static int forkserver_timeout_abort_count(void) {
-    const char *var = getenv("BINRADAR_FORKSERVER_TIMEOUT_ABORT_COUNT");
-    if (var == NULL) return FORKSERVER_ABORT_DEFAULT;
-    return atoi(var);
-}
-
 /* Parent-side deferred-finding reporter: after the child died (or was
  * killed on timeout), surface any provenance finding the child recorded
  * in shared memory.  Returns true if a finding was reported. */
-static bool report_shared_prov_finding(uint32_t *status_out) {
+static bool report_shared_prov_finding(void *opaque, uint32_t *status_out) {
+    (void)opaque;
     if (shared_trace_data == NULL) return false;
     /* Acquire-load the shared publication state and copy the whole
      * record once, so a promotion cannot be observed half-written. */
@@ -6350,85 +4001,6 @@ static bool report_shared_prov_finding(uint32_t *status_out) {
     return true;
 }
 
-/* Wait while draining both result channels.  Return 1 for a child timeout,
- * 2 for the aggregate iteration deadline, and -1 for an internal error. */
-static int wait_child_and_drain_patch(pid_t child_pid, uint32_t *status_out,
-                                      int64_t iteration_deadline_us) {
-    int status = 0;
-    int64_t child_timeout_ms = forkserver_child_timeout_ms();
-    int64_t child_deadline = child_timeout_ms >= 0
-        ? g_get_monotonic_time() + child_timeout_ms * 1000 : -1;
-    struct pollfd pfds[2];
-    nfds_t nfds = 0;
-
-    if (binradar_manager != NULL) {
-        set_nonblock(binradar_manager->patch_fd_r);
-        pfds[nfds].fd = binradar_manager->patch_fd_r;
-        pfds[nfds].events = POLLIN | POLLHUP | POLLERR;
-        nfds++;
-        if (binradar_manager->cache_fd_r >= 0) {
-            set_nonblock(binradar_manager->cache_fd_r);
-            pfds[nfds].fd = binradar_manager->cache_fd_r;
-            pfds[nfds].events = POLLIN | POLLHUP | POLLERR;
-            nfds++;
-        }
-    }
-
-    for (;;) {
-        pid_t waited = waitpid(child_pid, &status, WNOHANG);
-        if (waited == child_pid) break;
-        if (waited < 0) {
-            log_msg("waitpid(WNOHANG)\n");
-            return -1;
-        }
-        int64_t now = g_get_monotonic_time();
-        bool iteration_timeout = iteration_deadline_us >= 0 &&
-                                 now >= iteration_deadline_us;
-        bool child_timeout = child_deadline >= 0 && now >= child_deadline;
-        if (iteration_timeout || child_timeout) {
-            log_msg(iteration_timeout
-                    ? "[forkserver] [iteration-timeout] killing child %d\n"
-                    : "[forkserver] [child-timeout] killing child %d after %ld ms\n",
-                    (int)child_pid, (long)child_timeout_ms);
-            kill(child_pid, SIGKILL);
-            if (waitpid(child_pid, &status, 0) < 0) return -1;
-            report_shared_prov_finding((uint32_t *)&status);
-            if (binradar_manager != NULL) {
-                binradar_manager_drain_patch_fd_once(binradar_manager);
-                binradar_manager_drain_cache_fd_once(binradar_manager);
-            }
-            *status_out = (uint32_t)status;
-            return iteration_timeout ? 2 : 1;
-        }
-        if (nfds == 0) {
-            g_usleep(50 * 1000);
-            continue;
-        }
-        int pr = poll(pfds, nfds, 50);
-        if (pr < 0) {
-            if (errno == EINTR) continue;
-            log_msg("poll\n");
-            return -1;
-        }
-        if (pr > 0) {
-            if (pfds[0].revents & (POLLIN | POLLHUP | POLLERR)) {
-                binradar_manager_drain_patch_fd_once(binradar_manager);
-            }
-            if (nfds == 2 &&
-                (pfds[1].revents & (POLLIN | POLLHUP | POLLERR))) {
-                binradar_manager_drain_cache_fd_once(binradar_manager);
-            }
-        }
-    }
-    if (binradar_manager != NULL) {
-        binradar_manager_drain_patch_fd_once(binradar_manager);
-        binradar_manager_drain_cache_fd_once(binradar_manager);
-    }
-    *status_out = (uint32_t)status;
-    return 0;
-}
-
-
 void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
                          const ArgumentInfo *arg_info, size_t num_arg_regs) {
     log_msg("[snapshot] [forkserver] [called %d]\n", forkserver_installed);
@@ -6436,47 +4008,32 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
     forkserver_installed = true;
     rcu_disable_atfork();
     snapshot_save();
-    if (binradar_forkserver_ctrl_r == -1 ||
-        binradar_forkserver_stat_w == -1) {
+    BinradarForkserverDriver driver;
+    if (!binradar_forkserver_driver_init(
+            &driver, binradar_forkserver_ctrl_r,
+            binradar_forkserver_stat_w)) {
         log_msg("[snapshot] [forkserver] [error] invalid control fds\n");
         exit_with_status(1);
     }
 
     bool binradar_mode = binradar_manager != NULL;
-    uint32_t iteration = 0;
-    uint32_t version = BINRADAR_FORKSERVER_PROTOCOL_V3;
-    uint32_t expected_reply = version ^ UINT32_MAX;
-    uint32_t reply_value;
-    int consecutive_child_timeouts = 0;
-    int abort_after_timeouts = forkserver_timeout_abort_count();
-
-    if (write_exact(binradar_forkserver_stat_w, &version, sizeof(version)) < 0) {
-        exit_with_status(1);
-    }
     afl_forksrv_pid = getpid();
-    if (read_exact(binradar_forkserver_ctrl_r, &reply_value,
-                   sizeof(reply_value)) < 0 ||
-        reply_value != expected_reply) {
+    if (!binradar_forkserver_handshake(&driver)) {
         log_msg("[snapshot] [forkserver] [error] protocol-v3 handshake\n");
-        exit_with_status(1);
-    }
-    if (write_exact(binradar_forkserver_stat_w, &version, sizeof(version)) < 0) {
         exit_with_status(1);
     }
     log_msg("[forkserver] [start] [protocol 3]\n");
 
     for (;;) {
         uint32_t was_killed;
-        if (read_exact(binradar_forkserver_ctrl_r, &was_killed,
-                       sizeof(was_killed)) < 0) {
+        if (!binradar_forkserver_next(&driver, &was_killed)) {
             log_msg("[forkserver] [exit] parent (fuzzolic) dead or exit\n");
             exit_with_status(2);
         }
-        iteration++;
+        const uint32_t iteration = driver.iteration;
         uint32_t representative_runs = 0;
         uint32_t remaining_mods = 0;
         bool iteration_aborted = false;
-        int64_t iteration_deadline = forkserver_iteration_deadline_us();
         bool *uncovered = NULL;
         bool *executed = NULL;
         SnapshotExitInfo baseline_exit = {0};
@@ -6486,7 +4043,7 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
             uncovered = g_new0(bool, binradar_manager->patch_max_id + 1u);
             executed = g_new0(bool, binradar_manager->patch_max_id + 1u);
             for (uint32_t i = 0; i < binradar_manager->patch_cnt; i++) {
-                uint32_t patch = (uint32_t)binradar_manager_patch_id_at(
+                uint32_t patch = (uint32_t)binradar_cache_patch_id_at(
                     binradar_manager, i + 1u);
                 uncovered[patch] = true;
             }
@@ -6496,8 +4053,8 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
         for (;;) {
             uint32_t child_status = 0;
             if (binradar_mode) {
-                binradar_manager_reset_capture(binradar_manager);
-                if (!binradar_publish_selector(binradar_manager,
+                binradar_cache_reset_child(binradar_manager);
+                if (!binradar_cache_publish_selector(binradar_manager,
                                                 selected_patch, iteration)) {
                     log_msg("[binradar] [cache-fatal] "
                             "[reason selector-publication]\n");
@@ -6532,29 +4089,17 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
                                                 g_osprey_shared_run);
                 }
                 afl_fork_child = 1;
-                close(binradar_forkserver_ctrl_r);
-                close(binradar_forkserver_stat_w);
+                binradar_forkserver_child_close(&driver);
                 return;
             }
 
             representative_runs++;
-            int wait_rc = wait_child_and_drain_patch(
-                child_pid, &child_status, iteration_deadline);
+            int wait_rc = binradar_forkserver_wait_child(
+                &driver, child_pid, binradar_manager, &child_status,
+                report_shared_prov_finding, NULL);
             if (wait_rc < 0) exit_with_status(6);
-            if (wait_rc > 0) {
-                consecutive_child_timeouts++;
-                log_msg("[forkserver] [child-timeout] [consecutive %d]\n",
-                        consecutive_child_timeouts);
-            } else {
-                consecutive_child_timeouts = 0;
-            }
-            if (wait_rc == 2 ||
-                (abort_after_timeouts > 0 &&
-                 consecutive_child_timeouts >= abort_after_timeouts)) {
-                log_msg("[forkserver] [abort] [consecutive-timeout %d] "
-                        "[iter %u] [runs %u]\n",
-                        consecutive_child_timeouts, iteration,
-                        representative_runs);
+            if (binradar_forkserver_record_wait(
+                    &driver, wait_rc, representative_runs)) {
                 iteration_aborted = true;
                 break;
             }
@@ -6569,7 +4114,9 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
                 break;
             }
             if (binradar_mode) {
-                binradar_record_outcome(binradar_manager, selected_patch);
+                binradar_cache_record_outcome(
+                    binradar_manager, selected_patch,
+                    snapshot_exit_info_ptr());
                 if (executed != NULL && selected_patch != 0) {
                     executed[selected_patch] = true;
                 }
@@ -6591,7 +4138,7 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
             }
 
             if (binradar_mode && binradar_manager->cache_enabled) {
-                PatchedResult *observed = get_patched_result_tmp(
+                PatchedResult *observed = binradar_cache_result(
                     binradar_manager, selected_patch);
                 GArray *selected_vector = NULL;
                 bool selected_valid =
@@ -6599,7 +4146,7 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
                     binradar_cache_vector(binradar_manager, selected_patch,
                                           selected_patch,
                                           &selected_vector) &&
-                    binradar_observed_vector_matches(observed->br_taken,
+                    binradar_cache_observed_matches(observed->br_taken,
                                                      selected_vector);
                 if (!selected_valid) {
                     if (selected_vector != NULL) {
@@ -6614,13 +4161,21 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
                     if (binradar_manager->cache_inference_enabled) {
                         binradar_cache_disable(binradar_manager,
                                                "representative-mismatch");
-                        binradar_restore_uncached_candidates(
+                        binradar_cache_restore_uncovered(
                             binradar_manager, uncovered, executed);
                     }
                 } else {
-                    if (!binradar_feedback_write(binradar_manager, iteration,
-                                                 selected_patch,
-                                                 selected_vector)) {
+                    const SnapshotMutationPlan *feedback_plan =
+                        mod_manager != NULL ? mod_manager->current : NULL;
+                    const BinradarMutationFeedbackView mutation_view = {
+                        .writes = feedback_plan != NULL
+                            ? feedback_plan->mods : NULL,
+                        .write_count = feedback_plan != NULL
+                            ? feedback_plan->num_mods : 0,
+                    };
+                    if (!binradar_cache_feedback_write(
+                            binradar_manager, iteration, selected_patch,
+                            selected_vector, &mutation_view)) {
                         g_array_free(selected_vector, TRUE);
                         exit_with_status(1);
                     }
@@ -6629,7 +4184,7 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
                         for (uint32_t i = 0;
                              i < binradar_manager->patch_cnt; i++) {
                             uint32_t candidate =
-                                (uint32_t)binradar_manager_patch_id_at(
+                                (uint32_t)binradar_cache_patch_id_at(
                                     binradar_manager, i + 1u);
                             if (!uncovered[candidate] ||
                                 candidate == selected_patch) continue;
@@ -6640,15 +4195,16 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
                                 binradar_cache_disable(
                                     binradar_manager,
                                     "candidate-evaluation");
-                                binradar_restore_uncached_candidates(
+                                binradar_cache_restore_uncovered(
                                     binradar_manager, uncovered, executed);
                                 break;
                             }
-                            if (binradar_observed_vector_matches(
+                            if (binradar_cache_observed_matches(
                                     observed->br_taken, candidate_vector)) {
-                                binradar_materialize_cache_hit(
+                                binradar_cache_materialize(
                                     binradar_manager, candidate,
-                                    selected_patch, candidate_vector);
+                                    selected_patch, candidate_vector,
+                                    snapshot_exit_info_ptr());
                                 uncovered[candidate] = false;
                             }
                             g_array_free(candidate_vector, TRUE);
@@ -6663,7 +4219,7 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
             selected_patch = 0;
             for (uint32_t i = 0; i < binradar_manager->patch_cnt; i++) {
                 uint32_t candidate =
-                    (uint32_t)binradar_manager_patch_id_at(
+                    (uint32_t)binradar_cache_patch_id_at(
                         binradar_manager, i + 1u);
                 if (uncovered[candidate]) {
                     selected_patch = candidate;
@@ -6675,7 +4231,7 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
 
         if (binradar_mode) {
             if (iteration_aborted || !baseline_exit_valid) {
-                binradar_clear_current(binradar_manager);
+                binradar_cache_clear_iteration(binradar_manager);
                 remaining_mods = 0;
             } else {
                 *snapshot_exit_info_ptr() = baseline_exit;
@@ -6689,25 +4245,23 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
                     remaining_mods = analyze_collected_data(
                         arg_info, num_arg_regs);
                 } else {
-                    binradar_commit(binradar_manager);
+                    if (!binradar_cache_commit(binradar_manager)) {
+                        exit_with_status(1);
+                    }
                     remaining_mods = analyze_collected_data(
                         arg_info, num_arg_regs);
                 }
-                if (iteration == 1) {
-                    binradar_commit(binradar_manager);
+                if (iteration == 1 &&
+                    !binradar_cache_commit(binradar_manager)) {
+                    exit_with_status(1);
                 }
             }
         }
         g_free(executed);
         g_free(uncovered);
 
-        uint32_t summary[3] = {
-            iteration,
-            representative_runs,
-            remaining_mods,
-        };
-        if (write_exact(binradar_forkserver_stat_w, summary,
-                        sizeof(summary)) < 0) {
+        if (!binradar_forkserver_send_summary(
+                &driver, representative_runs, remaining_mods)) {
             exit_with_status(7);
         }
     }

@@ -2675,6 +2675,143 @@ static void record_access_fact(OspreySharedRun *run, uint64_t pc,
         sat_add_u64(run->total_dynamic_observations, 1);
 }
 
+void osprey_sem_ea_clear(CPUArchState *env, bool clear_mode)
+{
+    OspreyCpuOriginState *state = osprey_cpu_origin(env);
+    memset(&state->ea, 0, sizeof(state->ea));
+    if (clear_mode) state->ea_mode = 0;
+}
+
+void osprey_sem_transfer_clear(CPUArchState *env)
+{
+    OspreyCpuOriginState *state = osprey_cpu_origin(env);
+    state->pending_transfer_pc = 0;
+    state->pending_transfer_pc_valid = 0;
+}
+
+void osprey_sem_ea_begin(CPUArchState *env, uint32_t base_reg,
+                         uint32_t index_reg, uint32_t scale,
+                         target_ulong disp, uint32_t mode, bool eligible)
+{
+    OspreyCpuOriginState *state = osprey_cpu_origin(env);
+    state->pending_helper_count = 0;
+    osprey_sem_transfer_clear(env);
+    state->ea_mode = mode;
+    memset(&state->ea, 0, sizeof(state->ea));
+    if (!eligible) {
+        state->ea_mode = 0;
+        return;
+    }
+    state->ea.valid = 1;
+    state->ea.base_reg = (int32_t)base_reg;
+    state->ea.index_reg = (int32_t)index_reg;
+    state->ea.scale = (int32_t)scale;
+    state->ea.disp = (int64_t)(int32_t)disp;
+}
+
+void osprey_sem_ea_set_mode(CPUArchState *env, uint32_t mode, bool eligible)
+{
+    OspreyCpuOriginState *state = osprey_cpu_origin(env);
+    state->pending_helper_count = 0;
+    osprey_sem_transfer_clear(env);
+    state->ea_mode = mode;
+    if (!eligible) osprey_sem_ea_clear(env, true);
+}
+
+void osprey_sem_ea_set_values(CPUArchState *env, target_ulong base_value,
+                              target_ulong index_value)
+{
+    OspreyCpuOriginState *state = osprey_cpu_origin(env);
+    if (!state->ea.valid) return;
+    state->ea.base_val = base_value;
+    state->ea.index_val = index_value;
+    memset(&state->ea.base_origin, 0, sizeof(state->ea.base_origin));
+    memset(&state->ea.index_origin, 0, sizeof(state->ea.index_origin));
+    if (state->ea.base_reg >= 0 && state->ea.base_reg < CPU_NB_REGS) {
+        state->ea.base_origin = state->regs[state->ea.base_reg].address;
+    }
+    if (state->ea.index_reg >= 0 && state->ea.index_reg < CPU_NB_REGS) {
+        state->ea.index_origin = state->regs[state->ea.index_reg].address;
+    }
+}
+
+uint32_t osprey_sem_ea_peek_mode(CPUArchState *env)
+{
+    return osprey_cpu_origin(env)->ea_mode;
+}
+
+uint32_t osprey_sem_ea_take_mode(CPUArchState *env)
+{
+    OspreyCpuOriginState *state = osprey_cpu_origin(env);
+    uint32_t mode = state->ea_mode;
+    state->ea_mode = 0;
+    return mode;
+}
+
+void osprey_sem_transfer_set(CPUArchState *env, target_ulong pc)
+{
+    OspreyCpuOriginState *state = osprey_cpu_origin(env);
+    state->pending_transfer_pc = pc;
+    state->pending_transfer_pc_valid = 1;
+}
+
+target_ulong osprey_sem_transfer_take(CPUArchState *env)
+{
+    OspreyCpuOriginState *state = osprey_cpu_origin(env);
+    target_ulong pc = state->pending_transfer_pc_valid
+        ? state->pending_transfer_pc : 0;
+    state->pending_transfer_pc = 0;
+    state->pending_transfer_pc_valid = 0;
+    return pc;
+}
+
+void osprey_helper_intervals_reset(CPUArchState *env)
+{
+    osprey_cpu_origin(env)->pending_helper_count = 0;
+}
+
+OspreyHelperIntervalResult osprey_helper_interval_stage(
+    CPUArchState *env, target_ulong addr, target_ulong size, target_ulong pc,
+    bool is_store, uint32_t op_class, uint32_t interval_policy,
+    uint32_t producer_id)
+{
+    OspreyCpuOriginState *state = osprey_cpu_origin(env);
+    if (state->pending_helper_count != 0 &&
+        (state->pending_helper[0].interval_policy != interval_policy ||
+         state->pending_helper[0].producer_id != producer_id)) {
+        return OSPREY_HELPER_INTERVAL_CONTRACT_MISMATCH;
+    }
+    if (state->pending_helper_count >=
+        OSPREY_MAX_PENDING_HELPER_INTERVALS) {
+        return OSPREY_HELPER_INTERVAL_FULL;
+    }
+    OspreyPendingHelperInterval *pending =
+        &state->pending_helper[state->pending_helper_count++];
+    pending->addr = addr;
+    pending->size = size;
+    pending->pc = pc;
+    pending->op_class = op_class;
+    pending->interval_policy = interval_policy;
+    pending->producer_id = producer_id;
+    pending->is_store = is_store;
+    return OSPREY_HELPER_INTERVAL_OK;
+}
+
+void osprey_helper_intervals_commit(CPUArchState *env)
+{
+    OspreyCpuOriginState *state = osprey_cpu_origin(env);
+    uint32_t count = state->pending_helper_count;
+    state->pending_helper_count = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        const OspreyPendingHelperInterval *pending =
+            &state->pending_helper[i];
+        osprey_on_mem_access_class(env, pending->addr, pending->size,
+                                   pending->pc, pending->is_store,
+                                   pending->op_class);
+    }
+    state->ea_mode = 0;
+}
+
 void osprey_on_mem_access(CPUArchState *env, target_ulong addr,
                           uint64_t size, uint64_t pc, uint32_t is_store) {
     osprey_on_mem_access_class(env, addr, size, pc, is_store,
