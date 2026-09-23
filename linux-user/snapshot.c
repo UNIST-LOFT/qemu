@@ -4173,6 +4173,16 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
                         selected_patch, iteration);
             }
 
+            /* Each representative must start from a baseline-owned shared
+             * finding slot.  The child clears it again after patch
+             * application (below), but a child that dies before reaching
+             * that point - most importantly a mutation child killed by the
+             * child/iteration timeout - would otherwise leave the previous
+             * representative's finding in the MAP_SHARED slot for
+             * report_shared_prov_finding() to salvage as this
+             * representative's.  Clearing here, before fork(), makes the
+             * baseline state unambiguous regardless of how the child ends. */
+            provenance_clear_pending_fault();
             fflush(NULL);
             trace_mem_flush();
             log_msg_flush();

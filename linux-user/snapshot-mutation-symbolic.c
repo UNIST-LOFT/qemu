@@ -5,7 +5,7 @@
  * forkserver parent after the baseline patch-0 child exits, borrows the frozen
  * expression and query pools for the duration of the call, and owns nothing
  * afterwards.  See
- * agent-docs/memo/BINRADAR_IN_PROCESS_SYMBOLIC_MUTATION_PLAN.md.
+ * agent-docs/done/plans/BINRADAR_IN_PROCESS_SYMBOLIC_MUTATION_PLAN.md.
  *
  * Pipeline:
  *  1. select eligible retained primitive reads in canonical baseline order;

@@ -409,6 +409,53 @@ typedef struct {
 
 static GSList* plt_info = NULL;
 static GHashTable* plt_addrs = NULL;
+
+/* PLT_INFO_FILE rows are keyed by the basename of the executable the model
+ * table was generated from (fuzzolic/find_models_addrs.py uses
+ * os.path.basename(binary)).  BinRadar executes derived artifacts of that
+ * same executable - <binary>.brpatched / <binary>.brcached - which differ
+ * only by patching: the executable LOAD layout, and therefore every PLT
+ * stub offset, is unchanged from the executable the table was built
+ * from.  Comparing raw basenames would silently register no model at all
+ * for an artifact run (load_image never matches), which disables the
+ * allocator hooks and makes provenance findings disappear.  Only the main
+ * executable may use an artifact alias; shared libraries must match their
+ * table rows exactly, even if their names end with an artifact suffix. */
+static const char *const plt_image_suffixes[] = {
+    ".orig", ".brpatched", ".brcached", ".brprefilter", ".patched",
+};
+
+/* Length of `name` after removing one known pipeline artifact suffix, or
+ * the full length when the name carries none.  Rows name the executable the
+ * table was generated from (usually the plain `<binary>`); the executed
+ * artifact is that same executable plus one suffix, so both sides reduce to
+ * the same stem. */
+static size_t plt_image_stem_len(const char *name)
+{
+    size_t len = strlen(name);
+    for (size_t i = 0; i < G_N_ELEMENTS(plt_image_suffixes); i++) {
+        size_t suffix_len = strlen(plt_image_suffixes[i]);
+        if (len > suffix_len &&
+            strcmp(name + len - suffix_len, plt_image_suffixes[i]) == 0) {
+            return len - suffix_len;
+        }
+    }
+    return len;
+}
+
+/* True when a PLT_INFO_FILE row image denotes the loaded image.  Rows are
+ * written for the executable the table was generated from; only the main
+ * executable may compare equal on the shared stem. */
+static bool plt_image_matches(const char *row_image, const char *loaded)
+{
+    if (strcmp(row_image, loaded) == 0) {
+        return true;
+    }
+    size_t row_len = plt_image_stem_len(row_image);
+    size_t loaded_len = plt_image_stem_len(loaded);
+    return row_len == loaded_len && strncmp(row_image, loaded, row_len) == 0;
+}
+
 inline static void parse_plt_info(char* path) 
 {
     FILE* fp = fopen(path, "r");
@@ -608,7 +655,9 @@ void load_image(char* name, uintptr_t addr)
     GSList* el = plt_info;
     while (el) {
         PltInfo* plt = el->data;
-        if (strcmp(plt->image, name) == 0) {
+        if (addr == symbolic_start_code
+                ? plt_image_matches(plt->image, name)
+                : strcmp(plt->image, name) == 0) {
 #if 0
             printf("PLT: image=%s model=%u addr=%lx\n",
                         plt->image, plt->model, (addr + plt->offset));

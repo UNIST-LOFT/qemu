@@ -27,6 +27,7 @@ import ctypes
 import os
 import random
 import re
+import shutil
 import struct
 import subprocess
 import sys
@@ -463,6 +464,27 @@ PHASE6_TESTS: list[dict[str, Any]] = [
 TESTS += PHASE6_TESTS
 
 # ---------------------------------------------------------------------------
+# t81: PLT model table identity across artifact-named executions
+# ---------------------------------------------------------------------------
+# PLT_INFO_FILE rows are keyed by the basename of the executable the table
+# was generated from, and BinRadar executes derived artifacts of that
+# executable (<binary>.brpatched / <binary>.brcached) whose PLT layout is
+# identical.  Comparing raw basenames registered no model for an artifact
+# run, so the allocator hooks vanished and a real heap violation reported a
+# normal exit.  Generate the table from a `.orig` copy, then execute the
+# `.brpatched` copy: the finding must still be published.
+PHASE7_TESTS: list[dict[str, Any]] = [
+    dict(name="t81_plt_image_identity", mode="mem", rc=(0,),
+         verdict="crash", artifact_suffix=".brpatched",
+         plt_source_suffix=".orig",
+         finding=dict(reason="heap-buffer-overflow", is_uaf=0,
+                      fields={"obj_id": 1, "gen": 1, "size": 8, "offset": 8}),
+         note="artifact-suffixed execution still resolves the PLT model "
+              "table generated for the .orig executable"),
+]
+TESTS += PHASE7_TESTS
+
+# ---------------------------------------------------------------------------
 # Log parsing
 # ---------------------------------------------------------------------------
 
@@ -588,13 +610,34 @@ def run_memcheck(test, guest, qemu, workdir):
     env["BINRADAR_PROBE_FILE"] = test.get("probe_file", "")
     env["BINRADAR_ENTRYPOINT"] = resolve_entrypoint(guest)
     env["PLT_INFO_FILE"] = guest + ".plt"
+    source_suffix = test.get("plt_source_suffix")
+    if source_suffix:
+        source = guest + source_suffix
+        shutil.copyfile(guest, source)
+        env["PLT_INFO_FILE"] = source + ".plt"
+        subprocess.run([sys.executable,
+                        os.path.join(os.path.dirname(__file__), "gen_plt.py"),
+                        "-o", env["PLT_INFO_FILE"], source], check=True)
     if test.get("no_consistency"):
         # Phase 4: changed-byte syscall outputs must be invalidated by the
         # hook, not silently dropped by the load-time value-consistency
         # check.  With debug logging on, a missing hook shows up as a
         # `[prov] [consistency]` line; the check() below rejects it.
         env["BINRADAR_PROVENANCE_DEBUG"] = "1"
-    cmd = [qemu, "-d", "page", guest]
+    # Execute under a name carrying a pipeline artifact suffix while
+    # PLT_INFO_FILE names the .orig binary: exactly how BinRadar runs
+    # <binary>.brpatched/.brcached against a table generated from
+    # <binary>.orig.  Copy through a temporary file so the suffixed
+    # executable is never a partially written binary.
+    suffix = test.get("artifact_suffix")
+    binary = guest
+    if suffix:
+        binary = guest + suffix
+        temporary = binary + ".tmp"
+        shutil.copyfile(guest, temporary)
+        os.chmod(temporary, 0o755)
+        os.replace(temporary, binary)
+    cmd = [qemu, "-d", "page", binary]
     return run_tracer(cmd, env, test.get("timeout", 30))
 
 
