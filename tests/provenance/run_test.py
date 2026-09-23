@@ -184,10 +184,27 @@ TESTS: list[dict[str, Any]] = [
          fs_min_discarded=1, fs_discard_reason="no-observation",
          allow_findings=True,
          note="the driver stops after its own bounded attempt budget, not "
-              "because the tracer ended the sweep: the first mutation plans "
-              "divert control before the patch site and are discarded as "
-              "ordinary no-observation misses while the queue keeps "
-              "advancing and later attempts still publish their outcomes"),
+              "because the tracer ended the sweep: every mutation plan for "
+              "this guest diverts control before the patch site, so the "
+              "attempts are discarded as ordinary no-observation misses "
+              "while the queue keeps advancing.  That proves a discard does "
+              "not consume the queue; a later *committing* attempt is proven "
+              "by the real subject run recorded in the fix plan's P2 audit, "
+              "which the synthetic 8-byte mod target here cannot force"),
+    dict(name="t83_final_discarded_plan", 
+         guest="t82_unusable_attempt_recovery",
+         mode="fors", rc=(0,), verdict=None, fs_binradar=True,
+         fs_patch_cnt=3, fs_abort_count=0,   # 0 disables the bad-attempt limit
+         fs_max_attempts=400, fs_stop="exhausted", fs_remaining=0,
+         fs_attempt_result=ATTEMPT_NO_OBSERVATION, fs_committed=1,
+         fs_only_no_observation_discards=True, fs_evidence_attempts=(1,),
+         fs_min_discarded=1, fs_discard_reason="no-observation",
+         allow_findings=True, timeout=900,
+         note="every plan for this guest is discarded, so the LAST queued "
+              "plan is discarded too: the sweep ends `exhausted` with "
+              "remaining 0, one committed baseline frame and no mutation "
+              "frame.  This is the real terminal-discard case; the reducer "
+              "must report it partial, never complete"),
     # --- UNKNOWN-provenance negative cases (no numeric UAF) --------------
     dict(name="t28_unknown_no_uaf", mode="mem", rc=(0,), verdict="normal",
          finding=None,
@@ -739,6 +756,7 @@ def _summarize(summaries):
     results = [row[3] for row in summaries]
     return {
         "attempts": attempts,
+        "initial_remaining": summaries[0][2],
         "attempt_result": results[-1],
         "stop_reason": summaries[-1][4],
         "stop_name": STOP_NAMES.get(summaries[-1][4], "invalid"),
@@ -883,7 +901,8 @@ def run_forkserver(test, guest, qemu, workdir):
         with open(stderr_path, "r", errors="replace") as f:
             stderr_text = f.read()
         evidence = None
-        if test.get("compact_fault_reference"):
+        if test.get("compact_fault_reference") or \
+                "fs_evidence_attempts" in test:
             evidence_path = env["BINRADAR_EVIDENCE_FILE"]
             if os.path.isfile(evidence_path):
                 evidence = list(binradar_evidence.read_binradar(
@@ -1011,6 +1030,35 @@ def check(test, rc, fs_status, out, evidence=None, probe_text="",
                     f"forkserver remaining "
                     f"{summary['remaining'] if summary else None} != "
                     f"{want_remaining}")
+        want_committed = test.get("fs_committed")
+        if want_committed is not None:
+            if summary is None or summary["committed"] != want_committed:
+                problems.append(
+                    f"forkserver committed "
+                    f"{summary['committed'] if summary else None} != "
+                    f"{want_committed}")
+        if test.get("fs_only_no_observation_discards"):
+            if summary is None:
+                problems.append("missing summary for discarded-attempt outcomes")
+            elif (summary["attempts"] < 2 or
+                  summary["attempts"] != summary["initial_remaining"] + 1 or
+                  summary["committed"] != 1 or
+                  summary["no_observation"] != summary["attempts"] - 1):
+                problems.append(
+                    "mutation queue did not finish with only "
+                    "no-observation discards "
+                    f"(attempts={summary['attempts']}, "
+                    f"initial-remaining={summary['initial_remaining']}, "
+                    f"committed={summary['committed']}, "
+                    f"no-observation={summary['no_observation']})")
+        want_evidence_attempts = test.get("fs_evidence_attempts")
+        if want_evidence_attempts is not None:
+            evidence_attempts = ([iteration.iteration for iteration in evidence]
+                                 if evidence is not None else None)
+            if evidence_attempts != list(want_evidence_attempts):
+                problems.append(
+                    f"BINRADAR evidence attempts {evidence_attempts} != "
+                    f"{list(want_evidence_attempts)}")
         want_discard_rows = test.get("fs_discard_reason")
         if want_discard_rows is not None:
             marker = f"[binradar] [attempt-discarded] [iter "
@@ -1020,7 +1068,9 @@ def check(test, rc, fs_status, out, evidence=None, probe_text="",
                 problems.append(
                     f"missing attempt-discarded reason {want_discard_rows!r}")
         want_abort = test.get("fs_abort_count")
-        if want_abort is not None:
+        # 0 disables the consecutive-bad-attempt limit, so no failure-limit
+        # row is expected; only a positive bound must produce one.
+        if want_abort:
             marker = (f"[forkserver] [failure-limit] "
                       f"[consecutive-bad {want_abort}]")
             if marker not in out:
