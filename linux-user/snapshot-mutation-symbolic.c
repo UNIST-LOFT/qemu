@@ -598,6 +598,8 @@ typedef struct SnapshotSymbolicStats {
     uint32_t valid_roots;
     uint32_t consumers;
     uint32_t candidates;
+    uint32_t candidates_generated;
+    uint32_t families_generated;
     uint32_t families;
     uint32_t unsupported;
     uint32_t budget;
@@ -1600,6 +1602,7 @@ static bool engine_consumers(SnapshotSymbolicEngine *engine)
                 memcmp(&lowered, entry->planner_bytes, source->width) == 0) {
                 continue;
             }
+            engine->stats.candidates_generated++;
             if (!engine_candidate_insert(engine, &candidate)) return false;
         }
     }
@@ -1692,6 +1695,7 @@ uint32_t snapshot_symbolic_run(const SnapshotSymbolicView *view,
                                SnapshotMutationProposalSink *sink)
 {
     SnapshotSymbolicEngine engine;
+    uint32_t generated = 0;
     uint32_t submitted = 0;
 
     snapshot_symbolic_configure();
@@ -1790,6 +1794,7 @@ uint32_t snapshot_symbolic_run(const SnapshotSymbolicView *view,
             }
             submitted_ok = submit_source(&engine, sink, selected, count, s,
                                          &emitted);
+            if (emitted > 0) generated++;
             if (!submitted_ok) {
                 /* The sink rejected the family (quota, validation, or
                  * allocation): a local abstention that leaves the source's
@@ -1802,6 +1807,7 @@ uint32_t snapshot_symbolic_run(const SnapshotSymbolicView *view,
     }
 
 out:
+    engine.stats.families_generated = generated;
     engine.stats.families = submitted;
     if (engine.budget.work_exhausted || engine.budget.bytes_exhausted ||
         engine.budget.deadline_exhausted) {
@@ -1813,7 +1819,8 @@ out:
     log_msg("[symbolic-advisor] [summary] [mode %s] [sources %u] "
             "[valid-roots %u] [consumers %u] [candidates %u] [families %u] "
             "[unsupported %u] [budget %u] [work %llu] [bytes %llu] "
-            "[time-ms %lld]\n",
+            "[time-ms %lld] [candidates-generated %u] "
+            "[families-generated %u] [families-accepted %u]\n",
             s_symbolic_config.mode == SNAPSHOT_SYMBOLIC_BOUNDARY
                 ? "boundary" : "shadow",
             engine.stats.sources, engine.stats.valid_roots,
@@ -1821,7 +1828,9 @@ out:
             engine.stats.families, engine.stats.unsupported,
             engine.stats.budget, (unsigned long long)engine.stats.work,
             (unsigned long long)engine.stats.bytes,
-            (long long)((engine.stats.end_us - engine.stats.start_us) / 1000));
+            (long long)((engine.stats.end_us - engine.stats.start_us) / 1000),
+            engine.stats.candidates_generated,
+            engine.stats.families_generated, engine.stats.families);
     index_destroy(&engine.index);
     g_free(engine.candidate_counts);
     g_free(engine.candidates);

@@ -860,6 +860,9 @@ bool snapshot_mutation_stage_family(
             g_ptr_array_free(local, TRUE);
             return false;
         }
+        plan->advisor_id = family->advisor_id;
+        plan->source_ordinal = family->primary_seed.source_ordinal;
+        plan->family_id = family->family_id;
         g_ptr_array_add(local, plan);
     }
     for (guint i = 0; i < local->len; i++) {

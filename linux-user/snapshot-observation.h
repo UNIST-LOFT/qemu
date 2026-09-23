@@ -67,6 +67,7 @@ typedef struct PointerAccess {
 
 typedef struct SharedTraceData {
     uint64_t run_epoch;
+    uint32_t symbolic_advisor_plan_applied;
     uint32_t prim_idx;
     uint32_t ptr_idx;
     uint64_t prim_access_cnt;

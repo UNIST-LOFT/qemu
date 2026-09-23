@@ -1006,6 +1006,7 @@ TESTS = [
             ("t16", "[tag high] [value 00001000]"),
         ],
         expect_symbolic_families_min=1,
+        expect_advisor_child_uses_min=1,
         timeout=120,
     ),
     dict(
@@ -2756,6 +2757,23 @@ def check(test, rc, out):
         elif families_max is not None and max(counts) > families_max:
             problems.append(
                 f"symbolic advisor families {max(counts)} > {families_max}")
+    min_child_uses = test.get("expect_advisor_child_uses_min")
+    if min_child_uses is not None:
+        funnels = re.findall(
+            r"\[symbolic-advisor\] \[summary\] \[mode boundary\]"
+            r"[^\n]*\[candidates-generated (\d+)\] "
+            r"\[families-generated (\d+)\] "
+            r"\[families-accepted (\d+)\]", out)
+        if not any(int(candidates) >= int(generated) >= int(accepted) >= 1
+                   for candidates, generated, accepted in funnels):
+            problems.append("symbolic advisor generation/admission funnel missing")
+        counts = [int(n) for n in re.findall(
+            r"\[binradar\] \[advisor-attempt\] \[attempt \d+\]"
+            r"[^\n]*\[child-uses (\d+)\]", out)]
+        if sum(counts) < min_child_uses:
+            problems.append(
+                f"applied advisor child uses {sum(counts)} < "
+                f"{min_child_uses}")
     return problems
 
 

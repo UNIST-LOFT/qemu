@@ -53,6 +53,9 @@ _Static_assert(sizeof(target_ulong) <= sizeof(((MutationCandidate *)0)->value),
 
 typedef struct SnapshotMutationPlan {
     uint32_t num_mods;
+    uint32_t advisor_id;       /* 0 for generic plans */
+    uint32_t source_ordinal;   /* baseline source; scalar, no arena pointer */
+    uint64_t family_id;
     SnapshotMutationWrite *mods;
 } SnapshotMutationPlan;
 

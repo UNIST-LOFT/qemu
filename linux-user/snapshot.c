@@ -3161,7 +3161,14 @@ static void snapshot_modify_memory(CPUArchState *cpu_env)
     result = snapshot_mutation_apply(mod_manager->current,
                                      &snapshot_mutation_child_host,
                                      &context);
-    if (result == SNAPSHOT_MUTATION_APPLY_OK) return;
+    if (result == SNAPSHOT_MUTATION_APPLY_OK) {
+        if (shared_trace_data != NULL && mod_manager->current != NULL &&
+            mod_manager->current->advisor_id ==
+                SNAPSHOT_SYMBOLIC_ADVISOR_ID) {
+            shared_trace_data->symbolic_advisor_plan_applied = 1;
+        }
+        return;
+    }
 
     static const char *const errors[] = {
         [SNAPSHOT_MUTATION_APPLY_EMPTY] = "empty mutation plan",
@@ -4188,7 +4195,16 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
         bool *executed = NULL;
         SnapshotExitInfo baseline_exit = {0};
         bool baseline_exit_valid = false;
+        uint32_t symbolic_advisor_child_uses = 0;
+        uint32_t attempt_advisor_id = 0;
+        uint32_t attempt_advisor_source = 0;
+        uint64_t attempt_advisor_family = 0;
 
+        if (mod_manager != NULL && mod_manager->current != NULL) {
+            attempt_advisor_id = mod_manager->current->advisor_id;
+            attempt_advisor_source = mod_manager->current->source_ordinal;
+            attempt_advisor_family = mod_manager->current->family_id;
+        }
         if (binradar_mode && attempt > 1) {
             uncovered = g_new0(bool, binradar_manager->patch_max_id + 1u);
             executed = g_new0(bool, binradar_manager->patch_max_id + 1u);
@@ -4211,6 +4227,7 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
                     exit_with_status(5);
                 }
                 if (shared_trace_data != NULL) {
+                    shared_trace_data->symbolic_advisor_plan_applied = 0;
                     memset(&shared_trace_data->exit_info, 0,
                            sizeof(shared_trace_data->exit_info));
                 }
@@ -4262,6 +4279,10 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
                 report_shared_prov_finding, NULL);
             if (wait_rc < 0) exit_with_status(6);
             trace_mem_flush();
+            if (shared_trace_data != NULL &&
+                shared_trace_data->symbolic_advisor_plan_applied) {
+                symbolic_advisor_child_uses++;
+            }
 
             SnapshotExitInfo *exit_info = snapshot_exit_info_ptr();
             bool exit_unusable = exit_info == NULL || !exit_info->valid ||
@@ -4474,6 +4495,15 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
                         arg_info, num_arg_regs);
                 }
             }
+        }
+        if (binradar_mode && attempt_advisor_id ==
+                SNAPSHOT_SYMBOLIC_ADVISOR_ID) {
+            log_msg("[binradar] [advisor-attempt] [attempt %u] "
+                    "[advisor-id %u] [family %llu] [source %u] "
+                    "[child-uses %u]\n",
+                    attempt, attempt_advisor_id,
+                    (unsigned long long)attempt_advisor_family,
+                    attempt_advisor_source, symbolic_advisor_child_uses);
         }
         g_free(executed);
         g_free(uncovered);
