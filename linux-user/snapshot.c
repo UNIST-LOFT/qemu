@@ -466,22 +466,55 @@ void snapshot_init_binradar_patch_shm(uintptr_t key) {
             log_msg("[binradar] [feedback] [disabled] "
                     "[reason brcached-required]\n");
         } else {
+            const char *valid_text = getenv("BINRADAR_POC_FAULT_VALID");
+            const char *source_text = getenv("BINRADAR_POC_FAULT_SOURCE");
             const char *fault_text = getenv("BINRADAR_POC_FAULT_ADDR");
             char *end = NULL;
-            errno = 0;
-            unsigned long long fault = fault_text != NULL
-                ? strtoull(fault_text, &end, 0) : 0;
-            if (fault_text == NULL || fault_text[0] == '\0' || errno != 0 ||
-                end == fault_text || *end != '\0' ||
-                (target_ulong)fault != fault ||
+            unsigned long long fault = 0;
+            bool valid;
+            SnapshotFaultReferenceSource source =
+                SNAPSHOT_FAULT_REFERENCE_UNAVAILABLE;
+
+            if (valid_text == NULL ||
+                (strcmp(valid_text, "0") != 0 && strcmp(valid_text, "1") != 0) ||
+                source_text == NULL ||
                 !g_file_test(feedback_dir, G_FILE_TEST_IS_DIR)) {
                 log_msg("[binradar] [feedback] [error configuration]\n");
                 exit_with_status(1);
             }
+            valid = strcmp(valid_text, "1") == 0;
+            if (strcmp(source_text, "guest-signal") == 0) {
+                source = SNAPSHOT_FAULT_REFERENCE_GUEST_SIGNAL;
+            } else if (strcmp(source_text, "provenance-access") == 0) {
+                source = SNAPSHOT_FAULT_REFERENCE_PROVENANCE_ACCESS;
+            } else if (strcmp(source_text, "unavailable") != 0) {
+                log_msg("[binradar] [feedback] [error configuration]\n");
+                exit_with_status(1);
+            }
+            if (valid != (source != SNAPSHOT_FAULT_REFERENCE_UNAVAILABLE)) {
+                log_msg("[binradar] [feedback] [error configuration]\n");
+                exit_with_status(1);
+            }
+            if (valid) {
+                errno = 0;
+                fault = strtoull(fault_text != NULL ? fault_text : "",
+                                 &end, 0);
+                if (fault_text == NULL || fault_text[0] == '\0' ||
+                    errno != 0 || end == fault_text || *end != '\0' ||
+                    (target_ulong)fault != fault) {
+                    log_msg("[binradar] [feedback] [error configuration]\n");
+                    exit_with_status(1);
+                }
+            }
             binradar_manager->feedback_dir = g_strdup(feedback_dir);
+            binradar_manager->poc_fault_valid = valid;
+            binradar_manager->poc_fault_source = source;
             binradar_manager->poc_fault_addr = (target_ulong)fault;
             log_msg("[binradar] [feedback] [enabled] [dir %s] "
+                    "[poc-fault-valid %s] [poc-fault-source %s] "
                     "[poc-fault-addr %lx]\n", feedback_dir,
+                    valid ? "true" : "false",
+                    snapshot_fault_reference_source_name(source),
                     binradar_manager->poc_fault_addr);
         }
     }
@@ -883,6 +916,117 @@ static void dump_coverage_edge_log(gboolean update) {
     }
 }
 
+static void snapshot_emit_fault_reference(const SnapshotExitInfo *info)
+{
+    const char *source;
+    bool valid;
+
+    if (info == NULL) return;
+    valid = info->fault_reference_valid != 0 &&
+        (info->fault_reference_source ==
+             SNAPSHOT_FAULT_REFERENCE_GUEST_SIGNAL ||
+         info->fault_reference_source ==
+             SNAPSHOT_FAULT_REFERENCE_PROVENANCE_ACCESS);
+    source = valid ? snapshot_fault_reference_source_name(
+        info->fault_reference_source) : "unavailable";
+    log_msg("[snapshot] [fault-reference] [version 2] [valid %s] "
+            "[source %s] [address %lx]\n",
+            valid ? "true" : "false", source,
+            valid ? info->fault_addr : 0ul);
+
+    if (binradar_probe_file != NULL) {
+        FILE *fp = fopen(binradar_probe_file, "a");
+        if (fp == NULL) {
+            fprintf(stderr, "Failed to open binradar probe file: %s\n",
+                    binradar_probe_file);
+        } else {
+            fprintf(fp, "[snapshot] [fault-reference] [version 2] "
+                    "[valid %s] [source %s] [address %lx]\n",
+                    valid ? "true" : "false", source,
+                    valid ? info->fault_addr : 0ul);
+            fclose(fp);
+        }
+    }
+}
+
+static void snapshot_emit_crash_rows(const SnapshotExitInfo *info)
+{
+    if (info == NULL) return;
+    snapshot_emit_fault_reference(info);
+    log_msg("[snapshot] [exit] [crash] [entrypoint-hit %lu]\n",
+             binradar_entrypoint_hit_count);
+    snapshot_log_cursor_indices(info);
+    log_msg("[snapshot] [crash] [hit-count %lu] [reason %s] "
+            "[guest_pc %lx] [guest_cs_base %lx] [fault_addr %lx] "
+            "[host_fault_addr %lx]\n",
+            binradar_entrypoint_hit_count, info->description,
+            info->guest_pc, info->guest_cs_base, info->fault_addr,
+            info->host_fault_addr);
+    if (binradar_manager) {
+        int patch_id = binradar_cache_patch_id(binradar_manager, -1);
+        int iter = binradar_cache_iteration(binradar_manager, -1);
+        log_msg("[binradar] [crash] [iter %d] [patch %d] [guest_pc %lx] "
+                "[guest_cs_base %lx] [fault_addr %lx] "
+                "[host_fault_addr %lx] [reason %s]\n",
+                iter, patch_id, info->guest_pc, info->guest_cs_base,
+                info->fault_addr, info->host_fault_addr, info->description);
+    }
+    if (binradar_probe_file != NULL) {
+        FILE *fp = fopen(binradar_probe_file, "a");
+        if (fp == NULL) {
+            fprintf(stderr, "Failed to open binradar probe file: %s\n",
+                    binradar_probe_file);
+        } else {
+            fprintf(fp, "[snapshot] [crash] [hit-count %lu] [reason %s] "
+                    "[guest_pc %lx] [guest_cs_base %lx] "
+                    "[fault_addr %lx] [host_fault_addr %lx]\n",
+                    binradar_entrypoint_hit_count, info->description,
+                    info->guest_pc, info->guest_cs_base, info->fault_addr,
+                    info->host_fault_addr);
+            fclose(fp);
+        }
+    }
+    dump_coverage_edge_log(true);
+}
+
+static void snapshot_record_guest_crash_with_reference(
+    CPUArchState *cpu_env, int target_signal, int host_signal, int si_code,
+    uintptr_t host_fault_addr, const char *reason,
+    SnapshotFaultReferenceSource reference_source, target_ulong reference_addr)
+{
+    SnapshotExitInfo *info;
+
+    snapshot_load_binradar_env();
+    info = snapshot_exit_info_ptr();
+    if (!snapshot_exit_info_should_update(info, true)) return;
+    info->valid = 0;
+    info->crashed = 1;
+    info->target_signal = target_signal;
+    info->host_signal = host_signal;
+    info->si_code = si_code;
+    info->exit_code = (host_signal > 0) ? (128 + host_signal) : -target_signal;
+    info->host_fault_addr = host_fault_addr;
+    snapshot_exit_info_capture(info, cpu_env);
+    if (reference_source == SNAPSHOT_FAULT_REFERENCE_GUEST_SIGNAL) {
+        reference_addr = info->guest_pc;
+    }
+    snapshot_exit_info_set_fault_reference(info, reference_source,
+                                           reference_addr);
+    char buffer[SNAPSHOT_EXIT_DESC_LEN];
+    const char *base = reason ? reason : "unhandled signal";
+    const char *host_name = (host_signal > 0) ? strsignal(host_signal) : NULL;
+    if (host_name) {
+        g_snprintf(buffer, sizeof(buffer), "%s (host=%s[%d], target=%d)",
+                   base, host_name, host_signal, target_signal);
+    } else {
+        g_snprintf(buffer, sizeof(buffer), "%s (host=%d, target=%d)",
+                   base, host_signal, target_signal);
+    }
+    snapshot_exit_info_set_reason(info, buffer);
+    info->valid = 1;
+    snapshot_emit_crash_rows(info);
+}
+
 void snapshot_record_guest_normal_exit(CPUArchState *cpu_env, int exit_code, const char *reason) {
     /* Deferred provenance finding: finalize as a synthetic crash unless a
      * real crash already won the exit-info slot (deterministic precedence,
@@ -900,29 +1044,29 @@ void snapshot_record_guest_normal_exit(CPUArchState *cpu_env, int exit_code, con
 		 * signal), with the real crash selecting the verdict. */
 		provenance_report_pending_finding();
 
-		SnapshotExitInfo *info = snapshot_exit_info_ptr();
-		if (info->valid && info->crashed) {
-			/* Real crash already recorded — the earlier record wins the
-			 * verdict; the finding was preserved above. */
-			return;
-		}
-		snapshot_record_guest_crash(cpu_env, TARGET_SIGSEGV, 0,
-		                            SEGV_ACCERR, fault.payload.access_pc, 0,
-		                            pf_reason);
-		/* Crash record stores fault_addr = guest_pc (code address).
-		 * Re-expose the provenance access PC for diagnostics. */
-		info = snapshot_exit_info_ptr();
-		info->fault_addr = fault.payload.access_pc;
-		return;
+        SnapshotExitInfo *info = snapshot_exit_info_ptr();
+        if (info != NULL && info->valid && info->crashed) {
+            /* Real crash already recorded — the earlier record wins the
+             * verdict; the finding was preserved above. */
+            return;
+        }
+        snapshot_record_guest_crash_with_reference(
+            cpu_env, TARGET_SIGSEGV, 0, SEGV_ACCERR, 0, pf_reason,
+            SNAPSHOT_FAULT_REFERENCE_PROVENANCE_ACCESS,
+            fault.payload.access_pc);
+        return;
 	}
 
     SnapshotExitInfo *info = snapshot_exit_info_ptr();
     if (!snapshot_exit_info_should_update(info, false)) return;
-    info->valid = 1;
+    info->valid = 0;
     info->crashed = 0;
     info->exit_code = exit_code;
     snapshot_exit_info_capture(info, cpu_env);
+    snapshot_exit_info_set_fault_reference(
+        info, SNAPSHOT_FAULT_REFERENCE_UNAVAILABLE, 0);
     snapshot_exit_info_set_reason(info, reason ? reason : "normal_exit");
+    info->valid = 1;
 	log_msg("[snapshot] [exit] [normal] [entrypoint-hit %lu]\n",
 	        binradar_entrypoint_hit_count);
 	snapshot_log_cursor_indices(info);
@@ -936,54 +1080,18 @@ void snapshot_record_guest_normal_exit(CPUArchState *cpu_env, int exit_code, con
     dump_coverage_edge_log(true);
 }
 
-void snapshot_record_guest_crash(CPUArchState *cpu_env, int target_signal, int host_signal, int si_code, target_ulong fault_addr, uintptr_t host_fault_addr, const char *reason) {
-    snapshot_load_binradar_env();
-    SnapshotExitInfo *info = snapshot_exit_info_ptr();
-    if (!snapshot_exit_info_should_update(info, true)) return;
-    info->valid = 1;
-    info->crashed = 1;
-    info->target_signal = target_signal;
-    info->host_signal = host_signal;
-    info->si_code = si_code;
-    info->exit_code = (host_signal > 0) ? (128 + host_signal) : -target_signal;
-    info->host_fault_addr = host_fault_addr;
-    snapshot_exit_info_capture(info, cpu_env);
-    /* The binradar comparison matches this against the probe's [fault-addr],
-     * which is a code address (the faulting instruction).  Store guest_pc
-     * here rather than the siginfo data address so both sides agree. */
-    info->fault_addr = info->guest_pc;
-    char buffer[SNAPSHOT_EXIT_DESC_LEN];
-    const char *base = reason ? reason : "unhandled signal";
-    const char *host_name = (host_signal > 0) ? strsignal(host_signal) : NULL;
-    if (host_name) {
-        g_snprintf(buffer, sizeof(buffer), "%s (host=%s[%d], target=%d)", base, host_name, host_signal, target_signal);
-    } else {
-        g_snprintf(buffer, sizeof(buffer), "%s (host=%d, target=%d)", base, host_signal, target_signal);
-    }
-    snapshot_exit_info_set_reason(info, buffer);
-	log_msg("[snapshot] [exit] [crash] [entrypoint-hit %lu]\n",
-	        binradar_entrypoint_hit_count);
-	snapshot_log_cursor_indices(info);
-	log_msg("[snapshot] [crash] [hit-count %lu] [reason %s] [guest_pc %lx] [guest_cs_base %lx] [fault_addr %lx] [host_fault_addr %lx]\n",
-	            binradar_entrypoint_hit_count, buffer, info->guest_pc, info->guest_cs_base, info->fault_addr, info->host_fault_addr);
-    if (binradar_manager) {
-        int patch_id = binradar_cache_patch_id(binradar_manager, -1);
-        int iter = binradar_cache_iteration(binradar_manager, -1);
-        log_msg("[binradar] [crash] [iter %d] [patch %d] [guest_pc %lx] [guest_cs_base %lx] [fault_addr %lx] [host_fault_addr %lx] [reason %s]\n",
-                  iter, patch_id, info->guest_pc, info->guest_cs_base, info->fault_addr, info->host_fault_addr, buffer);
-    }
-    
-    if (binradar_probe_file) {
-        FILE *binradar_probe_file_fp = fopen(binradar_probe_file, "a");
-        if (binradar_probe_file_fp == NULL) {
-            fprintf(stderr, "Failed to open binradar probe file: %s\n", binradar_probe_file);
-            return;
-        }
-        fprintf(binradar_probe_file_fp, "[snapshot] [crash] [hit-count %lu] [reason %s] [guest_pc %lx] [guest_cs_base %lx] [fault_addr %lx] [host_fault_addr %lx]\n",
-                binradar_entrypoint_hit_count, buffer, info->guest_pc, info->guest_cs_base, info->fault_addr, info->host_fault_addr);
-        fclose(binradar_probe_file_fp);
-    }
-    dump_coverage_edge_log(true);
+void snapshot_record_guest_crash(CPUArchState *cpu_env, int target_signal,
+                                 int host_signal, int si_code,
+                                 target_ulong fault_addr,
+                                 uintptr_t host_fault_addr,
+                                 const char *reason)
+{
+    (void)fault_addr;
+    snapshot_record_guest_crash_with_reference(
+        cpu_env, target_signal, host_signal, si_code, host_fault_addr, reason,
+        target_signal > 0 ? SNAPSHOT_FAULT_REFERENCE_GUEST_SIGNAL
+                          : SNAPSHOT_FAULT_REFERENCE_UNAVAILABLE,
+        0);
 }
 
 static bool reserve_read_access_index(uint32_t *counter, uint32_t capacity,
@@ -3963,7 +4071,7 @@ static bool report_shared_prov_finding(void *opaque, uint32_t *status_out) {
     SnapshotExitInfo *info = snapshot_exit_info_ptr();
     if (info != NULL && !info->valid) {
         memset(info, 0, sizeof(*info));
-        info->valid = 1;
+        info->valid = 0;
         info->crashed = 1;
         info->target_signal = TARGET_SIGSEGV;
         info->host_signal = 0;
@@ -3971,7 +4079,9 @@ static bool report_shared_prov_finding(void *opaque, uint32_t *status_out) {
         info->exit_code = 139;
         info->guest_pc = f->access_pc;
         info->guest_cs_base = 0;
-        info->fault_addr = f->access_pc;
+        snapshot_exit_info_set_fault_reference(
+            info, SNAPSHOT_FAULT_REFERENCE_PROVENANCE_ACCESS,
+            f->access_pc);
         info->host_fault_addr = 0;
         info->guest_last_translation_block = last_translation_block;
         info->query_cursor = (fault.finding_query_idx >= 0 &&
@@ -3990,13 +4100,8 @@ static bool report_shared_prov_finding(void *opaque, uint32_t *status_out) {
         g_strlcpy(info->description,
                   pf_reason ? pf_reason : "memcheck: provenance finding",
                   SNAPSHOT_EXIT_DESC_LEN);
-        log_msg("[snapshot] [exit] [crash] [entrypoint-hit %lu]\n",
-                binradar_entrypoint_hit_count);
-        snapshot_log_cursor_indices(info);
-        log_msg("[snapshot] [crash] [hit-count %lu] [reason %s] [guest_pc %lx] [guest_cs_base %lx] [fault_addr %lx] [host_fault_addr %lx]\n",
-                binradar_entrypoint_hit_count,
-                info->description, info->guest_pc, info->guest_cs_base,
-                info->fault_addr, info->host_fault_addr);
+        info->valid = 1;
+        snapshot_emit_crash_rows(info);
     }
     return true;
 }
@@ -4106,7 +4211,9 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
             trace_mem_flush();
 
             SnapshotExitInfo *exit_info = snapshot_exit_info_ptr();
-            if (binradar_mode && (exit_info == NULL || !exit_info->valid)) {
+            if (binradar_mode &&
+                (exit_info == NULL || !exit_info->valid ||
+                 (exit_info->crashed && !exit_info->fault_reference_valid))) {
                 log_msg("[binradar] [iteration-discarded] [iter %u] "
                         "[reason unusable-exit] [patch %u]\n",
                         iteration, selected_patch);

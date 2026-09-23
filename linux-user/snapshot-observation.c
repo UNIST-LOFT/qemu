@@ -1,5 +1,34 @@
 #include "snapshot-observation.h"
 
+const char *snapshot_fault_reference_source_name(
+    SnapshotFaultReferenceSource source)
+{
+    switch (source) {
+    case SNAPSHOT_FAULT_REFERENCE_GUEST_SIGNAL:
+        return "guest-signal";
+    case SNAPSHOT_FAULT_REFERENCE_PROVENANCE_ACCESS:
+        return "provenance-access";
+    case SNAPSHOT_FAULT_REFERENCE_UNAVAILABLE:
+    default:
+        return "unavailable";
+    }
+}
+
+void snapshot_exit_info_set_fault_reference(
+    SnapshotExitInfo *info, SnapshotFaultReferenceSource source,
+    target_ulong address)
+{
+    bool valid = source == SNAPSHOT_FAULT_REFERENCE_GUEST_SIGNAL ||
+                 source == SNAPSHOT_FAULT_REFERENCE_PROVENANCE_ACCESS;
+    if (info == NULL) return;
+    info->fault_reference_valid = valid;
+    info->fault_reference_source = valid
+        ? source : SNAPSHOT_FAULT_REFERENCE_UNAVAILABLE;
+    /* A zero address is meaningful only for an explicitly valid reference.
+     * Unavailable observations use zero as their stable placeholder. */
+    info->fault_addr = valid ? address : 0;
+}
+
 static int snapshot_observation_compare_primitive(const void *a, const void *b)
 {
     const PrimitiveAccess *left = a;

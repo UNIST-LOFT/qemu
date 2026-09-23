@@ -34,6 +34,10 @@ import tempfile
 import time
 from typing import Any
 
+ROOT = os.path.realpath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+sys.path.insert(0, os.path.join(ROOT, "fuzzolic"))
+import binradar_evidence
+
 
 HANDSHAKE_EXPECTED = 0x41464C02
 LOCAL_SOLVER_MAPPING_SIZES = {
@@ -114,11 +118,14 @@ TESTS: list[dict[str, Any]] = [
          finding=None),
     dict(name="t20_concolic_heap_off", mode="sym", rc=(0,), verdict="crash",
          finding=dict(reason="heap-buffer-overflow", is_uaf=0,
-                      fields={"obj_id": 1, "gen": 1, "size": 8, "offset": 1000})),
+                      fields={"obj_id": 1, "gen": 1, "size": 8, "offset": 1000}),
+         fault_reference=dict(valid="true", source="provenance-access")),
     dict(name="t21_crash_precedence", mode="sym", rc=(-11, 139), verdict="crash",
          finding=dict(reason="heap-buffer-overflow", is_uaf=0,
                       fields={"obj_id": 1, "gen": 1, "size": 8, "offset": 9}),
          reason="unhandled_target_signal",
+         fault_reference=dict(valid="true", source="guest-signal",
+                              nonzero=True),
          note="dual-record: pending finding preserved, real crash wins verdict"),
     dict(name="t22_region_halfopen", mode="mem", rc=(0,), verdict="crash",
          finding=dict(reason="heap-use-after-free", is_uaf=1,
@@ -136,6 +143,7 @@ TESTS: list[dict[str, Any]] = [
          finding=dict(reason="heap-use-after-free", is_uaf=1,
                       fields={"obj_id": 1, "gen": 1, "size": 8, "offset": 0,
                               "width": 1}),
+         fault_reference=dict(valid="true", source="provenance-access"),
          note="timeout transport: deferred UAF surfaces as synthetic 139"),
     dict(name="t79_forkserver_abort", mode="fors", rc=(2,),
          verdict="crash", fs_binradar=True, fs_abort_count=3,
@@ -233,6 +241,11 @@ TESTS: list[dict[str, Any]] = [
          cursors=dict(query_after=True, expr_after=True),
          note="post-finding branch query survives and advances the exit "
               "cursors strictly past the finding-time cursors"),
+    dict(name="t45_compact_fault_reference", guest="t45_post_finding_query",
+         mode="fors", rc=(2,), verdict="crash", fs_binradar=True,
+         fs_patch_cnt=1, compact_fault_reference=True, allow_findings=True,
+         fault_reference=dict(valid="true", source="provenance-access"),
+         note="real forkserver child keeps deferred access PC in compact v1 evidence"),
     dict(name="t48_sticky_first_finding", mode="mem", rc=(0,),
          verdict="crash",
          finding=dict(reason="heap-buffer-overflow", is_uaf=0,
@@ -475,6 +488,26 @@ def parse_crash_reason(out):
     return m.group(1) if m else None
 
 
+def parse_fault_references(out):
+    return [
+        dict(valid=valid, source=source, address=int(address, 16))
+        for valid, source, address in re.findall(
+            r"^\[snapshot\] \[fault-reference\] \[version 2\] "
+            r"\[valid (true|false)\] \[source ([^\]]+)\] "
+            r"\[address ([0-9a-fA-F]+)\]$", out, re.MULTILINE)
+    ]
+
+
+def parse_crash_fault_addresses(out):
+    return [
+        int(address, 16)
+        for address in re.findall(
+            r"^\[snapshot\] \[crash\] \[hit-count [0-9]+\] .*"
+            r"\[fault_addr ([0-9a-fA-F]+)\] \[host_fault_addr [^\]]+\]$",
+            out, re.MULTILINE)
+    ]
+
+
 def parse_findings(out):
     """Parse finding records without rejecting unknown or missing fields."""
     findings = []
@@ -552,6 +585,7 @@ def run_tracer(cmd, env, timeout):
 def run_memcheck(test, guest, qemu, workdir):
     env = dict(os.environ)
     env.update(BASE_ENV)
+    env["BINRADAR_PROBE_FILE"] = test.get("probe_file", "")
     env["BINRADAR_ENTRYPOINT"] = resolve_entrypoint(guest)
     env["PLT_INFO_FILE"] = guest + ".plt"
     if test.get("no_consistency"):
@@ -580,6 +614,7 @@ def run_symbolic(test, guest, qemu, workdir):
     run_dir = tempfile.mkdtemp(prefix="prov-test-")
     env = dict(os.environ)
     env.update(BASE_ENV)
+    env["BINRADAR_PROBE_FILE"] = test.get("probe_file", "")
     env["BINRADAR_ENTRYPOINT"] = resolve_entrypoint(guest)
     env["PLT_INFO_FILE"] = guest + ".plt"
     prepare_symbolic_env(env, run_dir)
@@ -620,10 +655,12 @@ def run_forkserver(test, guest, qemu, workdir):
     (remaining == 0), close the parent pipe.  With ``fs_binradar`` the
     driver also sets up the binradar patch shm/fd so the forkserver runs
     its binradar-mode loop (patch-id iteration, child-timeout abort).
-    Returns (tracer_rc, None, stderr_text); outcomes live in stderr rows."""
+    Returns (tracer_rc, None, stderr_text, evidence); outcomes live in
+    stderr rows and optional production-decoded compact evidence."""
     run_dir = tempfile.mkdtemp(prefix="prov-fs-")
     env = dict(os.environ)
     env.update(BASE_ENV)
+    env["BINRADAR_PROBE_FILE"] = test.get("probe_file", "")
     env["BINRADAR_FORKSERVER_ENABLE"] = "1"
     env["BINRADAR_ENTRYPOINT"] = resolve_entrypoint(guest)
     env["PLT_INFO_FILE"] = guest + ".plt"
@@ -645,7 +682,7 @@ def run_forkserver(test, guest, qemu, workdir):
             raise RuntimeError(
                 f"shmget failed: {ctypes.geterrno()}")
         env["BINRADAR_PATCH_SHM_KEY"] = hex(patch_shm_key)
-        env["BINRADAR_PATCH_CNT"] = "2"
+        env["BINRADAR_PATCH_CNT"] = str(test.get("fs_patch_cnt", 2))
         env["BINRADAR_EVIDENCE_FILE"] = os.path.join(
             run_dir, "binradar.br")
         patch_r, patch_w = os.pipe()
@@ -710,6 +747,11 @@ def run_forkserver(test, guest, qemu, workdir):
         child_status = None
         expected_iteration = 1
         for _ in range(20):
+            if fs_binradar and expected_iteration > 1:
+                for patch_id in range(1, test.get("fs_patch_cnt", 2) + 1):
+                    row = (f"[patch] [id {patch_id}] [br 0] "
+                           f"[v {expected_iteration}]\n").encode()
+                    os.write(patch_w, row)
             os.write(ctrl_w, struct.pack("<I", 0))  # was_killed
             summary = read_exact(stat_r, 12)
             if len(summary) != 12:
@@ -733,7 +775,13 @@ def run_forkserver(test, guest, qemu, workdir):
         stderr_fh.close()
         with open(stderr_path, "r", errors="replace") as f:
             stderr_text = f.read()
-        return (proc.returncode, child_status, stderr_text)
+        evidence = None
+        if test.get("compact_fault_reference"):
+            evidence_path = env["BINRADAR_EVIDENCE_FILE"]
+            if os.path.isfile(evidence_path):
+                evidence = list(binradar_evidence.read_binradar(
+                    evidence_path))
+        return (proc.returncode, child_status, stderr_text, evidence)
     finally:
         if ctrl_w is not None:
             try:
@@ -754,28 +802,37 @@ def run_forkserver(test, guest, qemu, workdir):
 
 
 def run_test(test, guests_dir, workdir, qemu):
-    guest = os.path.join(workdir, test["name"])
+    guest = os.path.join(workdir, test.get("guest", test["name"]))
     if not os.path.isfile(guest):
         raise FileNotFoundError(f"guest binary missing: {guest} (run 'make guests')")
     if test.get("meta"):
         sym_names = {v for k, v in test["meta"].items()
                      if k in ("producer_pc", "last_writer", "access_pc")}
         test["_symbols"] = resolve_symbols(guest, sym_names)
-    if test["mode"] == "mem":
-        result = run_memcheck(test, guest, qemu, workdir)
-        rc, stderr_text = result.returncode, result.stderr.decode(errors="replace")
-        fs_status = None
-    elif test["mode"] == "sym":
-        result = run_symbolic(test, guest, qemu, workdir)
-        rc, stderr_text = result.returncode, result.stderr.decode(errors="replace")
-        fs_status = None
-    else:
-        rc, fs_status, stderr_text = run_forkserver(test, guest, qemu, workdir)
+    evidence = None
+    with tempfile.TemporaryDirectory(prefix="prov-probe-") as probe_dir:
+        probe_file = os.path.join(probe_dir, "probe.sbsv")
+        run_spec = dict(test, probe_file=probe_file)
+        if test["mode"] == "mem":
+            result = run_memcheck(run_spec, guest, qemu, workdir)
+            rc, stderr_text = result.returncode, result.stderr.decode(errors="replace")
+            fs_status = None
+        elif test["mode"] == "sym":
+            result = run_symbolic(run_spec, guest, qemu, workdir)
+            rc, stderr_text = result.returncode, result.stderr.decode(errors="replace")
+            fs_status = None
+        else:
+            rc, fs_status, stderr_text, evidence = run_forkserver(
+                run_spec, guest, qemu, workdir)
+        probe_text = ""
+        if os.path.isfile(probe_file):
+            with open(probe_file, encoding="utf-8") as probe:
+                probe_text = probe.read()
 
-    return (rc, fs_status, stderr_text)
+    return (rc, fs_status, stderr_text, evidence, probe_text)
 
 
-def check(test, rc, fs_status, out):
+def check(test, rc, fs_status, out, evidence=None, probe_text=""):
     problems = []
     if not rc_ok(rc, test.get("rc", (0,))):
         problems.append(f"rc={rc} not in {test.get('rc')}")
@@ -813,6 +870,70 @@ def check(test, rc, fs_status, out):
     elif test.get("reason") and test["reason"] not in reason:
         problems.append(f"crash reason {reason!r} != {test['reason']!r}")
 
+    reference_expectation = test.get("fault_reference")
+    if reference_expectation is not None:
+        references = parse_fault_references(out)
+        crashes = parse_crash_fault_addresses(out)
+        addresses = [reference["address"] for reference in references]
+        if not references:
+            problems.append("missing normalized version-2 fault-reference row")
+        for reference in references:
+            if reference["valid"] != reference_expectation["valid"]:
+                problems.append(
+                    f"fault reference validity {reference['valid']!r} != "
+                    f"{reference_expectation['valid']!r}")
+            if reference["source"] != reference_expectation["source"]:
+                problems.append(
+                    f"fault reference source {reference['source']!r} != "
+                    f"{reference_expectation['source']!r}")
+            if reference_expectation.get("nonzero") and reference["address"] == 0:
+                problems.append("signal fault reference unexpectedly uses PC zero")
+        if addresses != crashes:
+            problems.append(
+                "fault-reference addresses disagree with structured crash rows")
+        # Cross-channel agreement alone accepts the same wrong exit PC in
+        # every channel. Anchor the identity to the independent finding or
+        # signal PC, for every real child rather than only the last row.
+        finding_pcs = [finding_int(finding, "access_pc")
+                       for finding in parse_findings(out)]
+        if reference_expectation["source"] == "provenance-access":
+            if not finding_pcs or addresses != finding_pcs:
+                problems.append("fault reference does not identify provenance access PC")
+        elif reference_expectation["source"] == "guest-signal":
+            signal_pcs = [int(pc, 16) for pc in re.findall(
+                r"^\[snapshot\] \[crash\].*\[guest_pc ([0-9a-fA-F]+)\]",
+                out, re.MULTILINE)]
+            if addresses != signal_pcs:
+                problems.append("fault reference does not identify signal guest PC")
+            if finding_pcs and addresses == finding_pcs:
+                problems.append("signal fixture did not distinguish deferred access PC")
+        rows = [line for line in out.splitlines() if line.startswith((
+            "[snapshot] [fault-reference]", "[snapshot] [crash]"))]
+        probe_rows = [line for line in probe_text.splitlines() if line.startswith((
+            "[snapshot] [fault-reference]", "[snapshot] [crash]"))]
+        if rows != probe_rows:
+            problems.append("probe file does not match normalized log publication")
+        if len(rows) != 2 * len(references) or any(
+                not row.startswith("[snapshot] [fault-reference]" if i % 2 == 0
+                                   else "[snapshot] [crash]")
+                for i, row in enumerate(rows)):
+            problems.append("fault reference was not published before each crash row")
+
+    if test.get("compact_fault_reference"):
+        references = parse_fault_references(out)
+        compact_faults = [
+            group.fault_addr
+            for iteration in (evidence or [])
+            for group in iteration.groups
+            if group.outcome == "crash"
+        ]
+        if not compact_faults:
+            problems.append("compact evidence has no crash fault group")
+        elif not references or any(
+                fault != references[-1]["address"] for fault in compact_faults):
+            problems.append(
+                "compact evidence fault address disagrees with fault-reference row")
+
     final_queries, final_expressions = parse_symbolic_counts(out)
     if "final_queries" in test and final_queries != test["final_queries"]:
         problems.append(
@@ -834,7 +955,7 @@ def check(test, rc, fs_status, out):
             problems.append("consistency-mismatch log present: missing "
                             "syscall output invalidation hook")
     if want is None:
-        if findings:
+        if findings and not test.get("allow_findings"):
             problems.append(f"unexpected finding: {findings[0].get('reason', '?')}")
         return problems
 
@@ -937,13 +1058,13 @@ def main():
         ran += 1
         start = time.time()
         try:
-            rc, fs_status, out = run_test(spec, args.guests, args.work,
-                                          args.qemu)
+            rc, fs_status, out, evidence, probe_text = run_test(
+                spec, args.guests, args.work, args.qemu)
         except Exception as e:  # noqa: BLE001 — per-test isolation
             failures.append(spec)
             print(f"FAIL {spec['name']}: {e}")
             continue
-        problems = check(spec, rc, fs_status, out)
+        problems = check(spec, rc, fs_status, out, evidence, probe_text)
         dt = time.time() - start
         if problems:
             failures.append(spec)

@@ -217,6 +217,7 @@ bool binradar_cache_feedback_write(
                                            metadata_name, NULL);
     GString *metadata = g_string_new(NULL);
     const bool same_fault = run->is_crash &&
+        run->fault_reference_valid && manager->poc_fault_valid &&
         run->fault_loc == manager->poc_fault_addr;
     const char *result = !run->is_crash ? "benign" :
         same_fault ? "malicious" : "ignored";
@@ -234,14 +235,19 @@ bool binradar_cache_feedback_write(
         }
     }
     g_string_append_printf(metadata,
-        "[binradar-feedback] [version 1] [iteration %u] [patch %u] "
+        "[binradar-feedback] [version 2] [iteration %u] [patch %u] "
         "[snapshot-file %s] [snapshot-count %u] [branches %s] "
-        "[outcome %s] [fault-addr %lx] [poc-fault-addr %lx] "
-        "[same-fault %s] [result %s] [mutation-writes %u]\n",
+        "[outcome %s] [fault-addr %lx] [fault-valid %s] "
+        "[fault-source %s] [poc-fault-addr %lx] [poc-fault-valid %s] "
+        "[poc-fault-source %s] [same-fault %s] [result %s] "
+        "[mutation-writes %u]\n",
         iteration, patch_id, snapshot_name, branches->len, branch_text->str,
         run->is_crash ? "crash" : "normal", run->fault_loc,
-        manager->poc_fault_addr, same_fault ? "true" : "false", result,
-        mutation_writes);
+        run->fault_reference_valid ? "true" : "false",
+        snapshot_fault_reference_source_name(run->fault_reference_source),
+        manager->poc_fault_addr, manager->poc_fault_valid ? "true" : "false",
+        snapshot_fault_reference_source_name(manager->poc_fault_source),
+        same_fault ? "true" : "false", result, mutation_writes);
     g_string_free(branch_text, TRUE);
 
     for (uint32_t i = 0; mutation != NULL &&
@@ -371,6 +377,8 @@ void binradar_cache_record_outcome(BinradarManager *manager,
     result->patch_id = patch_id;
     result->representative = patch_id;
     result->is_crash = info->crashed;
+    result->fault_reference_valid = info->fault_reference_valid != 0;
+    result->fault_reference_source = info->fault_reference_source;
     result->fault_loc = info->fault_addr;
 }
 
@@ -387,6 +395,8 @@ void binradar_cache_materialize(BinradarManager *manager,
         ? NULL : binradar_clone_branch_vector(branches);
     if (info != NULL && info->valid) {
         result->is_crash = info->crashed;
+        result->fault_reference_valid = info->fault_reference_valid != 0;
+        result->fault_reference_source = info->fault_reference_source;
         result->fault_loc = info->fault_addr;
     }
 }
@@ -418,7 +428,13 @@ bool binradar_cache_commit(BinradarManager *manager)
         PatchedResult *result = &manager->current->patch_results[patch];
         uint32_t representative = result->representative;
         if (result->patch_id != patch ||
-            representative > manager->patch_max_id) {
+            representative > manager->patch_max_id ||
+            (result->is_crash &&
+             (!result->fault_reference_valid ||
+              (result->fault_reference_source !=
+                   SNAPSHOT_FAULT_REFERENCE_GUEST_SIGNAL &&
+               result->fault_reference_source !=
+                   SNAPSHOT_FAULT_REFERENCE_PROVENANCE_ACCESS)))) {
             log_msg("[binradar] [evidence] [error incomplete-result] "
                     "[iter %d] [patch %u]\n", cur_iter, patch);
             goto out;

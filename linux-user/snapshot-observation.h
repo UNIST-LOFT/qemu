@@ -6,6 +6,13 @@
 
 #define SNAPSHOT_EXIT_DESC_LEN 256
 
+typedef enum SnapshotFaultReferenceSource {
+    /* Only guest-signal and provenance-access can accompany valid=true. */
+    SNAPSHOT_FAULT_REFERENCE_UNAVAILABLE = 0,
+    SNAPSHOT_FAULT_REFERENCE_GUEST_SIGNAL = 1,
+    SNAPSHOT_FAULT_REFERENCE_PROVENANCE_ACCESS = 2,
+} SnapshotFaultReferenceSource;
+
 typedef struct SnapshotExitInfo {
     uint32_t valid;
     uint32_t crashed;
@@ -15,7 +22,11 @@ typedef struct SnapshotExitInfo {
     int32_t exit_code;
     target_ulong guest_pc;
     target_ulong guest_cs_base;
+    /* Normalized guest instruction identity used by probe/cache/evidence. */
     target_ulong fault_addr;
+    uint32_t fault_reference_valid;
+    SnapshotFaultReferenceSource fault_reference_source;
+    /* Host/data address remains diagnostic and is never compared to POC PCs. */
     uintptr_t host_fault_addr;
     uint64_t guest_last_translation_block;
     int64_t query_cursor;
@@ -83,6 +94,12 @@ typedef struct SnapshotObservationView {
     PrimitiveAccess *primitives;
     PointerAccess *pointers;
 } SnapshotObservationView;
+
+const char *snapshot_fault_reference_source_name(
+    SnapshotFaultReferenceSource source);
+void snapshot_exit_info_set_fault_reference(
+    SnapshotExitInfo *info, SnapshotFaultReferenceSource source,
+    target_ulong address);
 
 SharedTraceData *snapshot_observation_create_shared(void);
 void snapshot_observation_destroy_shared(SharedTraceData *shared);

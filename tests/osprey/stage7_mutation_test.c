@@ -2530,6 +2530,8 @@ static void test_cached_feedback_writer(void)
     manager.patch_max_id = 3;
     manager.current = binradar_cache_new_iteration(&manager);
     manager.feedback_dir = directory;
+    manager.poc_fault_valid = true;
+    manager.poc_fault_source = SNAPSHOT_FAULT_REFERENCE_GUEST_SIGNAL;
     manager.poc_fault_addr = 0x1234;
     manager.cache_bytes = g_byte_array_new();
     const uint8_t snapshot[] = {'B', 'R', 'C', 'H'};
@@ -2565,6 +2567,10 @@ static void test_cached_feedback_writer(void)
         result->patch_id = patch;
         result->representative = patch;
         result->is_crash = crashes[patch - 1];
+        result->fault_reference_valid = result->is_crash;
+        result->fault_reference_source = result->is_crash
+            ? SNAPSHOT_FAULT_REFERENCE_GUEST_SIGNAL
+            : SNAPSHOT_FAULT_REFERENCE_UNAVAILABLE;
         result->fault_loc = faults[patch - 1];
         CHECK(binradar_cache_feedback_write(
                   &manager, 2, patch, branches, &mutation),
@@ -2596,7 +2602,9 @@ static void test_cached_feedback_writer(void)
                     "[binradar-feedback] [version: int] [iteration: int] "
                     "[patch: int] [snapshot-file: str] "
                     "[snapshot-count: int] [branches: str] [outcome: str] "
-                    "[fault-addr: str] [poc-fault-addr: str] "
+                    "[fault-addr: str] [fault-valid: bool] "
+                    "[fault-source: str] [poc-fault-addr: str] "
+                    "[poc-fault-valid: bool] [poc-fault-source: str] "
                     "[same-fault: bool] [result: str] "
                     "[mutation-writes: int]") == SBSV_OK &&
                     sbsv_parser_add_schema(parser,
@@ -2627,6 +2635,70 @@ static void test_cached_feedback_writer(void)
         g_free(metadata);
         g_free(metadata_path);
         g_free(metadata_name);
+    }
+
+    /* An explicitly valid PC-zero reference must classify as malicious;
+     * making the POC reference unavailable must instead ignore the same
+     * numeric crash address. */
+    {
+        PatchedResult *zero = &manager.current->patch_results[3];
+        char *zero_name;
+        char *zero_path;
+        char *zero_snapshot;
+        char *zero_metadata = NULL;
+        gsize zero_metadata_size = 0;
+        zero->is_crash = true;
+        zero->fault_reference_valid = true;
+        zero->fault_reference_source = SNAPSHOT_FAULT_REFERENCE_GUEST_SIGNAL;
+        zero->fault_loc = 0;
+        manager.poc_fault_valid = true;
+        manager.poc_fault_source = SNAPSHOT_FAULT_REFERENCE_GUEST_SIGNAL;
+        manager.poc_fault_addr = 0;
+        CHECK(binradar_cache_feedback_write(
+                  &manager, 3, 3, branches, &mutation),
+              "feedback writer accepts an explicitly valid PC-zero crash");
+        zero_name = g_strdup("iteration-00000003-patch-00000003.sbsv");
+        zero_path = g_build_filename(directory, zero_name, NULL);
+        CHECK(g_file_get_contents(zero_path, &zero_metadata,
+                                  &zero_metadata_size, NULL) &&
+              strstr(zero_metadata, "[result malicious]") != NULL,
+              "valid PC-zero reference remains malicious");
+        g_free(zero_metadata);
+        zero_metadata = NULL;
+        zero_snapshot = g_strdup("iteration-00000003-patch-00000003.brch");
+        {
+            char *snapshot_file = g_build_filename(directory, zero_snapshot,
+                                                   NULL);
+            unlink(snapshot_file);
+            g_free(snapshot_file);
+        }
+        g_free(zero_snapshot);
+        unlink(zero_path);
+        g_free(zero_path);
+        g_free(zero_name);
+        manager.poc_fault_valid = false;
+        manager.poc_fault_source = SNAPSHOT_FAULT_REFERENCE_UNAVAILABLE;
+        CHECK(binradar_cache_feedback_write(
+                  &manager, 4, 3, branches, &mutation),
+              "feedback writer records unavailable POC reference");
+        zero_name = g_strdup("iteration-00000004-patch-00000003.sbsv");
+        zero_path = g_build_filename(directory, zero_name, NULL);
+        CHECK(g_file_get_contents(zero_path, &zero_metadata,
+                                  &zero_metadata_size, NULL) &&
+              strstr(zero_metadata, "[result ignored]") != NULL,
+              "unavailable POC reference ignores crash feedback");
+        g_free(zero_metadata);
+        unlink(zero_path);
+        zero_snapshot = g_strdup("iteration-00000004-patch-00000003.brch");
+        {
+            char *snapshot_file = g_build_filename(directory, zero_snapshot,
+                                                   NULL);
+            unlink(snapshot_file);
+            g_free(snapshot_file);
+        }
+        g_free(zero_snapshot);
+        g_free(zero_path);
+        g_free(zero_name);
     }
 
     char *snapshot_path = g_build_filename(
@@ -2842,7 +2914,7 @@ static SnapshotMutationCoordinator fixture_coordinator(SymbolicFixture *fx)
 /* Package 4: the feedback sidecar must describe the plan the boundary advisor
  * actually applied, and the child must have observed the same value.  This
  * links three independently-produced artifacts -- the advisor's family, the
- * owned plan the child applied, and the version-1 sidecar bytes -- instead of
+ * owned plan the child applied, and the version-2 sidecar bytes -- instead of
  * asserting each one separately. */
 static void test_symbolic_feedback_matches_applied_plan(void)
 {
@@ -2905,6 +2977,8 @@ static void test_symbolic_feedback_matches_applied_plan(void)
         manager.patch_max_id = 2;
         manager.current = binradar_cache_new_iteration(&manager);
         manager.feedback_dir = directory;
+        manager.poc_fault_valid = true;
+        manager.poc_fault_source = SNAPSHOT_FAULT_REFERENCE_GUEST_SIGNAL;
         manager.poc_fault_addr = 0x1234;
         manager.cache_bytes = g_byte_array_new();
         g_byte_array_append(manager.cache_bytes, snapshot, sizeof(snapshot));
@@ -2914,6 +2988,10 @@ static void test_symbolic_feedback_matches_applied_plan(void)
             result->patch_id = patch;
             result->representative = patch;
             result->is_crash = patch == 2;
+            result->fault_reference_valid = result->is_crash;
+            result->fault_reference_source = result->is_crash
+                ? SNAPSHOT_FAULT_REFERENCE_GUEST_SIGNAL
+                : SNAPSHOT_FAULT_REFERENCE_UNAVAILABLE;
             result->fault_loc = patch == 2 ? 0x1234u : 0u;
         }
         const SnapshotMutationPlan *feedback_plan =
@@ -2940,13 +3018,15 @@ static void test_symbolic_feedback_matches_applied_plan(void)
                 "[binradar-feedback] [version: int] [iteration: int] "
                 "[patch: int] [snapshot-file: str] [snapshot-count: int] "
                 "[branches: str] [outcome: str] [fault-addr: str] "
-                "[poc-fault-addr: str] [same-fault: bool] [result: str] "
-                "[mutation-writes: int]") == SBSV_OK &&
+                "[fault-valid: bool] [fault-source: str] "
+                "[poc-fault-addr: str] [poc-fault-valid: bool] "
+                "[poc-fault-source: str] [same-fault: bool] "
+                "[result: str] [mutation-writes: int]") == SBSV_OK &&
                 sbsv_parser_add_schema(parser,
                 "[binradar-mutation] [index: int] [kind: str] [addr: str] "
                 "[size: int] [value: str] [target-extent: int]") == SBSV_OK &&
                 sbsv_parser_loads(parser, metadata) == SBSV_OK,
-                "symbolic feedback sidecar is valid version-1 SBSV");
+                "symbolic feedback sidecar is valid version-2 SBSV");
             CHECK(sbsv_parser_get_rows(parser, "binradar-mutation",
                                        &rows, &row_count) == SBSV_OK &&
                       row_count == 1,

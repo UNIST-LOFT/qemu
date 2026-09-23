@@ -2,9 +2,8 @@
 #define BINRADAR_CACHE_H
 
 #include "snapshot-mutation.h"
+#include "snapshot-observation.h"
 #include "sbsv.h"
-
-typedef struct SnapshotExitInfo SnapshotExitInfo;
 
 #define BRCACHE_SNAPSHOT_MAGIC 0x48435242u
 #define BRCACHE_SNAPSHOT_VERSION 1u
@@ -21,6 +20,8 @@ typedef struct PatchedResult {
     uint32_t representative;
     GArray *br_taken;
     bool is_crash;
+    bool fault_reference_valid;
+    SnapshotFaultReferenceSource fault_reference_source;
     uint64_t fault_loc;
 } PatchedResult;
 
@@ -129,6 +130,8 @@ typedef struct BinradarManager {
     BinradarPatchSelector *selector;
     size_t selector_size;
     char *feedback_dir;
+    bool poc_fault_valid;
+    SnapshotFaultReferenceSource poc_fault_source;
     target_ulong poc_fault_addr;
 } BinradarManager;
 
