@@ -47,6 +47,7 @@
 #include "tcg/symbolic/symbolic-struct.h"
 #include "stage7_mutation_reference.h"
 
+#include <glib/gstdio.h>
 #include <stdio.h>
 #include <unistd.h>
 #include <sys/wait.h>
@@ -2574,7 +2575,9 @@ static void test_cached_feedback_writer(void)
         result->fault_loc = faults[patch - 1];
         CHECK(binradar_cache_feedback_write(
                   &manager, 2, patch, branches, &mutation),
-              "feedback writer commits representative pair");
+              "feedback writer stages representative pair");
+        CHECK(binradar_cache_feedback_publish(&manager),
+              "staged feedback pair publishes completely");
 
         char *metadata_name = g_strdup_printf(
             "iteration-00000002-patch-%08u.sbsv", patch);
@@ -2656,7 +2659,9 @@ static void test_cached_feedback_writer(void)
         manager.poc_fault_addr = 0;
         CHECK(binradar_cache_feedback_write(
                   &manager, 3, 3, branches, &mutation),
-              "feedback writer accepts an explicitly valid PC-zero crash");
+              "feedback writer stages an explicitly valid PC-zero crash");
+        CHECK(binradar_cache_feedback_publish(&manager),
+              "staged feedback pair publishes completely");
         zero_name = g_strdup("iteration-00000003-patch-00000003.sbsv");
         zero_path = g_build_filename(directory, zero_name, NULL);
         CHECK(g_file_get_contents(zero_path, &zero_metadata,
@@ -2680,7 +2685,9 @@ static void test_cached_feedback_writer(void)
         manager.poc_fault_source = SNAPSHOT_FAULT_REFERENCE_UNAVAILABLE;
         CHECK(binradar_cache_feedback_write(
                   &manager, 4, 3, branches, &mutation),
-              "feedback writer records unavailable POC reference");
+              "feedback writer stages unavailable POC reference");
+        CHECK(binradar_cache_feedback_publish(&manager),
+              "staged feedback pair publishes completely");
         zero_name = g_strdup("iteration-00000004-patch-00000003.sbsv");
         zero_path = g_build_filename(directory, zero_name, NULL);
         CHECK(g_file_get_contents(zero_path, &zero_metadata,
@@ -2699,6 +2706,61 @@ static void test_cached_feedback_writer(void)
         g_free(zero_snapshot);
         g_free(zero_path);
         g_free(zero_name);
+    }
+
+    /* A forkserver child may exit during mutation validation, before guest
+     * execution.  Its inherited manager must not remove the parent's staged
+     * pair. */
+    {
+        BinradarManager *saved_manager = binradar_manager;
+        char *staged_path;
+        int status = 0;
+        CHECK(binradar_cache_feedback_write(
+                  &manager, 5, 1, branches, &mutation),
+              "child-cleanup fixture stages a complete pair");
+        staged_path = g_build_filename(
+            manager.feedback_staging_dir,
+            "iteration-00000005-patch-00000001.brch", NULL);
+        binradar_manager = &manager;
+        pid_t pid = fork();
+        if (pid == 0) {
+            afl_fork_child = 1;
+            exit_with_status(1);
+        }
+        CHECK(pid > 0 && waitpid(pid, &status, 0) == pid &&
+                  WIFEXITED(status) && WEXITSTATUS(status) == 1,
+              "forkserver child exits through manager-aware cleanup");
+        binradar_manager = saved_manager;
+        CHECK(g_file_test(staged_path, G_FILE_TEST_EXISTS),
+              "forkserver child preserves the parent's staged pair");
+        binradar_cache_feedback_drop(&manager);
+        CHECK(manager.feedback_staging_dir == NULL,
+              "parent drop removes child-preserved staging");
+        g_free(staged_path);
+    }
+
+    /* A second-file collision must not leave the first half of a pair in the
+     * committed directory.  This exercises rollback after the BRCH rename has
+     * already succeeded. */
+    {
+        char *blocked_path = g_build_filename(
+            directory, "iteration-00000005-patch-00000001.sbsv", NULL);
+        char *rolled_back_path = g_build_filename(
+            directory, "iteration-00000005-patch-00000001.brch", NULL);
+        CHECK(g_mkdir(blocked_path, 0700) == 0,
+              "feedback rollback fixture creates destination collision");
+        CHECK(binradar_cache_feedback_write(
+                  &manager, 5, 1, branches, &mutation),
+              "feedback rollback fixture stages a complete pair");
+        CHECK(!binradar_cache_feedback_publish(&manager),
+              "feedback publication reports a second-file failure");
+        CHECK(!g_file_test(rolled_back_path, G_FILE_TEST_EXISTS),
+              "feedback publication rolls back the first renamed file");
+        CHECK(manager.feedback_staging_dir == NULL,
+              "feedback failure removes the attempt staging directory");
+        rmdir(blocked_path);
+        g_free(rolled_back_path);
+        g_free(blocked_path);
     }
 
     char *snapshot_path = g_build_filename(
@@ -2728,6 +2790,7 @@ static void test_cached_feedback_writer(void)
         g_free(name);
         g_free(stem);
     }
+    binradar_cache_feedback_release(&manager);
     rmdir(directory);
     g_array_free(branches, TRUE);
     g_byte_array_free(manager.cache_bytes, TRUE);
@@ -3002,7 +3065,16 @@ static void test_symbolic_feedback_matches_applied_plan(void)
         };
         CHECK(binradar_cache_feedback_write(
                   &manager, 4, 1, branches, &mutation),
-              "feedback writer commits the representative child pair");
+              "feedback writer stages the representative child pair");
+        {
+            char *staged_pair = g_build_filename(
+                directory, "iteration-00000004-patch-00000001.sbsv", NULL);
+            CHECK(!g_file_test(staged_pair, G_FILE_TEST_EXISTS),
+                  "a staged pair is not yet committed sweep evidence");
+            g_free(staged_pair);
+        }
+        CHECK(binradar_cache_feedback_publish(&manager),
+              "staged feedback pair publishes completely");
 
         metadata_path = g_build_filename(
             directory, "iteration-00000004-patch-00000001.sbsv", NULL);
@@ -3058,8 +3130,8 @@ static void test_symbolic_feedback_matches_applied_plan(void)
         metadata = NULL;
 
         /* Iteration 1 is the baseline: no pair, because no mutation child
-         * ran.  The writer must refuse rather than publish a stale plan. */
-        CHECK(binradar_cache_feedback_write(
+         * ran.  The writer must refuse rather than stage a stale plan. */
+            CHECK(binradar_cache_feedback_write(
                   &manager, 1, 1, branches, &mutation),
               "iteration 1 is a no-op for the feedback writer");
         {
@@ -3072,6 +3144,7 @@ static void test_symbolic_feedback_matches_applied_plan(void)
 
         g_array_free(branches, TRUE);
         g_byte_array_free(manager.cache_bytes, TRUE);
+        binradar_cache_feedback_release(&manager);
         binradar_cache_clear_iteration(&manager);
         g_free(manager.current->patch_results);
         g_free(manager.current);
@@ -3156,6 +3229,7 @@ static void test_feedback_requires_representative_child(void)
 
     g_array_free(branches, TRUE);
     g_byte_array_free(manager.cache_bytes, TRUE);
+    binradar_cache_feedback_release(&manager);
     binradar_cache_clear_iteration(&manager);
     g_free(manager.current->patch_results);
     g_free(manager.current);
@@ -3821,6 +3895,65 @@ static void test_symbolic_mismatched_wrapper_not_bound(void)
 
 /* ------------------------------------------------------------------ */
 
+/* Continuation policy (P2).  One unusable attempt must not end a healthy
+ * queue, a long tail of ordinary mutation misses must not trip the failure
+ * limit, and a discarded baseline is reported as baseline-unavailable. */
+static void test_forkserver_continuation_policy(void)
+{
+    BinradarForkserverDriver driver = {0};
+    /* A completed attempt with queued work keeps going and clears nothing. */
+    CHECK(binradar_forkserver_stop_reason(
+              &driver, BINRADAR_FORKSERVER_ATTEMPT_COMPLETED, false, false,
+              false, false, 7) == BINRADAR_FORKSERVER_STOP_CONTINUE,
+          "a committed attempt with queued plans continues");
+    CHECK(driver.consecutive_bad_attempts == 0,
+          "a committed attempt resets the bad-attempt counter");
+    /* Unusable exits advance the counter but keep the sweep alive. */
+    CHECK(binradar_forkserver_stop_reason(
+              &driver, BINRADAR_FORKSERVER_ATTEMPT_UNUSABLE_EXIT, true, false,
+              false, false, 6) == BINRADAR_FORKSERVER_STOP_CONTINUE,
+          "one unusable exit does not end the sweep");
+    CHECK(driver.consecutive_bad_attempts == 1,
+          "an unusable exit advances the bad-attempt counter");
+    /* Ordinary no-observation misses neither advance nor reset it, so a long
+     * tail of mutation misses cannot stop a healthy queue. */
+    for (uint32_t i = 0; i < 50; i++) {
+        CHECK(binradar_forkserver_stop_reason(
+                  &driver, BINRADAR_FORKSERVER_ATTEMPT_NO_OBSERVATION, true,
+                  false, false, false, 6) == BINRADAR_FORKSERVER_STOP_CONTINUE,
+              "a no-observation miss never stops the sweep");
+    }
+    CHECK(driver.consecutive_bad_attempts == 1,
+          "no-observation misses leave the bad-attempt counter alone");
+    /* The bounded limit is reached only by genuinely bad attempts. */
+    driver.bad_attempt_limit = 3;
+    CHECK(binradar_forkserver_stop_reason(
+              &driver, BINRADAR_FORKSERVER_ATTEMPT_TIMEOUT, true, true, false,
+              false, 5) == BINRADAR_FORKSERVER_STOP_CONTINUE,
+          "the second bad attempt is still below the limit");
+    CHECK(binradar_forkserver_stop_reason(
+              &driver, BINRADAR_FORKSERVER_ATTEMPT_UNUSABLE_EXIT, true, false,
+              false, false, 4) == BINRADAR_FORKSERVER_STOP_FAILURE_LIMIT,
+          "the consecutive limit stops the sweep");
+    /* A discarded baseline is its own terminal reason and reports no queue. */
+    BinradarForkserverDriver fresh = {0};
+    CHECK(binradar_forkserver_stop_reason(
+              &fresh, BINRADAR_FORKSERVER_ATTEMPT_TIMEOUT, true, true, false,
+              true, 0) == BINRADAR_FORKSERVER_STOP_BASELINE_UNAVAILABLE,
+          "a discarded baseline reports baseline-unavailable");
+    CHECK(binradar_forkserver_attempt_result_name(
+              BINRADAR_FORKSERVER_ATTEMPT_NO_OBSERVATION) != NULL &&
+          strcmp(binradar_forkserver_attempt_result_name(
+                     BINRADAR_FORKSERVER_ATTEMPT_NO_OBSERVATION),
+                 "no-observation") == 0,
+          "attempt-result names are stable for logs");
+    /* An engine failure outranks every other classification. */
+    CHECK(binradar_forkserver_stop_reason(
+              &fresh, BINRADAR_FORKSERVER_ATTEMPT_UNUSABLE_EXIT, true, false,
+              true, false, 3) == BINRADAR_FORKSERVER_STOP_RESOURCE_FAILURE,
+          "an unexplained engine death reports resource-failure");
+}
+
 int main(void)
 {
     /* The at-cap matrix records thousands of accesses; diagnostics are
@@ -3862,6 +3995,7 @@ int main(void)
     test_child_multiwrite_atomicity();
     test_variant_multiwrite_child_observation();
     test_child_application_does_not_mutate_plan();
+    test_forkserver_continuation_policy();
     test_invalid_patch_result();
     test_cached_feedback_writer();
     test_symbolic_feedback_matches_applied_plan();

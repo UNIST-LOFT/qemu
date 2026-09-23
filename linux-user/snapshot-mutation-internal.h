@@ -15,7 +15,10 @@ typedef struct SnapshotMutationApplyHost {
     target_ulong (*allocate_target)(void *opaque, uint64_t extent);
     bool (*initialize_target)(void *opaque, target_ulong target,
                               const uint8_t *bytes, uint64_t extent);
-    bool (*publish_cell)(void *opaque, const SnapshotMutationWrite *write,
+    /* Called only after every destination and fresh target was validated.
+     * Implementations must be infallible so a multiwrite plan cannot expose a
+     * prefix and then report failure without rollback. */
+    void (*publish_cell)(void *opaque, const SnapshotMutationWrite *write,
                          const uint8_t *value);
     void (*observe_write)(void *opaque, const SnapshotMutationWrite *write,
                           target_ulong fresh_target,
@@ -34,7 +37,6 @@ typedef enum SnapshotMutationApplyResult {
     SNAPSHOT_MUTATION_APPLY_DESTINATION,
     SNAPSHOT_MUTATION_APPLY_OVERLAP,
     SNAPSHOT_MUTATION_APPLY_FRESH_TARGET,
-    SNAPSHOT_MUTATION_APPLY_PUBLISH,
 } SnapshotMutationApplyResult;
 
 SnapshotMutationApplyResult snapshot_mutation_apply(

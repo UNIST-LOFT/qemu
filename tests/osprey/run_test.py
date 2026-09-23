@@ -37,7 +37,9 @@ sys.path.insert(0, str(ROOT / "fuzzolic"))
 import binradar_evidence
 
 
-HANDSHAKE_EXPECTED = 0x41464C02
+HANDSHAKE_EXPECTED = 0x41464C03
+# Mirrors the protocol-v4 stop-reason table in binradar-forkserver.h.
+STOP_CONTINUE = 0
 
 # ---------------------------------------------------------------------------
 # Test configuration
@@ -939,7 +941,7 @@ TESTS = [
         observe_applied=True,
         drain_queue=True,
         patch_count=0,
-        rc=(2,),
+        rc=(0,),
         expect_rows=[("test-model", "[extent 13]")],
         applied_assert=True,
         timeout=120,
@@ -961,7 +963,7 @@ TESTS = [
         symbolic_observation=True,
         drain_queue=True,
         patch_count=0,
-        rc=(2,),
+        rc=(0,),
         expect_log_rows=[
             ("symbolic-advisor", "[mode shadow]"),
             ("t16", "[tag low] [value 00000041]"),
@@ -997,7 +999,7 @@ TESTS = [
         symbolic_observation=True,
         drain_queue=True,
         patch_count=0,
-        rc=(2,),
+        rc=(0,),
         expect_log_rows=[
             ("symbolic-advisor", "[mode boundary]"),
             ("t16", "[tag low] [value 00000041]"),
@@ -1258,37 +1260,37 @@ def run_binradar(test, guest, qemu, workdir):
 
         expected_iteration = 0
 
-        def run_one_iteration(label):
+        def run_one_attempt(label):
             nonlocal expected_iteration
             os.write(ctrl_w, struct.pack("<I", 0))
-            summary_bytes = read_exact(stat_r, 12)
-            if len(summary_bytes) != 12:
+            summary_bytes = read_exact(stat_r, 20)
+            if len(summary_bytes) != 20:
                 raise RuntimeError(f"{label} summary EOF")
-            iteration, representative_runs, remaining = struct.unpack(
-                "<III", summary_bytes)
+            attempt, representative_runs, remaining, attempt_result, \
+                stop_reason = struct.unpack("<IIIII", summary_bytes)
             expected_iteration += 1
-            if iteration != expected_iteration or representative_runs == 0:
+            if attempt != expected_iteration or representative_runs == 0:
                 raise RuntimeError(
-                    f"{label} invalid forkserver summary: iteration="
-                    f"{iteration}, runs={representative_runs}")
-            return remaining
+                    f"{label} invalid forkserver summary: attempt="
+                    f"{attempt}, runs={representative_runs}")
+            return remaining, stop_reason
 
-        # Baseline iteration.  Its returned count is the first owned plan
-        # plus the queued tail after analyze_collected_data().
-        remaining_count = run_one_iteration("baseline")
+        # Baseline attempt.  Its returned count is the first owned plan plus
+        # the queued tail after analyze_collected_data().
+        remaining_count, stop_reason = run_one_attempt("baseline")
 
         if test.get("drain_queue"):
             rounds = 0
-            while remaining_count != 0:
+            while stop_reason == STOP_CONTINUE:
                 rounds += 1
                 if rounds > 4096:
                     raise RuntimeError("mutation queue did not drain")
-                remaining_count = run_one_iteration(
+                remaining_count, stop_reason = run_one_attempt(
                     f"mutation-{rounds}")
         else:
-            # Existing fixtures observe one logical mutation iteration after
-            # the iteration-1 analysis barrier.
-            run_one_iteration("second")
+            # Existing fixtures observe one logical mutation attempt after the
+            # baseline analysis barrier.
+            run_one_attempt("second")
 
         os.close(ctrl_w)
         try:
@@ -1308,23 +1310,32 @@ def run_binradar(test, guest, qemu, workdir):
                 stderr_text += "\n" + f.read()
         evidence = list(binradar_evidence.read_binradar(
             env["BINRADAR_EVIDENCE_FILE"]))
-        # A mutation child that is killed by the per-child timeout is discarded
-        # by the tracer: it commits nothing and publishes no evidence pair.  The
-        # invariant is therefore one record per *committed* iteration, and every
-        # requested iteration must either commit or be explicitly discarded.
+        # A discarded attempt commits no evidence frame and no feedback pair,
+        # so evidence stays keyed by committed attempt ids and may carry gaps.
+        # Every requested attempt must either commit or be explicitly
+        # discarded.
         commits = len(re.findall(
             r"\[binradar\] \[commit\] \[iter \d+\]", stderr_text))
         discards = len(re.findall(
-            r"\[binradar\] \[iteration-discarded\] \[iter \d+\]",
+            r"\[binradar\] \[attempt-discarded\] \[iter \d+\]",
             stderr_text))
         if commits + discards != expected_iteration:
             raise RuntimeError(
-                f"BINRADAR iteration accounting: {commits} commit(s) + "
-                f"{discards} discard(s) != {expected_iteration} iteration(s)")
+                f"BINRADAR attempt accounting: {commits} commit(s) + "
+                f"{discards} discard(s) != {expected_iteration} attempt(s)")
         if len(evidence) != commits:
             raise RuntimeError(
                 f"BINRADAR evidence has {len(evidence)} record(s), expected "
-                f"one per committed iteration ({commits})")
+                f"one per committed attempt ({commits})")
+        committed_attempts = [record.iteration for record in evidence]
+        if committed_attempts and committed_attempts[0] != 1:
+            raise RuntimeError(
+                f"BINRADAR evidence does not start at baseline attempt 1: "
+                f"{committed_attempts[:1]}")
+        if committed_attempts != sorted(set(committed_attempts)):
+            raise RuntimeError(
+                f"BINRADAR evidence attempt ids are not strictly increasing: "
+                f"{committed_attempts}")
         patch_count = int(env["BINRADAR_PATCH_CNT"])
         for record in evidence:
             members = {
@@ -1334,7 +1345,7 @@ def run_binradar(test, guest, qemu, workdir):
                                 else set(range(patch_count + 1)))
             if members != expected_members:
                 raise RuntimeError(
-                    f"BINRADAR evidence iteration {record.iteration} "
+                    f"BINRADAR evidence attempt {record.iteration} "
                     f"members {sorted(members)} != "
                     f"{sorted(expected_members)}")
         return (proc.returncode, stderr_text)

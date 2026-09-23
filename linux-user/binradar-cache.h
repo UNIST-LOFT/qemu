@@ -130,6 +130,11 @@ typedef struct BinradarManager {
     BinradarPatchSelector *selector;
     size_t selector_size;
     char *feedback_dir;
+    /* One attempt's feedback pairs are staged here and renamed into
+     * ``feedback_dir`` only when the attempt commits, so a discarded attempt
+     * never appears as committed sweep evidence. */
+    char *feedback_staging_dir;
+    GPtrArray *feedback_staged_pairs;
     bool poc_fault_valid;
     SnapshotFaultReferenceSource poc_fault_source;
     target_ulong poc_fault_addr;
@@ -164,6 +169,12 @@ void binradar_cache_materialize(BinradarManager *manager, uint32_t patch_id,
                                 const GArray *branches,
                                 const SnapshotExitInfo *outcome);
 bool binradar_cache_commit(BinradarManager *manager);
+/* Publish or drop the feedback pairs staged for the current attempt.  A
+ * discarded attempt calls the drop path so its pairs never look committed.
+ * Publication returns false after rolling back any files already renamed. */
+bool binradar_cache_feedback_publish(BinradarManager *manager);
+void binradar_cache_feedback_drop(BinradarManager *manager);
+void binradar_cache_feedback_release(BinradarManager *manager);
 bool binradar_cache_feedback_write(
     BinradarManager *manager, uint32_t iteration, uint32_t patch_id,
     const GArray *branches, const BinradarMutationFeedbackView *mutation);
@@ -188,7 +199,10 @@ bool br_evidence_write_header(FILE *fp, uint16_t kind);
 #define BR_EVIDENCE_HEADER_SIZE 16u
 #define BR_EVIDENCE_FRAME_HEADER_SIZE 8u
 #define BR_EVIDENCE_MAGIC "BRDATAB1"
+/* FILTER and VERIFIER payloads keep version 1; BINRADAR evidence is version 2
+ * because attempt ids may now have gaps after a discarded attempt. */
 #define BR_EVIDENCE_VERSION 1u
+#define BR_EVIDENCE_VERSION_BINRADAR 2u
 #define BR_EVIDENCE_KIND_FILTER 1u
 #define BR_EVIDENCE_KIND_BINRADAR 3u
 #define BR_EVIDENCE_RECORD_FILTER 1u

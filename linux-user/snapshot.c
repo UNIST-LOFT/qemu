@@ -367,6 +367,13 @@ bool snapshot_addr_is_protected(target_ulong addr) {
 static void exit_with_status(int status) {
     trace_mem_flush();
     snapshot_modification_manager_reset(false);
+    /* Only the snapshot parent owns the feedback staging tree.  A forkserver
+     * child inherits the manager through fork() but must never unlink or
+     * rmdir the parent's staged pairs when it exits early - including the
+     * deliberate exit on a mutation-validation failure. */
+    if (binradar_manager != NULL && !afl_fork_child) {
+        binradar_cache_feedback_release(binradar_manager);
+    }
     exit(status);
 }
 
@@ -404,7 +411,8 @@ void snapshot_init_binradar_patch_shm(uintptr_t key) {
         log_msg("[binradar] [evidence] [error open] [file %s]\n", var);
         exit_with_status(1);
     }
-    log_msg("[binradar] [evidence] [file %s] [version 1]\n", var);
+    log_msg("[binradar] [evidence] [file %s] [version %u]\n", var,
+            BR_EVIDENCE_VERSION_BINRADAR);
 
     var = getenv("BINRADAR_PATCH_CACHE_ENABLE");
     binradar_manager->cache_enabled = var != NULL && strcmp(var, "1") == 0;
@@ -507,6 +515,26 @@ void snapshot_init_binradar_patch_shm(uintptr_t key) {
                 }
             }
             binradar_manager->feedback_dir = g_strdup(feedback_dir);
+            binradar_manager->feedback_staged_pairs =
+                g_ptr_array_new_with_free_func(g_free);
+            /* Remove a same-PID staging tree after PID reuse.  Other
+             * crash-left .staging-* directories are ignored by export. */
+            char *stale = g_strdup_printf("%s/.staging-%ld", feedback_dir,
+                                          (long)getpid());
+            if (g_file_test(stale, G_FILE_TEST_IS_DIR)) {
+                GDir *dir = g_dir_open(stale, 0, NULL);
+                const char *entry;
+                if (dir != NULL) {
+                    while ((entry = g_dir_read_name(dir)) != NULL) {
+                        char *path = g_build_filename(stale, entry, NULL);
+                        unlink(path);
+                        g_free(path);
+                    }
+                    g_dir_close(dir);
+                }
+                rmdir(stale);
+            }
+            g_free(stale);
             binradar_manager->poc_fault_valid = valid;
             binradar_manager->poc_fault_source = source;
             binradar_manager->poc_fault_addr = (target_ulong)fault;
@@ -3084,7 +3112,7 @@ static bool snapshot_mutation_child_initialize_target(
     return snapshot_apply_fresh_target(context->cpu_env, target, bytes, extent);
 }
 
-static bool snapshot_mutation_child_publish_cell(
+static void snapshot_mutation_child_publish_cell(
     void *opaque, const SnapshotMutationWrite *write, const uint8_t *value)
 {
     SnapshotMutationApplyContext *context = opaque;
@@ -3103,7 +3131,6 @@ static bool snapshot_mutation_child_publish_cell(
         log_msg("[mod] [addr %lx] [size %ld] [total %d]\n",
                 write->addr, write->size, context->remaining);
     }
-    return true;
 }
 
 static void snapshot_mutation_child_observe(
@@ -3148,7 +3175,6 @@ static void snapshot_modify_memory(CPUArchState *cpu_env)
         [SNAPSHOT_MUTATION_APPLY_DESTINATION] = "unwritable destination",
         [SNAPSHOT_MUTATION_APPLY_OVERLAP] = "overlapping destinations",
         [SNAPSHOT_MUTATION_APPLY_FRESH_TARGET] = "fresh target failed",
-        [SNAPSHOT_MUTATION_APPLY_PUBLISH] = "mutation publication failed",
     };
     const char *message = result < G_N_ELEMENTS(errors) ? errors[result] : NULL;
     log_msg("[mod] [apply-error] %s\n", message != NULL ? message : "unknown");
@@ -3547,6 +3573,17 @@ static int select_next_modification(SnapshotExitInfo *exit_info) {
     // Finished: reset shared_trace_data
     memset(shared_trace_data, 0, sizeof(SharedTraceData));
     return g_queue_get_length(mod_manager->modifications) + 1;
+}
+
+/* Retire the plan one discarded attempt ran and own the next queued plan,
+ * without publishing any evidence or analysis for the discarded attempt.
+ * Returns the number of plans that have not been executed yet, including the
+ * plan popped here.  A discarded attempt consumes its plan exactly once; a
+ * no-observation or unusable attempt therefore never stalls the queue and
+ * never commits a fabricated frame. */
+static uint32_t snapshot_advance_modification_plan(void)
+{
+    return (uint32_t)select_next_modification(NULL);
 }
 
 static bool snapshot_mutation_baseline_add_history(
@@ -4124,10 +4161,10 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
     bool binradar_mode = binradar_manager != NULL;
     afl_forksrv_pid = getpid();
     if (!binradar_forkserver_handshake(&driver)) {
-        log_msg("[snapshot] [forkserver] [error] protocol-v3 handshake\n");
+        log_msg("[snapshot] [forkserver] [error] protocol-v4 handshake\n");
         exit_with_status(1);
     }
-    log_msg("[forkserver] [start] [protocol 3]\n");
+    log_msg("[forkserver] [start] [protocol 4]\n");
 
     for (;;) {
         uint32_t was_killed;
@@ -4135,16 +4172,24 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
             log_msg("[forkserver] [exit] parent (fuzzolic) dead or exit\n");
             exit_with_status(2);
         }
-        const uint32_t iteration = driver.iteration;
+        const uint32_t attempt = driver.attempt;
         uint32_t representative_runs = 0;
-        uint32_t remaining_mods = 0;
-        bool iteration_aborted = false;
+        uint32_t remaining_plans = 0;
+        /* Attempt classification.  A committed sweep is the only result that
+         * publishes evidence; every other result discards the attempt. */
+        BinradarForkserverAttemptResult attempt_result =
+            BINRADAR_FORKSERVER_ATTEMPT_COMPLETED;
+        bool engine_failure = false;
+        bool attempt_discarded = false;
+        /* Set when any child of this attempt was killed by the child or
+         * aggregate deadline.  Counted once per attempt, not once per child. */
+        bool deadline_kill = false;
         bool *uncovered = NULL;
         bool *executed = NULL;
         SnapshotExitInfo baseline_exit = {0};
         bool baseline_exit_valid = false;
 
-        if (binradar_mode && iteration > 1) {
+        if (binradar_mode && attempt > 1) {
             uncovered = g_new0(bool, binradar_manager->patch_max_id + 1u);
             executed = g_new0(bool, binradar_manager->patch_max_id + 1u);
             for (uint32_t i = 0; i < binradar_manager->patch_cnt; i++) {
@@ -4160,7 +4205,7 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
             if (binradar_mode) {
                 binradar_cache_reset_child(binradar_manager);
                 if (!binradar_cache_publish_selector(binradar_manager,
-                                                selected_patch, iteration)) {
+                                                selected_patch, attempt)) {
                     log_msg("[binradar] [cache-fatal] "
                             "[reason selector-publication]\n");
                     exit_with_status(5);
@@ -4170,14 +4215,14 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
                            sizeof(shared_trace_data->exit_info));
                 }
                 log_msg("[binradar] [shm] [patch-id %u] [iter %u]\n",
-                        selected_patch, iteration);
+                        selected_patch, attempt);
             }
 
             /* Each representative must start from a baseline-owned shared
              * finding slot.  The child clears it again after patch
              * application (below), but a child that dies before reaching
              * that point - most importantly a mutation child killed by the
-             * child/iteration timeout - would otherwise leave the previous
+             * child/attempt timeout - would otherwise leave the previous
              * representative's finding in the MAP_SHARED slot for
              * report_shared_prov_finding() to salvage as this
              * representative's.  Clearing here, before fork(), makes the
@@ -4188,12 +4233,16 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
             log_msg_flush();
             if (g_osprey_ctx != NULL && g_osprey_shared_run != NULL) {
                 osprey_shared_run_prepare(g_osprey_ctx, g_osprey_shared_run,
-                                          iteration);
+                                          attempt);
             }
             snapshot_prepare_mutation_epoch();
             pid_t child_pid = fork();
             if (child_pid < 0) exit_with_status(4);
             if (child_pid == 0) {
+                /* Mark child ownership before mutation application: a
+                 * validation failure exits from snapshot_modify_memory(), and
+                 * must not tear down the parent's staged feedback pairs. */
+                afl_fork_child = 1;
 #ifdef SNAPSHOT_DEBUG
                 snapshot_install_crash_handler();
 #endif
@@ -4203,7 +4252,6 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
                     osprey_child_use_shared_run(g_osprey_ctx,
                                                 g_osprey_shared_run);
                 }
-                afl_fork_child = 1;
                 binradar_forkserver_child_close(&driver);
                 return;
             }
@@ -4213,22 +4261,49 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
                 &driver, child_pid, binradar_manager, &child_status,
                 report_shared_prov_finding, NULL);
             if (wait_rc < 0) exit_with_status(6);
-            if (binradar_forkserver_record_wait(
-                    &driver, wait_rc, representative_runs)) {
-                iteration_aborted = true;
-                break;
-            }
             trace_mem_flush();
 
             SnapshotExitInfo *exit_info = snapshot_exit_info_ptr();
-            if (binradar_mode &&
-                (exit_info == NULL || !exit_info->valid ||
-                 (exit_info->crashed && !exit_info->fault_reference_valid))) {
-                log_msg("[binradar] [iteration-discarded] [iter %u] "
-                        "[reason unusable-exit] [patch %u]\n",
-                        iteration, selected_patch);
-                iteration_aborted = true;
-                break;
+            bool exit_unusable = exit_info == NULL || !exit_info->valid ||
+                (exit_info->crashed && !exit_info->fault_reference_valid);
+            if (binradar_mode && (wait_rc > 0 || exit_unusable)) {
+                if (wait_rc > 0) {
+                    /* A deadline killed this child.  Salvage already gave
+                     * provenance its chance at a normalized record, so a
+                     * child-cap kill that still published one produced a
+                     * usable outcome - the documented deferred-finding
+                     * path.  An aggregate attempt-deadline kill ends the
+                     * sweep no matter what was salvaged, and a kill with no
+                     * publication at all is unusable. */
+                    deadline_kill = true;
+                    if (wait_rc == 2 || exit_unusable) {
+                        attempt_result =
+                            BINRADAR_FORKSERVER_ATTEMPT_TIMEOUT;
+                        attempt_discarded = true;
+                    }
+                } else if (WIFSIGNALED(child_status)) {
+                    /* The child died from a signal we never sent and never
+                     * translated into a guest exit record: the engine
+                     * itself broke.  Never fabricate a guest crash and
+                     * never fork into it again. */
+                    engine_failure = true;
+                    attempt_result =
+                        BINRADAR_FORKSERVER_ATTEMPT_UNUSABLE_EXIT;
+                    attempt_discarded = true;
+                } else {
+                    attempt_result =
+                        BINRADAR_FORKSERVER_ATTEMPT_UNUSABLE_EXIT;
+                    attempt_discarded = true;
+                }
+                if (attempt_discarded) {
+                    log_msg("[binradar] [attempt-discarded] [iter %u] "
+                            "[reason %s] [patch %u] [status %#x]\n",
+                            attempt,
+                            binradar_forkserver_attempt_result_name(
+                                (uint32_t)attempt_result),
+                            selected_patch, child_status);
+                    break;
+                }
             }
             if (binradar_mode) {
                 binradar_cache_record_outcome(
@@ -4245,7 +4320,7 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
 
             if (wait_rc == 0 && g_osprey_ctx != NULL &&
                 g_osprey_shared_run != NULL && g_osprey_ctx->config.enabled &&
-                binradar_mode && iteration == 1 && selected_patch == 0) {
+                binradar_mode && attempt == 1 && selected_patch == 0) {
                 OspreyStatus merged = osprey_parent_merge_sample(
                     g_osprey_ctx, g_osprey_shared_run);
                 if (merged != OSPREY_OK && merged != OSPREY_DISABLED) {
@@ -4272,7 +4347,7 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
                     if (binradar_manager->feedback_dir != NULL) {
                         log_msg("[binradar] [feedback] [error snapshot] "
                                 "[iter %u] [patch %u]\n",
-                                iteration, selected_patch);
+                                attempt, selected_patch);
                         exit_with_status(1);
                     }
                     if (binradar_manager->cache_inference_enabled) {
@@ -4291,13 +4366,13 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
                             ? feedback_plan->num_mods : 0,
                     };
                     if (!binradar_cache_feedback_write(
-                            binradar_manager, iteration, selected_patch,
+                            binradar_manager, attempt, selected_patch,
                             selected_vector, &mutation_view)) {
                         g_array_free(selected_vector, TRUE);
                         exit_with_status(1);
                     }
                     if (binradar_manager->cache_inference_enabled &&
-                        iteration > 1) {
+                        attempt > 1) {
                         for (uint32_t i = 0;
                              i < binradar_manager->patch_cnt; i++) {
                             uint32_t candidate =
@@ -4331,7 +4406,19 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
                 }
             }
 
-            if (!binradar_mode || iteration == 1) break;
+            if (!binradar_mode || attempt == 1) break;
+            /* A mutation attempt whose patch-0 sub-run never reached the
+             * patch site has no usable baseline: it is an ordinary mutation
+             * miss, discarded without fabricating an empty branch vector. */
+            if (selected_patch == 0 &&
+                binradar_cache_result(binradar_manager, 0)->br_taken == NULL) {
+                attempt_result =
+                    BINRADAR_FORKSERVER_ATTEMPT_NO_OBSERVATION;
+                attempt_discarded = true;
+                log_msg("[binradar] [attempt-discarded] [iter %u] "
+                        "[reason no-observation] [patch 0]\n", attempt);
+                break;
+            }
             if (selected_patch != 0) uncovered[selected_patch] = false;
             selected_patch = 0;
             for (uint32_t i = 0; i < binradar_manager->patch_cnt; i++) {
@@ -4347,39 +4434,67 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
         }
 
         if (binradar_mode) {
-            if (iteration_aborted || !baseline_exit_valid) {
+            if (attempt_discarded || !baseline_exit_valid) {
+                /* Keep partial captures and every uncommitted candidate
+                 * outcome out of FINAL: discard the whole attempt, drop its
+                 * staged feedback pairs, and consume its plan once. */
+                if (!attempt_discarded) {
+                    attempt_result =
+                        BINRADAR_FORKSERVER_ATTEMPT_UNUSABLE_EXIT;
+                    log_msg("[binradar] [attempt-discarded] [iter %u] "
+                            "[reason unusable-exit] [patch 0]\n", attempt);
+                }
+                binradar_cache_feedback_drop(binradar_manager);
                 binradar_cache_clear_iteration(binradar_manager);
-                remaining_mods = 0;
+                remaining_plans = attempt == 1
+                    ? 0 : snapshot_advance_modification_plan();
             } else {
                 *snapshot_exit_info_ptr() = baseline_exit;
-                if (iteration == 1) {
+                if (attempt == 1) {
                     if (g_osprey_ctx != NULL && g_osprey_ctx->config.enabled &&
                         osprey_tx_ok(g_osprey_ctx)) {
                         if (!snapshot_test_install_applied_model()) {
                             osprey_analyze(g_osprey_ctx);
                         }
                     }
-                    remaining_mods = analyze_collected_data(
+                    /* The initial unmutated baseline only has to produce a
+                     * sound observation set; it is normal for it not to
+                     * reach the patch site, because reaching it is what the
+                     * mutations are for. */
+                    remaining_plans = analyze_collected_data(
                         arg_info, num_arg_regs);
+                    if (!binradar_cache_commit(binradar_manager)) {
+                        exit_with_status(1);
+                    }
                 } else {
                     if (!binradar_cache_commit(binradar_manager)) {
                         exit_with_status(1);
                     }
-                    remaining_mods = analyze_collected_data(
+                    remaining_plans = analyze_collected_data(
                         arg_info, num_arg_regs);
-                }
-                if (iteration == 1 &&
-                    !binradar_cache_commit(binradar_manager)) {
-                    exit_with_status(1);
                 }
             }
         }
         g_free(executed);
         g_free(uncovered);
 
+        BinradarForkserverStopReason stop_reason =
+            binradar_forkserver_stop_reason(
+                &driver, attempt_result, attempt_discarded, deadline_kill,
+                binradar_mode && engine_failure,
+                binradar_mode && attempt == 1, remaining_plans);
         if (!binradar_forkserver_send_summary(
-                &driver, representative_runs, remaining_mods)) {
+                &driver, representative_runs, remaining_plans,
+                stop_reason)) {
             exit_with_status(7);
+        }
+        if (stop_reason != BINRADAR_FORKSERVER_STOP_CONTINUE) {
+            /* Terminal reply delivered.  This process only ever leaves the
+             * forkserver loop by exiting: returning would resume guest
+             * execution inside the snapshot parent. */
+            log_msg("[forkserver] [exiting] [stop %s]\n",
+                    binradar_forkserver_stop_reason_name(stop_reason));
+            exit_with_status(0);
         }
     }
 }

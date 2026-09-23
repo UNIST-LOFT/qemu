@@ -40,7 +40,25 @@ sys.path.insert(0, os.path.join(ROOT, "fuzzolic"))
 import binradar_evidence
 
 
-HANDSHAKE_EXPECTED = 0x41464C02
+HANDSHAKE_EXPECTED = 0x41464C03
+# Mirrors tracer/linux-user/binradar-forkserver.h (protocol v4 enum table).
+STOP_CONTINUE = 0
+STOP_EXHAUSTED = 1
+STOP_BASELINE_UNAVAILABLE = 2
+STOP_FAILURE_LIMIT = 3
+STOP_RESOURCE_FAILURE = 4
+ATTEMPT_COMPLETED = 0
+ATTEMPT_NO_OBSERVATION = 1
+ATTEMPT_UNUSABLE_EXIT = 2
+ATTEMPT_TIMEOUT = 3
+
+STOP_NAMES = {
+    STOP_CONTINUE: "continue",
+    STOP_EXHAUSTED: "exhausted",
+    STOP_BASELINE_UNAVAILABLE: "baseline-unavailable",
+    STOP_FAILURE_LIMIT: "failure-limit",
+    STOP_RESOURCE_FAILURE: "resource-failure",
+}
 LOCAL_SOLVER_MAPPING_SIZES = {
     "expression pool": 8 * 1024 * 1024 * 32,
     "query queue": 1024 * 1024 * 24,
@@ -58,8 +76,8 @@ LOCAL_SOLVER_MAPPING_SIZES = {
 #     None = rc must just be nonzero.  Negative values are host signals
 #     (Python returncode convention); positive values are _exit() codes.
 # finding: None or dict(reason=<substring>, is_uaf=<0|1>, count=N)
-# Forkserver v3 returns one 12-byte logical-iteration summary; child outcomes
-# are verified from the structured tracer log rather than the control pipe.
+# Forkserver v4 returns one fixed 20-byte attempt summary; detailed child
+# outcomes are also verified from the structured tracer log.
 # reason: substring required in the [snapshot] [crash] reason field.
 # timeout: per-run timeout seconds (forkserver child timeout is separate).
 # final_queries: exact `Number of queries` summary expected from symbolic mode.
@@ -108,7 +126,7 @@ TESTS: list[dict[str, Any]] = [
                               "width": 16})),
     dict(name="t14_ea_static", mode="mem", rc=(0,), verdict="normal", finding=None),
     dict(name="t15_ea_dynamic", mode="mem", rc=(0,), verdict="normal", finding=None),
-    dict(name="t16_ea_forkserver", mode="fors", rc=(2,),
+    dict(name="t16_ea_forkserver", mode="fors", rc=(0,),
          verdict="normal", finding=None, check_local_solver_mapping=True,
          note="standalone solver pool and queue use shared mappings required "
               "for forkserver child publication"),
@@ -139,20 +157,37 @@ TESTS: list[dict[str, Any]] = [
     dict(name="t26_use_after_free_gen", mode="mem", rc=(0,), verdict="crash",
          finding=dict(reason="heap-use-after-free", is_uaf=1,
                       fields={"obj_id": 1, "gen": 1, "size": 16, "offset": 0})),
-    dict(name="t27_timeout_crash", mode="fors", rc=(2,),
+    dict(name="t27_timeout_crash", mode="fors", rc=(0,),
          verdict="crash",
          finding=dict(reason="heap-use-after-free", is_uaf=1,
                       fields={"obj_id": 1, "gen": 1, "size": 8, "offset": 0,
                               "width": 1}),
          fault_reference=dict(valid="true", source="provenance-access"),
          note="timeout transport: deferred UAF surfaces as synthetic 139"),
-    dict(name="t79_forkserver_abort", mode="fors", rc=(2,),
+    dict(name="t79_forkserver_abort", mode="fors", rc=(0,),
          verdict="crash", fs_binradar=True, fs_abort_count=3,
-         fs_child_timeout=3, timeout=90,
+         fs_child_timeout=3, timeout=120,
+         fs_stop="failure-limit", fs_attempts=3,
+         fs_attempt_result=ATTEMPT_NO_OBSERVATION, fs_min_discarded=2,
+         fs_discard_reason="no-observation",
          finding=dict(reason="heap-use-after-free", is_uaf=1, count=3,
                       fields={"obj_id": 1, "gen": 1, "size": 8, "offset": 0,
                               "width": 1}),
-         note="binradar plan aborts after 3 consecutive child timeouts"),
+         note="a hanging guest costs one deadline-killed child per attempt: "
+              "each attempt is still discarded and consumes exactly one plan "
+              "(remaining 2 -> 1 -> 0) instead of ending the sweep at the "
+              "first kill, and the consecutive-bad-attempt limit then stops "
+              "the tracer"),
+    dict(name="t82_unusable_attempt_recovery", mode="fors", rc=(2,),
+         verdict=None, fs_binradar=True, fs_patch_cnt=3, timeout=300,
+         fs_max_attempts=8, fs_stop="continue", fs_min_attempts=8,
+         fs_min_discarded=1, fs_discard_reason="no-observation",
+         allow_findings=True,
+         note="the driver stops after its own bounded attempt budget, not "
+              "because the tracer ended the sweep: the first mutation plans "
+              "divert control before the patch site and are discarded as "
+              "ordinary no-observation misses while the queue keeps "
+              "advancing and later attempts still publish their outcomes"),
     # --- UNKNOWN-provenance negative cases (no numeric UAF) --------------
     dict(name="t28_unknown_no_uaf", mode="mem", rc=(0,), verdict="normal",
          finding=None,
@@ -245,8 +280,11 @@ TESTS: list[dict[str, Any]] = [
     dict(name="t45_compact_fault_reference", guest="t45_post_finding_query",
          mode="fors", rc=(2,), verdict="crash", fs_binradar=True,
          fs_patch_cnt=1, compact_fault_reference=True, allow_findings=True,
+         fs_max_attempts=2, timeout=120, fs_compaction_only=True,
          fault_reference=dict(valid="true", source="provenance-access"),
-         note="real forkserver child keeps deferred access PC in compact v1 evidence"),
+         note="a real forkserver child publishes its deferred access PC in "
+              "compact v2 evidence; the fixture stops once the baseline "
+              "attempt is committed instead of draining 486 mutation plans"),
     dict(name="t48_sticky_first_finding", mode="mem", rc=(0,),
          verdict="crash",
          finding=dict(reason="heap-buffer-overflow", is_uaf=0,
@@ -457,7 +495,7 @@ TESTS += PHASE5_TESTS
 # saw a banner EOF.  This must now handshake, run the child to a normal
 # exit, and report no finding.
 PHASE6_TESTS: list[dict[str, Any]] = [
-    dict(name="t80_xmm_preentry_forkserver", mode="fors", rc=(2,),
+    dict(name="t80_xmm_preentry_forkserver", mode="fors", rc=(0,),
          verdict="normal", finding=None,
          note="pre-entry movss under sem-events: banner instead of abort"),
 ]
@@ -693,6 +731,27 @@ def check_local_solver_mapping(pid):
             ",".join(hex(size) for size in sorted(shared_sizes)))
 
 
+def _summarize(summaries):
+    """Reduce raw protocol-v4 replies into the fields ``check`` asserts on."""
+    if not summaries:
+        return None
+    attempts = len(summaries)
+    results = [row[3] for row in summaries]
+    return {
+        "attempts": attempts,
+        "attempt_result": results[-1],
+        "stop_reason": summaries[-1][4],
+        "stop_name": STOP_NAMES.get(summaries[-1][4], "invalid"),
+        "remaining": summaries[-1][2],
+        "committed": results.count(ATTEMPT_COMPLETED),
+        "discarded": sum(1 for result in results
+                         if result != ATTEMPT_COMPLETED),
+        "no_observation": results.count(ATTEMPT_NO_OBSERVATION),
+        "timeouts": results.count(ATTEMPT_TIMEOUT),
+        "unusable": results.count(ATTEMPT_UNUSABLE_EXIT),
+    }
+
+
 def run_forkserver(test, guest, qemu, workdir):
     """Forkserver driver: handshake, iterate children until the plan ends
     (remaining == 0), close the parent pipe.  With ``fs_binradar`` the
@@ -708,6 +767,9 @@ def run_forkserver(test, guest, qemu, workdir):
     env["BINRADAR_ENTRYPOINT"] = resolve_entrypoint(guest)
     env["PLT_INFO_FILE"] = guest + ".plt"
     env["BINRADAR_FORKSERVER_CHILD_TIMEOUT"] = str(test.get("fs_child_timeout", 4))
+    if test.get("fs_iteration_timeout") is not None:
+        env["BINRADAR_FORKSERVER_ITERATION_TIMEOUT"] = str(
+            test["fs_iteration_timeout"])
     fs_binradar = test.get("fs_binradar", False)
     patch_r = patch_w = None
     if fs_binradar:
@@ -783,30 +845,32 @@ def run_forkserver(test, guest, qemu, workdir):
         if test.get("check_local_solver_mapping"):
             check_local_solver_mapping(proc.pid)
 
-        # Iterate children until the plan reports no remaining mods.
-        # Non-binradar forkserver tests see remaining == 0 after the first
-        # iteration, i.e. exactly one child as before.
-        remaining = 1
+        # Iterate attempts until the tracer reports a terminal stop reason.
+        # Non-binradar forkserver tests see stop=exhausted after the first
+        # attempt, i.e. exactly one child as before.
         child_status = None
-        expected_iteration = 1
-        for _ in range(20):
-            if fs_binradar and expected_iteration > 1:
+        expected_attempt = 1
+        summaries = []
+        for _ in range(test.get("fs_max_attempts", 40)):
+            if fs_binradar and expected_attempt > 1:
                 for patch_id in range(1, test.get("fs_patch_cnt", 2) + 1):
                     row = (f"[patch] [id {patch_id}] [br 0] "
-                           f"[v {expected_iteration}]\n").encode()
+                           f"[v {expected_attempt}]\n").encode()
                     os.write(patch_w, row)
             os.write(ctrl_w, struct.pack("<I", 0))  # was_killed
-            summary = read_exact(stat_r, 12)
-            if len(summary) != 12:
+            summary = read_exact(stat_r, 20)
+            if len(summary) != 20:
                 break
-            iteration, representative_runs, remaining = struct.unpack(
-                "<III", summary)
-            if iteration != expected_iteration or representative_runs == 0:
+            attempt, representative_runs, remaining, attempt_result, \
+                stop_reason = struct.unpack("<IIIII", summary)
+            summaries.append((attempt, representative_runs, remaining,
+                              attempt_result, stop_reason))
+            if attempt != expected_attempt or representative_runs == 0:
                 raise RuntimeError(
-                    f"invalid forkserver summary: iteration={iteration}, "
+                    f"invalid forkserver summary: attempt={attempt}, "
                     f"runs={representative_runs}")
-            expected_iteration += 1
-            if remaining == 0:
+            expected_attempt += 1
+            if stop_reason != STOP_CONTINUE:
                 break
 
         os.close(ctrl_w)
@@ -824,7 +888,8 @@ def run_forkserver(test, guest, qemu, workdir):
             if os.path.isfile(evidence_path):
                 evidence = list(binradar_evidence.read_binradar(
                     evidence_path))
-        return (proc.returncode, child_status, stderr_text, evidence)
+        return (proc.returncode, child_status, stderr_text, evidence,
+                _summarize(summaries))
     finally:
         if ctrl_w is not None:
             try:
@@ -853,9 +918,15 @@ def run_test(test, guests_dir, workdir, qemu):
                      if k in ("producer_pc", "last_writer", "access_pc")}
         test["_symbols"] = resolve_symbols(guest, sym_names)
     evidence = None
+    summary = None
+    # Compaction fixtures only need the committed baseline frame; draining the
+    # whole mutation queue would cost minutes without adding evidence shape.
+    run_spec = dict(test)
+    if test.get("fs_compaction_only"):
+        run_spec["fs_max_attempts"] = 1
     with tempfile.TemporaryDirectory(prefix="prov-probe-") as probe_dir:
         probe_file = os.path.join(probe_dir, "probe.sbsv")
-        run_spec = dict(test, probe_file=probe_file)
+        run_spec = dict(run_spec, probe_file=probe_file)
         if test["mode"] == "mem":
             result = run_memcheck(run_spec, guest, qemu, workdir)
             rc, stderr_text = result.returncode, result.stderr.decode(errors="replace")
@@ -865,17 +936,18 @@ def run_test(test, guests_dir, workdir, qemu):
             rc, stderr_text = result.returncode, result.stderr.decode(errors="replace")
             fs_status = None
         else:
-            rc, fs_status, stderr_text, evidence = run_forkserver(
+            rc, fs_status, stderr_text, evidence, summary = run_forkserver(
                 run_spec, guest, qemu, workdir)
         probe_text = ""
         if os.path.isfile(probe_file):
             with open(probe_file, encoding="utf-8") as probe:
                 probe_text = probe.read()
 
-    return (rc, fs_status, stderr_text, evidence, probe_text)
+    return (rc, fs_status, stderr_text, evidence, probe_text, summary)
 
 
-def check(test, rc, fs_status, out, evidence=None, probe_text=""):
+def check(test, rc, fs_status, out, evidence=None, probe_text="",
+          summary=None):
     problems = []
     if not rc_ok(rc, test.get("rc", (0,))):
         problems.append(f"rc={rc} not in {test.get('rc')}")
@@ -895,17 +967,70 @@ def check(test, rc, fs_status, out, evidence=None, probe_text=""):
         want_status = test.get("fs_status")
         if want_status is not None and fs_status != want_status:
             problems.append(f"child status {fs_status} != {want_status}")
+        want_stop = test.get("fs_stop")
+        if want_stop is not None:
+            if summary is None:
+                problems.append("missing forkserver summary")
+            elif summary["stop_name"] != want_stop:
+                problems.append(
+                    f"forkserver stop {summary['stop_name']!r} != "
+                    f"{want_stop!r}")
+        want_attempts = test.get("fs_attempts")
+        if want_attempts is not None:
+            if summary is None or summary["attempts"] != want_attempts:
+                problems.append(
+                    f"forkserver attempts "
+                    f"{summary['attempts'] if summary else None} != "
+                    f"{want_attempts}")
+        want_min_attempts = test.get("fs_min_attempts")
+        if want_min_attempts is not None:
+            if summary is None or summary["attempts"] < want_min_attempts:
+                problems.append(
+                    f"forkserver attempts "
+                    f"{summary['attempts'] if summary else None} < "
+                    f"{want_min_attempts}")
+        want_last_result = test.get("fs_attempt_result")
+        if want_last_result is not None:
+            if summary is None or \
+                    summary["attempt_result"] != want_last_result:
+                problems.append(
+                    f"forkserver attempt result "
+                    f"{summary['attempt_result'] if summary else None} != "
+                    f"{want_last_result}")
+        want_discards = test.get("fs_min_discarded")
+        if want_discards is not None:
+            if summary is None or summary["discarded"] < want_discards:
+                problems.append(
+                    f"forkserver discarded "
+                    f"{summary['discarded'] if summary else None} < "
+                    f"{want_discards}")
+        want_remaining = test.get("fs_remaining")
+        if want_remaining is not None:
+            if summary is None or summary["remaining"] != want_remaining:
+                problems.append(
+                    f"forkserver remaining "
+                    f"{summary['remaining'] if summary else None} != "
+                    f"{want_remaining}")
+        want_discard_rows = test.get("fs_discard_reason")
+        if want_discard_rows is not None:
+            marker = f"[binradar] [attempt-discarded] [iter "
+            if marker not in out:
+                problems.append("missing attempt-discarded row")
+            elif f"[reason {want_discard_rows}]" not in out:
+                problems.append(
+                    f"missing attempt-discarded reason {want_discard_rows!r}")
         want_abort = test.get("fs_abort_count")
         if want_abort is not None:
-            marker = f"[forkserver] [abort] [consecutive-timeout {want_abort}]"
+            marker = (f"[forkserver] [failure-limit] "
+                      f"[consecutive-bad {want_abort}]")
             if marker not in out:
-                problems.append(f"missing forkserver abort line {marker!r}")
+                problems.append(f"missing failure-limit line {marker!r}")
             if "[forkserver] [child-timeout]" not in out:
                 problems.append("missing forkserver child-timeout line")
 
     verdict, final_query, final_expr = parse_exit_line(out)
     want_verdict = test["verdict"]
-    if verdict != want_verdict:
+    if want_verdict is not None and verdict != want_verdict:
         problems.append(f"exit verdict {verdict!r} != {want_verdict!r}")
     reason = parse_crash_reason(out)
     if test.get("reason") and reason is None:
@@ -1101,13 +1226,14 @@ def main():
         ran += 1
         start = time.time()
         try:
-            rc, fs_status, out, evidence, probe_text = run_test(
+            rc, fs_status, out, evidence, probe_text, summary = run_test(
                 spec, args.guests, args.work, args.qemu)
         except Exception as e:  # noqa: BLE001 — per-test isolation
             failures.append(spec)
             print(f"FAIL {spec['name']}: {e}")
             continue
-        problems = check(spec, rc, fs_status, out, evidence, probe_text)
+        problems = check(spec, rc, fs_status, out, evidence, probe_text,
+                         summary)
         dt = time.time() - start
         if problems:
             failures.append(spec)

@@ -52,7 +52,8 @@ TESTS := t01_double_free t02_small_double_free t03_uaf_stack t04_uaf_heap \
          t70_store_width_4 t71_store_unaligned_8 t72_store_width_16 \
          t73_store_atomic t74_producer_malloc t75_producer_mov \
          t76_producer_add t77_producer_pop t78_producer_calloc \
-         t80_xmm_preentry_forkserver t81_plt_image_identity
+         t80_xmm_preentry_forkserver t81_plt_image_identity \
+         t82_unusable_attempt_recovery
 
 GUEST_BINS := $(addprefix $(WORK)/,$(TESTS))
 PLT_FILES  := $(addprefix $(WORK)/,$(addsuffix .plt,$(TESTS)))

@@ -163,13 +163,12 @@ SnapshotMutationApplyResult snapshot_mutation_apply(
                sizeof(prepared->fresh_target));
     }
 
+    /* Publication cannot fail after the complete preflight above.  The guest
+     * resumes only after every cell is written, so no plan can report failure
+     * after exposing a multiwrite prefix. */
     for (uint32_t i = 0; i < plan->num_mods; i++) {
         SnapshotMutationPreparedWrite *prepared = &writes[i];
-        if (!host->publish_cell(opaque, &prepared->local,
-                                prepared->local.value)) {
-            result = SNAPSHOT_MUTATION_APPLY_PUBLISH;
-            goto out;
-        }
+        host->publish_cell(opaque, &prepared->local, prepared->local.value);
         host->observe_write(opaque, &prepared->local,
                             prepared->fresh_target,
                             prepared->before_value, true);

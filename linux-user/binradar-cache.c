@@ -133,7 +133,8 @@ bool br_evidence_write_header(FILE *fp, uint16_t kind)
 {
     GByteArray *header = g_byte_array_sized_new(BR_EVIDENCE_HEADER_SIZE);
     g_byte_array_append(header, (const uint8_t *)BR_EVIDENCE_MAGIC, 8);
-    br_evidence_append_u16(header, BR_EVIDENCE_VERSION);
+    br_evidence_append_u16(header, kind == BR_EVIDENCE_KIND_BINRADAR
+        ? BR_EVIDENCE_VERSION_BINRADAR : BR_EVIDENCE_VERSION);
     br_evidence_append_u16(header, kind);
     br_evidence_append_u32(header, 0);
     bool ok = fwrite(header->data, 1, header->len, fp) == header->len;
@@ -194,8 +195,13 @@ static bool binradar_cache_feedback_write_atomic(const char *path,
     return ok;
 }
 
-/* Commit one pair for one real child execution.  Cache-materialized members
- * never call this function: they have no child-local snapshot of their own. */
+/* Stage one pair for one real child execution.  Cache-materialized members
+ * never call this function: they have no child-local snapshot of their own.
+ *
+ * The pair is written under the attempt's staging directory and is renamed
+ * into ``feedback_dir`` only by binradar_cache_feedback_publish().  A
+ * discarded attempt drops it, so committed sweep evidence never carries a
+ * pair produced by an attempt that never committed. */
 bool binradar_cache_feedback_write(
     BinradarManager *manager, uint32_t iteration, uint32_t patch_id,
     const GArray *branches, const BinradarMutationFeedbackView *mutation)
@@ -206,14 +212,29 @@ bool binradar_cache_feedback_write(
     if (run->patch_id != patch_id || run->representative != patch_id) {
         return false;
     }
+    if (manager->feedback_staging_dir == NULL) {
+        manager->feedback_staging_dir = g_strdup_printf(
+            "%s/.staging-%ld", manager->feedback_dir, (long)getpid());
+        if (g_mkdir_with_parents(manager->feedback_staging_dir, 0700) != 0) {
+            g_free(manager->feedback_staging_dir);
+            manager->feedback_staging_dir = NULL;
+            log_msg("[binradar] [feedback] [error staging] "
+                    "[iter %u] [patch %u]\n", iteration, patch_id);
+            return false;
+        }
+    }
+    if (manager->feedback_staged_pairs == NULL) {
+        manager->feedback_staged_pairs = g_ptr_array_new_with_free_func(
+            g_free);
+    }
 
     char *stem = g_strdup_printf("iteration-%08u-patch-%08u",
                                  iteration, patch_id);
     char *snapshot_name = g_strconcat(stem, ".brch", NULL);
     char *metadata_name = g_strconcat(stem, ".sbsv", NULL);
-    char *snapshot_path = g_build_filename(manager->feedback_dir,
+    char *snapshot_path = g_build_filename(manager->feedback_staging_dir,
                                            snapshot_name, NULL);
-    char *metadata_path = g_build_filename(manager->feedback_dir,
+    char *metadata_path = g_build_filename(manager->feedback_staging_dir,
                                            metadata_name, NULL);
     GString *metadata = g_string_new(NULL);
     const bool same_fault = run->is_crash &&
@@ -281,7 +302,11 @@ bool binradar_cache_feedback_write(
         log_msg("[binradar] [feedback] [error write] [iter %u] [patch %u]\n",
                 iteration, patch_id);
     } else {
-        log_msg("[binradar] [feedback] [commit] [iter %u] [patch %u] "
+        g_ptr_array_add(manager->feedback_staged_pairs,
+                        g_strdup(snapshot_name));
+        g_ptr_array_add(manager->feedback_staged_pairs,
+                        g_strdup(metadata_name));
+        log_msg("[binradar] [feedback] [staged] [iter %u] [patch %u] "
                 "[snapshots %u] [bytes %u] [result %s]\n",
                 iteration, patch_id, branches->len, manager->cache_bytes->len,
                 result);
@@ -293,6 +318,86 @@ bool binradar_cache_feedback_write(
     g_free(snapshot_name);
     g_free(stem);
     return ok;
+}
+
+/* Rename every staged pair into the feedback directory.  Called only after
+ * the attempt's evidence frame is committed.  Publication is all-or-none for
+ * the run: a collision or rename failure rolls back files already moved and
+ * makes the caller fail the phase instead of leaving a partial pair. */
+bool binradar_cache_feedback_publish(BinradarManager *manager)
+{
+    GPtrArray *published;
+    bool ok = true;
+
+    if (manager == NULL) return false;
+    if (manager->feedback_staging_dir == NULL) return true;
+    if (manager->feedback_staged_pairs == NULL) {
+        binradar_cache_feedback_drop(manager);
+        return true;
+    }
+    published = g_ptr_array_new_with_free_func(g_free);
+    for (guint i = 0; i < manager->feedback_staged_pairs->len; i++) {
+        const char *name = g_ptr_array_index(manager->feedback_staged_pairs, i);
+        char *source = g_build_filename(manager->feedback_staging_dir,
+                                        name, NULL);
+        char *destination = g_build_filename(manager->feedback_dir, name,
+                                             NULL);
+        if (g_file_test(destination, G_FILE_TEST_EXISTS) ||
+            rename(source, destination) != 0) {
+            log_msg("[binradar] [feedback] [error publish] [file %s]\n", name);
+            ok = false;
+        } else {
+            g_ptr_array_add(published, destination);
+            destination = NULL;
+        }
+        g_free(destination);
+        g_free(source);
+        if (!ok) break;
+    }
+    if (!ok) {
+        for (guint i = 0; i < published->len; i++) {
+            unlink(g_ptr_array_index(published, i));
+        }
+    }
+    g_ptr_array_free(published, TRUE);
+    binradar_cache_feedback_drop(manager);
+    return ok;
+}
+
+/* Drop every staged pair of the current attempt without publishing it. */
+void binradar_cache_feedback_drop(BinradarManager *manager)
+{
+    if (manager == NULL) return;
+    if (manager->feedback_staging_dir != NULL &&
+        manager->feedback_staged_pairs != NULL) {
+        for (guint i = 0; i < manager->feedback_staged_pairs->len; i++) {
+            const char *name =
+                g_ptr_array_index(manager->feedback_staged_pairs, i);
+            char *path = g_build_filename(manager->feedback_staging_dir,
+                                          name, NULL);
+            unlink(path);
+            g_free(path);
+        }
+    }
+    if (manager->feedback_staged_pairs != NULL) {
+        g_ptr_array_set_size(manager->feedback_staged_pairs, 0);
+    }
+    if (manager->feedback_staging_dir != NULL) {
+        rmdir(manager->feedback_staging_dir);
+        g_free(manager->feedback_staging_dir);
+        manager->feedback_staging_dir = NULL;
+    }
+}
+
+/* Release feedback staging ownership when the manager is torn down. */
+void binradar_cache_feedback_release(BinradarManager *manager)
+{
+    if (manager == NULL) return;
+    binradar_cache_feedback_drop(manager);
+    if (manager->feedback_staged_pairs != NULL) {
+        g_ptr_array_free(manager->feedback_staged_pairs, TRUE);
+        manager->feedback_staged_pairs = NULL;
+    }
 }
 
 void binradar_cache_disable(BinradarManager *manager,
@@ -516,7 +621,13 @@ out:
         if (members[patch] != NULL) g_array_free(members[patch], TRUE);
     }
     g_free(members);
-    if (ok) binradar_cache_clear_iteration(manager);
+    if (ok) {
+        /* The attempted sweep is now canonical evidence: only now may its
+         * staged feedback pairs become committed sweep evidence.  Failure is
+         * fatal to the phase and rolls back every moved pair. */
+        ok = binradar_cache_feedback_publish(manager);
+        if (ok) binradar_cache_clear_iteration(manager);
+    }
     return ok;
 }
 
