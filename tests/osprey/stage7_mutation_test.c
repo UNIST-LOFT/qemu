@@ -4200,6 +4200,14 @@ static void test_symbolic_would_submit_matches_boundary(void)
           "boundary mode submits exactly the shadow would-submit families");
     CHECK(coordinator.families->len == would_submit,
           "boundary coordinator holds one family per would-submit family");
+    /* A completed submission is not a stop.  Reporting `submit/<cause>` here
+     * would describe a clean run as if it had aborted at the submission
+     * stage, and the exact cause field is what a trial is read for. */
+    CHECK(s_symbolic_last_stats.stop_reason == SNAPSHOT_SYMBOLIC_STOP_NONE,
+          "a completed boundary submission publishes no stop");
+    CHECK(s_symbolic_last_stats.budget == 0 &&
+              s_symbolic_last_stats.allocation_failures == 0,
+          "a completed boundary submission exhausts no resource budget");
 
     g_ptr_array_free(coordinator.families, TRUE);
     g_ptr_array_free(coordinator.staged, TRUE);

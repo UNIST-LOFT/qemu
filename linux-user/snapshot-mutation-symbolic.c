@@ -2171,7 +2171,13 @@ uint32_t snapshot_symbolic_run(const SnapshotSymbolicView *view,
 out:
     if (submit_started) {
         stage_end(&engine, SNAPSHOT_SYMBOLIC_STAGE_SUBMIT, submit_mark);
-        stage_abort(&engine, SNAPSHOT_SYMBOLIC_STAGE_SUBMIT);
+        /* Attribute a stop to the submission stage only when the run actually
+         * stopped.  A completed submission leaves every budget intact, and
+         * labelling that as a stop would report a clean run as if it had
+         * aborted at submit. */
+        if (engine.aborted || engine.budget.exhausted) {
+            stage_abort(&engine, SNAPSHOT_SYMBOLIC_STAGE_SUBMIT);
+        }
     }
     engine.stats.families_generated = generated;
     engine.stats.families = submitted;
