@@ -958,8 +958,14 @@ TESTS = [
         mode="binradar",
         memcheck=0,
         entrypoint_symbol="t16_check",
+        # Nondefault budgets ride along with the mode: the real tracer's
+        # `[config]` and `[profile]` rows must echo what the environment
+        # requested, which is what makes the settings-provenance check against
+        # a trial's settings row meaningful.
         env={"BINRADAR_OSPREY_ANALYSIS_MODE": "mutation",
-             "BINRADAR_SYMBOLIC_MUTATION_MODE": "shadow"},
+             "BINRADAR_SYMBOLIC_MUTATION_MODE": "shadow",
+             "BINRADAR_SYMBOLIC_MAX_WORK": "500000",
+             "BINRADAR_SYMBOLIC_DEADLINE_MS": "500"},
         symbolic_observation=True,
         drain_queue=True,
         patch_count=0,
@@ -967,6 +973,14 @@ TESTS = [
         expect_log_rows=[
             ("symbolic-advisor", "[mode shadow]"),
             ("t16", "[tag low] [value 00000041]"),
+            ("symbolic-advisor",
+             "[config] [mode shadow] [max-work 500000] "
+             "[max-bytes 16777216] [deadline-ms 500]"),
+            ("symbolic-advisor", "[profile] [version 1]"),
+            ("symbolic-advisor",
+             "[max-work 500000] [max-bytes 16777216] [deadline-ms 500]"),
+            ("symbolic-advisor", "[stop-stage none] [stop-reason none]"),
+            ("symbolic-advisor", "[analysis-complete 1]"),
         ],
         # The advisor must submit nothing, and the guest must therefore never
         # observe the synthesized threshold.  The generic families are still
@@ -979,6 +993,40 @@ TESTS = [
             ("t16", "[tag high] [value 00001000]"),
         ],
         expect_symbolic_families_max=0,
+        timeout=120,
+    ),
+    dict(
+        # A malformed advisor budget disables the advisor rather than
+        # silently substituting a default: the tracer's own `[config]` row
+        # reports the rejection, the guest never observes a synthesized
+        # value, and the run still completes.  This is the tracer-side half of
+        # the budget-validation contract (the Python resolver rejects the same
+        # input before a phase starts).
+        name="t16_symbolic_invalid_budget",
+        guest="t16_symbolic_boundary",
+        mode="binradar",
+        memcheck=0,
+        entrypoint_symbol="t16_check",
+        env={"BINRADAR_OSPREY_ANALYSIS_MODE": "mutation",
+             "BINRADAR_SYMBOLIC_MUTATION_MODE": "boundary",
+             # strtoull accepts a leading plus; the advisor contract does not.
+             "BINRADAR_SYMBOLIC_DEADLINE_MS": "+1"},
+        symbolic_observation=True,
+        drain_queue=True,
+        patch_count=0,
+        rc=(0,),
+        expect_log_rows=[
+            ("symbolic-advisor", "[config] [invalid-number] [disabled]"),
+            ("t16", "[tag low] [value 00000041]"),
+        ],
+        absent_log_rows=[
+            ("t16", "[tag high] [value 00001000]"),
+            # A disabled advisor does not analyze at all, so no summary or
+            # profile row is published; `[config] [invalid-number]` is the
+            # only advisor row this run may carry.
+            ("symbolic-advisor", "[summary]"),
+            ("symbolic-advisor", "[profile]"),
+        ],
         timeout=120,
     ),
     dict(

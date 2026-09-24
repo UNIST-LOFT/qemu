@@ -2974,6 +2974,42 @@ static SnapshotMutationCoordinator fixture_coordinator(SymbolicFixture *fx)
     return coordinator;
 }
 
+/* Canonical textual dump of every staged plan descriptor.  Used to prove that
+ * a mode which must not change the queue leaves it byte-identical. */
+static GString *dump_staged_plans(const SnapshotMutationCoordinator *coordinator)
+{
+    GString *out = g_string_new(NULL);
+
+    for (guint i = 0; i < coordinator->staged->len; i++) {
+        const SnapshotMutationPlan *plan =
+            g_ptr_array_index(coordinator->staged, i);
+        g_string_append_printf(out,
+                               "plan[%u] mods=%u advisor=%u ordinal=%u "
+                               "family=%llu\n",
+                               i, plan->num_mods, plan->advisor_id,
+                               plan->source_ordinal,
+                               (unsigned long long)plan->family_id);
+        for (uint32_t m = 0; m < plan->num_mods; m++) {
+            const SnapshotMutationWrite *mod = &plan->mods[m];
+            g_string_append_printf(out,
+                                   "  mod[%u] addr=%llx size=%u kind=%u "
+                                   "value=",
+                                   m, (unsigned long long)mod->addr,
+                                   mod->size, (uint32_t)mod->kind);
+            for (size_t b = 0; b < sizeof(mod->value); b++) {
+                g_string_append_printf(out, "%02x", mod->value[b]);
+            }
+            g_string_append_printf(out,
+                                   " target-raw=%llx target-end=%llx "
+                                   "extent=%llu\n",
+                                   (unsigned long long)mod->target.resolved_raw,
+                                   (unsigned long long)mod->target.resolved_end,
+                                   (unsigned long long)mod->target.extent);
+        }
+    }
+    return out;
+}
+
 /* Package 4: the feedback sidecar must describe the plan the boundary advisor
  * actually applied, and the child must have observed the same value.  This
  * links three independently-produced artifacts -- the advisor's family, the
@@ -3954,6 +3990,358 @@ static void test_forkserver_continuation_policy(void)
           "an unexplained engine death reports resource-failure");
 }
 
+/* ------------------------------------------------------------------ */
+/* P4a: stage profile, stop attribution, completed-digest determinism  */
+/* ------------------------------------------------------------------ */
+
+/* Build the canonical unsigned fixture: one 4-byte retained read compared
+ * against 0x1000 with LTU, observed on the true side. */
+static void symbolic_canonical_fixture(SymbolicFixture *fx, uintptr_t cell)
+{
+    uint32_t leaf, zext;
+
+    fixture_init(fx);
+    leaf = fixture_leaf(fx);
+    zext = fixture_push(fx, ZEXT, &fx->arena[leaf], false, 0, NULL, true, 32);
+    fixture_source(fx, cell, 0x0010, (int64_t)zext, 0);
+    fixture_bind(fx, zext, cell, 0x0010);
+    fixture_branch(fx, LTU, &fx->arena[zext], false, 0, NULL, true, 0x1000, 8);
+    fixture_seal(fx, 0, 0);
+}
+
+/* Direct tracer entry points use the same unsigned-decimal language as the
+ * orchestrator.  Missing means default; an explicitly empty or signed value is
+ * malformed rather than another spelling of a default or positive integer. */
+static void test_symbolic_budget_parser_is_strict(void)
+{
+    const char *name = "BINRADAR_TEST_SYMBOLIC_BUDGET";
+    uint64_t value = 99;
+
+    g_unsetenv(name);
+    CHECK(parse_u64_env(name, &value) && value == 99,
+          "missing symbolic budget preserves the caller default");
+    g_setenv(name, "", TRUE);
+    CHECK(!parse_u64_env(name, &value),
+          "empty symbolic budget is malformed");
+    g_setenv(name, "+1", TRUE);
+    CHECK(!parse_u64_env(name, &value),
+          "positive sign is outside the unsigned-decimal grammar");
+    g_setenv(name, " 1", TRUE);
+    CHECK(!parse_u64_env(name, &value),
+          "budget whitespace is outside the unsigned-decimal grammar");
+    g_setenv(name, "18446744073709551615", TRUE);
+    CHECK(parse_u64_env(name, &value) && value == UINT64_MAX,
+          "maximum uint64 symbolic budget parses exactly");
+    g_setenv(name, "18446744073709551616", TRUE);
+    CHECK(!parse_u64_env(name, &value),
+          "overflowing symbolic budget is malformed");
+    g_unsetenv(name);
+}
+
+/* A completed analysis publishes an identical descriptor digest and
+ * would-submit summary regardless of the wall-clock budget, and each budget
+ * cause stays distinguishable.  The fixed arena is what makes the digest
+ * comparison meaningful: a fresh subject trace has no such guarantee. */
+static void test_symbolic_profile_digest_is_budget_independent(void)
+{
+    SymbolicFixture fx;
+    SnapshotMutationCoordinator coordinator;
+    SnapshotMutationProposalSink sink;
+    uintptr_t cell = TEST_GUEST_BASE + 0xea00;
+    uint64_t baseline_digest[SNAPSHOT_SYMBOLIC_DIGEST_ROUNDS];
+    uint32_t baseline_families = 0;
+    uint32_t baseline_variants = 0;
+    const uint64_t budgets[] = { 100, 500, 1000 };
+
+    coordinator = fixture_coordinator(&fx);
+    symbolic_configure(SNAPSHOT_SYMBOLIC_SHADOW);
+    for (size_t i = 0; i < G_N_ELEMENTS(budgets); i++) {
+        reset_runtime();
+        symbolic_canonical_fixture(&fx, cell);
+        s_symbolic_config.deadline_ms = budgets[i];
+        s_symbolic_config.max_work = SNAPSHOT_SYMBOLIC_DEFAULT_MAX_WORK;
+        s_symbolic_config.max_bytes = SNAPSHOT_SYMBOLIC_DEFAULT_MAX_BYTES;
+        CHECK(symbolic_run_fixture(&fx, &coordinator, &sink) == 0,
+              "shadow mode submits nothing at any budget");
+        CHECK(s_symbolic_last_stats.analysis_complete &&
+                  s_symbolic_last_stats.digest_complete,
+              "shadow analysis completes and publishes a comparable set");
+        CHECK(s_symbolic_last_stats.stop_reason ==
+                  SNAPSHOT_SYMBOLIC_STOP_NONE,
+              "no guard fires at the trial budgets");
+        CHECK(s_symbolic_last_stats.would_submit_families >= 1,
+              "shadow reports the families boundary mode would submit");
+        if (i == 0) {
+            memcpy(baseline_digest, s_symbolic_last_stats.digest,
+                   sizeof(baseline_digest));
+            baseline_families = s_symbolic_last_stats.would_submit_families;
+            baseline_variants = s_symbolic_last_stats.would_submit_variants;
+            continue;
+        }
+        CHECK(memcmp(baseline_digest, s_symbolic_last_stats.digest,
+                     sizeof(baseline_digest)) == 0,
+              "completed digest is identical across trial budgets");
+        CHECK(s_symbolic_last_stats.would_submit_families == baseline_families &&
+                  s_symbolic_last_stats.would_submit_variants ==
+                      baseline_variants,
+              "would-submit summary is identical across trial budgets");
+    }
+
+    /* Forcing a budget cause must attribute that exact cause at its stage and
+     * publish no family.  The deadline guard is forced already-expired so the
+     * cause cannot be raced against the wall clock. */
+    reset_runtime();
+    symbolic_canonical_fixture(&fx, cell);
+    s_symbolic_config.deadline_ms = SNAPSHOT_SYMBOLIC_DEFAULT_DEADLINE_MS;
+    s_symbolic_config.max_work = 1;
+    CHECK(symbolic_run_fixture(&fx, &coordinator, &sink) == 0 &&
+              s_symbolic_last_stats.stop_reason == SNAPSHOT_SYMBOLIC_STOP_WORK &&
+              s_symbolic_last_stats.stop_stage ==
+                  SNAPSHOT_SYMBOLIC_STAGE_SOURCES,
+          "forced work exhaustion attributes the work cause to its stage");
+    CHECK(!s_symbolic_last_stats.digest_complete &&
+              s_symbolic_last_stats.would_submit_families == 0,
+          "interrupted analysis has no comparable digest");
+    {
+        /* The all-zero digest is the documented incomparable marker: it must
+         * never be mistaken for a real completed-set identity. */
+        bool all_zero = true;
+        for (uint32_t lane = 0; lane < SNAPSHOT_SYMBOLIC_DIGEST_ROUNDS; lane++) {
+            if (s_symbolic_last_stats.digest[lane] != 0) all_zero = false;
+        }
+        CHECK(all_zero,
+              "interrupted analysis leaves the digest at its incomparable "
+              "all-zero marker");
+    }
+
+    /* Leave exactly enough bytes for the four top-level fixed arrays.  The
+     * index reservation must then stop as a byte budget at the index stage,
+     * not masquerade as a host allocation failure. */
+    reset_runtime();
+    symbolic_canonical_fixture(&fx, cell);
+    s_symbolic_config.max_work = SNAPSHOT_SYMBOLIC_DEFAULT_MAX_WORK;
+    s_symbolic_config.max_bytes =
+        (uint64_t)SNAPSHOT_SYMBOLIC_MAX_SOURCES *
+            sizeof(SnapshotSymbolicSource) +
+        (uint64_t)SNAPSHOT_SYMBOLIC_SOURCE_TABLE_CAPACITY *
+            sizeof(SnapshotSymbolicSourceLookupEntry) +
+        (uint64_t)SNAPSHOT_SYMBOLIC_MAX_SOURCES *
+            SNAPSHOT_SYMBOLIC_MAX_CANDIDATES_PER_SOURCE *
+            sizeof(SnapshotSymbolicCandidate) +
+        (uint64_t)SNAPSHOT_SYMBOLIC_MAX_SOURCES * sizeof(uint8_t);
+    CHECK(symbolic_run_fixture(&fx, &coordinator, &sink) == 0 &&
+              s_symbolic_last_stats.stop_reason ==
+                  SNAPSHOT_SYMBOLIC_STOP_BYTES &&
+              s_symbolic_last_stats.stop_stage ==
+                  SNAPSHOT_SYMBOLIC_STAGE_INDEX,
+          "index reservation preserves the byte-budget stop cause");
+    CHECK(s_symbolic_last_stats.allocation_failures == 0 &&
+              coordinator.families->len == 0,
+          "index byte exhaustion is not an allocation failure or prefix");
+
+    reset_runtime();
+    symbolic_canonical_fixture(&fx, cell);
+    s_symbolic_config.max_work = SNAPSHOT_SYMBOLIC_DEFAULT_MAX_WORK;
+    s_symbolic_config.max_bytes = SNAPSHOT_SYMBOLIC_DEFAULT_MAX_BYTES;
+    s_symbolic_test_deadline_expired = true;
+    CHECK(symbolic_run_fixture(&fx, &coordinator, &sink) == 0 &&
+              s_symbolic_last_stats.stop_reason ==
+                  SNAPSHOT_SYMBOLIC_STOP_DEADLINE &&
+              s_symbolic_last_stats.stop_stage ==
+                  SNAPSHOT_SYMBOLIC_STAGE_SOURCES,
+          "forced deadline expiry attributes the deadline cause");
+    CHECK(coordinator.families->len == 0,
+          "deadline exhaustion publishes no family prefix");
+    s_symbolic_test_deadline_expired = false;
+
+    /* Restoring every budget must admit the same fixture with the same
+     * candidate set, so the abstentions above were the guards. */
+    reset_runtime();
+    symbolic_canonical_fixture(&fx, cell);
+    CHECK(symbolic_run_fixture(&fx, &coordinator, &sink) == 0 &&
+              s_symbolic_last_stats.analysis_complete &&
+              s_symbolic_last_stats.would_submit_families == baseline_families,
+          "restored budgets admit the fixture with the same candidate set");
+
+    s_symbolic_config.deadline_ms = SNAPSHOT_SYMBOLIC_DEFAULT_DEADLINE_MS;
+    g_ptr_array_free(coordinator.families, TRUE);
+    g_ptr_array_free(coordinator.staged, TRUE);
+    symbolic_configure(SNAPSHOT_SYMBOLIC_OFF);
+}
+
+/* Boundary mode publishes a whole family for the same arena shadow mode only
+ * summarized, and records no capacity refusal on a completed analysis.  This
+ * is what makes the shadow would-submit count an actual proposal count. */
+static void test_symbolic_would_submit_matches_boundary(void)
+{
+    SymbolicFixture fx;
+    SnapshotMutationCoordinator coordinator;
+    SnapshotMutationProposalSink sink;
+    uintptr_t cell = TEST_GUEST_BASE + 0xea80;
+    uint32_t would_submit = 0;
+
+    reset_runtime();
+    symbolic_canonical_fixture(&fx, cell);
+    coordinator = fixture_coordinator(&fx);
+    symbolic_configure(SNAPSHOT_SYMBOLIC_SHADOW);
+    s_symbolic_config.deadline_ms = SNAPSHOT_SYMBOLIC_DEFAULT_DEADLINE_MS;
+    s_symbolic_config.max_work = SNAPSHOT_SYMBOLIC_DEFAULT_MAX_WORK;
+    s_symbolic_config.max_bytes = SNAPSHOT_SYMBOLIC_DEFAULT_MAX_BYTES;
+    CHECK(symbolic_run_fixture(&fx, &coordinator, &sink) == 0,
+          "shadow mode proposes nothing");
+    would_submit = s_symbolic_last_stats.would_submit_families;
+    CHECK(would_submit >= 1 && s_symbolic_last_stats.label_cap_refusals == 0,
+          "completed shadow analysis records a would-submit count");
+
+    reset_runtime();
+    symbolic_canonical_fixture(&fx, cell);
+    symbolic_configure(SNAPSHOT_SYMBOLIC_BOUNDARY);
+    CHECK(symbolic_run_fixture(&fx, &coordinator, &sink) == would_submit,
+          "boundary mode submits exactly the shadow would-submit families");
+    CHECK(coordinator.families->len == would_submit,
+          "boundary coordinator holds one family per would-submit family");
+
+    g_ptr_array_free(coordinator.families, TRUE);
+    g_ptr_array_free(coordinator.staged, TRUE);
+    symbolic_configure(SNAPSHOT_SYMBOLIC_OFF);
+}
+
+/* `off` and `shadow` must leave the published queue identical.  Shadow runs
+ * the same analysis but submits nothing, so the queue it publishes is exactly
+ * the one `off` publishes -- this is the descriptor/order guarantee, checked
+ * by dumping every staged plan descriptor rather than by counting plans. */
+static void test_symbolic_shadow_leaves_queue_unchanged(void)
+{
+    SymbolicFixture fx;
+    SnapshotMutationCoordinator off_coordinator;
+    SnapshotMutationCoordinator shadow_coordinator;
+    SnapshotMutationProposalSink sink;
+    uintptr_t cell = TEST_GUEST_BASE + 0xec00;
+    GString *off_dump;
+    GString *shadow_dump;
+
+    /* Two independent coordinators over structurally identical fixtures. */
+    reset_runtime();
+    symbolic_canonical_fixture(&fx, cell);
+    off_coordinator = fixture_coordinator(&fx);
+    symbolic_configure(SNAPSHOT_SYMBOLIC_OFF);
+    CHECK(symbolic_run_fixture(&fx, &off_coordinator, &sink) == 0,
+          "off mode proposes nothing");
+    off_dump = dump_staged_plans(&off_coordinator);
+
+    reset_runtime();
+    symbolic_canonical_fixture(&fx, cell);
+    shadow_coordinator = fixture_coordinator(&fx);
+    symbolic_configure(SNAPSHOT_SYMBOLIC_SHADOW);
+    s_symbolic_config.deadline_ms = SNAPSHOT_SYMBOLIC_DEFAULT_DEADLINE_MS;
+    s_symbolic_config.max_work = SNAPSHOT_SYMBOLIC_DEFAULT_MAX_WORK;
+    s_symbolic_config.max_bytes = SNAPSHOT_SYMBOLIC_DEFAULT_MAX_BYTES;
+    CHECK(symbolic_run_fixture(&fx, &shadow_coordinator, &sink) == 0 &&
+              shadow_coordinator.families->len == 0,
+          "shadow mode proposes nothing");
+    shadow_dump = dump_staged_plans(&shadow_coordinator);
+
+    CHECK(strcmp(off_dump->str, shadow_dump->str) == 0,
+          "off and shadow stage byte-identical plan descriptors in order");
+
+    g_string_free(off_dump, TRUE);
+    g_string_free(shadow_dump, TRUE);
+    g_ptr_array_free(off_coordinator.families, TRUE);
+    g_ptr_array_free(off_coordinator.staged, TRUE);
+    g_ptr_array_free(shadow_coordinator.families, TRUE);
+    g_ptr_array_free(shadow_coordinator.staged, TRUE);
+    symbolic_configure(SNAPSHOT_SYMBOLIC_OFF);
+}
+
+/* A submit-stage allocation failure is an advisor environment event, not a
+ * sink rejection: the two are counted separately so a quota/validation
+ * abstention cannot masquerade as memory pressure (or the reverse). */
+static void test_symbolic_submit_allocation_is_distinct(void)
+{
+    SymbolicFixture fx;
+    SnapshotMutationCoordinator coordinator;
+    SnapshotMutationProposalSink sink;
+    uintptr_t cell = TEST_GUEST_BASE + 0xeb80;
+    uint32_t analysis_allocations = 6;  /* four fixed tables, keys, labels */
+
+    reset_runtime();
+    symbolic_canonical_fixture(&fx, cell);
+    coordinator = fixture_coordinator(&fx);
+    symbolic_configure(SNAPSHOT_SYMBOLIC_BOUNDARY);
+    s_symbolic_config.deadline_ms = SNAPSHOT_SYMBOLIC_DEFAULT_DEADLINE_MS;
+    s_symbolic_config.max_work = SNAPSHOT_SYMBOLIC_DEFAULT_MAX_WORK;
+    s_symbolic_config.max_bytes = SNAPSHOT_SYMBOLIC_DEFAULT_MAX_BYTES;
+    /* The analysis allocations succeed; the first submit-side allocation is
+     * the one that fails. */
+    s_symbolic_test_alloc_fail_after = analysis_allocations;
+    CHECK(symbolic_run_fixture(&fx, &coordinator, &sink) == 0 &&
+              coordinator.families->len == 0,
+          "submit-stage allocation failure publishes no family");
+    CHECK(s_symbolic_last_stats.analysis_complete,
+          "submit-stage allocation failure happens after a complete analysis");
+    CHECK(s_symbolic_last_stats.allocation_failures >= 1 &&
+              s_symbolic_last_stats.submission_rejections == 0,
+          "submit-stage allocation failure is not a sink rejection");
+    CHECK(s_symbolic_last_stats.stop_reason ==
+              SNAPSHOT_SYMBOLIC_STOP_ALLOCATION &&
+              s_symbolic_last_stats.stop_stage ==
+                  SNAPSHOT_SYMBOLIC_STAGE_SUBMIT,
+          "submit allocation failure records its exact stop cause");
+    s_symbolic_test_alloc_fail_after = -1;
+
+    reset_runtime();
+    symbolic_canonical_fixture(&fx, cell);
+    CHECK(symbolic_run_fixture(&fx, &coordinator, &sink) == 1 &&
+              coordinator.families->len == 1,
+          "restored allocation admits the same family again");
+
+    g_ptr_array_free(coordinator.families, TRUE);
+    g_ptr_array_free(coordinator.staged, TRUE);
+    symbolic_configure(SNAPSHOT_SYMBOLIC_OFF);
+}
+
+/* An allocation failure is an environment event, not an unsupported
+ * expression: it must be attributed separately and must publish nothing. */
+static void test_symbolic_allocation_failure_cleanup(void)
+{
+    SymbolicFixture fx;
+    SnapshotMutationCoordinator coordinator;
+    SnapshotMutationProposalSink sink;
+    uintptr_t cell = TEST_GUEST_BASE + 0xeb00;
+
+    /* Every advisor-owned allocation is forced to fail. */
+    reset_runtime();
+    symbolic_canonical_fixture(&fx, cell);
+    coordinator = fixture_coordinator(&fx);
+    symbolic_configure(SNAPSHOT_SYMBOLIC_BOUNDARY);
+    s_symbolic_config.deadline_ms = SNAPSHOT_SYMBOLIC_DEFAULT_DEADLINE_MS;
+    s_symbolic_config.max_work = SNAPSHOT_SYMBOLIC_DEFAULT_MAX_WORK;
+    s_symbolic_config.max_bytes = SNAPSHOT_SYMBOLIC_DEFAULT_MAX_BYTES;
+    s_symbolic_test_alloc_fail_after = 0;
+    CHECK(symbolic_run_fixture(&fx, &coordinator, &sink) == 0 &&
+              coordinator.families->len == 0,
+          "allocation failure publishes no family");
+    CHECK(s_symbolic_last_stats.stop_reason ==
+              SNAPSHOT_SYMBOLIC_STOP_ALLOCATION &&
+              s_symbolic_last_stats.allocation_failures >= 1,
+          "allocation failure is attributed separately from abstention");
+    CHECK(s_symbolic_last_stats.unsupported == 0,
+          "allocation failure is not counted as unsupported input");
+    s_symbolic_test_alloc_fail_after = -1;
+
+    /* The same fixture with allocation restored still succeeds: cleanup left
+     * no state behind that blocks a later analysis. */
+    reset_runtime();
+    symbolic_canonical_fixture(&fx, cell);
+    CHECK(symbolic_run_fixture(&fx, &coordinator, &sink) == 1 &&
+              coordinator.families->len == 1,
+          "allocation failure leaves the advisor reusable");
+
+    g_ptr_array_free(coordinator.families, TRUE);
+    g_ptr_array_free(coordinator.staged, TRUE);
+    symbolic_configure(SNAPSHOT_SYMBOLIC_OFF);
+}
+
 int main(void)
 {
     /* The at-cap matrix records thousands of accesses; diagnostics are
@@ -4017,6 +4405,12 @@ int main(void)
     test_symbolic_byte_budget_abstains();
     test_symbolic_replaced_record_binds_alias();
     test_symbolic_mismatched_wrapper_not_bound();
+    test_symbolic_budget_parser_is_strict();
+    test_symbolic_profile_digest_is_budget_independent();
+    test_symbolic_would_submit_matches_boundary();
+    test_symbolic_allocation_failure_cleanup();
+    test_symbolic_submit_allocation_is_distinct();
+    test_symbolic_shadow_leaves_queue_unchanged();
 
     osprey_free_runtime_regions();
     teardown_guest_memory();

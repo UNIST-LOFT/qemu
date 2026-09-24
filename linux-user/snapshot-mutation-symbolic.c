@@ -31,6 +31,8 @@
 
 #include "../tcg/symbolic/symbolic-struct.h"
 
+#include <errno.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -41,6 +43,21 @@
 #define SNAPSHOT_SYMBOLIC_DEFAULT_MAX_WORK 1000000ull
 #define SNAPSHOT_SYMBOLIC_DEFAULT_MAX_BYTES (16ull * 1024ull * 1024ull)
 #define SNAPSHOT_SYMBOLIC_DEFAULT_DEADLINE_MS 100ull
+
+/* Test-only seams.  The focused runner includes this translation unit and can
+ * drive these file-local controls without adding production API surface. */
+static int64_t s_symbolic_test_alloc_fail_after = -1;
+static bool s_symbolic_test_deadline_expired = false;
+
+/* Advisor-owned allocation with the failure seam in front of it. */
+static void *symbolic_try_malloc0(size_t bytes)
+{
+    if (s_symbolic_test_alloc_fail_after >= 0) {
+        if (s_symbolic_test_alloc_fail_after == 0) return NULL;
+        s_symbolic_test_alloc_fail_after--;
+    }
+    return g_try_malloc0(bytes);
+}
 
 /* Fixed ceilings.  The source ceiling is the retained primitive record count;
  * the label and table ceilings bound the sparse index regardless of guest
@@ -71,11 +88,46 @@ static bool parse_u64_env(const char *name, uint64_t *out)
     char *end = NULL;
     unsigned long long value;
 
-    if (text == NULL || text[0] == '\0') return true; /* keep default */
+    if (text == NULL) return true; /* missing keeps the default */
+    if (text[0] == '\0') return false;
+    /* strtoull() accepts signs and leading whitespace.  The orchestrator's
+     * contract is unsigned decimal digits only, so reject every other byte
+     * before conversion instead of silently accepting a different language. */
+    for (const char *cursor = text; *cursor != '\0'; cursor++) {
+        if (*cursor < '0' || *cursor > '9') return false;
+    }
+    errno = 0;
     value = strtoull(text, &end, 10);
     if (end == text || (end != NULL && *end != '\0')) return false;
+    if (errno == ERANGE && value == ULLONG_MAX) return false;
     *out = (uint64_t)value;
     return true;
+}
+
+/* Milliseconds to microseconds.  The guard adds the configured span to the
+ * current monotonic clock, so the span itself must leave room for that sum;
+ * clamping keeps the comparison in ``budget_expired`` from wrapping into a
+ * deadline that has already passed. */
+#define SNAPSHOT_SYMBOLIC_MAX_DEADLINE_MS \
+    ((uint64_t)((INT64_MAX / 4) / 1000))
+
+static uint64_t bounded_deadline_ms(uint64_t deadline_ms)
+{
+    return MIN(deadline_ms, SNAPSHOT_SYMBOLIC_MAX_DEADLINE_MS);
+}
+
+/* Absolute monotonic deadline in microseconds; zero disables the guard.  The
+ * focused runner can force an already-expired guard so the deadline stop cause
+ * is exercised deterministically instead of raced against the wall clock. */
+static int64_t deadline_guard_us(uint64_t deadline_ms)
+{
+    uint64_t bounded = bounded_deadline_ms(deadline_ms);
+
+    if (bounded == 0) return 0;
+    if (s_symbolic_test_deadline_expired) {
+        return g_get_monotonic_time() - 1000;
+    }
+    return g_get_monotonic_time() + (int64_t)(bounded * 1000ull);
 }
 
 void snapshot_symbolic_configure(void)
@@ -119,6 +171,9 @@ void snapshot_symbolic_configure(void)
     if (config.max_bytes == 0) {
         config.max_bytes = SNAPSHOT_SYMBOLIC_DEFAULT_MAX_BYTES;
     }
+    /* The `[config]` row reports the effective value, so a clamped deadline is
+     * visible instead of silently truncated at use time. */
+    config.deadline_ms = bounded_deadline_ms(config.deadline_ms);
 
     config.valid = true;
     s_symbolic_config = config;
@@ -515,11 +570,11 @@ static bool index_init(SnapshotSymbolicIndex *index,
                   sizeof(SnapshotSymbolicLabel);
     if (!budget_reserve_bytes(budget, table_bytes + label_bytes)) return false;
 
-    index->keys = g_try_malloc0((size_t)table_bytes);
+    index->keys = symbolic_try_malloc0((size_t)table_bytes);
     if (index->keys == NULL) return false;
     index->values = (uint32_t *)(void *)((uint8_t *)index->keys +
         (uint64_t)SNAPSHOT_SYMBOLIC_TABLE_CAPACITY * sizeof(int64_t));
-    index->labels = g_try_malloc0((size_t)label_bytes);
+    index->labels = symbolic_try_malloc0((size_t)label_bytes);
     if (index->labels == NULL) {
         g_free(index->keys);
         index->keys = NULL;
@@ -558,12 +613,16 @@ static uint32_t index_lookup(const SnapshotSymbolicIndex *index, int64_t key)
     return UINT32_MAX;
 }
 
+/* Insert one key/label pair.  ``*cap_full`` distinguishes a bounded-capacity
+ * refusal from a budget refusal so the caller can attribute each one. */
 static bool index_insert(SnapshotSymbolicIndex *index, int64_t key,
-                         uint32_t label, SnapshotSymbolicBudget *budget)
+                         uint32_t label, SnapshotSymbolicBudget *budget,
+                         bool *cap_full)
 {
     uint32_t mask;
     uint32_t slot;
 
+    if (cap_full != NULL) *cap_full = false;
     if (index == NULL || index->keys == NULL) return false;
     mask = index->capacity - 1u;
     slot = table_hash(key, mask);
@@ -577,6 +636,7 @@ static bool index_insert(SnapshotSymbolicIndex *index, int64_t key,
             if (!budget_charge_work(budget, 1)) return false;
             /* Keep a free slot so lookup termination stays bounded. */
             if (index->count + 1u >= index->capacity - (index->capacity >> 3)) {
+                if (cap_full != NULL) *cap_full = true;
                 return false;
             }
             index->keys[slot] = key + 1;
@@ -593,6 +653,40 @@ static bool index_insert(SnapshotSymbolicIndex *index, int64_t key,
 /* Diagnostics                                                         */
 /* ------------------------------------------------------------------ */
 
+/* One measured pipeline stage.  `work` is the charged-work delta and `us` the
+ * monotonic elapsed time, so a stage that is cheap in operations but slow in
+ * wall time (or the reverse) is visible instead of being collapsed into the
+ * aggregate budget counters. */
+typedef enum SnapshotSymbolicStage {
+    SNAPSHOT_SYMBOLIC_STAGE_ALLOC = 0,
+    SNAPSHOT_SYMBOLIC_STAGE_INDEX = 1,
+    SNAPSHOT_SYMBOLIC_STAGE_SOURCES = 2,
+    SNAPSHOT_SYMBOLIC_STAGE_ROOTS = 3,
+    SNAPSHOT_SYMBOLIC_STAGE_FORWARD = 4,
+    SNAPSHOT_SYMBOLIC_STAGE_CONSUMERS = 5,
+    SNAPSHOT_SYMBOLIC_STAGE_SUBMIT = 6,
+    SNAPSHOT_SYMBOLIC_STAGE_COUNT = 7,
+} SnapshotSymbolicStage;
+
+/* First stage/reason that stopped the analysis.  `budget` deliberately stays
+ * aggregate for existing consumers; this is the attribution P4a needs. */
+typedef enum SnapshotSymbolicStop {
+    SNAPSHOT_SYMBOLIC_STOP_NONE = 0,
+    SNAPSHOT_SYMBOLIC_STOP_WORK = 1,
+    SNAPSHOT_SYMBOLIC_STOP_BYTES = 2,
+    SNAPSHOT_SYMBOLIC_STOP_DEADLINE = 3,
+    SNAPSHOT_SYMBOLIC_STOP_ALLOCATION = 4,
+    SNAPSHOT_SYMBOLIC_STOP_INDEX_CAP = 5,
+    SNAPSHOT_SYMBOLIC_STOP_LABEL_CAP = 6,
+    SNAPSHOT_SYMBOLIC_STOP_MALFORMED = 7,
+} SnapshotSymbolicStop;
+
+/* Bounded digest of the completed candidate set.  Field order is fixed by the
+ * descriptor layout: source ordinal, width, canonical candidate rank, query
+ * identity, lowered bytes.  Pointers, padding, wall time, and hash-table
+ * insertion order are never hashed. */
+#define SNAPSHOT_SYMBOLIC_DIGEST_ROUNDS 8u
+
 typedef struct SnapshotSymbolicStats {
     uint32_t sources;
     uint32_t valid_roots;
@@ -607,6 +701,20 @@ typedef struct SnapshotSymbolicStats {
     uint64_t bytes;
     int64_t start_us;
     int64_t end_us;
+    /* P4a profiling */
+    uint64_t stage_work[SNAPSHOT_SYMBOLIC_STAGE_COUNT];
+    int64_t stage_us[SNAPSHOT_SYMBOLIC_STAGE_COUNT];
+    uint32_t would_submit_families;
+    uint32_t would_submit_variants;
+    uint64_t digest[SNAPSHOT_SYMBOLIC_DIGEST_ROUNDS];
+    bool digest_complete;
+    bool analysis_complete;
+    uint8_t stop_stage;
+    uint8_t stop_reason;
+    uint32_t allocation_failures;
+    uint32_t index_cap_refusals;
+    uint32_t label_cap_refusals;
+    uint32_t submission_rejections;
 } SnapshotSymbolicStats;
 
 static bool detail_enabled(void)
@@ -734,6 +842,104 @@ typedef struct SnapshotSymbolicEngine {
     SnapshotSymbolicStats stats;
     bool aborted;
 } SnapshotSymbolicEngine;
+
+/* ------------------------------------------------------------------ */
+/* Stage profiling                                                     */
+/* ------------------------------------------------------------------ */
+
+typedef struct SnapshotSymbolicStageMark {
+    uint64_t work;
+    int64_t start_us;
+} SnapshotSymbolicStageMark;
+
+static SnapshotSymbolicStageMark stage_begin(const SnapshotSymbolicEngine *engine)
+{
+    SnapshotSymbolicStageMark mark;
+
+    mark.work = engine->budget.work;
+    mark.start_us = g_get_monotonic_time();
+    return mark;
+}
+
+/* Record one stage.  The first stop wins: a later stage that happens to touch
+ * an already-exhausted budget must not relabel the real cause. */
+static void stage_end(SnapshotSymbolicEngine *engine, SnapshotSymbolicStage stage,
+                      SnapshotSymbolicStageMark mark)
+{
+    int64_t end_us = g_get_monotonic_time();
+
+    engine->stats.stage_work[stage] = engine->budget.work - mark.work;
+    engine->stats.stage_us[stage] += end_us - mark.start_us;
+}
+
+/* Attribute the stop to the stage that was running when it happened.  The
+ * first stop wins: a later stage that happens to touch an already-exhausted
+ * budget must not relabel the real cause. */
+static void stage_abort(SnapshotSymbolicEngine *engine,
+                        SnapshotSymbolicStage stage)
+{
+    SnapshotSymbolicStop reason = SNAPSHOT_SYMBOLIC_STOP_MALFORMED;
+
+    if (engine->stats.stop_reason != SNAPSHOT_SYMBOLIC_STOP_NONE) return;
+    if (engine->budget.work_exhausted) {
+        reason = SNAPSHOT_SYMBOLIC_STOP_WORK;
+    } else if (engine->budget.bytes_exhausted) {
+        reason = SNAPSHOT_SYMBOLIC_STOP_BYTES;
+    } else if (engine->budget.deadline_exhausted) {
+        reason = SNAPSHOT_SYMBOLIC_STOP_DEADLINE;
+    }
+    engine->stats.stop_stage = (uint8_t)stage;
+    engine->stats.stop_reason = (uint8_t)reason;
+}
+
+/* Allocation failure and fixed-capacity exhaustion are distinct from
+ * unsupported expressions: the first two are environment/limit events, the
+ * third is an ordinary grammar abstention. */
+static void record_allocation_failure(SnapshotSymbolicEngine *engine,
+                                      SnapshotSymbolicStage stage)
+{
+    engine->stats.allocation_failures++;
+    if (engine->stats.stop_reason == SNAPSHOT_SYMBOLIC_STOP_NONE) {
+        engine->stats.stop_stage = (uint8_t)stage;
+        engine->stats.stop_reason = SNAPSHOT_SYMBOLIC_STOP_ALLOCATION;
+    }
+}
+
+/* Called when a fixed table or label ceiling refuses an insertion.  When the
+ * refusal ends the traversal (`aborted`) it is the stop; otherwise it is a
+ * bounded-capacity abstention that the analysis survived. */
+static void record_cap_refusal(SnapshotSymbolicEngine *engine,
+                               SnapshotSymbolicStage stage,
+                               SnapshotSymbolicStop reason)
+{
+    if (reason == SNAPSHOT_SYMBOLIC_STOP_LABEL_CAP) {
+        engine->stats.label_cap_refusals++;
+    } else {
+        engine->stats.index_cap_refusals++;
+    }
+    if (!engine->aborted) return;
+    if (engine->stats.stop_reason == SNAPSHOT_SYMBOLIC_STOP_NONE) {
+        engine->stats.stop_stage = (uint8_t)stage;
+        engine->stats.stop_reason = (uint8_t)reason;
+    }
+}
+
+/* Mix one 64-bit word into the fixed digest state.  Independent of host
+ * endianness and of any address the run happened to use. */
+static void digest_mix(uint64_t digest[SNAPSHOT_SYMBOLIC_DIGEST_ROUNDS],
+                       uint64_t value)
+{
+    for (uint32_t lane = 0; lane < SNAPSHOT_SYMBOLIC_DIGEST_ROUNDS; lane++) {
+        uint64_t mixed = digest[lane] ^ value;
+        mixed *= 0x9E3779B97F4A7C15ull;
+        mixed ^= mixed >> 29;
+        mixed *= 0xBF58476D1CE4E5B9ull;
+        mixed ^= mixed >> 32;
+        digest[lane] = mixed + (uint64_t)lane;
+        value = mixed;
+    }
+}
+
 
 static uint32_t source_hash(uint64_t addr)
 {
@@ -875,16 +1081,19 @@ static bool engine_label(SnapshotSymbolicEngine *engine, int64_t index,
                          uint32_t source_slot, uint8_t transform,
                          uint64_t constant, uint8_t result_width,
                          uint8_t operand_width, int64_t operand_index,
-                         uint64_t observed)
+                         uint64_t observed, SnapshotSymbolicStage stage)
 {
     SnapshotSymbolicLabel *label;
+    bool cap_full = false;
 
     if (engine->index.label_count >= SNAPSHOT_SYMBOLIC_MAX_LABELS) {
         engine->aborted = true;
+        record_cap_refusal(engine, stage, SNAPSHOT_SYMBOLIC_STOP_LABEL_CAP);
         return false;
     }
     if (!budget_charge_work(&engine->budget, 1)) {
         engine->aborted = true;
+        stage_abort(engine, stage);
         return false;
     }
     label = &engine->index.labels[engine->index.label_count];
@@ -897,8 +1106,15 @@ static bool engine_label(SnapshotSymbolicEngine *engine, int64_t index,
     label->operand_width = operand_width;
     label->reserved = 0;
     if (!index_insert(&engine->index, index, engine->index.label_count,
-                      &engine->budget)) {
-        if (engine->budget.exhausted) engine->aborted = true;
+                      &engine->budget, &cap_full)) {
+        if (cap_full) {
+            engine->aborted = true;
+            record_cap_refusal(engine, stage,
+                               SNAPSHOT_SYMBOLIC_STOP_INDEX_CAP);
+        } else if (engine->budget.exhausted) {
+            engine->aborted = true;
+            stage_abort(engine, stage);
+        }
         return false;
     }
     engine->index.label_count++;
@@ -1089,7 +1305,8 @@ static bool engine_bind_roots(SnapshotSymbolicEngine *engine)
                 root_project(transform, source->observed, operand_width),
                 root_width);
             if (!engine_label(engine, root_index, s, transform, 0, root_width,
-                              operand_width, -1, projected)) {
+                              operand_width, -1, projected,
+                              SNAPSHOT_SYMBOLIC_STAGE_ROOTS)) {
                 if (engine->aborted) return false;
                 engine->stats.unsupported++;
                 continue;
@@ -1186,7 +1403,8 @@ static bool engine_forward(SnapshotSymbolicEngine *engine)
                                   ? SNAPSHOT_SYMBOLIC_XFORM_ZEXT
                                   : SNAPSHOT_SYMBOLIC_XFORM_SEXT,
                               0, (uint8_t)sizeof(target_ulong), from_width,
-                              labelled_index, extended)) {
+                              labelled_index, extended,
+                              SNAPSHOT_SYMBOLIC_STAGE_FORWARD)) {
                 return false;
             }
             break;
@@ -1260,7 +1478,8 @@ static bool engine_forward(SnapshotSymbolicEngine *engine)
                               engine->index.labels[label_id].source_slot,
                               transform, constant, op_width,
                               op_width, labelled_index,
-                              width_truncate(result, op_width))) {
+                              width_truncate(result, op_width),
+                              SNAPSHOT_SYMBOLIC_STAGE_FORWARD)) {
                 return false;
             }
             break;
@@ -1613,16 +1832,25 @@ static bool engine_consumers(SnapshotSymbolicEngine *engine)
 /* Submission                                                          */
 /* ------------------------------------------------------------------ */
 
+/* Outcome of one family submission.  An advisor-owned allocation failure is
+ * an environment event and must not be reported as a sink rejection (quota or
+ * validation), which is an ordinary local abstention. */
+typedef enum SnapshotSymbolicSubmitResult {
+    SNAPSHOT_SYMBOLIC_SUBMIT_DONE = 0,       /* nothing left to publish */
+    SNAPSHOT_SYMBOLIC_SUBMIT_REJECTED = 1,   /* sink refused the family */
+    SNAPSHOT_SYMBOLIC_SUBMIT_ALLOCATION = 2, /* advisor ran out of memory */
+} SnapshotSymbolicSubmitResult;
+
 /* Verify and submit the best candidates for one source.  A candidate is only
  * submitted when the independent forward re-evaluation proves the recorded
  * predicate flips, when the lowered value is in the root projection's image,
  * and when it differs from both the physical and observed baseline bytes.
  *
- * Returns false only when the sink rejected the family (quota, validation, or
- * allocation).  ``*emitted_out`` reports how many variants survived
- * verification: zero means every candidate was a local abstention and nothing
- * was proposed, which the caller must not count as a submitted family. */
-static bool submit_source(SnapshotSymbolicEngine *engine,
+ * ``*emitted_out`` reports how many variants survived verification: zero means
+ * every candidate was a local abstention and nothing was proposed, which the
+ * caller must not count as a submitted family. */
+static SnapshotSymbolicSubmitResult submit_source(
+                          SnapshotSymbolicEngine *engine,
                           SnapshotMutationProposalSink *sink,
                           const SnapshotSymbolicCandidate **selected,
                           uint32_t count, uint32_t source_slot,
@@ -1638,13 +1866,13 @@ static bool submit_source(SnapshotSymbolicEngine *engine,
     bool ok;
 
     *emitted_out = 0;
-    if (count == 0) return true;
-    variants = g_try_malloc0((size_t)count * sizeof(*variants));
-    if (variants == NULL) return false;
-    writes = g_try_malloc0((size_t)count * sizeof(*writes));
+    if (count == 0) return SNAPSHOT_SYMBOLIC_SUBMIT_DONE;
+    variants = symbolic_try_malloc0((size_t)count * sizeof(*variants));
+    if (variants == NULL) return SNAPSHOT_SYMBOLIC_SUBMIT_ALLOCATION;
+    writes = symbolic_try_malloc0((size_t)count * sizeof(*writes));
     if (writes == NULL) {
         g_free(variants);
-        return false;
+        return SNAPSHOT_SYMBOLIC_SUBMIT_ALLOCATION;
     }
     memset(&family, 0, sizeof(family));
     family.advisor_id = SNAPSHOT_SYMBOLIC_ADVISOR_ID;
@@ -1680,7 +1908,7 @@ static bool submit_source(SnapshotSymbolicEngine *engine,
     if (emitted == 0) {
         g_free(writes);
         g_free(variants);
-        return true;
+        return SNAPSHOT_SYMBOLIC_SUBMIT_DONE;
     }
     *emitted_out = emitted;
     family.variant_count = emitted;
@@ -1688,13 +1916,99 @@ static bool submit_source(SnapshotSymbolicEngine *engine,
     ok = snapshot_mutation_sink_submit(sink, &family);
     g_free(writes);
     g_free(variants);
-    return ok;
+    /* A false return is the sink's own rejection (quota or validation), not
+     * an advisor allocation failure: the two are counted separately. */
+    return ok ? SNAPSHOT_SYMBOLIC_SUBMIT_DONE
+              : SNAPSHOT_SYMBOLIC_SUBMIT_REJECTED;
+}
+
+/* Summarize a *completed* analysis: the would-submit family count and a
+ * deterministic digest over the fixed candidate slots in canonical
+ * source/rank order.
+ *
+ * Shadow mode never reaches the sink, so its `families-generated`/
+ * `families-accepted` counters stay zero by contract; `would-submit-*` is the
+ * estimate of what boundary mode would have proposed for the same frozen
+ * arena.  Candidate slots are already ranked (query, class, distance, Hamming,
+ * value), so hashing them in slot order is order-stable. */
+static void summarize_completed_analysis(SnapshotSymbolicEngine *engine)
+{
+    uint32_t families = 0;
+    uint32_t variants = 0;
+
+    for (uint32_t s = 0; s < engine->source_count; s++) {
+        const SnapshotSymbolicSource *source = &engine->sources[s];
+        uint32_t count = engine->candidate_counts[s];
+
+        digest_mix(engine->stats.digest, source->ordinal);
+        digest_mix(engine->stats.digest, source->width);
+        digest_mix(engine->stats.digest, count);
+        if (count > 0) {
+            families++;
+            variants += count;
+        }
+        for (uint32_t ci = 0; ci < count; ci++) {
+            const SnapshotSymbolicCandidate *candidate =
+                engine_candidate_at(engine, s, ci);
+
+            /* Identity of the descriptor: rank position, the recorded query
+             * it came from, the compare shape, and the lowered bytes that
+             * would be written.  Never an address or a pointer. */
+            digest_mix(engine->stats.digest, ci);
+            digest_mix(engine->stats.digest, candidate->query_index);
+            digest_mix(engine->stats.digest, candidate->compare_width);
+            digest_mix(engine->stats.digest, candidate->opkind);
+            digest_mix(engine->stats.digest, candidate->rank_class);
+            digest_mix(engine->stats.digest, candidate->lowered);
+            digest_mix(engine->stats.digest, candidate->constant);
+            digest_mix(engine->stats.digest, candidate->observed);
+        }
+    }
+    engine->stats.would_submit_families = families;
+    engine->stats.would_submit_variants = variants;
+    engine->stats.digest_complete = true;
+}
+
+/* Last completed-or-aborted profile, retained so the focused runner can assert
+ * the digest and stop attribution without parsing the log.  One fixed copy per
+ * analysis run (not per load, plan, or candidate). */
+static SnapshotSymbolicStats s_symbolic_last_stats;
+
+static const char *stage_name(SnapshotSymbolicStage stage)
+{
+    switch (stage) {
+    case SNAPSHOT_SYMBOLIC_STAGE_ALLOC: return "alloc";
+    case SNAPSHOT_SYMBOLIC_STAGE_INDEX: return "index";
+    case SNAPSHOT_SYMBOLIC_STAGE_SOURCES: return "sources";
+    case SNAPSHOT_SYMBOLIC_STAGE_ROOTS: return "roots";
+    case SNAPSHOT_SYMBOLIC_STAGE_FORWARD: return "forward";
+    case SNAPSHOT_SYMBOLIC_STAGE_CONSUMERS: return "consumers";
+    case SNAPSHOT_SYMBOLIC_STAGE_SUBMIT: return "submit";
+    default: return "none";
+    }
+}
+
+static const char *stop_reason_name(SnapshotSymbolicStop reason)
+{
+    switch (reason) {
+    case SNAPSHOT_SYMBOLIC_STOP_WORK: return "work";
+    case SNAPSHOT_SYMBOLIC_STOP_BYTES: return "bytes";
+    case SNAPSHOT_SYMBOLIC_STOP_DEADLINE: return "deadline";
+    case SNAPSHOT_SYMBOLIC_STOP_ALLOCATION: return "allocation";
+    case SNAPSHOT_SYMBOLIC_STOP_INDEX_CAP: return "index-cap";
+    case SNAPSHOT_SYMBOLIC_STOP_LABEL_CAP: return "label-cap";
+    case SNAPSHOT_SYMBOLIC_STOP_MALFORMED: return "malformed";
+    default: return "none";
+    }
 }
 
 uint32_t snapshot_symbolic_run(const SnapshotSymbolicView *view,
                                SnapshotMutationProposalSink *sink)
 {
     SnapshotSymbolicEngine engine;
+    SnapshotSymbolicStageMark mark;
+    SnapshotSymbolicStageMark submit_mark = { 0, 0 };
+    bool submit_started = false;
     uint32_t generated = 0;
     uint32_t submitted = 0;
 
@@ -1715,11 +2029,9 @@ uint32_t snapshot_symbolic_run(const SnapshotSymbolicView *view,
     engine.view = view;
     engine.budget.max_work = s_symbolic_config.max_work;
     engine.budget.max_bytes = s_symbolic_config.max_bytes;
-    engine.budget.deadline_us = s_symbolic_config.deadline_ms == 0
-        ? 0
-        : g_get_monotonic_time() +
-          (int64_t)(s_symbolic_config.deadline_ms * 1000ull);
+    engine.budget.deadline_us = deadline_guard_us(s_symbolic_config.deadline_ms);
     engine.stats.start_us = g_get_monotonic_time();
+    mark = stage_begin(&engine);
     {
         uint64_t source_bytes =
             (uint64_t)SNAPSHOT_SYMBOLIC_MAX_SOURCES * sizeof(*engine.sources);
@@ -1737,33 +2049,77 @@ uint32_t snapshot_symbolic_run(const SnapshotSymbolicView *view,
         if (!budget_reserve_bytes(&engine.budget, source_bytes + lookup_bytes +
                                                    candidate_bytes +
                                                    count_bytes)) {
+            stage_end(&engine, SNAPSHOT_SYMBOLIC_STAGE_ALLOC, mark);
+            stage_abort(&engine, SNAPSHOT_SYMBOLIC_STAGE_ALLOC);
             goto out;
         }
-        engine.sources = g_try_malloc0((size_t)source_bytes);
-        engine.source_lookup = g_try_malloc0((size_t)lookup_bytes);
-        engine.candidates = g_try_malloc0((size_t)candidate_bytes);
-        engine.candidate_counts = g_try_malloc0((size_t)count_bytes);
+        engine.sources = symbolic_try_malloc0((size_t)source_bytes);
+        engine.source_lookup = symbolic_try_malloc0((size_t)lookup_bytes);
+        engine.candidates = symbolic_try_malloc0((size_t)candidate_bytes);
+        engine.candidate_counts = symbolic_try_malloc0((size_t)count_bytes);
     }
+    stage_end(&engine, SNAPSHOT_SYMBOLIC_STAGE_ALLOC, mark);
     if (engine.sources == NULL || engine.source_lookup == NULL ||
         engine.candidates == NULL || engine.candidate_counts == NULL) {
         /* Allocation failure before traversal: disable this advisor while
          * preserving every pre-existing family. */
         engine.stats.budget++;
+        record_allocation_failure(&engine, SNAPSHOT_SYMBOLIC_STAGE_ALLOC);
         goto out;
     }
+    mark = stage_begin(&engine);
     if (!index_init(&engine.index, &engine.budget)) {
-        engine.stats.budget++;
+        stage_end(&engine, SNAPSHOT_SYMBOLIC_STAGE_INDEX, mark);
+        if (engine.budget.exhausted) {
+            stage_abort(&engine, SNAPSHOT_SYMBOLIC_STAGE_INDEX);
+        } else {
+            engine.stats.budget++;
+            record_allocation_failure(&engine, SNAPSHOT_SYMBOLIC_STAGE_INDEX);
+        }
         goto out;
     }
+    stage_end(&engine, SNAPSHOT_SYMBOLIC_STAGE_INDEX, mark);
 
-    if (!engine_select_sources(&engine)) goto out;
-    if (!engine_bind_roots(&engine)) goto out;
-    if (!engine_forward(&engine)) goto out;
-    if (!engine_consumers(&engine)) goto out;
+    mark = stage_begin(&engine);
+    if (!engine_select_sources(&engine)) {
+        stage_end(&engine, SNAPSHOT_SYMBOLIC_STAGE_SOURCES, mark);
+        stage_abort(&engine, SNAPSHOT_SYMBOLIC_STAGE_SOURCES);
+        goto out;
+    }
+    stage_end(&engine, SNAPSHOT_SYMBOLIC_STAGE_SOURCES, mark);
+    mark = stage_begin(&engine);
+    if (!engine_bind_roots(&engine)) {
+        stage_end(&engine, SNAPSHOT_SYMBOLIC_STAGE_ROOTS, mark);
+        stage_abort(&engine, SNAPSHOT_SYMBOLIC_STAGE_ROOTS);
+        goto out;
+    }
+    stage_end(&engine, SNAPSHOT_SYMBOLIC_STAGE_ROOTS, mark);
+    mark = stage_begin(&engine);
+    if (!engine_forward(&engine)) {
+        stage_end(&engine, SNAPSHOT_SYMBOLIC_STAGE_FORWARD, mark);
+        stage_abort(&engine, SNAPSHOT_SYMBOLIC_STAGE_FORWARD);
+        goto out;
+    }
+    stage_end(&engine, SNAPSHOT_SYMBOLIC_STAGE_FORWARD, mark);
+    mark = stage_begin(&engine);
+    if (!engine_consumers(&engine)) {
+        stage_end(&engine, SNAPSHOT_SYMBOLIC_STAGE_CONSUMERS, mark);
+        stage_abort(&engine, SNAPSHOT_SYMBOLIC_STAGE_CONSUMERS);
+        goto out;
+    }
+    stage_end(&engine, SNAPSHOT_SYMBOLIC_STAGE_CONSUMERS, mark);
+
+    /* The complete analysis is the precondition for both the digest and the
+     * would-submit summary: an interrupted scan has no comparable set. */
+    engine.stats.analysis_complete = true;
+    summarize_completed_analysis(&engine);
 
     if (s_symbolic_config.mode == SNAPSHOT_SYMBOLIC_BOUNDARY) {
         uint64_t proposal_bytes = 0;
         uint64_t submission_work = 0;
+
+        submit_mark = stage_begin(&engine);
+        submit_started = true;
 
         /* Reserve the complete bounded submission footprint and work before
          * publishing the first family.  Budget exhaustion therefore cannot
@@ -1778,6 +2134,8 @@ uint32_t snapshot_symbolic_run(const SnapshotSymbolicView *view,
         }
         if (!budget_reserve_bytes(&engine.budget, proposal_bytes) ||
             !budget_step(&engine.budget, submission_work)) {
+            /* The whole submission allowance is refused before the first sink
+             * call, so no family prefix is published. */
             goto out;
         }
 
@@ -1786,20 +2144,24 @@ uint32_t snapshot_symbolic_run(const SnapshotSymbolicView *view,
                 SNAPSHOT_SYMBOLIC_MAX_CANDIDATES_PER_SOURCE];
             uint32_t count = engine.candidate_counts[s];
             uint32_t emitted = 0;
-            bool submitted_ok;
+            SnapshotSymbolicSubmitResult outcome;
 
             if (count == 0) continue;
             for (uint32_t ci = 0; ci < count; ci++) {
                 selected[ci] = engine_candidate_at(&engine, s, ci);
             }
-            submitted_ok = submit_source(&engine, sink, selected, count, s,
-                                         &emitted);
+            outcome = submit_source(&engine, sink, selected, count, s,
+                                    &emitted);
             if (emitted > 0) generated++;
-            if (!submitted_ok) {
-                /* The sink rejected the family (quota, validation, or
-                 * allocation): a local abstention that leaves the source's
-                 * generic alternatives intact. */
+            if (outcome == SNAPSHOT_SYMBOLIC_SUBMIT_REJECTED) {
+                /* The sink rejected the family (quota or validation): a local
+                 * abstention that leaves the source's generic alternatives
+                 * intact. */
                 engine.stats.unsupported++;
+                engine.stats.submission_rejections++;
+            } else if (outcome == SNAPSHOT_SYMBOLIC_SUBMIT_ALLOCATION) {
+                record_allocation_failure(
+                    &engine, SNAPSHOT_SYMBOLIC_STAGE_SUBMIT);
             } else if (emitted > 0) {
                 submitted++;
             }
@@ -1807,6 +2169,10 @@ uint32_t snapshot_symbolic_run(const SnapshotSymbolicView *view,
     }
 
 out:
+    if (submit_started) {
+        stage_end(&engine, SNAPSHOT_SYMBOLIC_STAGE_SUBMIT, submit_mark);
+        stage_abort(&engine, SNAPSHOT_SYMBOLIC_STAGE_SUBMIT);
+    }
     engine.stats.families_generated = generated;
     engine.stats.families = submitted;
     if (engine.budget.work_exhausted || engine.budget.bytes_exhausted ||
@@ -1831,6 +2197,74 @@ out:
             (long long)((engine.stats.end_us - engine.stats.start_us) / 1000),
             engine.stats.candidates_generated,
             engine.stats.families_generated, engine.stats.families);
+    log_msg("[symbolic-advisor] [profile] [version 1] [mode %s] "
+            "[max-work %llu] [max-bytes %llu] [deadline-ms %llu] "
+            "[alloc-us %lld] [alloc-work %llu] "
+            "[index-us %lld] [index-work %llu] "
+            "[sources-us %lld] [sources-work %llu] "
+            "[roots-us %lld] [roots-work %llu] "
+            "[forward-us %lld] [forward-work %llu] "
+            "[consumers-us %lld] [consumers-work %llu] "
+            "[submit-us %lld] [submit-work %llu] "
+            "[work-exhausted %u] [bytes-exhausted %u] "
+            "[deadline-exhausted %u] [allocation-failures %u] "
+            "[index-cap-refusals %u] [label-cap-refusals %u] "
+            "[stop-stage %s] [stop-reason %s] "
+            "[sources %u] [valid-roots %u] [candidates-validated %u] "
+            "[would-submit-families %u] [would-submit-variants %u] "
+            "[analysis-complete %u] [digest %016llx%016llx%016llx%016llx"
+            "%016llx%016llx%016llx%016llx]\n",
+            s_symbolic_config.mode == SNAPSHOT_SYMBOLIC_BOUNDARY
+                ? "boundary" : "shadow",
+            (unsigned long long)s_symbolic_config.max_work,
+            (unsigned long long)s_symbolic_config.max_bytes,
+            (unsigned long long)s_symbolic_config.deadline_ms,
+            (long long)engine.stats.stage_us[SNAPSHOT_SYMBOLIC_STAGE_ALLOC],
+            (unsigned long long)engine.stats.stage_work[
+                SNAPSHOT_SYMBOLIC_STAGE_ALLOC],
+            (long long)engine.stats.stage_us[SNAPSHOT_SYMBOLIC_STAGE_INDEX],
+            (unsigned long long)engine.stats.stage_work[
+                SNAPSHOT_SYMBOLIC_STAGE_INDEX],
+            (long long)engine.stats.stage_us[SNAPSHOT_SYMBOLIC_STAGE_SOURCES],
+            (unsigned long long)engine.stats.stage_work[
+                SNAPSHOT_SYMBOLIC_STAGE_SOURCES],
+            (long long)engine.stats.stage_us[SNAPSHOT_SYMBOLIC_STAGE_ROOTS],
+            (unsigned long long)engine.stats.stage_work[
+                SNAPSHOT_SYMBOLIC_STAGE_ROOTS],
+            (long long)engine.stats.stage_us[SNAPSHOT_SYMBOLIC_STAGE_FORWARD],
+            (unsigned long long)engine.stats.stage_work[
+                SNAPSHOT_SYMBOLIC_STAGE_FORWARD],
+            (long long)engine.stats.stage_us[
+                SNAPSHOT_SYMBOLIC_STAGE_CONSUMERS],
+            (unsigned long long)engine.stats.stage_work[
+                SNAPSHOT_SYMBOLIC_STAGE_CONSUMERS],
+            (long long)engine.stats.stage_us[SNAPSHOT_SYMBOLIC_STAGE_SUBMIT],
+            (unsigned long long)engine.stats.stage_work[
+                SNAPSHOT_SYMBOLIC_STAGE_SUBMIT],
+            engine.budget.work_exhausted ? 1u : 0u,
+            engine.budget.bytes_exhausted ? 1u : 0u,
+            engine.budget.deadline_exhausted ? 1u : 0u,
+            engine.stats.allocation_failures,
+            engine.stats.index_cap_refusals,
+            engine.stats.label_cap_refusals,
+            engine.stats.stop_reason == SNAPSHOT_SYMBOLIC_STOP_NONE
+                ? "none"
+                : stage_name((SnapshotSymbolicStage)engine.stats.stop_stage),
+            stop_reason_name((SnapshotSymbolicStop)engine.stats.stop_reason),
+            engine.stats.sources, engine.stats.valid_roots,
+            engine.stats.candidates_generated,
+            engine.stats.would_submit_families,
+            engine.stats.would_submit_variants,
+            engine.stats.digest_complete ? 1u : 0u,
+            (unsigned long long)engine.stats.digest[0],
+            (unsigned long long)engine.stats.digest[1],
+            (unsigned long long)engine.stats.digest[2],
+            (unsigned long long)engine.stats.digest[3],
+            (unsigned long long)engine.stats.digest[4],
+            (unsigned long long)engine.stats.digest[5],
+            (unsigned long long)engine.stats.digest[6],
+            (unsigned long long)engine.stats.digest[7]);
+    s_symbolic_last_stats = engine.stats;
     index_destroy(&engine.index);
     g_free(engine.candidate_counts);
     g_free(engine.candidates);
