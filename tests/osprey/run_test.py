@@ -1030,6 +1030,80 @@ TESTS = [
         timeout=120,
     ),
     dict(
+        # Package 4 B2 real-child policy gate.  The schedule must apply to a
+        # real mutation sweep and must not change what the guest observes: the
+        # same boundary advice reaches the child, and the tracer publishes one
+        # versioned schedule row naming the policy it executed.
+        name="t16_schedule_retained_first",
+        guest="t16_symbolic_boundary",
+        mode="binradar",
+        memcheck=0,
+        entrypoint_symbol="t16_check",
+        env={"BINRADAR_OSPREY_ANALYSIS_MODE": "mutation",
+             "BINRADAR_SYMBOLIC_MUTATION_MODE": "boundary",
+             "BINRADAR_SYMBOLIC_SCHEDULE": "retained-first"},
+        symbolic_observation=True,
+        drain_queue=True,
+        patch_count=0,
+        rc=(0,),
+        expect_log_rows=[
+            ("binradar", "[schedule] [version 1] [policy retained-first]"),
+            ("binradar", "[input-digest "),
+            # The guest still observes the advised non-generic value, so
+            # selecting the policy did not change plan contents.
+            ("t16", "[tag high] [value 00001000]"),
+        ],
+        expect_symbolic_families_min=1,
+        expect_advisor_child_uses_min=1,
+        timeout=120,
+    ),
+    dict(
+        # The historical default: the tracer must report `existing` and must
+        # not claim to have moved anything.
+        name="t16_schedule_existing_default",
+        guest="t16_symbolic_boundary",
+        mode="binradar",
+        memcheck=0,
+        entrypoint_symbol="t16_check",
+        env={"BINRADAR_OSPREY_ANALYSIS_MODE": "mutation",
+             "BINRADAR_SYMBOLIC_MUTATION_MODE": "boundary"},
+        symbolic_observation=True,
+        drain_queue=True,
+        patch_count=0,
+        rc=(0,),
+        expect_log_rows=[
+            # The historical default reports the policy and that it moved
+            # nothing; the staged/class counts are subject-dependent.
+            ("binradar",
+             "[schedule] [version 1] [policy existing]"),
+            ("binradar", "[moved 0]"),
+            ("t16", "[tag high] [value 00001000]"),
+        ],
+        timeout=120,
+    ),
+    dict(
+        # An unrecognized policy is a configuration failure: the tracer keeps
+        # the historical order, says so, and still runs the sweep.
+        name="t16_schedule_invalid_value_fails_closed",
+        guest="t16_symbolic_boundary",
+        mode="binradar",
+        memcheck=0,
+        entrypoint_symbol="t16_check",
+        env={"BINRADAR_OSPREY_ANALYSIS_MODE": "mutation",
+             "BINRADAR_SYMBOLIC_MUTATION_MODE": "boundary",
+             "BINRADAR_SYMBOLIC_SCHEDULE": "retainedfirst"},
+        symbolic_observation=True,
+        drain_queue=True,
+        patch_count=0,
+        rc=(0,),
+        expect_log_rows=[
+            ("binradar", "[schedule] [invalid-value retainedfirst]"),
+            ("binradar", "[schedule] [version 1] [policy existing]"),
+            ("t16", "[tag high] [value 00001000]"),
+        ],
+        timeout=120,
+    ),
+    dict(
         # Package 4 real-child proof.  The guest loads a 4-byte scalar from the
         # injected input, compares it against 0x1000, and appends the side it
         # observed to BINRADAR_SYMBOLIC_OBSERVATION_FILE.  The observed input

@@ -4453,6 +4453,230 @@ static void test_symbolic_shadow_leaves_queue_unchanged(void)
 /* A submit-stage allocation failure is an advisor environment event, not a
  * sink rejection: the two are counted separately so a quota/validation
  * abstention cannot masquerade as memory pressure (or the reverse). */
+/* The scheduling policy is a permutation of the same plan set: it must move
+ * witness-capable plans ahead of the rest without changing membership,
+ * contents, or source identity, and the default must leave the order alone. */
+static bool plan_witness_capable_hint(const SnapshotMutationPlan *plan)
+{
+    return plan != NULL && plan->source_valid && plan->source_retained &&
+           plan->read_witness_applicable && plan->read_witness.valid &&
+           plan->seed_semantics == SNAPSHOT_MUTATION_SEED_OBSERVED_READ &&
+           plan->source_kind == SNAPSHOT_MUTATION_SOURCE_PRIMITIVE;
+}
+
+/* Position-independent descriptor text, so the membership/contents invariant
+ * is compared as a multiset rather than by index. */
+static GString *dump_plan_multiset(const SnapshotMutationCoordinator *coordinator)
+{
+    GString *out = g_string_new(NULL);
+    GString **lines = g_new0(GString *, coordinator->staged->len);
+
+    for (guint i = 0; i < coordinator->staged->len; i++) {
+        const SnapshotMutationPlan *plan =
+            g_ptr_array_index(coordinator->staged, i);
+        GString *line = g_string_new(NULL);
+
+        g_string_append_printf(line,
+                               "mods=%u advisor=%u ordinal=%u kind=%u "
+                               "retained=%d witness=%d family=%llu",
+                               plan->num_mods, plan->advisor_id,
+                               plan->source_ordinal,
+                               (uint32_t)plan->source_kind,
+                               plan->source_retained ? 1 : 0,
+                               plan->read_witness_applicable ? 1 : 0,
+                               (unsigned long long)plan->family_id);
+        for (uint32_t m = 0; m < plan->num_mods; m++) {
+            const SnapshotMutationWrite *mod = &plan->mods[m];
+            g_string_append_printf(line, " addr=%llx size=%u value=",
+                                   (unsigned long long)mod->addr, mod->size);
+            for (size_t b = 0; b < sizeof(mod->value); b++) {
+                g_string_append_printf(line, "%02x", mod->value[b]);
+            }
+        }
+        lines[i] = line;
+    }
+    for (guint i = 0; i + 1 < coordinator->staged->len; i++) {
+        for (guint j = i + 1; j < coordinator->staged->len; j++) {
+            if (strcmp(lines[i]->str, lines[j]->str) > 0) {
+                GString *swap = lines[i];
+                lines[i] = lines[j];
+                lines[j] = swap;
+            }
+        }
+    }
+    for (guint i = 0; i < coordinator->staged->len; i++) {
+        g_string_append(out, lines[i]->str);
+        g_string_append_c(out, '\n');
+        g_string_free(lines[i], TRUE);
+    }
+    g_free(lines);
+    return out;
+}
+
+static void test_mutation_schedule_partition(void)
+{
+    SnapshotMutationBaseline baseline = {0};
+    SnapshotMutationBaselineEntry entries[3] = {0};
+    SnapshotMutationCoordinator existing = {0};
+    SnapshotMutationCoordinator retained = {0};
+    SnapshotMutationScheduleStats stats = {0};
+    SnapshotMutationPlan *plans[3] = {NULL, NULL, NULL};
+    SnapshotMutationPlan *copies[3] = {NULL, NULL, NULL};
+    uint64_t existing_digest[SNAPSHOT_MUTATION_SCHEDULE_DIGEST_LANES];
+    uint64_t ordered_digest[SNAPSHOT_MUTATION_SCHEDULE_DIGEST_LANES];
+    uint8_t narrow[8] = {0x72};
+    bool valid = false;
+
+    baseline.run_epoch = 5;
+    baseline.entry_count = G_N_ELEMENTS(entries);
+    baseline.entries = entries;
+    for (uint32_t i = 0; i < G_N_ELEMENTS(entries); i++) {
+        entries[i].token.run_epoch = baseline.run_epoch;
+        entries[i].token.source_ordinal = i;
+        entries[i].lane = SNAPSHOT_MUTATION_LANE_PRIMITIVE;
+        entries[i].source_kind = SNAPSHOT_MUTATION_SOURCE_PRIMITIVE;
+        entries[i].eligible = true;
+        entries[i].typed_eligible = true;
+        entries[i].size = 1;
+        entries[i].addr = TEST_GUEST_BASE + 0xa100 + i * 0x10;
+        entries[i].observed_read_valid = true;
+        entries[i].access_id = 5 + i;
+        entries[i].pc = 0x400300 + i;
+        entries[i].observed_read_bytes[0] = (uint8_t)(0x30 + i);
+        entries[i].planner_bytes[0] = (uint8_t)(0x30 + i);
+        entries[i].expr_index = (int64_t)(8 + i);
+        entries[i].query_index = (int64_t)(2 + i);
+        entries[i].root_extension = SNAPSHOT_ROOT_ZEXT;
+    }
+
+    CHECK(snapshot_mutation_schedule_parse(NULL, &valid) ==
+              SNAPSHOT_MUTATION_SCHEDULE_EXISTING && valid,
+          "an unset schedule value selects the historical order");
+    CHECK(snapshot_mutation_schedule_parse("existing", &valid) ==
+              SNAPSHOT_MUTATION_SCHEDULE_EXISTING && valid,
+          "the explicit existing policy parses");
+    CHECK(snapshot_mutation_schedule_parse("retained-first", &valid) ==
+              SNAPSHOT_MUTATION_SCHEDULE_RETAINED_FIRST && valid,
+          "the retained-first policy parses");
+    /* Unknown text fails closed onto the historical order instead of silently
+     * selecting an experiment. */
+    CHECK(snapshot_mutation_schedule_parse("Retained-First", &valid) ==
+              SNAPSHOT_MUTATION_SCHEDULE_EXISTING && !valid,
+          "an unrecognized schedule value fails closed and reports invalid");
+
+    existing.baseline = &baseline;
+    existing.families = g_ptr_array_new_with_free_func(
+        snapshot_mutation_proposal_family_free);
+    existing.staged = g_ptr_array_new_with_free_func(
+        (GDestroyNotify)snapshot_mutation_free);
+    retained = existing;
+    retained.families = g_ptr_array_new_with_free_func(
+        snapshot_mutation_proposal_family_free);
+    retained.staged = g_ptr_array_new_with_free_func(
+        (GDestroyNotify)snapshot_mutation_free);
+
+    /* Every source is retained and every plan keeps the exact-width write, so
+     * the seed semantics is the only thing separating the classes: a
+     * snapshot-state seed is not witness-capable however well it matches. */
+    for (uint32_t i = 0; i < G_N_ELEMENTS(plans); i++) {
+        bool observed_seed = i == 2;
+
+        plans[i] = snapshot_mutation_new_descriptor(
+            entries[i].addr, 1, -1, -1, SNAPSHOT_MUTATION_BYTES,
+            narrow, 0, NULL);
+        copies[i] = snapshot_mutation_new_descriptor(
+            entries[i].addr, 1, -1, -1, SNAPSHOT_MUTATION_BYTES,
+            narrow, 0, NULL);
+        CHECK(plans[i] != NULL && copies[i] != NULL,
+              "schedule fixture allocates both plans");
+        snapshot_mutation_plan_set_source(
+            plans[i], &baseline, entries[i].token,
+            observed_seed ? SNAPSHOT_MUTATION_SEED_OBSERVED_READ
+                          : SNAPSHOT_MUTATION_SEED_SNAPSHOT_STATE, false, 0);
+        snapshot_mutation_plan_set_source(
+            copies[i], &baseline, entries[i].token,
+            observed_seed ? SNAPSHOT_MUTATION_SEED_OBSERVED_READ
+                          : SNAPSHOT_MUTATION_SEED_SNAPSHOT_STATE, false, 0);
+        CHECK(plans[i]->source_retained && plans[i]->read_witness_applicable,
+              "every fixture plan is retained and witness-applicable");
+        CHECK(plan_witness_capable_hint(plans[i]) == observed_seed,
+              "only the observed-read seed is witness-capable");
+    }
+
+    for (uint32_t i = 0; i < G_N_ELEMENTS(plans); i++) {
+        g_ptr_array_add(existing.staged, plans[i]);
+        g_ptr_array_add(retained.staged, copies[i]);
+    }
+
+    snapshot_mutation_coordinator_schedule(
+        &existing, SNAPSHOT_MUTATION_SCHEDULE_EXISTING, &stats);
+    CHECK(stats.staged == 3 && stats.witness_capable == 1 &&
+              stats.moved == 0 && !stats.allocation_failure,
+          "the existing policy reports both class sizes without reordering");
+    CHECK(g_ptr_array_index(existing.staged, 0) == plans[0] &&
+              g_ptr_array_index(existing.staged, 2) == plans[2],
+          "the existing policy publishes the advisors' own order");
+    memcpy(existing_digest, stats.input_digest, sizeof(existing_digest));
+
+    /* A required partition is allocation-atomic: failure reports the cause
+     * and leaves every staged position unchanged. */
+    snapshot_mutation_test_set_alloc_fail_after(0);
+    snapshot_mutation_coordinator_schedule(
+        &retained, SNAPSHOT_MUTATION_SCHEDULE_RETAINED_FIRST, &stats);
+    snapshot_mutation_test_set_alloc_fail_after(-1);
+    CHECK(stats.allocation_failure && stats.moved == 0 &&
+              g_ptr_array_index(retained.staged, 0) == copies[0] &&
+              g_ptr_array_index(retained.staged, 2) == copies[2],
+          "schedule allocation failure preserves the complete input order");
+
+    snapshot_mutation_coordinator_schedule(
+        &retained, SNAPSHOT_MUTATION_SCHEDULE_RETAINED_FIRST, &stats);
+    /* [p0,p1,p2] becomes [p2,p0,p1]: the witness plan moves to the front and
+     * every position changes identity, which is what `moved` counts. */
+    CHECK(stats.witness_capable == 1 && stats.moved == 3 &&
+              !stats.allocation_failure,
+          "retained-first moves the witness plan ahead of the other two");
+    CHECK(memcmp(existing_digest, stats.input_digest,
+                 sizeof(existing_digest)) == 0,
+          "both policies digest the same complete pre-schedule queue");
+    CHECK(g_ptr_array_index(retained.staged, 0) == copies[2],
+          "the witness-capable plan runs first");
+    CHECK(g_ptr_array_index(retained.staged, 1) == copies[0] &&
+              g_ptr_array_index(retained.staged, 2) == copies[1],
+          "the remaining plans keep their relative order");
+
+    GString *existing_set = dump_plan_multiset(&existing);
+    GString *retained_set = dump_plan_multiset(&retained);
+    CHECK(strcmp(existing_set->str, retained_set->str) == 0,
+          "the policy permutes the same plan set without changing contents");
+    g_string_free(existing_set, TRUE);
+    g_string_free(retained_set, TRUE);
+
+    /* Re-applying the policy to an array whose witness plan is already first
+     * is idempotent and needs no temporary allocation.  Leave the allocator
+     * armed to fail so an avoidable allocation would make this check fail. */
+    snapshot_mutation_test_set_alloc_fail_after(0);
+    snapshot_mutation_coordinator_schedule(
+        &retained, SNAPSHOT_MUTATION_SCHEDULE_RETAINED_FIRST, &stats);
+    snapshot_mutation_test_set_alloc_fail_after(-1);
+    CHECK(stats.moved == 0 && stats.witness_capable == 1 &&
+              !stats.allocation_failure &&
+              g_ptr_array_index(retained.staged, 0) == copies[2],
+          "re-applying the policy is allocation-free and idempotent");
+    memcpy(ordered_digest, stats.input_digest, sizeof(ordered_digest));
+    copies[0]->mods[0].value[0] ^= 1;
+    snapshot_mutation_coordinator_schedule(
+        &retained, SNAPSHOT_MUTATION_SCHEDULE_EXISTING, &stats);
+    CHECK(memcmp(ordered_digest, stats.input_digest,
+                 sizeof(ordered_digest)) != 0,
+          "the queue digest distinguishes sibling write values");
+
+    g_ptr_array_free(existing.families, TRUE);
+    g_ptr_array_free(existing.staged, TRUE);
+    g_ptr_array_free(retained.families, TRUE);
+    g_ptr_array_free(retained.staged, TRUE);
+}
+
 static void test_symbolic_submit_allocation_is_distinct(void)
 {
     SymbolicFixture fx;
@@ -4608,6 +4832,7 @@ int main(void)
     test_symbolic_would_submit_matches_boundary();
     test_symbolic_allocation_failure_cleanup();
     test_symbolic_submit_allocation_is_distinct();
+    test_mutation_schedule_partition();
     test_symbolic_shadow_leaves_queue_unchanged();
 
     osprey_free_runtime_regions();

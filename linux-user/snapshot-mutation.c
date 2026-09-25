@@ -327,6 +327,240 @@ bool snapshot_mutation_enqueue_one(GQueue *queue,
     return snapshot_mutation_enqueue_batch(queue, batch, 1);
 }
 
+/* ------------------------------------------------------------------ */
+/* Queue scheduling policy                                             */
+/* ------------------------------------------------------------------ */
+
+/* Witness-capable is the plan's own bounded spelling of the B2 key: an exact
+ * finalized OBSERVED_READ seed (the advisor only stages one when a candidate
+ * passed its independent forward re-evaluation, i.e. the source feeds a
+ * supported consumer) on a retained primitive whose planned write matches the
+ * copied descriptor, which is exactly what `snapshot_mutation_read_witness_arm`
+ * requires in the child.  Every term is scalar metadata already stamped on the
+ * plan; no query is rescanned and no engine state is retained. */
+static bool snapshot_mutation_plan_witness_capable(
+    const SnapshotMutationPlan *plan)
+{
+    return plan != NULL && plan->source_valid && plan->source_retained &&
+           plan->read_witness_applicable && plan->read_witness.valid &&
+           plan->seed_semantics == SNAPSHOT_MUTATION_SEED_OBSERVED_READ &&
+           plan->source_kind == SNAPSHOT_MUTATION_SOURCE_PRIMITIVE;
+}
+
+/* Deterministic, pointer-free digest of the complete queue before a scheduling
+ * policy runs.  It covers order, scalar identity, every write descriptor and
+ * each owned fresh-target payload.  Paired trials can therefore reject queues
+ * that merely have the same length or repeat the same non-unique family label. */
+static void snapshot_mutation_schedule_digest_mix(
+    uint64_t digest[SNAPSHOT_MUTATION_SCHEDULE_DIGEST_LANES], uint64_t value)
+{
+    for (uint32_t lane = 0;
+         lane < SNAPSHOT_MUTATION_SCHEDULE_DIGEST_LANES; lane++) {
+        uint64_t mixed = digest[lane] ^ value;
+        mixed *= 0x9E3779B97F4A7C15ull;
+        mixed ^= mixed >> 29;
+        mixed *= 0xBF58476D1CE4E5B9ull;
+        mixed ^= mixed >> 32;
+        digest[lane] = mixed + lane;
+        value = mixed;
+    }
+}
+
+static void snapshot_mutation_schedule_digest_bytes(
+    uint64_t digest[SNAPSHOT_MUTATION_SCHEDULE_DIGEST_LANES],
+    const uint8_t *bytes, uint64_t count)
+{
+    uint64_t offset = 0;
+
+    snapshot_mutation_schedule_digest_mix(digest, count);
+    while (bytes != NULL && offset < count) {
+        uint64_t word = 0;
+        uint32_t width = (uint32_t)MIN(count - offset, (uint64_t)8);
+
+        for (uint32_t i = 0; i < width; i++) {
+            word |= (uint64_t)bytes[offset + i] << (i * 8);
+        }
+        snapshot_mutation_schedule_digest_mix(digest, word);
+        offset += width;
+    }
+    if (bytes == NULL && count != 0) {
+        snapshot_mutation_schedule_digest_mix(digest,
+                                              0x4d495353494e4750ull);
+    }
+}
+
+static void snapshot_mutation_schedule_digest_plan(
+    uint64_t digest[SNAPSHOT_MUTATION_SCHEDULE_DIGEST_LANES],
+    const SnapshotMutationPlan *plan)
+{
+    snapshot_mutation_schedule_digest_mix(digest, 0x504c414e00000001ull);
+    if (plan == NULL) {
+        snapshot_mutation_schedule_digest_mix(digest, UINT64_MAX);
+        return;
+    }
+    snapshot_mutation_schedule_digest_mix(digest, plan->num_mods);
+    snapshot_mutation_schedule_digest_mix(digest, plan->advisor_id);
+    snapshot_mutation_schedule_digest_mix(digest, plan->source_ordinal);
+    snapshot_mutation_schedule_digest_mix(digest, plan->family_id);
+    snapshot_mutation_schedule_digest_mix(digest, plan->source_epoch);
+    snapshot_mutation_schedule_digest_mix(digest, plan->source_kind);
+    snapshot_mutation_schedule_digest_mix(digest, plan->seed_semantics);
+    snapshot_mutation_schedule_digest_mix(digest, plan->source_valid);
+    snapshot_mutation_schedule_digest_mix(digest, plan->family_valid);
+    snapshot_mutation_schedule_digest_mix(digest, plan->source_retained);
+    snapshot_mutation_schedule_digest_mix(
+        digest, plan->read_witness_applicable);
+    snapshot_mutation_schedule_digest_mix(digest,
+                                          plan->read_witness.valid);
+    if (plan->read_witness.valid) {
+        const SnapshotMutationReadWitnessDescriptor *witness =
+            &plan->read_witness;
+
+        snapshot_mutation_schedule_digest_mix(digest,
+                                              witness->baseline_epoch);
+        snapshot_mutation_schedule_digest_mix(digest, witness->lane);
+        snapshot_mutation_schedule_digest_mix(digest, witness->access_id);
+        snapshot_mutation_schedule_digest_mix(digest, witness->pc);
+        snapshot_mutation_schedule_digest_mix(digest, witness->addr);
+        snapshot_mutation_schedule_digest_mix(digest, witness->width);
+        snapshot_mutation_schedule_digest_bytes(
+            digest, witness->expected_bytes,
+            MIN(witness->width, sizeof(witness->expected_bytes)));
+    }
+    if (plan->mods == NULL && plan->num_mods != 0) {
+        snapshot_mutation_schedule_digest_mix(digest,
+                                              0x4d495353494e474dull);
+        return;
+    }
+    for (uint32_t i = 0; i < plan->num_mods; i++) {
+        const SnapshotMutationWrite *write = &plan->mods[i];
+
+        snapshot_mutation_schedule_digest_mix(digest, i);
+        snapshot_mutation_schedule_digest_mix(digest, write->kind);
+        snapshot_mutation_schedule_digest_mix(digest, write->addr);
+        snapshot_mutation_schedule_digest_mix(digest, write->size);
+        snapshot_mutation_schedule_digest_mix(
+            digest, (uint64_t)write->expr_index);
+        snapshot_mutation_schedule_digest_mix(
+            digest, (uint64_t)write->query_index);
+        snapshot_mutation_schedule_digest_bytes(
+            digest, write->value, MIN(write->size, sizeof(write->value)));
+        snapshot_mutation_schedule_digest_mix(digest,
+                                              write->target.extent);
+        snapshot_mutation_schedule_digest_mix(digest,
+                                              write->target.resolved_raw);
+        snapshot_mutation_schedule_digest_mix(digest,
+                                              write->target.resolved_end);
+        if (write->kind == SNAPSHOT_MUTATION_POINTER_FRESH) {
+            snapshot_mutation_schedule_digest_bytes(
+                digest, write->target.bytes, write->target.extent);
+        }
+    }
+}
+
+static void snapshot_mutation_schedule_digest_input(
+    SnapshotMutationPlan *const *plans, uint32_t count,
+    uint64_t digest[SNAPSHOT_MUTATION_SCHEDULE_DIGEST_LANES])
+{
+    static const uint64_t initial[SNAPSHOT_MUTATION_SCHEDULE_DIGEST_LANES] = {
+        0x6a09e667f3bcc909ull, 0xbb67ae8584caa73bull,
+        0x3c6ef372fe94f82bull, 0xa54ff53a5f1d36f1ull,
+        0x510e527fade682d1ull, 0x9b05688c2b3e6c1full,
+        0x1f83d9abfb41bd6bull, 0x5be0cd19137e2179ull,
+    };
+
+    memcpy(digest, initial, sizeof(initial));
+    snapshot_mutation_schedule_digest_mix(digest, count);
+    for (uint32_t i = 0; i < count; i++) {
+        snapshot_mutation_schedule_digest_mix(digest, i);
+        snapshot_mutation_schedule_digest_plan(digest, plans[i]);
+    }
+}
+
+SnapshotMutationSchedule snapshot_mutation_schedule_parse(
+    const char *text, bool *valid_out)
+{
+    if (valid_out != NULL) *valid_out = true;
+    if (text == NULL || text[0] == '\0' || strcmp(text, "existing") == 0) {
+        return SNAPSHOT_MUTATION_SCHEDULE_EXISTING;
+    }
+    if (strcmp(text, "retained-first") == 0) {
+        return SNAPSHOT_MUTATION_SCHEDULE_RETAINED_FIRST;
+    }
+    /* Unknown text is a configuration failure: stay with the historical
+     * order instead of guessing which policy was requested. */
+    if (valid_out != NULL) *valid_out = false;
+    return SNAPSHOT_MUTATION_SCHEDULE_EXISTING;
+}
+
+void snapshot_mutation_coordinator_schedule(
+    SnapshotMutationCoordinator *coordinator,
+    SnapshotMutationSchedule schedule,
+    SnapshotMutationScheduleStats *stats_out)
+{
+    SnapshotMutationScheduleStats stats = {0};
+    SnapshotMutationPlan **plans;
+    SnapshotMutationPlan **ordered;
+    uint32_t count;
+    uint32_t capable = 0;
+    uint32_t next = 0;
+    uint32_t moved = 0;
+    bool saw_other = false;
+    bool needs_reorder = false;
+
+    if (stats_out != NULL) *stats_out = stats;
+    if (coordinator == NULL || coordinator->staged == NULL) return;
+    count = (uint32_t)coordinator->staged->len;
+    stats.staged = count;
+    plans = (SnapshotMutationPlan **)coordinator->staged->pdata;
+    snapshot_mutation_schedule_digest_input(plans, count,
+                                            stats.input_digest);
+    for (uint32_t i = 0; i < count; i++) {
+        bool witness_capable =
+            snapshot_mutation_plan_witness_capable(plans[i]);
+
+        if (witness_capable) {
+            capable++;
+            if (saw_other) needs_reorder = true;
+        } else {
+            saw_other = true;
+        }
+    }
+    stats.witness_capable = capable;
+    if (schedule != SNAPSHOT_MUTATION_SCHEDULE_RETAINED_FIRST || count < 2 ||
+        capable == 0 || capable == count || !needs_reorder) {
+        if (stats_out != NULL) *stats_out = stats;
+        return;
+    }
+    /* One bounded allocation for one stable partition.  A failure keeps the
+     * historical order and is reported rather than silently ignored. */
+    ordered = snapshot_mutation_try_malloc0((size_t)count * sizeof(*ordered));
+    if (ordered == NULL) {
+        stats.allocation_failure = true;
+        if (stats_out != NULL) *stats_out = stats;
+        return;
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        if (snapshot_mutation_plan_witness_capable(plans[i])) {
+            ordered[next++] = plans[i];
+        }
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        if (!snapshot_mutation_plan_witness_capable(plans[i])) {
+            ordered[next++] = plans[i];
+        }
+    }
+    if (next == count) {
+        for (uint32_t i = 0; i < count; i++) {
+            if (plans[i] != ordered[i]) moved++;
+        }
+        for (uint32_t i = 0; i < count; i++) plans[i] = ordered[i];
+    }
+    g_free(ordered);
+    stats.moved = moved;
+    if (stats_out != NULL) *stats_out = stats;
+}
+
 
 /* Per-advisor family quota.  Advisor 1 is compact OSPREY and advisor 2 is
  * symbolic boundary advice; each gets its own 4,096 slots so an advisor can

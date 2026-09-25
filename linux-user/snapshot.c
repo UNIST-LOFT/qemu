@@ -329,6 +329,7 @@ void check_all_env_var(void) {
     check_env_var("BINRADAR_PATCH_SHM_KEY");
     // Symbolic boundary advisor (BinRadar only)
     check_env_var("BINRADAR_SYMBOLIC_MUTATION_MODE");
+    check_env_var("BINRADAR_SYMBOLIC_SCHEDULE");
     check_env_var("BINRADAR_SYMBOLIC_MAX_WORK");
     check_env_var("BINRADAR_SYMBOLIC_MAX_BYTES");
     check_env_var("BINRADAR_SYMBOLIC_DEADLINE_MS");
@@ -4153,6 +4154,28 @@ static void snapshot_mutation_log_queue_bins(const GQueue *queue)
             (unsigned long long)bins.unknown);
 }
 
+/* Scheduling policy for the mutation queue.  Unset or invalid text keeps the
+ * historical order, so a rollout cannot change execution order by accident and
+ * an unparseable value cannot silently select an experiment. */
+static SnapshotMutationSchedule snapshot_schedule_policy(void)
+{
+    static bool configured = false;
+    static SnapshotMutationSchedule schedule =
+        SNAPSHOT_MUTATION_SCHEDULE_EXISTING;
+    const char *text;
+    bool valid = true;
+
+    if (configured) return schedule;
+    configured = true;
+    text = getenv("BINRADAR_SYMBOLIC_SCHEDULE");
+    schedule = snapshot_mutation_schedule_parse(text, &valid);
+    if (!valid) {
+        log_msg("[binradar] [schedule] [invalid-value %s] [using existing]\n",
+                text == NULL ? "" : text);
+    }
+    return schedule;
+}
+
 static bool snapshot_mutation_coordinator_build(
     SnapshotMutationBaseline *baseline, GQueue *queue)
 {
@@ -4238,6 +4261,31 @@ static bool snapshot_mutation_coordinator_build(
         }
     }
     g_free(specialized);
+    {
+        SnapshotMutationScheduleStats schedule_stats;
+        SnapshotMutationSchedule schedule = snapshot_schedule_policy();
+        char input_digest[SNAPSHOT_MUTATION_SCHEDULE_DIGEST_HEX_LEN + 1];
+
+        snapshot_mutation_coordinator_schedule(&coordinator, schedule,
+                                               &schedule_stats);
+        for (uint32_t lane = 0;
+             lane < SNAPSHOT_MUTATION_SCHEDULE_DIGEST_LANES; lane++) {
+            g_snprintf(input_digest + lane * 16,
+                       sizeof(input_digest) - lane * 16,
+                       "%016llx",
+                       (unsigned long long)schedule_stats.input_digest[lane]);
+        }
+        log_msg("[binradar] [schedule] [version 1] [policy %s] "
+                "[staged %llu] [witness-capable %llu] [moved %llu] "
+                "[input-digest %s] [allocation-failure %s]\n",
+                schedule == SNAPSHOT_MUTATION_SCHEDULE_RETAINED_FIRST
+                    ? "retained-first" : "existing",
+                (unsigned long long)schedule_stats.staged,
+                (unsigned long long)schedule_stats.witness_capable,
+                (unsigned long long)schedule_stats.moved,
+                input_digest,
+                schedule_stats.allocation_failure ? "true" : "false");
+    }
     bool published = snapshot_mutation_coordinator_publish(&coordinator,
                                                             queue);
     if (published && binradar_manager != NULL) {

@@ -79,6 +79,36 @@ bool snapshot_mutation_stage_family(
     const SnapshotMutationProposalFamily *family);
 bool snapshot_mutation_coordinator_publish(
     SnapshotMutationCoordinator *coordinator, GQueue *queue);
+
+#define SNAPSHOT_MUTATION_SCHEDULE_DIGEST_LANES 8u
+#define SNAPSHOT_MUTATION_SCHEDULE_DIGEST_HEX_LEN \
+    (SNAPSHOT_MUTATION_SCHEDULE_DIGEST_LANES * 16u)
+
+/* Counts and the pre-policy queue digest for the one `[binradar] [schedule]`
+ * row.  `witness_capable` is the priority class size and `moved` the number of
+ * plans the partition actually relocated.  `input_digest` hashes the complete
+ * ordered plan descriptors before scheduling, so paired trials can prove that
+ * they started from the same generated queue rather than comparing labels. */
+typedef struct SnapshotMutationScheduleStats {
+    uint64_t staged;
+    uint64_t witness_capable;
+    uint64_t moved;
+    uint64_t input_digest[SNAPSHOT_MUTATION_SCHEDULE_DIGEST_LANES];
+    bool allocation_failure;
+} SnapshotMutationScheduleStats;
+
+/* Parse `existing`, `retained-first`, or nothing at all (the default).
+ * Any other text leaves *valid_out false and the caller keeps `existing`
+ * rather than guessing which policy was requested. */
+SnapshotMutationSchedule snapshot_mutation_schedule_parse(
+    const char *text, bool *valid_out);
+
+/* Stable-partition the staged array for the selected policy.  `existing`
+ * leaves the array untouched, so the default publication order is unchanged. */
+void snapshot_mutation_coordinator_schedule(
+    SnapshotMutationCoordinator *coordinator,
+    SnapshotMutationSchedule schedule,
+    SnapshotMutationScheduleStats *stats_out);
 void snapshot_mutation_coordinator_clear(
     SnapshotMutationCoordinator *coordinator);
 

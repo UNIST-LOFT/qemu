@@ -69,6 +69,16 @@ typedef enum SnapshotMutationSeedSemantics {
     SNAPSHOT_MUTATION_SEED_OBSERVED_READ = 1,
 } SnapshotMutationSeedSemantics;
 
+/* Queue scheduling policy.  `EXISTING` publishes the staged plans in the
+ * order the advisors produced them, which is the historical behavior and the
+ * default; `RETAINED_FIRST` applies one stable partition so witness-capable
+ * plans run first.  The policy is a permutation of the same finite plan set:
+ * it never changes membership, contents, or source identity. */
+typedef enum SnapshotMutationSchedule {
+    SNAPSHOT_MUTATION_SCHEDULE_EXISTING = 0,
+    SNAPSHOT_MUTATION_SCHEDULE_RETAINED_FIRST = 1,
+} SnapshotMutationSchedule;
+
 /* Scalar-only identity for the one retained primitive load a plan may
  * diagnose.  The bytes are the plan's expected loaded value; event identity
  * and the baseline epoch are copied from its validated source entry. */
