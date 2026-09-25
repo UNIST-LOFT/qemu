@@ -4522,8 +4522,10 @@ static void test_mutation_schedule_partition(void)
     SnapshotMutationScheduleStats stats = {0};
     SnapshotMutationPlan *plans[3] = {NULL, NULL, NULL};
     SnapshotMutationPlan *copies[3] = {NULL, NULL, NULL};
-    uint64_t existing_digest[SNAPSHOT_MUTATION_SCHEDULE_DIGEST_LANES];
-    uint64_t ordered_digest[SNAPSHOT_MUTATION_SCHEDULE_DIGEST_LANES];
+    uint64_t existing_content[SNAPSHOT_MUTATION_SCHEDULE_DIGEST_LANES];
+    uint64_t existing_cursors[SNAPSHOT_MUTATION_SCHEDULE_DIGEST_LANES];
+    uint64_t ordered_content[SNAPSHOT_MUTATION_SCHEDULE_DIGEST_LANES];
+    uint64_t ordered_cursors[SNAPSHOT_MUTATION_SCHEDULE_DIGEST_LANES];
     uint8_t narrow[8] = {0x72};
     bool valid = false;
 
@@ -4616,7 +4618,10 @@ static void test_mutation_schedule_partition(void)
     CHECK(g_ptr_array_index(existing.staged, 0) == plans[0] &&
               g_ptr_array_index(existing.staged, 2) == plans[2],
           "the existing policy publishes the advisors' own order");
-    memcpy(existing_digest, stats.input_digest, sizeof(existing_digest));
+    memcpy(existing_content, stats.plan_content_digest,
+           sizeof(existing_content));
+    memcpy(existing_cursors, stats.cursor_fingerprint,
+           sizeof(existing_cursors));
 
     /* A required partition is allocation-atomic: failure reports the cause
      * and leaves every staged position unchanged. */
@@ -4636,9 +4641,12 @@ static void test_mutation_schedule_partition(void)
     CHECK(stats.witness_capable == 1 && stats.moved == 3 &&
               !stats.allocation_failure,
           "retained-first moves the witness plan ahead of the other two");
-    CHECK(memcmp(existing_digest, stats.input_digest,
-                 sizeof(existing_digest)) == 0,
-          "both policies digest the same complete pre-schedule queue");
+    CHECK(memcmp(existing_content, stats.plan_content_digest,
+                 sizeof(existing_content)) == 0,
+          "both policies digest the same pre-schedule plan contents");
+    CHECK(memcmp(existing_cursors, stats.cursor_fingerprint,
+                 sizeof(existing_cursors)) == 0,
+          "both policies fingerprint the same pre-schedule cursors");
     CHECK(g_ptr_array_index(retained.staged, 0) == copies[2],
           "the witness-capable plan runs first");
     CHECK(g_ptr_array_index(retained.staged, 1) == copies[0] &&
@@ -4663,13 +4671,46 @@ static void test_mutation_schedule_partition(void)
               !stats.allocation_failure &&
               g_ptr_array_index(retained.staged, 0) == copies[2],
           "re-applying the policy is allocation-free and idempotent");
-    memcpy(ordered_digest, stats.input_digest, sizeof(ordered_digest));
+    memcpy(ordered_content, stats.plan_content_digest,
+           sizeof(ordered_content));
+    memcpy(ordered_cursors, stats.cursor_fingerprint,
+           sizeof(ordered_cursors));
+
+    copies[0]->mods[0].expr_index = 313;
+    copies[0]->mods[0].query_index = 271;
+    snapshot_mutation_coordinator_schedule(
+        &retained, SNAPSHOT_MUTATION_SCHEDULE_EXISTING, &stats);
+    CHECK(memcmp(ordered_content, stats.plan_content_digest,
+                 sizeof(ordered_content)) == 0,
+          "symbolic pool cursors do not perturb plan-content identity");
+    CHECK(memcmp(ordered_cursors, stats.cursor_fingerprint,
+                 sizeof(ordered_cursors)) != 0,
+          "symbolic pool cursors perturb the diagnostic fingerprint");
+    copies[0]->mods[0].expr_index = -1;
+    copies[0]->mods[0].query_index = -1;
+
+    copies[2]->read_witness.access_id++;
+    copies[2]->read_witness.pc++;
+    snapshot_mutation_coordinator_schedule(
+        &retained, SNAPSHOT_MUTATION_SCHEDULE_EXISTING, &stats);
+    CHECK(memcmp(ordered_content, stats.plan_content_digest,
+                 sizeof(ordered_content)) == 0,
+          "witness event positions do not perturb plan-content identity");
+    CHECK(memcmp(ordered_cursors, stats.cursor_fingerprint,
+                 sizeof(ordered_cursors)) != 0,
+          "witness event positions perturb the diagnostic fingerprint");
+    copies[2]->read_witness.access_id--;
+    copies[2]->read_witness.pc--;
+
     copies[0]->mods[0].value[0] ^= 1;
     snapshot_mutation_coordinator_schedule(
         &retained, SNAPSHOT_MUTATION_SCHEDULE_EXISTING, &stats);
-    CHECK(memcmp(ordered_digest, stats.input_digest,
-                 sizeof(ordered_digest)) != 0,
-          "the queue digest distinguishes sibling write values");
+    CHECK(memcmp(ordered_content, stats.plan_content_digest,
+                 sizeof(ordered_content)) != 0,
+          "the plan-content digest distinguishes sibling write values");
+    CHECK(memcmp(ordered_cursors, stats.cursor_fingerprint,
+                 sizeof(ordered_cursors)) == 0,
+          "write values do not perturb the diagnostic cursor fingerprint");
 
     g_ptr_array_free(existing.families, TRUE);
     g_ptr_array_free(existing.staged, TRUE);

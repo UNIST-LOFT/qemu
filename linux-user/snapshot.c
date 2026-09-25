@@ -4264,26 +4264,37 @@ static bool snapshot_mutation_coordinator_build(
     {
         SnapshotMutationScheduleStats schedule_stats;
         SnapshotMutationSchedule schedule = snapshot_schedule_policy();
-        char input_digest[SNAPSHOT_MUTATION_SCHEDULE_DIGEST_HEX_LEN + 1];
+        char plan_content_digest[
+            SNAPSHOT_MUTATION_SCHEDULE_DIGEST_HEX_LEN + 1];
+        char cursor_fingerprint[
+            SNAPSHOT_MUTATION_SCHEDULE_DIGEST_HEX_LEN + 1];
 
         snapshot_mutation_coordinator_schedule(&coordinator, schedule,
                                                &schedule_stats);
         for (uint32_t lane = 0;
              lane < SNAPSHOT_MUTATION_SCHEDULE_DIGEST_LANES; lane++) {
-            g_snprintf(input_digest + lane * 16,
-                       sizeof(input_digest) - lane * 16,
-                       "%016llx",
-                       (unsigned long long)schedule_stats.input_digest[lane]);
+            g_snprintf(
+                plan_content_digest + lane * 16,
+                sizeof(plan_content_digest) - lane * 16,
+                "%016llx",
+                (unsigned long long)
+                    schedule_stats.plan_content_digest[lane]);
+            g_snprintf(
+                cursor_fingerprint + lane * 16,
+                sizeof(cursor_fingerprint) - lane * 16,
+                "%016llx",
+                (unsigned long long)schedule_stats.cursor_fingerprint[lane]);
         }
         log_msg("[binradar] [schedule] [version 1] [policy %s] "
                 "[staged %llu] [witness-capable %llu] [moved %llu] "
-                "[input-digest %s] [allocation-failure %s]\n",
+                "[plan-content-digest %s] [cursor-fingerprint %s] "
+                "[allocation-failure %s]\n",
                 schedule == SNAPSHOT_MUTATION_SCHEDULE_RETAINED_FIRST
                     ? "retained-first" : "existing",
                 (unsigned long long)schedule_stats.staged,
                 (unsigned long long)schedule_stats.witness_capable,
                 (unsigned long long)schedule_stats.moved,
-                input_digest,
+                plan_content_digest, cursor_fingerprint,
                 schedule_stats.allocation_failure ? "true" : "false");
     }
     bool published = snapshot_mutation_coordinator_publish(&coordinator,

@@ -1048,7 +1048,8 @@ TESTS = [
         rc=(0,),
         expect_log_rows=[
             ("binradar", "[schedule] [version 1] [policy retained-first]"),
-            ("binradar", "[input-digest "),
+            ("binradar", "[plan-content-digest "),
+            ("binradar", "[cursor-fingerprint "),
             # The guest still observes the advised non-generic value, so
             # selecting the policy did not change plan contents.
             ("t16", "[tag high] [value 00001000]"),

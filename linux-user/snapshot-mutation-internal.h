@@ -84,16 +84,18 @@ bool snapshot_mutation_coordinator_publish(
 #define SNAPSHOT_MUTATION_SCHEDULE_DIGEST_HEX_LEN \
     (SNAPSHOT_MUTATION_SCHEDULE_DIGEST_LANES * 16u)
 
-/* Counts and the pre-policy queue digest for the one `[binradar] [schedule]`
- * row.  `witness_capable` is the priority class size and `moved` the number of
- * plans the partition actually relocated.  `input_digest` hashes the complete
- * ordered plan descriptors before scheduling, so paired trials can prove that
- * they started from the same generated queue rather than comparing labels. */
+/* Counts and the pre-policy queue identities for the one `[binradar]
+ * [schedule]` row.  `witness_capable` is the priority class size and `moved`
+ * the number of plans the partition actually relocated.  `plan_content_digest`
+ * hashes reproducible plan semantics and is the paired-trial equality key;
+ * `cursor_fingerprint` separately reports run-local symbolic/event positions
+ * that must never reject an otherwise matched pair. */
 typedef struct SnapshotMutationScheduleStats {
     uint64_t staged;
     uint64_t witness_capable;
     uint64_t moved;
-    uint64_t input_digest[SNAPSHOT_MUTATION_SCHEDULE_DIGEST_LANES];
+    uint64_t plan_content_digest[SNAPSHOT_MUTATION_SCHEDULE_DIGEST_LANES];
+    uint64_t cursor_fingerprint[SNAPSHOT_MUTATION_SCHEDULE_DIGEST_LANES];
     bool allocation_failure;
 } SnapshotMutationScheduleStats;
 

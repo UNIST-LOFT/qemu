@@ -347,10 +347,11 @@ static bool snapshot_mutation_plan_witness_capable(
            plan->source_kind == SNAPSHOT_MUTATION_SOURCE_PRIMITIVE;
 }
 
-/* Deterministic, pointer-free digest of the complete queue before a scheduling
- * policy runs.  It covers order, scalar identity, every write descriptor and
- * each owned fresh-target payload.  Paired trials can therefore reject queues
- * that merely have the same length or repeat the same non-unique family label. */
+/* Deterministic, pointer-free identities for the complete queue before a
+ * scheduling policy runs.  The plan-content digest covers reproducible plan
+ * semantics and is the paired-run equality key.  Run-local symbolic-pool,
+ * epoch, event and resolved-target positions are kept in a separate cursor
+ * fingerprint so they remain visible without manufacturing pair mismatches. */
 static void snapshot_mutation_schedule_digest_mix(
     uint64_t digest[SNAPSHOT_MUTATION_SCHEDULE_DIGEST_LANES], uint64_t value)
 {
@@ -389,11 +390,11 @@ static void snapshot_mutation_schedule_digest_bytes(
     }
 }
 
-static void snapshot_mutation_schedule_digest_plan(
+static void snapshot_mutation_schedule_plan_content_digest(
     uint64_t digest[SNAPSHOT_MUTATION_SCHEDULE_DIGEST_LANES],
     const SnapshotMutationPlan *plan)
 {
-    snapshot_mutation_schedule_digest_mix(digest, 0x504c414e00000001ull);
+    snapshot_mutation_schedule_digest_mix(digest, 0x504c414e434f4e01ull);
     if (plan == NULL) {
         snapshot_mutation_schedule_digest_mix(digest, UINT64_MAX);
         return;
@@ -402,7 +403,6 @@ static void snapshot_mutation_schedule_digest_plan(
     snapshot_mutation_schedule_digest_mix(digest, plan->advisor_id);
     snapshot_mutation_schedule_digest_mix(digest, plan->source_ordinal);
     snapshot_mutation_schedule_digest_mix(digest, plan->family_id);
-    snapshot_mutation_schedule_digest_mix(digest, plan->source_epoch);
     snapshot_mutation_schedule_digest_mix(digest, plan->source_kind);
     snapshot_mutation_schedule_digest_mix(digest, plan->seed_semantics);
     snapshot_mutation_schedule_digest_mix(digest, plan->source_valid);
@@ -416,11 +416,7 @@ static void snapshot_mutation_schedule_digest_plan(
         const SnapshotMutationReadWitnessDescriptor *witness =
             &plan->read_witness;
 
-        snapshot_mutation_schedule_digest_mix(digest,
-                                              witness->baseline_epoch);
         snapshot_mutation_schedule_digest_mix(digest, witness->lane);
-        snapshot_mutation_schedule_digest_mix(digest, witness->access_id);
-        snapshot_mutation_schedule_digest_mix(digest, witness->pc);
         snapshot_mutation_schedule_digest_mix(digest, witness->addr);
         snapshot_mutation_schedule_digest_mix(digest, witness->width);
         snapshot_mutation_schedule_digest_bytes(
@@ -439,18 +435,10 @@ static void snapshot_mutation_schedule_digest_plan(
         snapshot_mutation_schedule_digest_mix(digest, write->kind);
         snapshot_mutation_schedule_digest_mix(digest, write->addr);
         snapshot_mutation_schedule_digest_mix(digest, write->size);
-        snapshot_mutation_schedule_digest_mix(
-            digest, (uint64_t)write->expr_index);
-        snapshot_mutation_schedule_digest_mix(
-            digest, (uint64_t)write->query_index);
         snapshot_mutation_schedule_digest_bytes(
             digest, write->value, MIN(write->size, sizeof(write->value)));
         snapshot_mutation_schedule_digest_mix(digest,
                                               write->target.extent);
-        snapshot_mutation_schedule_digest_mix(digest,
-                                              write->target.resolved_raw);
-        snapshot_mutation_schedule_digest_mix(digest,
-                                              write->target.resolved_end);
         if (write->kind == SNAPSHOT_MUTATION_POINTER_FRESH) {
             snapshot_mutation_schedule_digest_bytes(
                 digest, write->target.bytes, write->target.extent);
@@ -458,9 +446,51 @@ static void snapshot_mutation_schedule_digest_plan(
     }
 }
 
+static void snapshot_mutation_schedule_cursor_fingerprint(
+    uint64_t digest[SNAPSHOT_MUTATION_SCHEDULE_DIGEST_LANES],
+    const SnapshotMutationPlan *plan)
+{
+    snapshot_mutation_schedule_digest_mix(digest, 0x435552534f525301ull);
+    if (plan == NULL) {
+        snapshot_mutation_schedule_digest_mix(digest, UINT64_MAX);
+        return;
+    }
+    snapshot_mutation_schedule_digest_mix(digest, plan->source_epoch);
+    snapshot_mutation_schedule_digest_mix(digest,
+                                          plan->read_witness.valid);
+    if (plan->read_witness.valid) {
+        const SnapshotMutationReadWitnessDescriptor *witness =
+            &plan->read_witness;
+
+        snapshot_mutation_schedule_digest_mix(digest,
+                                              witness->baseline_epoch);
+        snapshot_mutation_schedule_digest_mix(digest, witness->access_id);
+        snapshot_mutation_schedule_digest_mix(digest, witness->pc);
+    }
+    if (plan->mods == NULL && plan->num_mods != 0) {
+        snapshot_mutation_schedule_digest_mix(digest,
+                                              0x4d495353494e474dull);
+        return;
+    }
+    for (uint32_t i = 0; i < plan->num_mods; i++) {
+        const SnapshotMutationWrite *write = &plan->mods[i];
+
+        snapshot_mutation_schedule_digest_mix(digest, i);
+        snapshot_mutation_schedule_digest_mix(
+            digest, (uint64_t)write->expr_index);
+        snapshot_mutation_schedule_digest_mix(
+            digest, (uint64_t)write->query_index);
+        snapshot_mutation_schedule_digest_mix(digest,
+                                              write->target.resolved_raw);
+        snapshot_mutation_schedule_digest_mix(digest,
+                                              write->target.resolved_end);
+    }
+}
+
 static void snapshot_mutation_schedule_digest_input(
     SnapshotMutationPlan *const *plans, uint32_t count,
-    uint64_t digest[SNAPSHOT_MUTATION_SCHEDULE_DIGEST_LANES])
+    uint64_t plan_content_digest[SNAPSHOT_MUTATION_SCHEDULE_DIGEST_LANES],
+    uint64_t cursor_fingerprint[SNAPSHOT_MUTATION_SCHEDULE_DIGEST_LANES])
 {
     static const uint64_t initial[SNAPSHOT_MUTATION_SCHEDULE_DIGEST_LANES] = {
         0x6a09e667f3bcc909ull, 0xbb67ae8584caa73bull,
@@ -469,11 +499,17 @@ static void snapshot_mutation_schedule_digest_input(
         0x1f83d9abfb41bd6bull, 0x5be0cd19137e2179ull,
     };
 
-    memcpy(digest, initial, sizeof(initial));
-    snapshot_mutation_schedule_digest_mix(digest, count);
+    memcpy(plan_content_digest, initial, sizeof(initial));
+    memcpy(cursor_fingerprint, initial, sizeof(initial));
+    snapshot_mutation_schedule_digest_mix(plan_content_digest, count);
+    snapshot_mutation_schedule_digest_mix(cursor_fingerprint, count);
     for (uint32_t i = 0; i < count; i++) {
-        snapshot_mutation_schedule_digest_mix(digest, i);
-        snapshot_mutation_schedule_digest_plan(digest, plans[i]);
+        snapshot_mutation_schedule_digest_mix(plan_content_digest, i);
+        snapshot_mutation_schedule_digest_mix(cursor_fingerprint, i);
+        snapshot_mutation_schedule_plan_content_digest(plan_content_digest,
+                                                       plans[i]);
+        snapshot_mutation_schedule_cursor_fingerprint(cursor_fingerprint,
+                                                       plans[i]);
     }
 }
 
@@ -513,8 +549,8 @@ void snapshot_mutation_coordinator_schedule(
     count = (uint32_t)coordinator->staged->len;
     stats.staged = count;
     plans = (SnapshotMutationPlan **)coordinator->staged->pdata;
-    snapshot_mutation_schedule_digest_input(plans, count,
-                                            stats.input_digest);
+    snapshot_mutation_schedule_digest_input(
+        plans, count, stats.plan_content_digest, stats.cursor_fingerprint);
     for (uint32_t i = 0; i < count; i++) {
         bool witness_capable =
             snapshot_mutation_plan_witness_capable(plans[i]);
