@@ -651,6 +651,7 @@ static SnapshotReadToken record_access(CPUArchState *env, uintptr_t addr,
     ma.size = (uintptr_t)size;
     ma.symbolic_value = symbolic;
     ma.observed_valid = true;
+    ma.successful_load = true;
     ma.pc = 0x400100;
     memcpy(ma.target, &value, sizeof(target_ulong));
     return snapshot_read_access(env, &ma);
@@ -660,6 +661,7 @@ static SnapshotReadToken record_access(CPUArchState *env, uintptr_t addr,
  * reachable in this translation unit). */
 static void reset_shared_records(void)
 {
+    snapshot_mutation_read_witness_disarm();
     if (shared_trace_data != NULL) {
         memset(shared_trace_data, 0, sizeof(SharedTraceData));
     }
@@ -1023,6 +1025,151 @@ static void test_read_token_identity(void)
                                         SNAPSHOT_ROOT_IDENTITY),
           "a primitive token cannot finalize against the pointer lane");
 
+    g_free(env);
+}
+
+/* The B1 witness is a scalar exact-event diagnostic.  It reads only the
+ * concrete bytes supplied by a successful load event and is independent of
+ * whether the symbolic shadow survived to that load. */
+static void test_mutation_read_witness_identity(void)
+{
+    CPUArchState *env = g_malloc0(sizeof(*env));
+    SnapshotMutationBaseline baseline = {0};
+    SnapshotMutationBaselineEntry entry = {0};
+    SnapshotMutationPlan plan = {0};
+    SnapshotMutationWrite write = {0};
+    const uintptr_t cell = TEST_GUEST_BASE + 0xa200;
+    const uintptr_t other = TEST_GUEST_BASE + 0xa208;
+    const uint64_t baseline_epoch = 77;
+    const uint32_t expected_value = 0x1000;
+
+    reset_shared_records();
+    baseline.run_epoch = baseline_epoch;
+    baseline.entry_count = 1;
+    baseline.entries = &entry;
+    entry.token.run_epoch = baseline_epoch;
+    entry.token.source_ordinal = 0;
+    entry.lane = SNAPSHOT_MUTATION_LANE_PRIMITIVE;
+    entry.source_kind = SNAPSHOT_MUTATION_SOURCE_PRIMITIVE;
+    entry.access_id = 0;
+    entry.pc = 0x400100;
+    entry.addr = cell;
+    entry.size = sizeof(expected_value);
+    entry.observed_read_valid = true;
+    entry.observed_read_bytes[0] = 1;
+    write.kind = SNAPSHOT_MUTATION_BYTES;
+    write.addr = cell;
+    write.size = sizeof(expected_value);
+    memcpy(write.value, &expected_value, sizeof(expected_value));
+    plan.advisor_id = 1;
+    plan.num_mods = 1;
+    plan.mods = &write;
+    snapshot_mutation_baseline = &baseline;
+    shared_trace_data->run_epoch = 100;
+    snapshot_mutation_plan_set_source(
+        &plan, &baseline, entry.token,
+        SNAPSHOT_MUTATION_SEED_OBSERVED_READ, true, 42);
+    snapshot_mutation_read_witness_arm(&plan);
+
+    /* A concrete retained load (symbolic_value=false) still proves exactly
+     * the candidate bytes; witness matching cannot depend on taint. */
+    SnapshotReadToken token = record_access(env, cell, expected_value, 4,
+                                            false);
+    CHECK(token.valid == 0 &&
+          __atomic_load_n(&shared_trace_data->mutation_read_witness.state,
+                          __ATOMIC_ACQUIRE) ==
+              SNAPSHOT_MUTATION_READ_WITNESS_MATCHED_VALUE,
+          "successful untainted load witnesses exact planned value");
+    CHECK(shared_trace_data->prim_idx == 0,
+          "witness does not retain a new symbolic read record");
+    uint8_t duplicate_bytes[sizeof(expected_value)];
+    memcpy(duplicate_bytes, &expected_value, sizeof(duplicate_bytes));
+    snapshot_mutation_read_witness_observe(
+        SNAPSHOT_MUTATION_LANE_PRIMITIVE, 0, entry.pc, (target_ulong)cell,
+        sizeof(expected_value), 100, duplicate_bytes);
+    CHECK(__atomic_load_n(&shared_trace_data->mutation_read_witness.state,
+                          __ATOMIC_ACQUIRE) ==
+              SNAPSHOT_MUTATION_READ_WITNESS_AMBIGUOUS,
+          "duplicate exact event identity is ambiguous rather than positive");
+
+    snapshot_mutation_baseline = NULL;
+    reset_shared_records();
+    snapshot_mutation_baseline = &baseline;
+    shared_trace_data->run_epoch = 101;
+    snapshot_mutation_read_witness_arm(&plan);
+    (void)record_access(env, cell, 7, 4, false);
+    CHECK(__atomic_load_n(&shared_trace_data->mutation_read_witness.state,
+                          __ATOMIC_ACQUIRE) ==
+              SNAPSHOT_MUTATION_READ_WITNESS_DIFFERENT_VALUE,
+          "overwritten bytes report different-value rather than use");
+
+    /* A same-PC event before the target read shifts its lane counter.  The
+     * second same-PC access must not match by PC/address alone. */
+    snapshot_mutation_baseline = NULL;
+    reset_shared_records();
+    snapshot_mutation_baseline = &baseline;
+    shared_trace_data->run_epoch = 102;
+    snapshot_mutation_read_witness_arm(&plan);
+    (void)record_access(env, other, expected_value, 4, false);
+    (void)record_access(env, cell, expected_value, 4, false);
+    CHECK(shared_trace_data->prim_access_cnt == 2 &&
+          __atomic_load_n(&shared_trace_data->mutation_read_witness.state,
+                          __ATOMIC_ACQUIRE) ==
+              SNAPSHOT_MUTATION_READ_WITNESS_UNKNOWN,
+          "repeated PC with shifted event ID remains unknown");
+
+    /* A descriptor from a stale frozen epoch cannot arm, and a live child
+     * event from a different representative epoch cannot match an armed one. */
+    snapshot_mutation_baseline = NULL;
+    reset_shared_records();
+    snapshot_mutation_baseline = &baseline;
+    shared_trace_data->run_epoch = 103;
+    SnapshotMutationReadWitnessDescriptor saved_witness = plan.read_witness;
+    plan.read_witness.baseline_epoch = baseline_epoch - 1;
+    snapshot_mutation_read_witness_arm(&plan);
+    (void)record_access(env, cell, expected_value, 4, false);
+    CHECK(!snapshot_child_read_witness_armed &&
+          __atomic_load_n(&shared_trace_data->mutation_read_witness.state,
+                          __ATOMIC_ACQUIRE) ==
+              SNAPSHOT_MUTATION_READ_WITNESS_UNKNOWN,
+          "stale baseline epoch cannot arm a witness");
+    plan.read_witness = saved_witness;
+
+    snapshot_mutation_baseline = NULL;
+    reset_shared_records();
+    snapshot_mutation_baseline = &baseline;
+    shared_trace_data->run_epoch = 104;
+    snapshot_mutation_read_witness_arm(&plan);
+    shared_trace_data->run_epoch++;
+    (void)record_access(env, cell, expected_value, 4, false);
+    CHECK(__atomic_load_n(&shared_trace_data->mutation_read_witness.state,
+                          __ATOMIC_ACQUIRE) ==
+              SNAPSHOT_MUTATION_READ_WITNESS_UNKNOWN,
+          "stale representative epoch cannot match an event");
+
+    /* A new representative clears shared and child-local witness state and
+     * restarts its lane event counters. */
+    snapshot_mutation_baseline = NULL;
+    reset_shared_records();
+    snapshot_mutation_baseline = &baseline;
+    shared_trace_data->run_epoch = 105;
+    snapshot_mutation_read_witness_arm(&plan);
+    (void)record_access(env, cell, expected_value, 4, false);
+    snapshot_prepare_mutation_epoch();
+    CHECK(!snapshot_child_read_witness_armed &&
+          shared_trace_data->prim_access_cnt == 0 &&
+          __atomic_load_n(&shared_trace_data->mutation_read_witness.state,
+                          __ATOMIC_ACQUIRE) ==
+              SNAPSHOT_MUTATION_READ_WITNESS_UNKNOWN,
+          "representative reset clears witness and access counters");
+    (void)record_access(env, cell, expected_value, 4, false);
+    CHECK(__atomic_load_n(&shared_trace_data->mutation_read_witness.state,
+                          __ATOMIC_ACQUIRE) ==
+              SNAPSHOT_MUTATION_READ_WITNESS_UNKNOWN,
+          "previous representative witness is not reused");
+
+    snapshot_mutation_read_witness_disarm();
+    snapshot_mutation_baseline = NULL;
     g_free(env);
 }
 
@@ -2059,6 +2206,10 @@ static void test_mutation_coordinator_contract(void)
         entries[i].addr = i == 0 ? TEST_GUEST_BASE + 0xd000 : R_EAX;
         entries[i].planner_bytes[0] = (uint8_t)(0x10 + i);
     }
+    entries[0].observed_read_valid = true;
+    entries[0].access_id = 19;
+    entries[0].pc = 0x400200;
+    entries[0].observed_read_bytes[0] = 0x10;
     entries[3].addr = TEST_GUEST_BASE + 0xd000;
     entries[3].size = 2;
 
@@ -2172,6 +2323,44 @@ static void test_mutation_coordinator_contract(void)
                   staged->mods[1].size == sizeof(target_ulong) &&
                   staged->mods[1].value[0] == 0x44,
               "staged plan carries the complete ordered write set");
+        CHECK(staged->source_valid && staged->source_epoch == baseline.run_epoch &&
+                  staged->source_ordinal == 0 &&
+                  staged->source_kind == SNAPSHOT_MUTATION_SOURCE_PRIMITIVE &&
+                  staged->seed_semantics ==
+                      SNAPSHOT_MUTATION_SEED_SNAPSHOT_STATE &&
+                  staged->family_valid && staged->family_id == family.family_id &&
+                  staged->source_retained,
+              "specialized plan owns validated primary source metadata");
+        CHECK(staged->read_witness_applicable &&
+                  staged->read_witness.valid &&
+                  staged->read_witness.baseline_epoch == baseline.run_epoch &&
+                  staged->read_witness.lane ==
+                      SNAPSHOT_MUTATION_LANE_PRIMITIVE &&
+                  staged->read_witness.access_id == entries[0].access_id &&
+                  staged->read_witness.pc == entries[0].pc &&
+                  staged->read_witness.addr == entries[0].addr &&
+                  staged->read_witness.width == 1 &&
+                  staged->read_witness.expected_bytes[0] == 0x22,
+              "specialized scalar witness owns baseline identity and patch value");
+    }
+    free_plan_queue(queue);
+    queue = g_queue_new();
+    CHECK(snapshot_mutation_stage_generic(&coordinator, &entries[3]) &&
+              snapshot_mutation_coordinator_publish(&coordinator, queue) &&
+              g_queue_get_length(queue) == 3,
+          "generic source plans publish as a complete batch");
+    if (!g_queue_is_empty(queue)) {
+        SnapshotMutationPlan *generic = g_queue_peek_head(queue);
+        CHECK(generic->source_valid &&
+                  generic->source_epoch == baseline.run_epoch &&
+                  generic->source_ordinal == 3 &&
+                  generic->source_ordinal != 0 &&
+                  generic->source_kind ==
+                      SNAPSHOT_MUTATION_SOURCE_ARGUMENT_PRIMITIVE &&
+                  generic->seed_semantics ==
+                      SNAPSHOT_MUTATION_SEED_SNAPSHOT_STATE &&
+                  !generic->family_valid && !generic->source_retained,
+              "generic plan does not fabricate source ordinal zero");
     }
     free_plan_queue(queue);
     snapshot_mutation_coordinator_clear(&coordinator);
@@ -4372,6 +4561,7 @@ int main(void)
 
     test_record_width_replacement();
     test_read_token_identity();
+    test_mutation_read_witness_identity();
     test_pointer_over_primitive();
     test_at_cap_sticky();
     test_generic_without_locator();

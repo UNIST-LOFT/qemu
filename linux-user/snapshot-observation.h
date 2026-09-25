@@ -65,11 +65,27 @@ typedef struct PointerAccess {
     int64_t query_index;
 } PointerAccess;
 
+typedef enum SnapshotMutationReadWitnessState {
+    SNAPSHOT_MUTATION_READ_WITNESS_UNKNOWN = 0,
+    SNAPSHOT_MUTATION_READ_WITNESS_MATCHED_VALUE = 1,
+    SNAPSHOT_MUTATION_READ_WITNESS_DIFFERENT_VALUE = 2,
+    SNAPSHOT_MUTATION_READ_WITNESS_AMBIGUOUS = 3,
+    SNAPSHOT_MUTATION_READ_WITNESS_WRITING = 4,
+} SnapshotMutationReadWitnessState;
+
+typedef struct SnapshotMutationReadWitnessObservation {
+    uint32_t state;
+} SnapshotMutationReadWitnessObservation;
+
 typedef struct SharedTraceData {
     uint64_t run_epoch;
     uint32_t symbolic_advisor_plan_applied;
+    uint32_t mutation_plan_applied;
+    SnapshotMutationReadWitnessObservation mutation_read_witness;
     uint32_t prim_idx;
     uint32_t ptr_idx;
+    /* Successful snapshot_read_access events, including untainted loads;
+     * reset before each representative and copied into retained records. */
     uint64_t prim_access_cnt;
     uint64_t ptr_access_cnt;
     uint32_t prim_overflow;

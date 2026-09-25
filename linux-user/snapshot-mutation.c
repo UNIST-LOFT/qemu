@@ -375,6 +375,70 @@ const SnapshotMutationBaselineEntry *snapshot_mutation_lookup_entry(
     return snapshot_mutation_token_equal(entry->token, token) ? entry : NULL;
 }
 
+void snapshot_mutation_plan_set_source(
+    SnapshotMutationPlan *plan, const SnapshotMutationBaseline *baseline,
+    SnapshotMutationSourceToken primary,
+    SnapshotMutationSeedSemantics seed_semantics, bool family_valid,
+    uint64_t family_id)
+{
+    const SnapshotMutationBaselineEntry *entry;
+    const SnapshotMutationWrite *primary_write = NULL;
+
+    if (plan == NULL) return;
+    plan->source_valid = false;
+    plan->family_valid = false;
+    plan->source_retained = false;
+    plan->read_witness_applicable = false;
+    plan->read_witness.valid = false;
+    if (seed_semantics != SNAPSHOT_MUTATION_SEED_SNAPSHOT_STATE &&
+        seed_semantics != SNAPSHOT_MUTATION_SEED_OBSERVED_READ) {
+        return;
+    }
+    entry = snapshot_mutation_lookup_entry(baseline, primary);
+    if (entry == NULL) return;
+
+    plan->source_valid = true;
+    plan->source_epoch = entry->token.run_epoch;
+    plan->source_ordinal = entry->token.source_ordinal;
+    plan->source_kind = entry->source_kind;
+    plan->seed_semantics = seed_semantics;
+    plan->family_valid = family_valid;
+    plan->family_id = family_id;
+    plan->source_retained = entry->observed_read_valid;
+
+    if (entry->lane != SNAPSHOT_MUTATION_LANE_PRIMITIVE ||
+        entry->source_kind != SNAPSHOT_MUTATION_SOURCE_PRIMITIVE ||
+        entry->size == 0 || plan->mods == NULL || plan->num_mods == 0) {
+        return;
+    }
+    for (uint32_t i = 0; i < plan->num_mods; i++) {
+        const SnapshotMutationWrite *write = &plan->mods[i];
+        if (write->addr != entry->addr) continue;
+        if (primary_write != NULL || write->kind != SNAPSHOT_MUTATION_BYTES ||
+            write->size != entry->size) {
+            return;
+        }
+        primary_write = write;
+    }
+    if (primary_write == NULL) return;
+    plan->read_witness_applicable = true;
+    if (!entry->observed_read_valid ||
+        entry->size > sizeof(entry->observed_read_bytes)) {
+        return;
+    }
+
+    SnapshotMutationReadWitnessDescriptor *witness = &plan->read_witness;
+    witness->baseline_epoch = entry->token.run_epoch;
+    witness->lane = entry->lane;
+    witness->access_id = entry->access_id;
+    witness->pc = entry->pc;
+    witness->addr = entry->addr;
+    witness->width = primary_write->size;
+    memcpy(witness->expected_bytes, primary_write->value,
+           primary_write->size);
+    witness->valid = true;
+}
+
 void snapshot_mutation_proposal_family_free(gpointer data)
 {
     SnapshotMutationProposalFamily *family = data;
@@ -861,8 +925,9 @@ bool snapshot_mutation_stage_family(
             return false;
         }
         plan->advisor_id = family->advisor_id;
-        plan->source_ordinal = family->primary_seed.source_ordinal;
-        plan->family_id = family->family_id;
+        snapshot_mutation_plan_set_source(
+            plan, coordinator->baseline, family->primary_seed,
+            family->seed_semantics, true, family->family_id);
         g_ptr_array_add(local, plan);
     }
     for (guint i = 0; i < local->len; i++) {

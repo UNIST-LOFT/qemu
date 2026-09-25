@@ -172,6 +172,9 @@ static int64_t snapshot_mutation_query_start = -1;
 static int64_t snapshot_mutation_expr_start = -1;
 static SnapshotMutationBaseline *snapshot_mutation_baseline = NULL;
 static SnapshotExitInfo original_exit_info;
+static SnapshotMutationReadWitnessDescriptor snapshot_child_read_witness;
+static uint64_t snapshot_child_read_witness_epoch;
+static bool snapshot_child_read_witness_armed;
 
 static BinradarManager *binradar_manager = NULL;
 
@@ -1179,10 +1182,103 @@ static void remove_read_access_primitive(uintptr_t addr) {
     g_hash_table_remove(g_read_access_tainted_primitives->table, GSIZE_TO_POINTER(addr));
 }
 
+static void snapshot_mutation_read_witness_disarm(void)
+{
+    memset(&snapshot_child_read_witness, 0,
+           sizeof(snapshot_child_read_witness));
+    snapshot_child_read_witness_epoch = 0;
+    snapshot_child_read_witness_armed = false;
+}
+
+static void snapshot_mutation_read_witness_arm(
+    const SnapshotMutationPlan *plan)
+{
+    const SnapshotMutationReadWitnessDescriptor *witness;
+    bool planned_value_found = false;
+
+    snapshot_mutation_read_witness_disarm();
+    if (plan == NULL || snapshot_mutation_baseline == NULL ||
+        !plan->source_valid || !plan->source_retained ||
+        !plan->read_witness_applicable ||
+        plan->source_kind != SNAPSHOT_MUTATION_SOURCE_PRIMITIVE ||
+        plan->source_epoch != snapshot_mutation_baseline->run_epoch ||
+        !plan->read_witness.valid || shared_trace_data == NULL) {
+        return;
+    }
+    witness = &plan->read_witness;
+    if (witness->baseline_epoch != snapshot_mutation_baseline->run_epoch ||
+        witness->lane != SNAPSHOT_MUTATION_LANE_PRIMITIVE ||
+        witness->width == 0 || witness->width > sizeof(witness->expected_bytes)) {
+        return;
+    }
+    for (uint32_t i = 0; i < plan->num_mods; i++) {
+        const SnapshotMutationWrite *write = &plan->mods[i];
+        if (write->addr == witness->addr && write->size == witness->width &&
+            write->kind == SNAPSHOT_MUTATION_BYTES &&
+            memcmp(write->value, witness->expected_bytes,
+                   witness->width) == 0) {
+            if (planned_value_found) return;
+            planned_value_found = true;
+        }
+    }
+    if (!planned_value_found) return;
+
+    snapshot_child_read_witness = *witness;
+    snapshot_child_read_witness_epoch = shared_trace_data->run_epoch;
+    snapshot_child_read_witness_armed = true;
+}
+
+static void snapshot_mutation_read_witness_observe(
+    SnapshotMutationLane lane, uint64_t access_id, uintptr_t pc,
+    target_ulong addr, uint32_t width, uint64_t epoch,
+    const uint8_t *loaded_bytes)
+{
+    if (!snapshot_child_read_witness_armed || shared_trace_data == NULL ||
+        loaded_bytes == NULL ||
+        epoch != snapshot_child_read_witness_epoch ||
+        snapshot_child_read_witness.lane != lane ||
+        snapshot_child_read_witness.access_id != access_id ||
+        snapshot_child_read_witness.pc != pc ||
+        snapshot_child_read_witness.addr != addr ||
+        snapshot_child_read_witness.width != width) {
+        return;
+    }
+
+    uint32_t state = __atomic_load_n(
+        &shared_trace_data->mutation_read_witness.state, __ATOMIC_ACQUIRE);
+    if (state == SNAPSHOT_MUTATION_READ_WITNESS_UNKNOWN) {
+        uint32_t expected = SNAPSHOT_MUTATION_READ_WITNESS_UNKNOWN;
+        if (__atomic_compare_exchange_n(
+                &shared_trace_data->mutation_read_witness.state, &expected,
+                SNAPSHOT_MUTATION_READ_WITNESS_WRITING, false,
+                __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            uint32_t result = memcmp(loaded_bytes,
+                                     snapshot_child_read_witness.expected_bytes,
+                                     width) == 0
+                ? SNAPSHOT_MUTATION_READ_WITNESS_MATCHED_VALUE
+                : SNAPSHOT_MUTATION_READ_WITNESS_DIFFERENT_VALUE;
+            expected = SNAPSHOT_MUTATION_READ_WITNESS_WRITING;
+            (void)__atomic_compare_exchange_n(
+                &shared_trace_data->mutation_read_witness.state, &expected,
+                result, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+            return;
+        }
+        state = expected;
+    }
+    if (state == SNAPSHOT_MUTATION_READ_WITNESS_WRITING ||
+        state == SNAPSHOT_MUTATION_READ_WITNESS_MATCHED_VALUE ||
+        state == SNAPSHOT_MUTATION_READ_WITNESS_DIFFERENT_VALUE) {
+        __atomic_store_n(&shared_trace_data->mutation_read_witness.state,
+                         SNAPSHOT_MUTATION_READ_WITNESS_AMBIGUOUS,
+                         __ATOMIC_RELEASE);
+    }
+}
+
 static SnapshotReadToken add_read_access_pointer(CPUArchState *env,
                                                  uintptr_t addr,
                                                  uintptr_t target,
                                                  uintptr_t pc,
+                                                 uint64_t access_id,
                                                  const uint8_t *observed,
                                                  uint32_t observed_size) {
     SnapshotReadToken token = {0};
@@ -1211,7 +1307,7 @@ static SnapshotReadToken add_read_access_pointer(CPUArchState *env,
     ptr->addr = addr;
     ptr->target = target;
     ptr->pc = pc;
-    ptr->access_id = __atomic_fetch_add(&shared_trace_data->ptr_access_cnt, 1, __ATOMIC_RELAXED);
+    ptr->access_id = access_id;
     ptr->run_epoch = shared_trace_data->run_epoch;
     ptr->expr = NULL;
     /* A replaced record never carries symbolic metadata from the
@@ -1257,6 +1353,7 @@ static SnapshotReadToken add_read_access_pointer(CPUArchState *env,
 static SnapshotReadToken add_read_access_primitive(CPUArchState *env,
                                                    uintptr_t addr,
                                                    int size, uintptr_t pc,
+                                                   uint64_t access_id,
                                                    const uint8_t *observed,
                                                    uint32_t observed_size) {
     SnapshotReadToken token = {0};
@@ -1291,7 +1388,7 @@ static SnapshotReadToken add_read_access_primitive(CPUArchState *env,
     prim->addr = addr;
     prim->size = size;
     prim->pc = pc;
-    prim->access_id = __atomic_fetch_add(&shared_trace_data->prim_access_cnt, 1, __ATOMIC_RELAXED);
+    prim->access_id = access_id;
     prim->run_epoch = shared_trace_data->run_epoch;
     prim->expr = NULL;
     /* See add_read_access_pointer: a replaced record carries no symbolic
@@ -2215,7 +2312,7 @@ void snapshot_write_access(SnapshotMemAccess *mem_access) {
 
 SnapshotReadToken snapshot_read_access(CPUArchState *env, SnapshotMemAccess *mem_access) {
     SnapshotReadToken none = {0};
-    if (!forkserver_installed) return none;
+    if (!forkserver_installed || shared_trace_data == NULL) return none;
     uintptr_t addr = mem_access->addr;
     uintptr_t size = mem_access->size;
     /* The successful child load supplies the physical bytes.  A caller that
@@ -2228,29 +2325,53 @@ SnapshotReadToken snapshot_read_access(CPUArchState *env, SnapshotMemAccess *mem
         observed = mem_access->target;
         observed_size = (uint32_t)size;
     }
+
+    target_ulong target = 0;
+    bool pointer_event = false;
     if (size == sizeof(target_ulong)) {
-        target_ulong target;
         memcpy(&target, mem_access->target, sizeof(target_ulong));
-        if (is_valid_address(target, true)) {
-            // Add to pointer
-            SnapshotReadToken token = add_read_access_pointer(
-                env, addr, target, mem_access->pc, observed, observed_size);
-            trace_mem("[snapshot] [raccess] [pointer] [addr %lx] [target %lx] [pc %lx]\n", addr, target, mem_access->pc);
-            return token;
-        } else if (target == 0) {
-            // It may be a null pointer
-            SnapshotReadToken token = add_read_access_primitive(
-                env, addr, size, mem_access->pc, observed, observed_size);
-            trace_mem("[snapshot] [raccess] [null-pointer] [addr %lx] [pc %lx]\n", addr, mem_access->pc);
-            return token; // Do not add it twice
-        } else {
-            trace_mem("[snapshot] [raccess] [primitive] [addr %lx] [value %lx] [pc %lx]\n", addr, target, mem_access->pc);
-        }
+        pointer_event = is_valid_address(target, true);
+    }
+    SnapshotMutationLane lane = pointer_event
+        ? SNAPSHOT_MUTATION_LANE_POINTER
+        : SNAPSHOT_MUTATION_LANE_PRIMITIVE;
+    uint64_t access_id = 0;
+    if (mem_access->successful_load) {
+        access_id = pointer_event
+            ? __atomic_fetch_add(&shared_trace_data->ptr_access_cnt, 1,
+                                 __ATOMIC_RELAXED)
+            : __atomic_fetch_add(&shared_trace_data->prim_access_cnt, 1,
+                                 __ATOMIC_RELAXED);
+    }
+
+    /* This hook runs on successful TCG scalar loads, including concrete
+     * loads whose symbolic shadow was lost.  It compares the supplied load
+     * bytes; it never rereads guest memory for a diagnostic. */
+    if (mem_access->successful_load && observed != NULL) {
+        snapshot_mutation_read_witness_observe(
+            lane, access_id, mem_access->pc, (target_ulong)addr,
+            (uint32_t)size, shared_trace_data->run_epoch, observed);
+    }
+
+    if (pointer_event) {
+        SnapshotReadToken token = add_read_access_pointer(
+            env, addr, target, mem_access->pc, access_id,
+            observed, observed_size);
+        trace_mem("[snapshot] [raccess] [pointer] [addr %lx] [target %lx] [pc %lx]\n", addr, target, mem_access->pc);
+        return token;
+    } else if (size == sizeof(target_ulong) && target == 0) {
+        SnapshotReadToken token = add_read_access_primitive(
+            env, addr, size, mem_access->pc, access_id,
+            observed, observed_size);
+        trace_mem("[snapshot] [raccess] [null-pointer] [addr %lx] [pc %lx]\n", addr, mem_access->pc);
+        return token;
+    } else if (size == sizeof(target_ulong)) {
+        trace_mem("[snapshot] [raccess] [primitive] [addr %lx] [value %lx] [pc %lx]\n", addr, target, mem_access->pc);
     }
     if (mem_access->symbolic_value) {
-        // Tainted value
         SnapshotReadToken token = add_read_access_primitive(
-            env, addr, size, mem_access->pc, observed, observed_size);
+            env, addr, size, mem_access->pc, access_id,
+            observed, observed_size);
         trace_mem("[snapshot] [raccess] [mem] [addr %lx] [size %ld]\n", addr, size);
         return token;
     }
@@ -3155,6 +3276,7 @@ static void snapshot_modify_memory(CPUArchState *cpu_env)
     SnapshotMutationApplyContext context;
     SnapshotMutationApplyResult result;
 
+    snapshot_mutation_read_witness_disarm();
     if (mod_manager == NULL) return;
     context.cpu_env = cpu_env;
     context.remaining = g_queue_get_length(mod_manager->modifications);
@@ -3162,11 +3284,17 @@ static void snapshot_modify_memory(CPUArchState *cpu_env)
                                      &snapshot_mutation_child_host,
                                      &context);
     if (result == SNAPSHOT_MUTATION_APPLY_OK) {
-        if (shared_trace_data != NULL && mod_manager->current != NULL &&
-            mod_manager->current->advisor_id ==
-                SNAPSHOT_SYMBOLIC_ADVISOR_ID) {
-            shared_trace_data->symbolic_advisor_plan_applied = 1;
+        if (shared_trace_data != NULL && mod_manager->current != NULL) {
+            __atomic_store_n(&shared_trace_data->mutation_plan_applied, 1,
+                             __ATOMIC_RELEASE);
+            if (mod_manager->current->advisor_id ==
+                    SNAPSHOT_SYMBOLIC_ADVISOR_ID) {
+                shared_trace_data->symbolic_advisor_plan_applied = 1;
+            }
         }
+        /* The child-local matcher becomes live only after every plan write
+         * has passed preflight and been atomically published. */
+        snapshot_mutation_read_witness_arm(mod_manager->current);
         return;
     }
 
@@ -3882,10 +4010,147 @@ static bool snapshot_mutation_stage_generic(
     }
     while (!g_queue_is_empty(temporary)) {
         SnapshotMutationPlan *plan = g_queue_pop_head(temporary);
+        snapshot_mutation_plan_set_source(
+            plan, coordinator->baseline, entry->token,
+            SNAPSHOT_MUTATION_SEED_SNAPSHOT_STATE, false, 0);
         g_ptr_array_add(coordinator->staged, plan);
     }
     g_queue_free(temporary);
     return true;
+}
+
+typedef struct SnapshotMutationQueueBins {
+    uint64_t total;
+    uint64_t generic_primitive;
+    uint64_t generic_primitive_retained;
+    uint64_t generic_pointer;
+    uint64_t generic_pointer_retained;
+    uint64_t generic_argument_primitive;
+    uint64_t generic_argument_primitive_retained;
+    uint64_t generic_argument_pointer;
+    uint64_t generic_argument_pointer_retained;
+    uint64_t osprey_primitive;
+    uint64_t osprey_primitive_retained;
+    uint64_t osprey_pointer;
+    uint64_t osprey_pointer_retained;
+    uint64_t symbolic_primitive;
+    uint64_t symbolic_primitive_retained;
+    uint64_t symbolic_pointer;
+    uint64_t symbolic_pointer_retained;
+    uint64_t unknown;
+} SnapshotMutationQueueBins;
+
+static void snapshot_mutation_log_queue_bins(const GQueue *queue)
+{
+    SnapshotMutationQueueBins bins = {0};
+    if (queue != NULL) {
+        for (const GList *node = queue->head; node != NULL;
+             node = node->next) {
+            const SnapshotMutationPlan *plan = node->data;
+            if (plan == NULL) {
+                bins.total++;
+                bins.unknown++;
+                continue;
+            }
+            bins.total++;
+            if (!plan->source_valid) {
+                bins.unknown++;
+                continue;
+            }
+            switch (plan->advisor_id) {
+            case 0:
+                switch (plan->source_kind) {
+                case SNAPSHOT_MUTATION_SOURCE_PRIMITIVE:
+                    bins.generic_primitive++;
+                    if (plan->source_retained) {
+                        bins.generic_primitive_retained++;
+                    }
+                    break;
+                case SNAPSHOT_MUTATION_SOURCE_POINTER:
+                    bins.generic_pointer++;
+                    if (plan->source_retained) {
+                        bins.generic_pointer_retained++;
+                    }
+                    break;
+                case SNAPSHOT_MUTATION_SOURCE_ARGUMENT_PRIMITIVE:
+                    bins.generic_argument_primitive++;
+                    if (plan->source_retained) {
+                        bins.generic_argument_primitive_retained++;
+                    }
+                    break;
+                case SNAPSHOT_MUTATION_SOURCE_ARGUMENT_POINTER:
+                    bins.generic_argument_pointer++;
+                    if (plan->source_retained) {
+                        bins.generic_argument_pointer_retained++;
+                    }
+                    break;
+                default:
+                    bins.unknown++;
+                    break;
+                }
+                break;
+            case 1:
+                if (plan->source_kind == SNAPSHOT_MUTATION_SOURCE_PRIMITIVE) {
+                    bins.osprey_primitive++;
+                    if (plan->source_retained) bins.osprey_primitive_retained++;
+                } else if (plan->source_kind == SNAPSHOT_MUTATION_SOURCE_POINTER) {
+                    bins.osprey_pointer++;
+                    if (plan->source_retained) bins.osprey_pointer_retained++;
+                } else {
+                    bins.unknown++;
+                }
+                break;
+            case SNAPSHOT_SYMBOLIC_ADVISOR_ID:
+                if (plan->source_kind == SNAPSHOT_MUTATION_SOURCE_PRIMITIVE) {
+                    bins.symbolic_primitive++;
+                    if (plan->source_retained) {
+                        bins.symbolic_primitive_retained++;
+                    }
+                } else if (plan->source_kind == SNAPSHOT_MUTATION_SOURCE_POINTER) {
+                    bins.symbolic_pointer++;
+                    if (plan->source_retained) {
+                        bins.symbolic_pointer_retained++;
+                    }
+                } else {
+                    bins.unknown++;
+                }
+                break;
+            default:
+                bins.unknown++;
+                break;
+            }
+        }
+    }
+    log_msg("[binradar] [queue-bins] [version 1] [total %llu] "
+            "[generic-primitive %llu] [generic-primitive-retained %llu] "
+            "[generic-pointer %llu] [generic-pointer-retained %llu] "
+            "[generic-argument-primitive %llu] "
+            "[generic-argument-primitive-retained %llu] "
+            "[generic-argument-pointer %llu] "
+            "[generic-argument-pointer-retained %llu] "
+            "[osprey-primitive %llu] [osprey-primitive-retained %llu] "
+            "[osprey-pointer %llu] [osprey-pointer-retained %llu] "
+            "[symbolic-primitive %llu] [symbolic-primitive-retained %llu] "
+            "[symbolic-pointer %llu] [symbolic-pointer-retained %llu] "
+            "[unknown %llu]\n",
+            (unsigned long long)bins.total,
+            (unsigned long long)bins.generic_primitive,
+            (unsigned long long)bins.generic_primitive_retained,
+            (unsigned long long)bins.generic_pointer,
+            (unsigned long long)bins.generic_pointer_retained,
+            (unsigned long long)bins.generic_argument_primitive,
+            (unsigned long long)bins.generic_argument_primitive_retained,
+            (unsigned long long)bins.generic_argument_pointer,
+            (unsigned long long)bins.generic_argument_pointer_retained,
+            (unsigned long long)bins.osprey_primitive,
+            (unsigned long long)bins.osprey_primitive_retained,
+            (unsigned long long)bins.osprey_pointer,
+            (unsigned long long)bins.osprey_pointer_retained,
+            (unsigned long long)bins.symbolic_primitive,
+            (unsigned long long)bins.symbolic_primitive_retained,
+            (unsigned long long)bins.symbolic_pointer,
+            (unsigned long long)bins.symbolic_pointer_retained,
+            (unsigned long long)bins.unknown);
 }
 
 static bool snapshot_mutation_coordinator_build(
@@ -3975,6 +4240,9 @@ static bool snapshot_mutation_coordinator_build(
     g_free(specialized);
     bool published = snapshot_mutation_coordinator_publish(&coordinator,
                                                             queue);
+    if (published && binradar_manager != NULL) {
+        snapshot_mutation_log_queue_bins(queue);
+    }
     snapshot_mutation_coordinator_clear(&coordinator);
     return published;
 }
@@ -4085,6 +4353,18 @@ static void snapshot_prepare_mutation_epoch(void)
     epoch = ++next_snapshot_mutation_epoch;
     if (epoch == 0) epoch = ++next_snapshot_mutation_epoch;
     shared_trace_data->run_epoch = epoch;
+    /* Access IDs describe lane-local events within one representative, not
+     * a cumulative counter across siblings of the same attempt. */
+    __atomic_store_n(&shared_trace_data->prim_access_cnt, 0,
+                     __ATOMIC_RELAXED);
+    __atomic_store_n(&shared_trace_data->ptr_access_cnt, 0,
+                     __ATOMIC_RELAXED);
+    __atomic_store_n(&shared_trace_data->mutation_plan_applied, 0,
+                     __ATOMIC_RELAXED);
+    __atomic_store_n(&shared_trace_data->mutation_read_witness.state,
+                     SNAPSHOT_MUTATION_READ_WITNESS_UNKNOWN,
+                     __ATOMIC_RELEASE);
+    snapshot_mutation_read_witness_disarm();
 }
 
 /* Parent-side deferred-finding reporter: after the child died (or was
@@ -4150,6 +4430,170 @@ static bool report_shared_prov_finding(void *opaque, uint32_t *status_out) {
     return true;
 }
 
+typedef struct SnapshotPlanAttemptDiagnostic {
+    bool plan_present;
+    bool family_valid;
+    bool source_valid;
+    bool source_retained;
+    bool read_witness_applicable;
+    bool read_witness_valid;
+    uint32_t advisor_id;
+    uint32_t source_ordinal;
+    uint32_t source_kind;
+    uint32_t write_count;
+    uint64_t family_id;
+    uint64_t source_epoch;
+    SnapshotMutationSeedSemantics seed_semantics;
+    SnapshotExitInfo patch0_exit;
+    bool patch0_exit_record_valid;
+    bool patch0_applied_known;
+    bool patch0_applied;
+    bool patch0_site_known;
+    bool patch0_site;
+    bool patch0_witness_complete;
+    SnapshotMutationReadWitnessState patch0_witness_state;
+    bool committed;
+} SnapshotPlanAttemptDiagnostic;
+
+static const char *snapshot_mutation_source_kind_name(uint32_t source_kind)
+{
+    switch (source_kind) {
+    case SNAPSHOT_MUTATION_SOURCE_PRIMITIVE: return "primitive";
+    case SNAPSHOT_MUTATION_SOURCE_POINTER: return "pointer";
+    case SNAPSHOT_MUTATION_SOURCE_ARGUMENT_PRIMITIVE:
+        return "argument-primitive";
+    case SNAPSHOT_MUTATION_SOURCE_ARGUMENT_POINTER:
+        return "argument-pointer";
+    default: return "unknown";
+    }
+}
+
+static const char *snapshot_mutation_seed_semantics_name(
+    SnapshotMutationSeedSemantics semantics)
+{
+    switch (semantics) {
+    case SNAPSHOT_MUTATION_SEED_SNAPSHOT_STATE: return "snapshot-state";
+    case SNAPSHOT_MUTATION_SEED_OBSERVED_READ: return "observed-read";
+    default: return "unknown";
+    }
+}
+
+static const char *snapshot_plan_attempt_read_witness_name(
+    const SnapshotPlanAttemptDiagnostic *diagnostic)
+{
+    if (diagnostic == NULL || !diagnostic->source_valid) return "unknown";
+    if (diagnostic->source_kind == SNAPSHOT_MUTATION_SOURCE_POINTER ||
+        diagnostic->source_kind ==
+            SNAPSHOT_MUTATION_SOURCE_ARGUMENT_PRIMITIVE ||
+        diagnostic->source_kind ==
+            SNAPSHOT_MUTATION_SOURCE_ARGUMENT_POINTER) {
+        return "not-applicable";
+    }
+    if (diagnostic->source_kind != SNAPSHOT_MUTATION_SOURCE_PRIMITIVE) {
+        return "unknown";
+    }
+    if (!diagnostic->read_witness_applicable) return "not-applicable";
+    if (!diagnostic->read_witness_valid || !diagnostic->patch0_applied ||
+        !diagnostic->patch0_witness_complete) {
+        return "unknown";
+    }
+    switch (diagnostic->patch0_witness_state) {
+    case SNAPSHOT_MUTATION_READ_WITNESS_MATCHED_VALUE:
+        return "matched-value";
+    case SNAPSHOT_MUTATION_READ_WITNESS_DIFFERENT_VALUE:
+        return "different-value";
+    default:
+        return "unknown";
+    }
+}
+
+static void snapshot_plan_attempt_log(
+    uint32_t attempt, BinradarForkserverAttemptResult attempt_result,
+    const SnapshotPlanAttemptDiagnostic *diagnostic)
+{
+    char epoch[32] = "unknown";
+    char attempt_text[32];
+    char advisor_id[32] = "unknown";
+    char family_id[32] = "unknown";
+    char source_ordinal[32] = "unknown";
+    char source_kind[32] = "unknown";
+    char seed_semantics[32] = "unknown";
+    char write_count[32] = "unknown";
+    char applied[8] = "unknown";
+    char patch_site[8] = "unknown";
+    char fault_valid[8] = "unknown";
+    char fault_addr[2 + sizeof(target_ulong) * 2 + 1] = "unknown";
+    const char *patch_exit = "unusable";
+    const char *fault_source = "unknown";
+    const char *retained = "unknown";
+    const char *committed = "false";
+
+    if (diagnostic == NULL) return;
+    g_snprintf(attempt_text, sizeof(attempt_text), "%u", attempt);
+    if (diagnostic->plan_present) {
+        g_snprintf(advisor_id, sizeof(advisor_id), "%u",
+                   diagnostic->advisor_id);
+        g_snprintf(write_count, sizeof(write_count), "%u",
+                   diagnostic->write_count);
+    }
+    if (diagnostic->source_valid) {
+        g_snprintf(epoch, sizeof(epoch), "%llu",
+                   (unsigned long long)diagnostic->source_epoch);
+        g_snprintf(source_ordinal, sizeof(source_ordinal), "%u",
+                   diagnostic->source_ordinal);
+        g_strlcpy(source_kind,
+                  snapshot_mutation_source_kind_name(
+                      diagnostic->source_kind), sizeof(source_kind));
+        g_strlcpy(seed_semantics,
+                  snapshot_mutation_seed_semantics_name(
+                      diagnostic->seed_semantics), sizeof(seed_semantics));
+        retained = diagnostic->source_retained ? "true" : "false";
+    }
+    if (diagnostic->family_valid) {
+        g_snprintf(family_id, sizeof(family_id), "%llu",
+                   (unsigned long long)diagnostic->family_id);
+    }
+    if (diagnostic->patch0_applied_known) {
+        g_strlcpy(applied, diagnostic->patch0_applied ? "true" : "false",
+                  sizeof(applied));
+    }
+    if (diagnostic->patch0_site_known) {
+        g_strlcpy(patch_site, diagnostic->patch0_site ? "yes" : "no",
+                  sizeof(patch_site));
+    }
+    if (diagnostic->patch0_exit_record_valid) {
+        const SnapshotExitInfo *info = &diagnostic->patch0_exit;
+        patch_exit = info->crashed ? "crash" : "normal";
+        g_strlcpy(fault_valid,
+                  info->fault_reference_valid ? "true" : "false",
+                  sizeof(fault_valid));
+        fault_source = info->fault_reference_valid
+            ? snapshot_fault_reference_source_name(
+                  info->fault_reference_source)
+            : "unavailable";
+        if (info->fault_reference_valid) {
+            g_snprintf(fault_addr, sizeof(fault_addr), "%lx",
+                       (unsigned long)info->fault_addr);
+        }
+    }
+    committed = diagnostic->committed ? "true" : "false";
+    log_msg("[binradar] [plan-attempt] [version 1] [epoch %s] "
+            "[attempt %s] [advisor-id %s] [family-id %s] "
+            "[source-ordinal %s] [source-kind %s] "
+            "[seed-semantics %s] [source-retained %s] "
+            "[write-count %s] [patch0-applied %s] "
+            "[patch0-read-witness %s] [patch0-site %s] "
+            "[patch0-exit %s] [patch0-fault-valid %s] "
+            "[patch0-fault-source %s] [patch0-fault-addr %s] "
+            "[attempt-result %s] [committed %s]\n",
+            epoch, attempt_text, advisor_id, family_id, source_ordinal,
+            source_kind, seed_semantics, retained, write_count, applied,
+            snapshot_plan_attempt_read_witness_name(diagnostic), patch_site,
+            patch_exit, fault_valid, fault_source, fault_addr,
+            binradar_forkserver_attempt_result_name((uint32_t)attempt_result),
+            committed);
+}
+
 void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
                          const ArgumentInfo *arg_info, size_t num_arg_regs) {
     log_msg("[snapshot] [forkserver] [called %d]\n", forkserver_installed);
@@ -4191,6 +4635,10 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
         /* Set when any child of this attempt was killed by the child or
          * aggregate deadline.  Counted once per attempt, not once per child. */
         bool deadline_kill = false;
+        bool attempt_committed = false;
+        SnapshotPlanAttemptDiagnostic attempt_diagnostic = {
+            .patch0_witness_state = SNAPSHOT_MUTATION_READ_WITNESS_UNKNOWN,
+        };
         bool *uncovered = NULL;
         bool *executed = NULL;
         SnapshotExitInfo baseline_exit = {0};
@@ -4201,9 +4649,29 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
         uint64_t attempt_advisor_family = 0;
 
         if (mod_manager != NULL && mod_manager->current != NULL) {
-            attempt_advisor_id = mod_manager->current->advisor_id;
-            attempt_advisor_source = mod_manager->current->source_ordinal;
-            attempt_advisor_family = mod_manager->current->family_id;
+            const SnapshotMutationPlan *plan = mod_manager->current;
+            attempt_advisor_id = plan->advisor_id;
+            if (plan->source_valid) {
+                attempt_advisor_source = plan->source_ordinal;
+            }
+            attempt_advisor_family = plan->family_id;
+            attempt_diagnostic.plan_present = true;
+            attempt_diagnostic.advisor_id = plan->advisor_id;
+            attempt_diagnostic.family_valid = plan->family_valid;
+            attempt_diagnostic.family_id = plan->family_id;
+            attempt_diagnostic.write_count = plan->num_mods;
+            attempt_diagnostic.source_valid = plan->source_valid;
+            if (plan->source_valid) {
+                attempt_diagnostic.source_epoch = plan->source_epoch;
+                attempt_diagnostic.source_ordinal = plan->source_ordinal;
+                attempt_diagnostic.source_kind = plan->source_kind;
+                attempt_diagnostic.seed_semantics = plan->seed_semantics;
+                attempt_diagnostic.source_retained = plan->source_retained;
+                attempt_diagnostic.read_witness_applicable =
+                    plan->read_witness_applicable;
+                attempt_diagnostic.read_witness_valid =
+                    plan->read_witness.valid;
+            }
         }
         if (binradar_mode && attempt > 1) {
             uncovered = g_new0(bool, binradar_manager->patch_max_id + 1u);
@@ -4285,6 +4753,39 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
             }
 
             SnapshotExitInfo *exit_info = snapshot_exit_info_ptr();
+            if (binradar_mode && selected_patch == 0) {
+                bool applied = shared_trace_data != NULL &&
+                    __atomic_load_n(&shared_trace_data->mutation_plan_applied,
+                                    __ATOMIC_ACQUIRE) != 0;
+                if (applied) {
+                    attempt_diagnostic.patch0_applied_known = true;
+                    attempt_diagnostic.patch0_applied = true;
+                } else if (wait_rc == 0 && exit_info != NULL &&
+                           exit_info->valid) {
+                    attempt_diagnostic.patch0_applied_known = true;
+                    attempt_diagnostic.patch0_applied = false;
+                }
+                if (exit_info != NULL && exit_info->valid) {
+                    attempt_diagnostic.patch0_exit = *exit_info;
+                    attempt_diagnostic.patch0_exit_record_valid = true;
+                }
+                if (wait_rc == 0 && exit_info != NULL && exit_info->valid) {
+                    PatchedResult *patch0 = binradar_cache_result(
+                        binradar_manager, 0);
+                    if (patch0 != NULL) {
+                        attempt_diagnostic.patch0_site_known = true;
+                        attempt_diagnostic.patch0_site =
+                            patch0->br_taken != NULL;
+                    }
+                    attempt_diagnostic.patch0_witness_complete = true;
+                }
+                if (shared_trace_data != NULL && wait_rc == 0) {
+                    attempt_diagnostic.patch0_witness_state =
+                        (SnapshotMutationReadWitnessState)__atomic_load_n(
+                            &shared_trace_data->mutation_read_witness.state,
+                            __ATOMIC_ACQUIRE);
+                }
+            }
             bool exit_unusable = exit_info == NULL || !exit_info->valid ||
                 (exit_info->crashed && !exit_info->fault_reference_valid);
             if (binradar_mode && (wait_rc > 0 || exit_unusable)) {
@@ -4491,10 +4992,16 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
                     if (!binradar_cache_commit(binradar_manager)) {
                         exit_with_status(1);
                     }
+                    attempt_committed = true;
                     remaining_plans = analyze_collected_data(
                         arg_info, num_arg_regs);
                 }
             }
+        }
+        attempt_diagnostic.committed = attempt_committed;
+        if (binradar_mode && attempt > 1) {
+            snapshot_plan_attempt_log(attempt, attempt_result,
+                                      &attempt_diagnostic);
         }
         if (binradar_mode && attempt_advisor_id ==
                 SNAPSHOT_SYMBOLIC_ADVISOR_ID) {

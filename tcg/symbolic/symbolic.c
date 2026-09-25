@@ -1345,6 +1345,77 @@ static inline void add_void_call_8(void* f, TCGTemp* arg0, TCGTemp* arg1,
         *op_out = op;
 }
 
+/* Copy an operation result into a fresh temporary after the defining op.  The
+ * extra use makes TCG liveness retain the original result through this move;
+ * calling a helper with the defining temp directly can reach the register
+ * allocator as TEMP_VAL_DEAD. */
+static inline TCGOp *add_loaded_value_after(TCGTemp *dest, TCGTemp *source,
+                                            TCGOp *op_in,
+                                            TCGContext *tcg_ctx)
+{
+    assert(dest->temp_allocated);
+    assert(source->temp_allocated);
+    assert(dest->type == TCG_TYPE_I64);
+    assert(source->type == TCG_TYPE_I32 || source->type == TCG_TYPE_I64);
+
+    TCGOpcode opc = source->type == TCG_TYPE_I32
+        ? INDEX_op_extu_i32_i64 : INDEX_op_mov_i64;
+    TCGOp *op = tcg_op_insert_after(tcg_ctx, op_in, opc);
+    op->args[0] = temp_arg(dest);
+    op->args[1] = temp_arg(source);
+    return op;
+}
+
+static inline TCGOp *add_movi_after(TCGTemp *dest, uintptr_t value,
+                                    TCGOp *op_in, TCGContext *tcg_ctx)
+{
+    assert(dest->temp_allocated);
+    assert(dest->type == TCG_TYPE_I32 || dest->type == TCG_TYPE_I64);
+
+    TCGOpcode opc = dest->type == TCG_TYPE_I32
+        ? INDEX_op_movi_i32 : INDEX_op_movi_i64;
+    TCGOp *op = tcg_op_insert_after(tcg_ctx, op_in, opc);
+    op->args[0] = temp_arg(dest);
+    op->args[1] = value;
+    return op;
+}
+
+/* Insert a helper after the operation whose result it consumes.  The main
+ * translation walk snapshots each original operation's successor, so this
+ * generated call is not instrumented a second time. */
+static inline void add_void_call_8_after(
+    void *f, TCGTemp *arg0, TCGTemp *arg1, TCGTemp *arg2, TCGTemp *arg3,
+    TCGTemp *arg4, TCGTemp *arg5, TCGTemp *arg6, TCGTemp *arg7,
+    TCGOp *op_in, TCGOp **op_out, TCGContext *tcg_ctx)
+{
+    assert(arg0->temp_allocated);
+    assert(arg1->temp_allocated);
+    assert(arg2->temp_allocated);
+    assert(arg3->temp_allocated);
+    assert(arg4->temp_allocated);
+    assert(arg5->temp_allocated);
+    assert(arg6->temp_allocated);
+    assert(arg7->temp_allocated);
+
+    TCGOp *op = tcg_op_insert_after(tcg_ctx, op_in, INDEX_op_call);
+    op->args[0] = temp_arg(arg0);
+    op->args[1] = temp_arg(arg1);
+    op->args[2] = temp_arg(arg2);
+    op->args[3] = temp_arg(arg3);
+    op->args[4] = temp_arg(arg4);
+    op->args[5] = temp_arg(arg5);
+    op->args[6] = temp_arg(arg6);
+    op->args[7] = temp_arg(arg7);
+    op->args[8] = (uintptr_t)f;
+    op->args[9] = 0;
+    TCGOP_CALLI(op) = 8;
+    TCGOP_CALLO(op) = 0;
+
+    if (op_out) {
+        *op_out = op;
+    }
+}
+
 static inline void check_pool_expr_capacity(void)
 {
     assert(next_free_expr >= pool);
@@ -3371,7 +3442,8 @@ static void add_consistency_check_load(Expr* e, uintptr_t addr, size_t size)
 static inline void qemu_load_helper(CPUArchState *env, uintptr_t orig_addr,
                                     uintptr_t mem_op_offset, uintptr_t addr_idx,
                                     uintptr_t val_idx, uintptr_t base_val,
-                                    uintptr_t disp_pack)
+                                    uintptr_t disp_pack,
+                                    uintptr_t loaded_value)
 {
     TCGMemOp  mem_op = get_mem_op(mem_op_offset);
     uintptr_t offset = get_mem_offset(mem_op_offset);
@@ -3652,6 +3724,10 @@ static inline void qemu_load_helper(CPUArchState *env, uintptr_t orig_addr,
             .symbolic_addr = (addr_idx < TCG_MAX_TEMPS && s_temps[addr_idx] != NULL),
             .symbolic_value = (!early_exit),
             .observed_valid = false,
+            /* This helper runs after the guest load and receives its result.
+             * Only this path consumes lane event IDs; helper-copy reads do
+             * not. */
+            .successful_load = true,
             .addr = addr,
             .pc = current_tb_pc,
             .target = {0},
@@ -3659,8 +3735,7 @@ static inline void qemu_load_helper(CPUArchState *env, uintptr_t orig_addr,
             .size = size
         };
         if (is_valid_address(addr, false)) {
-            void *addr_h = g2h(addr);
-            memcpy(mem_access.target, addr_h, size);
+            memcpy(mem_access.target, &loaded_value, size);
             mem_access.observed_valid = true;
         }
         if (is_valid_address(addr, true)) {
@@ -6996,12 +7071,17 @@ int        parse_translation_block(TranslationBlock* tb, uintptr_t tb_pc,
     }
 #endif
 
-    TCGOp* op;
+    TCGOp *op;
+    TCGOp *next_original_op;
     int    hit_first_instr = 0;
 
     uintptr_t pc = 0;
-    QTAILQ_FOREACH(op, &tcg_ctx->ops, link)
+    for (op = QTAILQ_FIRST(&tcg_ctx->ops); op != NULL;
+         op = next_original_op)
     {
+        /* Instrumentation calls inserted before or after this operation are
+         * generated code, not original IR to instrument recursively. */
+        next_original_op = QTAILQ_NEXT(op, link);
 #if 0
         for (size_t idx = 0; idx < op_to_add_size; idx++) {
             tcg_op_insert_before_op(tcg_ctx, op, op_to_add[idx]);
@@ -7421,32 +7501,33 @@ int        parse_translation_block(TranslationBlock* tb, uintptr_t tb_pc,
                     } else {
                         TCGTemp* t_val = arg_temp(op->args[0]);
                         TCGTemp* t_ptr = arg_temp(op->args[1]);
+                        TCGTemp* t_addr_copy =
+                            new_non_conflicting_temp(t_ptr->type);
+                        MARK_TEMP_AS_ALLOCATED(t_ptr);
+                        tcg_mov(t_addr_copy, t_ptr, 0, 0, op, NULL, tcg_ctx);
+                        MARK_TEMP_AS_NOT_ALLOCATED(t_ptr);
 #if 0
                         TCGMemOp  mem_op = get_memop(op->args[2]);
                         uintptr_t offset = (uintptr_t)get_mmuidx(op->args[2]);
                         qemu_load(t_ptr, t_val, offset, mem_op, op,
                                 tcg_ctx); // bugged
 #else
+                        uintptr_t mem_op_value = make_mem_op_offset(
+                            get_memop(op->args[2]), get_mmuidx(op->args[2]));
+                        uintptr_t ptr_idx_value = temp_idx(t_ptr);
+                        uintptr_t val_idx_value = temp_idx(t_val);
+                        uintptr_t disp_pack_value = 0;
                         TCGTemp* t_mem_op =
                             new_non_conflicting_temp(TCG_TYPE_PTR);
-                        tcg_movi(t_mem_op,
-                                 make_mem_op_offset(get_memop(op->args[2]),
-                                                    get_mmuidx(op->args[2])),
-                                 0, op, NULL, tcg_ctx);
                         TCGTemp* t_ptr_idx =
                             new_non_conflicting_temp(TCG_TYPE_PTR);
-                        tcg_movi(t_ptr_idx, (uintptr_t)temp_idx(t_ptr), 0, op,
-                                 NULL, tcg_ctx);
                         TCGTemp* t_val_idx =
                             new_non_conflicting_temp(TCG_TYPE_PTR);
-                        tcg_movi(t_val_idx, (uintptr_t)temp_idx(t_val), 0, op,
-                                 NULL, tcg_ctx);
                         TCGTemp* t_base_val =
                             new_non_conflicting_temp(TCG_TYPE_PTR);
-                        tcg_movi(t_base_val, 0, 0, op, NULL, tcg_ctx);
                         TCGTemp* t_disp_pack =
                             new_non_conflicting_temp(TCG_TYPE_PTR);
-                        tcg_movi(t_disp_pack, 0, 0, op, NULL, tcg_ctx);
+                        bool base_value_copied = false;
                         TempAddrHint *addr_hint =
                             &temp_addr_hint[temp_idx(t_ptr)];
                         if (addr_hint->is_valid &&
@@ -7456,17 +7537,37 @@ int        parse_translation_block(TranslationBlock* tb, uintptr_t tb_pc,
                             MARK_TEMP_AS_ALLOCATED(t_base);
                             tcg_mov(t_base_val, t_base, 0, 0, op, NULL, tcg_ctx);
                             MARK_TEMP_AS_NOT_ALLOCATED(t_base);
-                            tcg_movi(t_disp_pack,
-                                     pack_disp(addr_hint->disp, 1), 0, op, NULL,
-                                     tcg_ctx);
+                            base_value_copied = true;
+                            disp_pack_value = pack_disp(addr_hint->disp, 1);
                         }
-                        TCGTemp *t_cpu_env = new_non_conflicting_temp(TCG_TYPE_PTR);
-                        tcg_movi(t_cpu_env, (uintptr_t)cpu_env, 0, op, NULL, tcg_ctx);
-                        MARK_TEMP_AS_ALLOCATED(t_ptr);
-                        add_void_call_7(qemu_load_helper, t_cpu_env, t_ptr, t_mem_op,
-                                        t_ptr_idx, t_val_idx, t_base_val,
-                                        t_disp_pack, op, NULL, tcg_ctx);
-                        MARK_TEMP_AS_NOT_ALLOCATED(t_ptr);
+                        TCGTemp *t_cpu_env =
+                            new_non_conflicting_temp(TCG_TYPE_PTR);
+                        TCGTemp *t_loaded_value =
+                            new_non_conflicting_temp(TCG_TYPE_I64);
+                        MARK_TEMP_AS_ALLOCATED(t_val);
+                        TCGOp *post_op = add_loaded_value_after(
+                            t_loaded_value, t_val, op, tcg_ctx);
+                        post_op = add_movi_after(
+                            t_cpu_env, (uintptr_t)cpu_env, post_op, tcg_ctx);
+                        post_op = add_movi_after(
+                            t_mem_op, mem_op_value, post_op, tcg_ctx);
+                        post_op = add_movi_after(
+                            t_ptr_idx, ptr_idx_value, post_op, tcg_ctx);
+                        post_op = add_movi_after(
+                            t_val_idx, val_idx_value, post_op, tcg_ctx);
+                        if (!base_value_copied) {
+                            post_op = add_movi_after(
+                                t_base_val, 0, post_op, tcg_ctx);
+                        }
+                        post_op = add_movi_after(
+                            t_disp_pack, disp_pack_value, post_op, tcg_ctx);
+                        add_void_call_8_after(
+                            qemu_load_helper, t_cpu_env, t_addr_copy, t_mem_op,
+                            t_ptr_idx, t_val_idx, t_base_val, t_disp_pack,
+                            t_loaded_value, post_op, NULL, tcg_ctx);
+                        MARK_TEMP_AS_NOT_ALLOCATED(t_val);
+                        tcg_temp_free_internal(t_loaded_value);
+                        tcg_temp_free_internal(t_addr_copy);
                         tcg_temp_free_internal(t_mem_op);
                         tcg_temp_free_internal(t_ptr_idx);
                         tcg_temp_free_internal(t_val_idx);
@@ -7660,36 +7761,55 @@ int        parse_translation_block(TranslationBlock* tb, uintptr_t tb_pc,
 
                             TCGTemp* t_val = arg_temp(op->args[0]);
                             TCGTemp* t_ptr = arg_temp(op->args[1]);
+                            TCGTemp* t_addr_copy =
+                                new_non_conflicting_temp(t_ptr->type);
                             MARK_TEMP_AS_ALLOCATED(t_ptr);
+                            tcg_mov(t_addr_copy, t_ptr, 0, 0, op, NULL,
+                                    tcg_ctx);
+                            MARK_TEMP_AS_NOT_ALLOCATED(t_ptr);
                             TCGTemp* t_mem_op =
                                 new_non_conflicting_temp(TCG_TYPE_PTR);
-
-                            uint32_t mem_op_kind =
-                                op->opc == INDEX_op_ld_i64 ? MO_LEQ : MO_LEUL;
-
-                            tcg_movi(t_mem_op,
-                                     make_mem_op_offset(mem_op_kind, offset), 0,
-                                     op, NULL, tcg_ctx);
                             TCGTemp* t_ptr_idx =
                                 new_non_conflicting_temp(TCG_TYPE_PTR);
-                            tcg_movi(t_ptr_idx, (uintptr_t) TCG_MAX_TEMPS + 1, 0, op, NULL,
-                                     tcg_ctx);
                             TCGTemp* t_val_idx =
                                 new_non_conflicting_temp(TCG_TYPE_PTR);
-                            tcg_movi(t_val_idx, (uintptr_t)temp_idx(t_val), 0,
-                                     op, NULL, tcg_ctx);
                             TCGTemp* t_base_val =
                                 new_non_conflicting_temp(TCG_TYPE_PTR);
-                            tcg_movi(t_base_val, 0, 0, op, NULL, tcg_ctx);
                             TCGTemp* t_disp_pack =
                                 new_non_conflicting_temp(TCG_TYPE_PTR);
-                            tcg_movi(t_disp_pack, 0, 0, op, NULL, tcg_ctx);
-                            TCGTemp *t_cpu_env = new_non_conflicting_temp(TCG_TYPE_PTR);
-                            tcg_movi(t_cpu_env, (uintptr_t)cpu_env, 0, op, NULL, tcg_ctx);
-                            add_void_call_7(qemu_load_helper, t_cpu_env, t_ptr, t_mem_op,
-                                            t_ptr_idx, t_val_idx, t_base_val,
-                                            t_disp_pack, op, NULL, tcg_ctx);
-                            MARK_TEMP_AS_NOT_ALLOCATED(t_ptr);
+                            TCGTemp *t_cpu_env =
+                                new_non_conflicting_temp(TCG_TYPE_PTR);
+                            TCGTemp *t_loaded_value =
+                                new_non_conflicting_temp(TCG_TYPE_I64);
+                            uint32_t mem_op_kind =
+                                op->opc == INDEX_op_ld_i64 ? MO_LEQ : MO_LEUL;
+                            MARK_TEMP_AS_ALLOCATED(t_val);
+                            TCGOp *post_op = add_loaded_value_after(
+                                t_loaded_value, t_val, op, tcg_ctx);
+                            post_op = add_movi_after(
+                                t_cpu_env, (uintptr_t)cpu_env, post_op, tcg_ctx);
+                            post_op = add_movi_after(
+                                t_mem_op,
+                                make_mem_op_offset(mem_op_kind, offset),
+                                post_op, tcg_ctx);
+                            post_op = add_movi_after(
+                                t_ptr_idx, (uintptr_t)TCG_MAX_TEMPS + 1,
+                                post_op, tcg_ctx);
+                            post_op = add_movi_after(
+                                t_val_idx, (uintptr_t)temp_idx(t_val),
+                                post_op, tcg_ctx);
+                            post_op = add_movi_after(
+                                t_base_val, 0, post_op, tcg_ctx);
+                            post_op = add_movi_after(
+                                t_disp_pack, 0, post_op, tcg_ctx);
+                            add_void_call_8_after(
+                                qemu_load_helper, t_cpu_env, t_addr_copy,
+                                t_mem_op, t_ptr_idx, t_val_idx, t_base_val,
+                                t_disp_pack, t_loaded_value, post_op, NULL,
+                                tcg_ctx);
+                            MARK_TEMP_AS_NOT_ALLOCATED(t_val);
+                            tcg_temp_free_internal(t_loaded_value);
+                            tcg_temp_free_internal(t_addr_copy);
                             tcg_temp_free_internal(t_mem_op);
                             tcg_temp_free_internal(t_ptr_idx);
                             tcg_temp_free_internal(t_val_idx);

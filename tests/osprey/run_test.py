@@ -1058,6 +1058,44 @@ TESTS = [
         timeout=120,
     ),
     dict(
+        # Package 4 B1 witness, negative case.  The guest stores a constant
+        # into the cell it is about to compare, so the comparison can never
+        # see a mutated value: a plan may be applied and may be observed by
+        # the guest's *first* load, but the load the branch depends on is a
+        # later one.  The guest derives its reported tag from the branch
+        # outcome, so the high side is unreachable without genuinely taking it.
+        # This is the concrete overwrite the plan's regression calls for.
+        name="t16_read_witness_overwrite",
+        guest="t16_read_witness_overwrite",
+        mode="binradar",
+        memcheck=0,
+        entrypoint_symbol="t16_check",
+        env={"BINRADAR_OSPREY_ANALYSIS_MODE": "mutation",
+             "BINRADAR_SYMBOLIC_MUTATION_MODE": "boundary"},
+        symbolic_observation=True,
+        drain_queue=True,
+        patch_count=0,
+        rc=(0,),
+        expect_log_rows=[
+            ("symbolic-advisor", "[mode boundary]"),
+            # The guest really took the low side of the overwritten load.
+            ("t16", "[tag low] [value 00000007]"),
+            # Every mutation attempt carries one bounded diagnostic row, and
+            # the queue denominator is a measured row rather than an inference.
+            ("binradar", "[plan-attempt] [version 1]"),
+            ("binradar", "[queue-bins] [version 1]"),
+            ("binradar", "[generic-argument-primitive-retained 0]"),
+            ("binradar", "[generic-argument-pointer-retained 0]"),
+        ],
+        absent_log_rows=[
+            ("t16", "[tag high]"),
+            # The selected load saw the overwriting store's bytes, never the
+            # planned value, so no attempt may report a matched witness.
+            ("binradar", "[patch0-read-witness matched-value]"),
+        ],
+        timeout=120,
+    ),
+    dict(
         name="t15_huft_build",
         mode="dump_compare",
         entrypoint_symbol="huft_build",

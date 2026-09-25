@@ -58,6 +58,11 @@ bool snapshot_mutation_enqueue_one(GQueue *queue,
 const SnapshotMutationBaselineEntry *snapshot_mutation_lookup_entry(
     const SnapshotMutationBaseline *baseline,
     SnapshotMutationSourceToken token);
+void snapshot_mutation_plan_set_source(
+    SnapshotMutationPlan *plan, const SnapshotMutationBaseline *baseline,
+    SnapshotMutationSourceToken primary,
+    SnapshotMutationSeedSemantics seed_semantics, bool family_valid,
+    uint64_t family_id);
 void snapshot_mutation_proposal_family_free(gpointer data);
 bool snapshot_mutation_proposal_validate(
     const SnapshotMutationCoordinator *coordinator,

@@ -51,14 +51,6 @@ typedef struct SnapshotMutationWrite {
 _Static_assert(sizeof(target_ulong) <= sizeof(((MutationCandidate *)0)->value),
                "target_ulong does not fit MutationCandidate value");
 
-typedef struct SnapshotMutationPlan {
-    uint32_t num_mods;
-    uint32_t advisor_id;       /* 0 for generic plans */
-    uint32_t source_ordinal;   /* baseline source; scalar, no arena pointer */
-    uint64_t family_id;
-    SnapshotMutationWrite *mods;
-} SnapshotMutationPlan;
-
 typedef enum SnapshotMutationLane {
     SNAPSHOT_MUTATION_LANE_PRIMITIVE = 0,
     SNAPSHOT_MUTATION_LANE_POINTER = 1,
@@ -72,6 +64,42 @@ typedef enum SnapshotMutationSourceKind {
     SNAPSHOT_MUTATION_SOURCE_ARGUMENT_POINTER = 3,
 } SnapshotMutationSourceKind;
 
+typedef enum SnapshotMutationSeedSemantics {
+    SNAPSHOT_MUTATION_SEED_SNAPSHOT_STATE = 0,
+    SNAPSHOT_MUTATION_SEED_OBSERVED_READ = 1,
+} SnapshotMutationSeedSemantics;
+
+/* Scalar-only identity for the one retained primitive load a plan may
+ * diagnose.  The bytes are the plan's expected loaded value; event identity
+ * and the baseline epoch are copied from its validated source entry. */
+typedef struct SnapshotMutationReadWitnessDescriptor {
+    uint64_t baseline_epoch;
+    SnapshotMutationLane lane;
+    uint64_t access_id;
+    uintptr_t pc;
+    target_ulong addr;
+    uint32_t width;
+    uint8_t expected_bytes[sizeof(target_ulong)];
+    bool valid;
+} SnapshotMutationReadWitnessDescriptor;
+
+typedef struct SnapshotMutationPlan {
+    uint32_t num_mods;
+    uint32_t advisor_id;       /* 0 for generic plans */
+    uint32_t source_ordinal;   /* meaningful only when source_valid */
+    uint64_t family_id;
+    uint64_t source_epoch;
+    SnapshotMutationSourceKind source_kind;
+    SnapshotMutationSeedSemantics seed_semantics;
+    bool source_valid;
+    bool family_valid;
+    bool source_retained;
+    bool read_witness_applicable;
+    SnapshotMutationReadWitnessDescriptor read_witness;
+    SnapshotMutationWrite *mods;
+} SnapshotMutationPlan;
+
+/* Source identity is the parent's baseline key; access IDs are lane-local. */
 typedef struct SnapshotMutationSourceToken {
     uint64_t run_epoch;
     uint32_t source_ordinal;
@@ -85,6 +113,7 @@ typedef struct SnapshotMutationSourceToken {
 #define SNAPSHOT_MUTATION_ROOT_ZEXT SNAPSHOT_ROOT_ZEXT
 #define SNAPSHOT_MUTATION_ROOT_SEXT SNAPSHOT_ROOT_SEXT
 typedef SnapshotRootExtension SnapshotMutationRootExtension;
+
 
 typedef struct SnapshotMutationBaselineEntry {
     SnapshotMutationSourceToken token;
@@ -123,11 +152,6 @@ typedef struct SnapshotMutationBaseline {
     int64_t expr_end;
     SnapshotMutationBaselineEntry *entries;
 } SnapshotMutationBaseline;
-
-typedef enum SnapshotMutationSeedSemantics {
-    SNAPSHOT_MUTATION_SEED_SNAPSHOT_STATE = 0,
-    SNAPSHOT_MUTATION_SEED_OBSERVED_READ = 1,
-} SnapshotMutationSeedSemantics;
 
 typedef struct SnapshotMutationProposalWrite {
     SnapshotMutationSourceToken destination;

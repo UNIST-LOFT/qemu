@@ -77,6 +77,8 @@ typedef struct {
     bool symbolic_value;
     /* Set by the caller when it copied `size` physical bytes into target[]. */
     bool observed_valid;
+    /* True only on the successful TCG scalar-load path, not helper copies. */
+    bool successful_load;
     uintptr_t addr;
     uintptr_t pc;
     uint8_t target[8];
