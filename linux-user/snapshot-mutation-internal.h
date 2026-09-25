@@ -80,6 +80,26 @@ bool snapshot_mutation_stage_family(
 bool snapshot_mutation_coordinator_publish(
     SnapshotMutationCoordinator *coordinator, GQueue *queue);
 
+typedef struct SnapshotMutationPortfolioStats {
+    uint64_t staged_input;
+    uint64_t staged_output;
+    uint64_t osprey_plans;
+    uint64_t boundary_plans;
+    uint64_t generic_plans;
+    uint64_t suppressed_duplicates;
+    bool allocation_failure;
+} SnapshotMutationPortfolioStats;
+
+SnapshotMutationPortfolio snapshot_mutation_portfolio_parse(
+    const char *text, bool *valid_out);
+/* `REPLACEMENT` is allocation-free and leaves `staged` byte-for-byte ordered.
+ * `MIXED` atomically replaces it with a stable OSPREY/boundary/generic
+ * round-robin, suppressing exact duplicate complete write sets. */
+bool snapshot_mutation_coordinator_portfolio(
+    SnapshotMutationCoordinator *coordinator,
+    SnapshotMutationPortfolio portfolio,
+    SnapshotMutationPortfolioStats *stats_out);
+
 #define SNAPSHOT_MUTATION_SCHEDULE_DIGEST_LANES 8u
 #define SNAPSHOT_MUTATION_SCHEDULE_DIGEST_HEX_LEN \
     (SNAPSHOT_MUTATION_SCHEDULE_DIGEST_LANES * 16u)

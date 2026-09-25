@@ -1105,13 +1105,41 @@ TESTS = [
         timeout=120,
     ),
     dict(
+        # P4c C1 real-child trigger and implementation proof.  Replacement
+        # suppresses the source's generic bitwise-not value (0xffffffbe), while
+        # mixed retains it beside the boundary-only 0x1000 value.  Draining the
+        # queue proves both stable streams reach disposable children.
+        name="t16_mutation_portfolio_mixed",
+        guest="t16_symbolic_boundary",
+        mode="binradar",
+        memcheck=0,
+        entrypoint_symbol="t16_check",
+        env={"BINRADAR_OSPREY_ANALYSIS_MODE": "mutation",
+             "BINRADAR_SYMBOLIC_MUTATION_MODE": "boundary",
+             "BINRADAR_SYMBOLIC_SCHEDULE": "existing",
+             "BINRADAR_MUTATION_PORTFOLIO": "mixed"},
+        symbolic_observation=True,
+        drain_queue=True,
+        patch_count=0,
+        rc=(0,),
+        expect_log_rows=[
+            ("binradar", "[portfolio] [version 1] [policy mixed]"),
+            ("t16", "[tag high] [value 00001000]"),
+            ("t16", "[tag high] [value ffffffbe]"),
+        ],
+        expect_symbolic_families_min=1,
+        expect_advisor_child_uses_min=1,
+        expect_portfolio_generic_extra_min=1,
+        timeout=120,
+    ),
+    dict(
         # Package 4 real-child proof.  The guest loads a 4-byte scalar from the
         # injected input, compares it against 0x1000, and appends the side it
         # observed to BINRADAR_SYMBOLIC_OBSERVATION_FILE.  The observed input
         # byte ('A' = 0x41) sits on the "low" side, so the boundary advisor must
         # propose the comparison constant and a later mutation child must
-        # actually take the "high" side.  patch_count=0 disables the generic
-        # patch families so the only source of mutation is the advisor, and the
+        # actually take the "high" side.  The replacement portfolio suppresses
+        # generic alternatives for this successfully advised source, and the
         # queue is drained so every proposed plan runs in a real child.
         name="t16_symbolic_boundary",
         mode="binradar",
@@ -1125,8 +1153,12 @@ TESTS = [
         rc=(0,),
         expect_log_rows=[
             ("symbolic-advisor", "[mode boundary]"),
+            ("binradar", "[portfolio] [version 1] [policy replacement]"),
             ("t16", "[tag low] [value 00000041]"),
             ("t16", "[tag high] [value 00001000]"),
+        ],
+        absent_log_rows=[
+            ("t16", "[tag high] [value ffffffbe]"),
         ],
         expect_symbolic_families_min=1,
         expect_advisor_child_uses_min=1,
@@ -2935,6 +2967,16 @@ def check(test, rc, out):
             problems.append(
                 f"applied advisor child uses {sum(counts)} < "
                 f"{min_child_uses}")
+    generic_extra_min = test.get("expect_portfolio_generic_extra_min")
+    if generic_extra_min is not None:
+        counts = [int(n) for n in re.findall(
+            r"\[binradar\] \[portfolio\] \[version 1\] \[policy mixed\]"
+            r"[^\n]*\[generic-extra-plans (\d+)\]", out)]
+        if not counts or max(counts) < generic_extra_min:
+            problems.append(
+                f"mixed portfolio generic extras "
+                f"{max(counts) if counts else 'missing'} < "
+                f"{generic_extra_min}")
     return problems
 
 

@@ -79,6 +79,16 @@ typedef enum SnapshotMutationSchedule {
     SNAPSHOT_MUTATION_SCHEDULE_RETAINED_FIRST = 1,
 } SnapshotMutationSchedule;
 
+/* Mutation-family portfolio policy.  `REPLACEMENT` preserves the historical
+ * contract: a surviving specialized family suppresses generic alternatives
+ * for its primary source.  `MIXED` is the bounded P4c C1 experiment: generic
+ * alternatives are also staged for primitive primaries with a surviving
+ * symbolic-boundary family, then the three advisor streams are interleaved. */
+typedef enum SnapshotMutationPortfolio {
+    SNAPSHOT_MUTATION_PORTFOLIO_REPLACEMENT = 0,
+    SNAPSHOT_MUTATION_PORTFOLIO_MIXED = 1,
+} SnapshotMutationPortfolio;
+
 /* Scalar-only identity for the one retained primitive load a plan may
  * diagnose.  The bytes are the plan's expected loaded value; event identity
  * and the baseline epoch are copied from its validated source entry. */

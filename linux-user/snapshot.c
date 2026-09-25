@@ -4176,13 +4176,51 @@ static SnapshotMutationSchedule snapshot_schedule_policy(void)
     return schedule;
 }
 
+static SnapshotMutationPortfolio snapshot_portfolio_policy(void)
+{
+    static bool configured = false;
+    static SnapshotMutationPortfolio portfolio =
+        SNAPSHOT_MUTATION_PORTFOLIO_REPLACEMENT;
+    const char *text;
+    bool valid = true;
+
+    if (configured) return portfolio;
+    configured = true;
+    text = getenv("BINRADAR_MUTATION_PORTFOLIO");
+    portfolio = snapshot_mutation_portfolio_parse(text, &valid);
+    if (!valid) {
+        log_msg("[binradar] [portfolio] [invalid-value %s] "
+                "[using replacement]\n", text == NULL ? "" : text);
+    }
+    return portfolio;
+}
+
+static uint64_t snapshot_mutation_plan_owned_bytes(
+    const SnapshotMutationPlan *plan)
+{
+    uint64_t bytes;
+
+    if (plan == NULL || plan->mods == NULL) return 0;
+    bytes = sizeof(*plan) + (uint64_t)plan->num_mods * sizeof(*plan->mods);
+    for (uint32_t i = 0; i < plan->num_mods; i++) {
+        if (plan->mods[i].kind == SNAPSHOT_MUTATION_POINTER_FRESH) {
+            bytes += plan->mods[i].target.extent;
+        }
+    }
+    return bytes;
+}
+
 static bool snapshot_mutation_coordinator_build(
     SnapshotMutationBaseline *baseline, GQueue *queue)
 {
     SnapshotMutationCoordinator coordinator;
     SnapshotMutationProposalSink sink;
     SnapshotOspreyAdapter osprey_adapter;
+    SnapshotMutationPortfolio portfolio = snapshot_portfolio_policy();
     bool *specialized;
+    bool *boundary_specialized = NULL;
+    uint64_t generic_extra_plans = 0;
+    uint64_t generic_extra_bytes = 0;
 
     if (baseline == NULL || queue == NULL) return false;
     if (!snapshot_mutation_coordinator_init(&coordinator, baseline)) {
@@ -4237,7 +4275,15 @@ static bool snapshot_mutation_coordinator_build(
     snapshot_mutation_coordinator_sort(&coordinator);
     specialized = g_try_malloc0((size_t)baseline->entry_count *
                                 sizeof(*specialized));
-    if (specialized == NULL && baseline->entry_count != 0) {
+    if (portfolio == SNAPSHOT_MUTATION_PORTFOLIO_MIXED) {
+        boundary_specialized = g_try_malloc0(
+            (size_t)baseline->entry_count * sizeof(*boundary_specialized));
+    }
+    if ((specialized == NULL ||
+         (portfolio == SNAPSHOT_MUTATION_PORTFOLIO_MIXED &&
+          boundary_specialized == NULL)) && baseline->entry_count != 0) {
+        g_free(specialized);
+        g_free(boundary_specialized);
         snapshot_mutation_coordinator_clear(&coordinator);
         return false;
     }
@@ -4248,19 +4294,68 @@ static bool snapshot_mutation_coordinator_build(
             snapshot_mutation_lookup_entry(baseline, family->primary_seed);
         bool staged = snapshot_mutation_stage_family(&coordinator, family);
         if (staged && primary != NULL) {
-            specialized[primary->token.source_ordinal] = true;
+            uint32_t ordinal = primary->token.source_ordinal;
+
+            specialized[ordinal] = true;
+            if (boundary_specialized != NULL &&
+                family->advisor_id == SNAPSHOT_SYMBOLIC_ADVISOR_ID) {
+                boundary_specialized[ordinal] = true;
+            }
         }
     }
     for (uint32_t i = 0; i < baseline->entry_count; i++) {
-        if (!specialized[i] &&
-            !snapshot_mutation_stage_generic(&coordinator,
-                                             &baseline->entries[i])) {
+        const SnapshotMutationBaselineEntry *entry = &baseline->entries[i];
+        bool extra_generic =
+            portfolio == SNAPSHOT_MUTATION_PORTFOLIO_MIXED &&
+            boundary_specialized[i] &&
+            entry->source_kind == SNAPSHOT_MUTATION_SOURCE_PRIMITIVE;
+        bool needs_generic = !specialized[i] || extra_generic;
+        guint before = coordinator.staged->len;
+
+        if (needs_generic &&
+            !snapshot_mutation_stage_generic(&coordinator, entry)) {
             g_free(specialized);
+            g_free(boundary_specialized);
+            snapshot_mutation_coordinator_clear(&coordinator);
+            return false;
+        }
+        if (extra_generic) {
+            generic_extra_plans += coordinator.staged->len - before;
+            for (guint pi = before; pi < coordinator.staged->len; pi++) {
+                generic_extra_bytes += snapshot_mutation_plan_owned_bytes(
+                    g_ptr_array_index(coordinator.staged, pi));
+            }
+        }
+    }
+    g_free(specialized);
+    g_free(boundary_specialized);
+    {
+        SnapshotMutationPortfolioStats portfolio_stats;
+        bool portfolio_ok = snapshot_mutation_coordinator_portfolio(
+            &coordinator, portfolio, &portfolio_stats);
+
+        log_msg("[binradar] [portfolio] [version 1] [policy %s] "
+                "[staged-input %llu] [staged-output %llu] "
+                "[osprey-plans %llu] [boundary-plans %llu] "
+                "[generic-plans %llu] [generic-extra-plans %llu] "
+                "[generic-extra-bytes %llu] "
+                "[suppressed-duplicates %llu] [allocation-failure %s]\n",
+                portfolio == SNAPSHOT_MUTATION_PORTFOLIO_MIXED
+                    ? "mixed" : "replacement",
+                (unsigned long long)portfolio_stats.staged_input,
+                (unsigned long long)portfolio_stats.staged_output,
+                (unsigned long long)portfolio_stats.osprey_plans,
+                (unsigned long long)portfolio_stats.boundary_plans,
+                (unsigned long long)portfolio_stats.generic_plans,
+                (unsigned long long)generic_extra_plans,
+                (unsigned long long)generic_extra_bytes,
+                (unsigned long long)portfolio_stats.suppressed_duplicates,
+                portfolio_stats.allocation_failure ? "true" : "false");
+        if (!portfolio_ok) {
             snapshot_mutation_coordinator_clear(&coordinator);
             return false;
         }
     }
-    g_free(specialized);
     {
         SnapshotMutationScheduleStats schedule_stats;
         SnapshotMutationSchedule schedule = snapshot_schedule_policy();

@@ -4513,6 +4513,193 @@ static GString *dump_plan_multiset(const SnapshotMutationCoordinator *coordinato
     return out;
 }
 
+static SnapshotMutationPlan *make_portfolio_plan(
+    uint32_t advisor_id, target_ulong addr, uint8_t value)
+{
+    uint8_t bytes[sizeof(target_ulong)] = {0};
+    SnapshotMutationPlan *plan;
+
+    bytes[0] = value;
+    plan = snapshot_mutation_new_descriptor(
+        addr, 1, -1, -1, SNAPSHOT_MUTATION_BYTES, bytes, 0, NULL);
+    if (plan != NULL) plan->advisor_id = advisor_id;
+    return plan;
+}
+
+static void test_mutation_mixed_portfolio(void)
+{
+    SnapshotMutationBaseline baseline = {0};
+    SnapshotMutationCoordinator coordinator = {0};
+    SnapshotMutationPortfolioStats stats = {0};
+    SnapshotMutationPlan *plans[8] = {0};
+    target_ulong base = TEST_GUEST_BASE + 0xa000;
+    bool valid = false;
+
+    CHECK(snapshot_mutation_portfolio_parse(NULL, &valid) ==
+              SNAPSHOT_MUTATION_PORTFOLIO_REPLACEMENT && valid,
+          "an unset portfolio selects replacement");
+    CHECK(snapshot_mutation_portfolio_parse("mixed", &valid) ==
+              SNAPSHOT_MUTATION_PORTFOLIO_MIXED && valid,
+          "the mixed portfolio parses");
+    CHECK(snapshot_mutation_portfolio_parse("Mixed", &valid) ==
+              SNAPSHOT_MUTATION_PORTFOLIO_REPLACEMENT && !valid,
+          "an invalid portfolio fails closed onto replacement");
+
+    coordinator.baseline = &baseline;
+    coordinator.families = g_ptr_array_new_with_free_func(
+        snapshot_mutation_proposal_family_free);
+    coordinator.staged = g_ptr_array_new_with_free_func(
+        (GDestroyNotify)snapshot_mutation_free);
+    plans[0] = make_portfolio_plan(1, base + 0x00, 0x11);
+    plans[1] = make_portfolio_plan(1, base + 0x08, 0x12);
+    plans[2] = make_two_write_plan(base + 0x10, 1, 0x21,
+                                   base + 0x18, 1, 0x22);
+    plans[2]->advisor_id = 2;
+    plans[3] = make_portfolio_plan(2, base + 0x08, 0x12);
+    plans[4] = make_portfolio_plan(2, base + 0x20, 0x23);
+    plans[5] = make_two_write_plan(base + 0x10, 1, 0x21,
+                                   base + 0x18, 1, 0x22);
+    plans[5]->advisor_id = 0;
+    plans[6] = make_portfolio_plan(0, base + 0x30, 0x31);
+    plans[7] = make_portfolio_plan(2, base + 0x28, 0x24);
+    for (uint32_t i = 0; i < G_N_ELEMENTS(plans); i++) {
+        CHECK(plans[i] != NULL, "portfolio fixture plan allocates");
+        if (plans[i] != NULL) g_ptr_array_add(coordinator.staged, plans[i]);
+    }
+
+    /* Replacement is the byte/order-compatible default and must not allocate. */
+    snapshot_mutation_test_set_alloc_fail_after(0);
+    CHECK(snapshot_mutation_coordinator_portfolio(
+              &coordinator, SNAPSHOT_MUTATION_PORTFOLIO_REPLACEMENT, &stats) &&
+              !stats.allocation_failure && stats.staged_input == 8 &&
+              stats.staged_output == 8 &&
+              g_ptr_array_index(coordinator.staged, 0) == plans[0] &&
+              g_ptr_array_index(coordinator.staged, 7) == plans[7],
+          "replacement portfolio is allocation-free and order preserving");
+    snapshot_mutation_test_set_alloc_fail_after(-1);
+
+    /* A mixed allocation failure publishes no prefix or partial reorder. */
+    snapshot_mutation_test_set_alloc_fail_after(0);
+    CHECK(!snapshot_mutation_coordinator_portfolio(
+              &coordinator, SNAPSHOT_MUTATION_PORTFOLIO_MIXED, &stats) &&
+              stats.allocation_failure && coordinator.staged->len == 8 &&
+              g_ptr_array_index(coordinator.staged, 0) == plans[0] &&
+              g_ptr_array_index(coordinator.staged, 7) == plans[7],
+          "mixed portfolio allocation failure preserves complete input order");
+    snapshot_mutation_test_set_alloc_fail_after(-1);
+
+    CHECK(snapshot_mutation_coordinator_portfolio(
+              &coordinator, SNAPSHOT_MUTATION_PORTFOLIO_MIXED, &stats),
+          "mixed portfolio stages atomically");
+    CHECK(stats.staged_input == 8 && stats.staged_output == 6 &&
+              stats.osprey_plans == 2 && stats.boundary_plans == 4 &&
+              stats.generic_plans == 2 && stats.suppressed_duplicates == 2,
+          "mixed portfolio reports every stream and exact duplicate");
+    CHECK(coordinator.staged->len == 6 &&
+              g_ptr_array_index(coordinator.staged, 0) == plans[0] &&
+              g_ptr_array_index(coordinator.staged, 1) == plans[2] &&
+              g_ptr_array_index(coordinator.staged, 2) == plans[6] &&
+              g_ptr_array_index(coordinator.staged, 3) == plans[1] &&
+              g_ptr_array_index(coordinator.staged, 4) == plans[4] &&
+              g_ptr_array_index(coordinator.staged, 5) == plans[7],
+          "mixed portfolio round-robins canonical unequal streams");
+    CHECK(g_ptr_array_index(coordinator.staged, 3) == plans[1],
+          "higher-priority OSPREY owns a later cross-stream duplicate");
+    CHECK(((SnapshotMutationPlan *)g_ptr_array_index(
+               coordinator.staged, 1))->num_mods == 2 &&
+              ((SnapshotMutationPlan *)g_ptr_array_index(
+               coordinator.staged, 1))->advisor_id == 2,
+          "whole multiwrite duplicate keeps deterministic boundary attribution");
+
+    g_ptr_array_free(coordinator.families, TRUE);
+    g_ptr_array_free(coordinator.staged, TRUE);
+
+    /* Fresh-pointer descriptor values are placeholders overwritten with the
+     * allocated guest address during preflight.  Exact write-set dedup must
+     * therefore use destination, payload, and extent rather than those unused
+     * bytes. */
+    {
+        SnapshotMutationCoordinator fresh = {0};
+        SnapshotMutationPlan *first;
+        SnapshotMutationPlan *second;
+        uint8_t first_value[sizeof(target_ulong)] = {0x11};
+        uint8_t second_value[sizeof(target_ulong)] = {0x22};
+        uint8_t payload[4] = {0xaa, 0xbb, 0xcc, 0xdd};
+
+        fresh.staged = g_ptr_array_new_with_free_func(
+            (GDestroyNotify)snapshot_mutation_free);
+        first = snapshot_mutation_new_descriptor(
+            base + 0x80, sizeof(target_ulong), -1, -1,
+            SNAPSHOT_MUTATION_POINTER_FRESH, first_value,
+            sizeof(payload), payload);
+        second = snapshot_mutation_new_descriptor(
+            base + 0x80, sizeof(target_ulong), -1, -1,
+            SNAPSHOT_MUTATION_POINTER_FRESH, second_value,
+            sizeof(payload), payload);
+        CHECK(first != NULL && second != NULL,
+              "fresh duplicate fixture allocates");
+        if (first != NULL && second != NULL) {
+            first->advisor_id = 1;
+            second->advisor_id = 2;
+            g_ptr_array_add(fresh.staged, first);
+            g_ptr_array_add(fresh.staged, second);
+            CHECK(snapshot_mutation_coordinator_portfolio(
+                      &fresh, SNAPSHOT_MUTATION_PORTFOLIO_MIXED, &stats) &&
+                      fresh.staged->len == 1 &&
+                      stats.suppressed_duplicates == 1 &&
+                      g_ptr_array_index(fresh.staged, 0) == first,
+                  "fresh duplicates ignore overwritten descriptor values");
+        } else {
+            snapshot_mutation_free(first);
+            snapshot_mutation_free(second);
+        }
+        g_ptr_array_free(fresh.staged, TRUE);
+    }
+
+    /* Global family insertion order is irrelevant after canonical per-stream
+     * ordering: equivalent stream records produce byte-identical output. */
+    {
+        SnapshotMutationCoordinator first = {0};
+        SnapshotMutationCoordinator second = {0};
+        const uint32_t advisor_ids[5] = {1, 1, 2, 2, 0};
+        const uint32_t second_order[5] = {4, 2, 0, 3, 1};
+        GString *first_dump;
+        GString *second_dump;
+
+        first.staged = g_ptr_array_new_with_free_func(
+            (GDestroyNotify)snapshot_mutation_free);
+        second.staged = g_ptr_array_new_with_free_func(
+            (GDestroyNotify)snapshot_mutation_free);
+        for (uint32_t i = 0; i < G_N_ELEMENTS(advisor_ids); i++) {
+            SnapshotMutationPlan *plan = make_portfolio_plan(
+                advisor_ids[i], base + 0x100 + i * 8, 0x40 + i);
+            CHECK(plan != NULL, "canonical portfolio plan allocates");
+            if (plan != NULL) g_ptr_array_add(first.staged, plan);
+        }
+        for (uint32_t i = 0; i < G_N_ELEMENTS(second_order); i++) {
+            uint32_t source = second_order[i];
+            SnapshotMutationPlan *plan = make_portfolio_plan(
+                advisor_ids[source], base + 0x100 + source * 8,
+                0x40 + source);
+            CHECK(plan != NULL, "reordered portfolio plan allocates");
+            if (plan != NULL) g_ptr_array_add(second.staged, plan);
+        }
+        CHECK(snapshot_mutation_coordinator_portfolio(
+                  &first, SNAPSHOT_MUTATION_PORTFOLIO_MIXED, NULL) &&
+                  snapshot_mutation_coordinator_portfolio(
+                  &second, SNAPSHOT_MUTATION_PORTFOLIO_MIXED, NULL),
+              "equivalent portfolio orders stage");
+        first_dump = dump_staged_plans(&first);
+        second_dump = dump_staged_plans(&second);
+        CHECK(strcmp(first_dump->str, second_dump->str) == 0,
+              "equivalent global insertion orders publish identically");
+        g_string_free(first_dump, TRUE);
+        g_string_free(second_dump, TRUE);
+        g_ptr_array_free(first.staged, TRUE);
+        g_ptr_array_free(second.staged, TRUE);
+    }
+}
+
 static void test_mutation_schedule_partition(void)
 {
     SnapshotMutationBaseline baseline = {0};
@@ -4873,6 +5060,7 @@ int main(void)
     test_symbolic_would_submit_matches_boundary();
     test_symbolic_allocation_failure_cleanup();
     test_symbolic_submit_allocation_is_distinct();
+    test_mutation_mixed_portfolio();
     test_mutation_schedule_partition();
     test_symbolic_shadow_leaves_queue_unchanged();
 

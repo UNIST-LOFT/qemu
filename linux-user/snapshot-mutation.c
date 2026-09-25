@@ -328,6 +328,267 @@ bool snapshot_mutation_enqueue_one(GQueue *queue,
 }
 
 /* ------------------------------------------------------------------ */
+/* Mutation portfolio policy                                           */
+/* ------------------------------------------------------------------ */
+
+SnapshotMutationPortfolio snapshot_mutation_portfolio_parse(
+    const char *text, bool *valid_out)
+{
+    if (valid_out != NULL) *valid_out = true;
+    if (text == NULL || text[0] == '\0' || strcmp(text, "replacement") == 0) {
+        return SNAPSHOT_MUTATION_PORTFOLIO_REPLACEMENT;
+    }
+    if (strcmp(text, "mixed") == 0) {
+        return SNAPSHOT_MUTATION_PORTFOLIO_MIXED;
+    }
+    if (valid_out != NULL) *valid_out = false;
+    return SNAPSHOT_MUTATION_PORTFOLIO_REPLACEMENT;
+}
+
+static int snapshot_mutation_portfolio_stream(
+    const SnapshotMutationPlan *plan)
+{
+    if (plan == NULL) return -1;
+    switch (plan->advisor_id) {
+    case 1: return 0; /* compact OSPREY */
+    case 2: return 1; /* symbolic boundary */
+    case 0: return 2; /* generic */
+    default: return -1;
+    }
+}
+
+static uint64_t snapshot_mutation_portfolio_hash_mix(uint64_t hash,
+                                                      uint64_t value)
+{
+    hash ^= value + UINT64_C(0x9e3779b97f4a7c15) + (hash << 6) + (hash >> 2);
+    hash ^= hash >> 30;
+    hash *= UINT64_C(0xbf58476d1ce4e5b9);
+    hash ^= hash >> 27;
+    hash *= UINT64_C(0x94d049bb133111eb);
+    return hash ^ (hash >> 31);
+}
+
+static uint64_t snapshot_mutation_portfolio_hash_bytes(
+    uint64_t hash, const uint8_t *bytes, size_t count)
+{
+    hash = snapshot_mutation_portfolio_hash_mix(hash, count);
+    for (size_t offset = 0; bytes != NULL && offset < count;) {
+        uint64_t word = 0;
+        size_t width = MIN(count - offset, sizeof(word));
+
+        memcpy(&word, bytes + offset, width);
+        hash = snapshot_mutation_portfolio_hash_mix(hash, word);
+        offset += width;
+    }
+    return hash;
+}
+
+static uint64_t snapshot_mutation_portfolio_plan_hash(
+    const SnapshotMutationPlan *plan)
+{
+    uint64_t hash = UINT64_C(0x6a09e667f3bcc909);
+
+    hash = snapshot_mutation_portfolio_hash_mix(hash, plan->num_mods);
+    for (uint32_t i = 0; i < plan->num_mods; i++) {
+        const SnapshotMutationWrite *write = &plan->mods[i];
+        /* `value` is fixed-capacity, and equality rejects an over-wide write
+         * rather than reading past it.  Hash only the representable prefix and
+         * mix an explicit over-wide marker so such a plan can never collide
+         * with the same prefix at a legal width. */
+        uint32_t width = MIN(write->size, (uint32_t)sizeof(write->value));
+
+        hash = snapshot_mutation_portfolio_hash_mix(hash, i);
+        hash = snapshot_mutation_portfolio_hash_mix(hash, write->kind);
+        hash = snapshot_mutation_portfolio_hash_mix(hash, write->addr);
+        hash = snapshot_mutation_portfolio_hash_mix(hash, write->size);
+        /* A fresh-pointer write publishes the newly allocated target address;
+         * its descriptor value bytes are overwritten during preflight and are
+         * not part of the executed write set. */
+        if (write->kind != SNAPSHOT_MUTATION_POINTER_FRESH) {
+            hash = snapshot_mutation_portfolio_hash_bytes(
+                hash, write->value, width);
+        }
+        hash = snapshot_mutation_portfolio_hash_mix(
+            hash, write->size > sizeof(write->value) ? 1 : 0);
+        hash = snapshot_mutation_portfolio_hash_mix(
+            hash, write->target.extent);
+        if (write->kind == SNAPSHOT_MUTATION_POINTER_FRESH &&
+            write->target.bytes != NULL) {
+            hash = snapshot_mutation_portfolio_hash_bytes(
+                hash, write->target.bytes, (size_t)write->target.extent);
+        }
+    }
+    return hash;
+}
+
+static bool snapshot_mutation_portfolio_size(
+    size_t count, size_t width, size_t *bytes_out)
+{
+    if (width != 0 && count > SIZE_MAX / width) return false;
+    *bytes_out = count * width;
+    return true;
+}
+
+static bool snapshot_mutation_portfolio_plan_equal(
+    const SnapshotMutationPlan *left, const SnapshotMutationPlan *right)
+{
+    if (left == NULL || right == NULL || left->mods == NULL ||
+        right->mods == NULL || left->num_mods != right->num_mods) {
+        return false;
+    }
+    for (uint32_t i = 0; i < left->num_mods; i++) {
+        const SnapshotMutationWrite *a = &left->mods[i];
+        const SnapshotMutationWrite *b = &right->mods[i];
+
+        if (a->kind != b->kind || a->addr != b->addr ||
+            a->size != b->size || a->size > sizeof(a->value) ||
+            (a->kind != SNAPSHOT_MUTATION_POINTER_FRESH &&
+             memcmp(a->value, b->value, a->size) != 0) ||
+            a->target.extent != b->target.extent) {
+            return false;
+        }
+        if (a->kind == SNAPSHOT_MUTATION_POINTER_FRESH &&
+            (a->target.bytes == NULL || b->target.bytes == NULL ||
+             memcmp(a->target.bytes, b->target.bytes,
+                    (size_t)a->target.extent) != 0)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool snapshot_mutation_coordinator_portfolio(
+    SnapshotMutationCoordinator *coordinator,
+    SnapshotMutationPortfolio portfolio,
+    SnapshotMutationPortfolioStats *stats_out)
+{
+    SnapshotMutationPortfolioStats stats = {0};
+    SnapshotMutationPlan **plans;
+    SnapshotMutationPlan **ordered = NULL;
+    uint32_t *slots = NULL;
+    guint count;
+    size_t slot_count = 1;
+    size_t slot_target;
+    size_t slot_bytes;
+    size_t ordered_bytes;
+    guint cursors[3] = {0, 0, 0};
+    guint output_count = 0;
+
+    if (stats_out != NULL) *stats_out = stats;
+    if (coordinator == NULL || coordinator->staged == NULL) return false;
+    count = coordinator->staged->len;
+    stats.staged_input = count;
+    plans = (SnapshotMutationPlan **)coordinator->staged->pdata;
+    for (guint i = 0; i < count; i++) {
+        switch (snapshot_mutation_portfolio_stream(plans[i])) {
+        case 0: stats.osprey_plans++; break;
+        case 1: stats.boundary_plans++; break;
+        case 2: stats.generic_plans++; break;
+        default:
+            if (stats_out != NULL) *stats_out = stats;
+            return false;
+        }
+    }
+    stats.staged_output = count;
+    if (portfolio == SNAPSHOT_MUTATION_PORTFOLIO_REPLACEMENT || count == 0) {
+        if (stats_out != NULL) *stats_out = stats;
+        return true;
+    }
+    if (portfolio != SNAPSHOT_MUTATION_PORTFOLIO_MIXED ||
+        count == G_MAXUINT ||
+        !snapshot_mutation_portfolio_size(
+            count, sizeof(SnapshotMutationPlan *), &ordered_bytes) ||
+        !snapshot_mutation_portfolio_size(count, 2, &slot_target)) {
+        if (stats_out != NULL) *stats_out = stats;
+        return false;
+    }
+    while (slot_count < slot_target) {
+        if (slot_count > SIZE_MAX / 2) {
+            if (stats_out != NULL) *stats_out = stats;
+            return false;
+        }
+        slot_count *= 2;
+    }
+    if (!snapshot_mutation_portfolio_size(
+            slot_count, sizeof(*slots), &slot_bytes)) {
+        if (stats_out != NULL) *stats_out = stats;
+        return false;
+    }
+    ordered = snapshot_mutation_try_malloc(ordered_bytes);
+    slots = snapshot_mutation_try_malloc0(slot_bytes);
+    if (ordered == NULL || slots == NULL) {
+        g_free(ordered);
+        g_free(slots);
+        stats.allocation_failure = true;
+        if (stats_out != NULL) *stats_out = stats;
+        return false;
+    }
+
+    /* Select duplicate owners before interleaving.  Visiting complete streams
+     * in advisor priority order makes attribution independent of where a plan
+     * happened to appear within its stream: OSPREY wins, then boundary, then
+     * generic; the first plan in canonical stream order wins a same-stream
+     * duplicate. */
+    for (int stream = 0; stream < 3; stream++) {
+        for (guint index = 0; index < count; index++) {
+            SnapshotMutationPlan *plan = plans[index];
+            uint64_t hash;
+            size_t slot;
+            bool duplicate = false;
+
+            if (snapshot_mutation_portfolio_stream(plan) != stream) continue;
+            hash = snapshot_mutation_portfolio_plan_hash(plan);
+            slot = (size_t)hash & (slot_count - 1);
+            while (slots[slot] != 0) {
+                guint existing_index = slots[slot] - 1u;
+
+                if (snapshot_mutation_portfolio_plan_equal(
+                        plans[existing_index], plan)) {
+                    duplicate = true;
+                    break;
+                }
+                slot = (slot + 1) & (slot_count - 1);
+            }
+            if (duplicate) {
+                snapshot_mutation_free(plan);
+                plans[index] = NULL;
+                stats.suppressed_duplicates++;
+            } else {
+                slots[slot] = index + 1u;
+            }
+        }
+    }
+
+    /* Each cursor now scans its surviving stream once. */
+    for (;;) {
+        bool progressed = false;
+
+        for (int stream = 0; stream < 3; stream++) {
+            while (cursors[stream] < count &&
+                   snapshot_mutation_portfolio_stream(
+                       plans[cursors[stream]]) != stream) {
+                cursors[stream]++;
+            }
+            if (cursors[stream] == count) continue;
+            ordered[output_count++] = plans[cursors[stream]++];
+            progressed = true;
+        }
+        if (!progressed) break;
+    }
+
+    /* No fallible operation remains: replace the owned pointer sequence only
+     * after the complete round-robin and dedup decision exists. */
+    for (guint i = 0; i < count; i++) plans[i] = NULL;
+    for (guint i = 0; i < output_count; i++) plans[i] = ordered[i];
+    g_ptr_array_set_size(coordinator->staged, output_count);
+    stats.staged_output = output_count;
+    g_free(ordered);
+    g_free(slots);
+    if (stats_out != NULL) *stats_out = stats;
+    return true;
+}
+
+/* ------------------------------------------------------------------ */
 /* Queue scheduling policy                                             */
 /* ------------------------------------------------------------------ */
 
