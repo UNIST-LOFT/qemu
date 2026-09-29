@@ -1699,6 +1699,10 @@ static void test_fact_cap_rejection(void)
     CHECK(osprey_table_insert_access(run, &f17) == -1, "cap rejects 17th");
     CHECK(run->overflow == 1, "fact-cap overflow sticky");
     CHECK(run->first_dropped_kind != 0, "drop kind recorded");
+    CHECK(osprey_table_insert_access(run, &dup) == -1,
+          "overflow makes later table operations terminal");
+    CHECK(run->total_facts_count == 16,
+          "terminal overflow preserves the accepted prefix");
 
     CHECK(osprey_parent_merge_sample(ctx, run) == OSPREY_INCOMPLETE_FACTS,
           "fact cap merge rejects fail-closed");

@@ -15,6 +15,9 @@ static inline bool prov_range_valid(target_ulong addr, target_ulong size,
 {
     int type = flags == PAGE_READ ? VERIFY_READ : VERIFY_WRITE;
 
+    if (size != 0 && addr > (target_ulong)-1 - (size - 1)) {
+        return false;
+    }
     return access_ok(type, addr, size);
 }
 
@@ -278,8 +281,11 @@ static inline int model_strcmp(CPUX86State* env, uintptr_t pc, uintptr_t n,
                                       R_ESI);
     }
 
-    Expr** s1_exprs = get_expr_addr((uintptr_t)s1, s1_width, 0, NULL);
-    Expr** s2_exprs = get_expr_addr((uintptr_t)s2, s2_width, 0, NULL);
+    bool s1_exprs_allocated = false, s2_exprs_allocated = false;
+    Expr** s1_exprs = get_expr_addr_span((uintptr_t)s1, s1_width,
+                                         &s1_exprs_allocated);
+    Expr** s2_exprs = get_expr_addr_span((uintptr_t)s2, s2_width,
+                                         &s2_exprs_allocated);
 
     if (s1_exprs == NULL && s2_exprs == NULL) {
         return mode;
@@ -300,11 +306,23 @@ static inline int model_strcmp(CPUX86State* env, uintptr_t pc, uintptr_t n,
     }
 
     if (!s1_is_not_null && !s2_is_not_null) {
+        if (s1_exprs_allocated) {
+            g_free(s1_exprs);
+        }
+        if (s2_exprs_allocated) {
+            g_free(s2_exprs);
+        }
         return mode;
     }
 
     Expr* s1_expr = build_expr(s1_exprs, s1, s1_width);
     Expr* s2_expr = build_expr(s2_exprs, s2, s2_width);
+    if (s1_exprs_allocated) {
+        g_free(s1_exprs);
+    }
+    if (s2_exprs_allocated) {
+        g_free(s2_exprs);
+    }
 
     uint64_t v = 0;
     v          = PACK_0(v, res);
@@ -354,7 +372,9 @@ static inline int model_strlen(CPUX86State* env, uintptr_t pc, uintptr_t n,
         provenance_model_check_access(env, (target_ulong)s1, len, pc, reg);
     }
     // printf("LEN: %lu\n", len);
-    Expr** s1_exprs = get_expr_addr_span((uintptr_t)s1, len);
+    bool s1_exprs_allocated = false;
+    Expr** s1_exprs = get_expr_addr_span((uintptr_t)s1, len,
+                                         &s1_exprs_allocated);
 
     if (s1_exprs == NULL) {
         return mode;
@@ -366,12 +386,16 @@ static inline int model_strlen(CPUX86State* env, uintptr_t pc, uintptr_t n,
     }
 
     if (!s1_is_not_null) {
-        g_free(s1_exprs);
+        if (s1_exprs_allocated) {
+            g_free(s1_exprs);
+        }
         return mode;
     }
 
     Expr* s1_expr = build_expr(s1_exprs, s1, len);
-    g_free(s1_exprs);
+    if (s1_exprs_allocated) {
+        g_free(s1_exprs);
+    }
 
     uint64_t v = 0;
     v          = PACK_0(v, s1_len);
@@ -415,7 +439,8 @@ static inline int model_memchr(CPUX86State* env, uintptr_t pc)
         provenance_model_check_access(env, (target_ulong)p, len, pc, R_EDI);
     }
 
-    Expr** exprs = get_expr_addr(p, len, 0, NULL);
+    bool exprs_allocated = false;
+    Expr** exprs = get_expr_addr_span(p, len, &exprs_allocated);
     if (exprs == NULL) {
         return mode;
     }
@@ -428,10 +453,16 @@ static inline int model_memchr(CPUX86State* env, uintptr_t pc)
     }
 
     if (!s1_is_not_null) {
+        if (exprs_allocated) {
+            g_free(exprs);
+        }
         return mode;
     }
 
     Expr* expr = build_expr(exprs, (void*)p, len);
+    if (exprs_allocated) {
+        g_free(exprs);
+    }
 
     uint16_t offset = res == NULL ? 0 : (((uintptr_t)res) - p) + 1;
 
@@ -480,8 +511,11 @@ static inline int model_memcmp(CPUX86State* env, uintptr_t pc)
         provenance_model_check_access(env, (target_ulong)s2, n, pc, R_ESI);
     }
 
-    Expr** s1_exprs = get_expr_addr((uintptr_t)s1, n, 0, NULL);
-    Expr** s2_exprs = get_expr_addr((uintptr_t)s2, n, 0, NULL);
+    bool s1_exprs_allocated = false, s2_exprs_allocated = false;
+    Expr** s1_exprs = get_expr_addr_span((uintptr_t)s1, n,
+                                         &s1_exprs_allocated);
+    Expr** s2_exprs = get_expr_addr_span((uintptr_t)s2, n,
+                                         &s2_exprs_allocated);
 
     if (s1_exprs == NULL && s2_exprs == NULL) {
         return mode;
@@ -502,11 +536,23 @@ static inline int model_memcmp(CPUX86State* env, uintptr_t pc)
     }
 
     if (!s1_is_not_null && !s2_is_not_null) {
+        if (s1_exprs_allocated) {
+            g_free(s1_exprs);
+        }
+        if (s2_exprs_allocated) {
+            g_free(s2_exprs);
+        }
         return mode;
     }
 
     Expr* s1_expr = build_expr(s1_exprs, s1, n);
     Expr* s2_expr = build_expr(s2_exprs, s2, n);
+    if (s1_exprs_allocated) {
+        g_free(s1_exprs);
+    }
+    if (s2_exprs_allocated) {
+        g_free(s2_exprs);
+    }
 
     uint64_t v = 0;
     v          = PACK_0(v, res);
@@ -590,12 +636,19 @@ static inline int model_atoi_like(CPUX86State* env, uintptr_t pc,
         span = 1;
     }
 
-    Expr** exprs = get_expr_addr((uintptr_t)s, span, 0, NULL);
+    bool exprs_allocated = false;
+    Expr** exprs = get_expr_addr_span((uintptr_t)s, span, &exprs_allocated);
     if (!model_has_symbolic_bytes(exprs, span)) {
+        if (exprs_allocated) {
+            g_free(exprs);
+        }
         return mode;
     }
 
     Expr* input_expr = build_expr(exprs, (void*)s, span);
+    if (exprs_allocated) {
+        g_free(exprs);
+    }
     uint64_t meta = 0;
     meta = PACK_0(meta, span);
     meta = PACK_1(meta, used_base);
@@ -641,12 +694,20 @@ static inline int model_strtol_like(CPUX86State* env, uintptr_t pc,
         span = 1;
     }
 
-    Expr** exprs = get_expr_addr((uintptr_t)nptr, span, 0, NULL);
+    bool exprs_allocated = false;
+    Expr** exprs = get_expr_addr_span((uintptr_t)nptr, span,
+                                      &exprs_allocated);
     if (!model_has_symbolic_bytes(exprs, span)) {
+        if (exprs_allocated) {
+            g_free(exprs);
+        }
         return mode;
     }
 
     Expr* input_expr = build_expr(exprs, (void*)nptr, span);
+    if (exprs_allocated) {
+        g_free(exprs);
+    }
     uint64_t meta = 0;
     uintptr_t end_off = 0;
     if (end_local != NULL) {

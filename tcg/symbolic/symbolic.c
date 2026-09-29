@@ -5516,19 +5516,28 @@ static Expr** get_expr_addr(uintptr_t addr, size_t size, uint8_t allocate,
 }
 
 /* Return a contiguous view of symbolic-byte metadata across the internal
- * 64-KiB pages used by s_memory.  Library models scan guest strings/ranges
- * whose start and length are not page-aligned; passing such a range directly
- * to get_expr_addr() used to assert when it crossed an internal page. */
-static Expr** get_expr_addr_span(uintptr_t addr, size_t size)
+ * 64-KiB pages used by s_memory.  A single-page range borrows its leaf;
+ * a crossing range sets `allocated` and returns a copy the caller must free.
+ * Library models scan guest strings/ranges whose start and length are not
+ * page-aligned; passing such a range directly to get_expr_addr() reads past
+ * one leaf in release builds. */
+static Expr** get_expr_addr_span(uintptr_t addr, size_t size, bool *allocated)
 {
-    if (size == 0) {
+    *allocated = false;
+    if (size == 0 || addr > UINTPTR_MAX - (size - 1)) {
         return NULL;
     }
 
-    Expr** span = g_new0(Expr*, size);
-    size_t copied = 0;
     const size_t page_size = (size_t)1 << L3_PAGE_BITS;
     const uintptr_t page_mask = (uintptr_t)(page_size - 1);
+    size_t page_offset = (size_t)(addr & page_mask);
+    if (size <= page_size - page_offset) {
+        return get_expr_addr(addr, size, 0, NULL);
+    }
+
+    Expr** span = g_new0(Expr*, size);
+    *allocated = true;
+    size_t copied = 0;
     while (copied < size) {
         uintptr_t current = addr + copied;
         size_t page_offset = (size_t)(current & page_mask);

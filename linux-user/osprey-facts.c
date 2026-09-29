@@ -491,6 +491,12 @@ static bool run_table_has_peer(const OspreySharedRun *run, int table,
 static int run_table_insert(OspreySharedRun *run, int table, const void *rec,
                             HashFn hash, VerifyFn eq, UpdateFn upd,
                             bool is_primary) {
+    /* Overflow rejects the complete sample.  Re-probing a saturated table
+     * cannot recover sound facts and turns every later access into an O(cap)
+     * scan, so preserve the first failure and fail fast. */
+    if (run->overflow) {
+        return -1;
+    }
     uint32_t cap = table_cap_of(run, table);
     uint32_t used = *table_used_ptr(run, table);
     if (cap == 0) {
@@ -758,8 +764,42 @@ typedef struct HeapInstance {
     bool live;
 } HeapInstance;
 
+typedef struct HeapIndexEntry {
+    target_ulong base;
+    uint64_t size;
+} HeapIndexEntry;
+
 static GArray *g_heap_instances = NULL; /* HeapInstance */
+/* Live instances only, ordered by base.  Values encode the stable GArray
+ * index plus one; keys own the interval used by address lookup. */
+static GTree *g_heap_index = NULL; /* HeapIndexEntry -> guint index + 1 */
 static uint64_t g_next_heap_instance = 1;
+
+static gint heap_index_compare(gconstpointer ap, gconstpointer bp,
+                               gpointer user_data) {
+    const HeapIndexEntry *a = ap;
+    const HeapIndexEntry *b = bp;
+    (void)user_data;
+    return a->base < b->base ? -1 : a->base > b->base ? 1 : 0;
+}
+
+static gint heap_index_search_addr(gconstpointer key, gconstpointer data) {
+    const HeapIndexEntry *entry = key;
+    target_ulong addr = *(const target_ulong *)data;
+    if (addr < entry->base) {
+        return -1;
+    }
+    if ((uint64_t)(addr - entry->base) >= entry->size) {
+        return 1;
+    }
+    return 0;
+}
+
+static void heap_index_ensure(void) {
+    if (g_heap_index == NULL) {
+        g_heap_index = g_tree_new_full(heap_index_compare, NULL, g_free, NULL);
+    }
+}
 
 /* Region-instance recorder (defined below with the allocation hooks;
  * used earlier by the image-global and stack-frame registration). */
@@ -797,16 +837,21 @@ static bool osprey_region_of_addr_inner(CPUArchState *env,
                                         OspreyRegionId *region,
                                         int64_t *offset, bool grow) {
     (void)env;
-    /* 1. Live heap instances. */
-    if (g_heap_instances != NULL) {
-        for (guint i = 0; i < g_heap_instances->len; i++) {
-            HeapInstance *h = &g_array_index(g_heap_instances, HeapInstance, i);
-            if (!h->live) continue;
-            if (addr >= h->base && (uint64_t)(addr - h->base) < h->size) {
-                *region = h->region;
-                *offset = (int64_t)(addr - h->base);
-                return true;
-            }
+    /* 1. Live heap instances.  Allocation history is append-only, but
+     * address resolution must scale with the live set rather than scan every
+     * retired generation for every guest access. */
+    if (g_heap_instances != NULL && g_heap_index != NULL) {
+        gpointer encoded = g_tree_search(g_heap_index,
+                                         heap_index_search_addr, &addr);
+        if (encoded != NULL) {
+            guint index = GPOINTER_TO_UINT(encoded) - 1;
+            g_assert(index < g_heap_instances->len);
+            HeapInstance *h = &g_array_index(g_heap_instances,
+                                             HeapInstance, index);
+            g_assert(h->live);
+            *region = h->region;
+            *offset = (int64_t)(addr - h->base);
+            return true;
         }
     }
     /* 2. Main-image global data. */
@@ -1562,6 +1607,30 @@ static void origin_invalidate_mem_range(OspreyCpuOriginState *st,
         g_hash_table_remove_all(st->mem_slots);
         return;
     }
+    guint live_slots = g_hash_table_size(st->mem_slots);
+    if (live_slots == 0) {
+        return;
+    }
+
+    /* Slots are fixed-width and aligned.  Ordinary guest stores overlap at
+     * most a few possible keys, so probe those keys directly instead of
+     * scanning an ever-growing pointer-shadow table on every write.  For a
+     * bulk overwrite wider than the live shadow, scanning the live entries
+     * remains cheaper and preserves the same exact overlap predicate. */
+    target_ulong first = addr & ~(target_ulong)(OSPREY_SHADOW_ALIGN - 1);
+    target_ulong final = last & ~(target_ulong)(OSPREY_SHADOW_ALIGN - 1);
+    uint64_t candidate_slots =
+        ((uint64_t)(final - first) / OSPREY_SHADOW_ALIGN) + 1;
+    if (candidate_slots <= live_slots) {
+        for (target_ulong slot = first;; slot += OSPREY_SHADOW_ALIGN) {
+            g_hash_table_remove(st->mem_slots, GSIZE_TO_POINTER(slot));
+            if (slot == final) {
+                break;
+            }
+        }
+        return;
+    }
+
     GHashTableIter it;
     gpointer key, value;
     g_hash_table_iter_init(&it, st->mem_slots);
@@ -2325,6 +2394,10 @@ void osprey_free_runtime_regions(void) {
         g_array_free(g_stack_frames, TRUE);
         g_stack_frames = NULL;
     }
+    if (g_heap_index != NULL) {
+        g_tree_destroy(g_heap_index);
+        g_heap_index = NULL;
+    }
     if (g_heap_instances != NULL) {
         g_array_free(g_heap_instances, TRUE);
         g_heap_instances = NULL;
@@ -2540,6 +2613,14 @@ void osprey_on_alloc_success(CPUArchState *env,
     if (g_heap_instances == NULL) {
         g_heap_instances = g_array_new(FALSE, FALSE, sizeof(HeapInstance));
     }
+    heap_index_ensure();
+    HeapIndexEntry probe = { .base = base, .size = 0 };
+    if (g_tree_lookup(g_heap_index, &probe) != NULL) {
+        if (g_shared_run != NULL) {
+            g_shared_run->bad_identity = 1;
+        }
+        return;
+    }
     /* A new instance even when the numeric base was reused. */
     HeapInstance h;
     memset(&h, 0, sizeof(h));
@@ -2553,6 +2634,11 @@ void osprey_on_alloc_success(CPUArchState *env,
     h.prov_generation = generation;
     h.live = true;
     g_array_append_val(g_heap_instances, h);
+    HeapIndexEntry *entry = g_new(HeapIndexEntry, 1);
+    entry->base = base;
+    entry->size = raw_size;
+    g_tree_insert(g_heap_index, entry,
+                  GUINT_TO_POINTER(g_heap_instances->len));
 
     record_region_instance(&h.region, h.instance_id, base,
                            raw_base, raw_base + raw_size,
@@ -2639,6 +2725,10 @@ static bool heap_retire_by_identity(uint64_t object_id, uint32_t generation) {
         if (h->live && h->prov_object_id == object_id &&
             h->prov_generation == generation) {
             h->live = false;
+            if (g_heap_index != NULL) {
+                HeapIndexEntry probe = { .base = h->base, .size = 0 };
+                g_tree_remove(g_heap_index, &probe);
+            }
             return true;
         }
     }
