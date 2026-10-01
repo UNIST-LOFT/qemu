@@ -57,9 +57,7 @@ extern uint64_t symbolic_start_code;
 extern uint64_t symbolic_end_code;
 
 static uint64_t binradar_entrypoint_hit_count   = 0;
-static uint64_t binradar_forkserver_target_hit_count = 1;
 static int      binradar_forkserver_enable      = -1;
-static int      binradar_preserve_child_queries = -1;
 static int      binradar_solver_mutation_mode   = -1;
 static int      binradar_forkserver_ctrl_r = -1;
 static int      binradar_forkserver_stat_w = -1;
@@ -297,8 +295,6 @@ void check_all_env_var(void) {
     check_env_var("BINRADAR_ENTRYPOINT");
     check_env_var("BINRADAR_FORKSERVER_CTRL_R");
     check_env_var("BINRADAR_FORKSERVER_STAT_W");
-    check_env_var("BINRADAR_FORKSERVER_TARGET_HIT_COUNT");
-    check_env_var("BINRADAR_PRESERVE_CHILD_QUERIES");
     check_env_var("BINRADAR_PROBE_FILE");
     check_env_var("BINRADAR_QUERY_WINDOW_FILE");
     check_env_var("BINRADAR_FORKSERVER_CHILD_TIMEOUT");
@@ -596,7 +592,6 @@ static void snapshot_load_binradar_env(void) {
     if (binradar_forkserver_enable != -1) return;
 
     binradar_forkserver_enable      = 1;
-    binradar_preserve_child_queries = 0;
     binradar_solver_mutation_mode = 0;
 
     const char* var = getenv("BINRADAR_FORKSERVER_ENABLE");
@@ -613,20 +608,6 @@ static void snapshot_load_binradar_env(void) {
         binradar_forkserver_stat_w = atoi(var);
     }
 
-    var = getenv("BINRADAR_FORKSERVER_TARGET_HIT_COUNT");
-    if (var) {
-        uint64_t target = strtoull(var, NULL, 10);
-        if (target == ULLONG_MAX) {
-            target = 0;
-        }
-        binradar_forkserver_target_hit_count = target;
-    }
-
-    var = getenv("BINRADAR_PRESERVE_CHILD_QUERIES");
-    if (var) {
-        binradar_preserve_child_queries = atoi(var) != 0;
-    }
-
     binradar_probe_file = getenv("BINRADAR_PROBE_FILE");
     if (binradar_probe_file && binradar_probe_file[0] == '\0') {
         binradar_probe_file = NULL;
@@ -641,8 +622,8 @@ static void snapshot_load_binradar_env(void) {
     if (var) {
         binradar_memcheck_enabled = atoi(var) != 0;
     }
-    log_msg("[snapshot-load-binradar] [forkserver %d] [hit-count %lu] [probe-file %s] [query-window-file %s] [memcheck %d]\n",
-              binradar_forkserver_enable, binradar_forkserver_target_hit_count,
+    log_msg("[snapshot-load-binradar] [forkserver %d] [probe-file %s] [query-window-file %s] [memcheck %d]\n",
+              binradar_forkserver_enable,
               binradar_probe_file ? binradar_probe_file : "null",
               binradar_query_window_file ? binradar_query_window_file : "null",
               binradar_memcheck_enabled);
@@ -678,13 +659,10 @@ uint8_t snapshot_on_entrypoint_hit(target_ulong pc) {
     snapshot_load_binradar_env();
     binradar_entrypoint_hit_count += 1;
 
-    log_msg("[snapshot] [entrypoint-hit] [pc %lx] [count %lu] [target %lu]\n",
-              pc, binradar_entrypoint_hit_count,
-              binradar_forkserver_target_hit_count);
+    log_msg("[snapshot] [entrypoint-hit] [pc %lx] [count %lu]\n",
+              pc, binradar_entrypoint_hit_count);
 
-    if (!binradar_forkserver_enable) return 0;
-    if (binradar_forkserver_target_hit_count == 0) return 0;
-    return binradar_entrypoint_hit_count == binradar_forkserver_target_hit_count;
+    return binradar_forkserver_enable && binradar_entrypoint_hit_count == 1;
 }
 
 static int use_trace = -1;
@@ -4507,6 +4485,15 @@ static void snapshot_prepare_mutation_epoch(void)
     epoch = ++next_snapshot_mutation_epoch;
     if (epoch == 0) epoch = ++next_snapshot_mutation_epoch;
     shared_trace_data->run_epoch = epoch;
+    /* The retained read lanes are per-representative observations, so their
+     * cursors restart here.  Each child records its own successful loads
+     * through a private ordered map and receives fresh lane indexes; leaving
+     * the cursors cumulative across representatives lets a long sweep exhaust
+     * the fixed arrays and then kills every later child inside the record
+     * writer (the over-cap guard in add_read_access_*), which discards whole
+     * attempts and trips the consecutive-bad-attempt failure limit. */
+    __atomic_store_n(&shared_trace_data->prim_idx, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&shared_trace_data->ptr_idx, 0, __ATOMIC_RELAXED);
     /* Access IDs describe lane-local events within one representative, not
      * a cumulative counter across siblings of the same attempt. */
     __atomic_store_n(&shared_trace_data->prim_access_cnt, 0,

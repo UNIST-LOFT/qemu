@@ -1148,16 +1148,22 @@ static void test_mutation_read_witness_identity(void)
           "stale representative epoch cannot match an event");
 
     /* A new representative clears shared and child-local witness state and
-     * restarts its lane event counters. */
+     * restarts its lane event counters and record cursors: cumulative
+     * cursors would exhaust the fixed lane arrays across a long sweep and
+     * kill later children in the over-cap guard. */
     snapshot_mutation_baseline = NULL;
     reset_shared_records();
     snapshot_mutation_baseline = &baseline;
     shared_trace_data->run_epoch = 105;
     snapshot_mutation_read_witness_arm(&plan);
     (void)record_access(env, cell, expected_value, 4, false);
+    shared_trace_data->prim_idx = 7;
+    shared_trace_data->ptr_idx = 3;
     snapshot_prepare_mutation_epoch();
     CHECK(!snapshot_child_read_witness_armed &&
           shared_trace_data->prim_access_cnt == 0 &&
+          shared_trace_data->prim_idx == 0 &&
+          shared_trace_data->ptr_idx == 0 &&
           __atomic_load_n(&shared_trace_data->mutation_read_witness.state,
                           __ATOMIC_ACQUIRE) ==
               SNAPSHOT_MUTATION_READ_WITNESS_UNKNOWN,
