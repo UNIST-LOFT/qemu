@@ -766,24 +766,8 @@ bool provenance_memcheck_site(target_ulong pc, ProvenanceFaultSite *site)
     return true;
 }
 
-bool provenance_memcheck_reference_pc(CPUArchState *env, target_ulong pc,
-                                      target_ulong *reference_pc)
-{
-    if (prov_main_pc(pc) && !is_in_e9_exclude_region(pc)) {
-        *reference_pc = pc;
-        return true;
-    }
-    ProvenanceFaultSite site;
-    if (provenance_memcheck_site(pc, &site)) {
-        *reference_pc = pc;
-        return true;
-    }
-    /* Unknown external code is not a whole-main-call identity. */
-    (void)env;
-    return false;
-}
-
-static bool prov_caller_reference_pc(CPUArchState *env, target_ulong *reference_pc)
+static bool prov_caller_reference_pc(CPUArchState *env, target_ulong *reference_pc,
+                                     bool main_only)
 {
     if (env == NULL) return false;
     PtrRegShadow *shadow = provenance_get_reg_shadow(env);
@@ -797,13 +781,37 @@ static bool prov_caller_reference_pc(CPUArchState *env, target_ulong *reference_
            env->regs[R_ESP] > shadow->external_calls[shadow->external_call_count - 1].entry_sp) {
         shadow->external_call_count--;
     }
-    if (!shadow->external_call_count) return false;
-    unsigned index = shadow->external_call_count - 1;
-    target_ulong saved_return;
-    if (!access_ok(VERIFY_READ, shadow->external_calls[index].entry_sp, sizeof(saved_return))) return false;
-    memcpy(&saved_return, g2h(shadow->external_calls[index].entry_sp), sizeof(saved_return));
-    if (saved_return != shadow->external_calls[index].return_pc) return false;
-    *reference_pc = saved_return;
+    for (unsigned count = shadow->external_call_count; count > 0; count--) {
+        unsigned index = count - 1;
+        target_ulong saved_return;
+        if (!access_ok(VERIFY_READ, shadow->external_calls[index].entry_sp,
+                       sizeof(saved_return))) return false;
+        memcpy(&saved_return, g2h(shadow->external_calls[index].entry_sp),
+               sizeof(saved_return));
+        if (saved_return != shadow->external_calls[index].return_pc) return false;
+        if (!provenance_memcheck_pc_eligible(saved_return)) return false;
+        if (main_only && !prov_main_pc(saved_return)) continue;
+        *reference_pc = saved_return;
+        return true;
+    }
+    return false;
+}
+
+bool provenance_memcheck_reference_pc(CPUArchState *env, target_ulong pc,
+                                      target_ulong *reference_pc)
+{
+    ProvenanceFaultSite site;
+    /* Do not turn an unknown jump target or E9 trampoline into a guessed
+     * caller fault. Only verified instruction sites can be attributed. */
+    if (!provenance_memcheck_site(pc, &site)) return false;
+    if (site.valid && prov_caller_reference_pc(env, reference_pc, true)) {
+        /* Match AFL's innermost main frame, including its return-PC
+         * convention. Capture now, not when a deferred finding finalizes. */
+        return true;
+    }
+    /* Main instructions identify themselves. With no validated main frame,
+     * retain the verified DSO site rather than inventing a main identity. */
+    *reference_pc = pc;
     return true;
 }
 
@@ -860,10 +868,10 @@ static bool prov_syscall_read_pc(CPUArchState *env, target_ulong *out)
 {
     if (!binradar_memcheck_enabled) return false;
     target_ulong pc = provenance_get_reg_shadow(env)->syscall_pc;
-    /* Runtime wrappers summarize a logical caller access; ordinary DSO
-     * instructions remain identified by their own verified image site. */
+    /* Runtime wrappers check the nearest eligible caller's logical access.
+     * Fault publication separately resolves its outer main-image identity. */
     if (!provenance_memcheck_pc_eligible(pc)) {
-        if (!prov_caller_reference_pc(env, &pc)) return false;
+        if (!prov_caller_reference_pc(env, &pc, false)) return false;
     }
     *out = pc;
     return true;

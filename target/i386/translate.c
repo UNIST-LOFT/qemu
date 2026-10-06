@@ -6131,6 +6131,10 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
             }
 #endif
 #endif
+            if (sem_events_active() &&
+                is_e9_relocated_call(pc_start - s->cs_base, NULL, NULL)) {
+                gen_sem_call(s->T0);
+            }
             gen_op_jmp_v(s->T0);
             gen_bnd_jmp(s);
             gen_jr(s, s->T0);

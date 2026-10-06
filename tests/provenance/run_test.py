@@ -580,23 +580,43 @@ for case, suffix in enumerate(("overflow", "badfd", "zero", "unmapped",
                           "syscall_input_pc") if overflow else None,
         fault_reference=dict(valid="true", source="provenance-access") if overflow else None))
 
-for suffix in (".orig", ".brpatched", ".brcached"):
-    TESTS.append(dict(
-        name="t85_library_coverage" + suffix, guest="t85_library_coverage",
-        mode="mem", rc=(0,), verdict="crash", artifact_suffix=suffix,
-        plt_source_suffix=".orig",
-        finding=dict(reason="heap-buffer-overflow", is_uaf=0,
-                     fields={"size": 8, "offset": 4, "width": 8}),
-        site_binary="libcoverage.so", site_symbol="coverage_access_pc",
-        fault_reference=dict(valid="true", source="provenance-access")))
-TESTS.append(dict(name="t85_library_coverage_benign", guest="t85_library_coverage",
-                  args=["benign"], mode="mem", rc=(0,), verdict="normal", finding=None))
-TESTS.append(dict(name="t85_library_coverage_symbolic", guest="t85_library_coverage",
-                  mode="sym", rc=(0,), verdict="crash",
-                  finding=dict(reason="heap-buffer-overflow", is_uaf=0,
-                               fields={"size": 8, "offset": 4, "width": 8}),
-                  site_binary="libcoverage.so", site_symbol="coverage_access_pc",
-                  fault_reference=dict(valid="true", source="provenance-access")))
+for mode in ("mem", "sym"):
+    for suffix in (".orig", ".brpatched", ".brcached"):
+        for case, return_symbol in (
+                ("direct", "library_call_return"),
+                ("nested", "library_nested_return"),
+                ("relocated", "library_relocated_return"),
+                ("callback", "library_callback_return"),
+                ("signal", "library_signal_return"),
+                ("no_caller", None), ("no_caller_signal", None)):
+            # Artifact aliases are covered by direct calls; the remaining
+            # cases exercise distinct call-stack behavior in both modes.
+            if suffix != ".orig" and (mode != "mem" or case != "direct"):
+                continue
+            signal = case in ("signal", "no_caller_signal")
+            spec = dict(
+                name="t85_library_coverage_" + case + "_" + mode + suffix,
+                guest=("t85_library_coverage_" + case if return_symbol is None
+                       else "t85_library_coverage"), args=[case], mode=mode,
+                rc=(-11, 139) if signal else (65,) if case == "no_caller" else (0,),
+                verdict="crash", artifact_suffix=suffix, plt_source_suffix=".orig",
+                finding=None if signal else dict(
+                    reason="heap-buffer-overflow", is_uaf=0,
+                    fields={"size": 8, "offset": 4, "width": 8}),
+                actual_pc_fixture=True, relocated_call=(case == "relocated"),
+                fault_reference=dict(valid="true", source=(
+                    "guest-signal" if signal else "provenance-access")))
+            if return_symbol:
+                spec["reference_pc_symbol"] = return_symbol
+                if not signal:
+                    spec["access_pc_symbol"] = return_symbol
+            else:
+                spec.update(site_binary="libcoverage.so", site_symbol=(
+                    "coverage_signal_pc" if signal else "coverage_access_pc"))
+            TESTS.append(spec)
+    TESTS.append(dict(name="t85_library_coverage_benign_" + mode,
+                      guest="t85_library_coverage", args=["benign"], mode=mode,
+                      rc=(0,), verdict="normal", finding=None))
 
 # ---------------------------------------------------------------------------
 # Log parsing
@@ -722,12 +742,13 @@ def run_tracer(cmd, env, timeout):
     return subprocess.run(cmd, env=env, capture_output=True, timeout=timeout)
 
 
-def run_memcheck(test, guest, qemu, workdir):
-    env = dict(os.environ)
-    env.update(BASE_ENV)
-    env["BINRADAR_PROBE_FILE"] = test.get("probe_file", "")
-    env["BINRADAR_ENTRYPOINT"] = resolve_entrypoint(guest)
+def prepare_artifact(test, guest, env):
     env["PLT_INFO_FILE"] = guest + ".plt"
+    if test.get("relocated_call"):
+        symbols = resolve_symbols(guest, {"library_relocated_jump", "library_relocated_return"})
+        jump = symbols["library_relocated_jump"]
+        ret = symbols["library_relocated_return"]
+        env["E9_RELOCATED_CALL_JUMPS"] = f"{jump:x}:{jump:x}:{ret:x}"
     source_suffix = test.get("plt_source_suffix")
     if source_suffix:
         source = guest + source_suffix
@@ -755,6 +776,15 @@ def run_memcheck(test, guest, qemu, workdir):
         shutil.copyfile(guest, temporary)
         os.chmod(temporary, 0o755)
         os.replace(temporary, binary)
+    return binary
+
+
+def run_memcheck(test, guest, qemu, workdir):
+    env = dict(os.environ)
+    env.update(BASE_ENV)
+    env["BINRADAR_PROBE_FILE"] = test.get("probe_file", "")
+    env["BINRADAR_ENTRYPOINT"] = resolve_entrypoint(guest)
+    binary = prepare_artifact(test, guest, env)
     cmd = [qemu, "-d", "page", binary, *test.get("args", [])]
     return run_tracer(cmd, env, test.get("timeout", 30))
 
@@ -777,9 +807,9 @@ def run_symbolic(test, guest, qemu, workdir):
     env.update(BASE_ENV)
     env["BINRADAR_PROBE_FILE"] = test.get("probe_file", "")
     env["BINRADAR_ENTRYPOINT"] = resolve_entrypoint(guest)
-    env["PLT_INFO_FILE"] = guest + ".plt"
+    binary = prepare_artifact(test, guest, env)
     prepare_symbolic_env(env, run_dir)
-    cmd = [qemu, "-symbolic", guest, *test.get("args", [])]
+    cmd = [qemu, "-symbolic", binary, *test.get("args", [])]
     return run_tracer(cmd, env, test.get("timeout", 30))
 
 
@@ -1001,6 +1031,9 @@ def run_test(test, guests_dir, workdir, qemu):
         test["_symbols"] = resolve_symbols(guest, sym_names)
     if test.get("access_pc_symbol"):
         test["_access_pc"] = resolve_symbols(guest, {test["access_pc_symbol"]})[test["access_pc_symbol"]]
+    if test.get("reference_pc_symbol"):
+        symbol = test["reference_pc_symbol"]
+        test["_reference_pc"] = resolve_symbols(guest, {symbol})[symbol]
     if test.get("site_binary"):
         image = os.path.join(workdir, test["site_binary"])
         with open(image, "rb") as stream:
@@ -1044,6 +1077,38 @@ def check(test, rc, fs_status, out, evidence=None, probe_text="",
                                  reference["image_offset"] != test["_site_offset"]
                                  for reference in references):
             problems.append("DSO fault identity does not match independent ELF digest/instruction")
+    if test.get("reference_pc_symbol"):
+        references = parse_fault_references(out)
+        if not references or any(reference["address"] != test["_reference_pc"] or
+                                 reference["image"] is not None or
+                                 reference["image_offset"] != 0
+                                 for reference in references):
+            problems.append("fault identity does not match independently labeled main return PC")
+    if test.get("actual_pc_fixture"):
+        fixture = re.findall(
+            r"^\[fixture\] \[actual_pc ([0-9a-f]+)\] \[inner_return ([0-9a-f]+)\]$",
+            out, re.MULTILINE)
+        if len(fixture) != 1:
+            problems.append("missing independent DSO runtime instruction labels")
+        else:
+            actual_pc, inner_return = (int(pc, 16) for pc in fixture[0])
+            references = parse_fault_references(out)
+            if test.get("reference_pc_symbol") and any(
+                    reference["address"] in (actual_pc, inner_return)
+                    for reference in references):
+                problems.append("DSO instruction/inner return displaced live main caller")
+            if test["fault_reference"]["source"] == "guest-signal":
+                observed = [int(pc, 16) for pc in re.findall(
+                    r"^\[snapshot\] \[crash\].*\[guest_pc ([0-9a-fA-F]+)\]",
+                    out, re.MULTILINE)]
+            else:
+                observed = [int(finding.get("actual_pc", "0"), 16)
+                            for finding in parse_findings(out)]
+            if not observed or any(pc != actual_pc for pc in observed):
+                problems.append("actual fault PC does not match independently labeled DSO instruction")
+            if test.get("site_binary") and any(
+                    reference["address"] != actual_pc for reference in references):
+                problems.append("no-main-caller fallback lost actual DSO instruction")
     if not rc_ok(rc, test.get("rc", (0,))):
         problems.append(f"rc={rc} not in {test.get('rc')}")
     meta = test.get("meta")
@@ -1197,8 +1262,10 @@ def check(test, rc, fs_status, out, evidence=None, probe_text="",
             signal_pcs = [int(pc, 16) for pc in re.findall(
                 r"^\[snapshot\] \[crash\].*\[guest_pc ([0-9a-fA-F]+)\]",
                 out, re.MULTILINE)]
-            if addresses != signal_pcs:
-                problems.append("fault reference does not identify signal guest PC")
+            expected_pcs = ([test["_reference_pc"]] * len(signal_pcs)
+                            if test.get("reference_pc_symbol") else signal_pcs)
+            if not signal_pcs or addresses != expected_pcs:
+                problems.append("fault reference does not identify expected signal attribution PC")
             if finding_pcs and addresses == finding_pcs:
                 problems.append("signal fixture did not distinguish deferred access PC")
         rows = [line for line in out.splitlines() if line.startswith((

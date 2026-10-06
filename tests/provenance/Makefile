@@ -64,8 +64,19 @@ $(WORK)/t83_final_discarded_plan: $(GUESTS)/t82_unusable_attempt_recovery.c | $(
 $(WORK)/libcoverage.so: $(GUESTS)/coverage-library.S | $(WORK)
 	$(CC) -shared -fPIC -o $@ $<
 
-$(WORK)/t85_library_coverage: $(GUESTS)/t85_library_coverage.c $(WORK)/libcoverage.so
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $< -L$(WORK) -lcoverage -Wl,-rpath,'$$ORIGIN'
+$(WORK)/libcoverage-outer.so: $(GUESTS)/coverage-outer.S $(WORK)/libcoverage.so
+	$(CC) -shared -fPIC -o $@ $< -L$(WORK) -lcoverage -Wl,-rpath,'$$ORIGIN'
+
+$(WORK)/t85_library_coverage: $(GUESTS)/t85_library_coverage.c $(WORK)/libcoverage.so $(WORK)/libcoverage-outer.so
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $< -L$(WORK) -lcoverage-outer -lcoverage -Wl,-rpath,'$$ORIGIN'
+
+TESTS += t85_library_coverage_no_caller t85_library_coverage_no_caller_signal
+
+$(WORK)/t85_library_coverage_no_caller: $(GUESTS)/t85_library_coverage.c $(WORK)/libcoverage.so $(WORK)/libcoverage-outer.so
+	$(CC) $(CFLAGS) $(LDFLAGS) -nostartfiles -Wl,-e,coverage_start_entry -DCOVERAGE_STANDALONE_ENTRY=1 -o $@ $< -L$(WORK) -lcoverage-outer -lcoverage -Wl,-rpath,'$$ORIGIN'
+
+$(WORK)/t85_library_coverage_no_caller_signal: $(GUESTS)/t85_library_coverage.c $(WORK)/libcoverage.so $(WORK)/libcoverage-outer.so
+	$(CC) $(CFLAGS) $(LDFLAGS) -nostartfiles -Wl,-e,coverage_start_entry -DCOVERAGE_STANDALONE_ENTRY=2 -o $@ $< -L$(WORK) -lcoverage-outer -lcoverage -Wl,-rpath,'$$ORIGIN'
 
 GUEST_BINS := $(addprefix $(WORK)/,$(TESTS))
 PLT_FILES  := $(addprefix $(WORK)/,$(addsuffix .plt,$(TESTS)))

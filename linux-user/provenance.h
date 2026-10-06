@@ -256,7 +256,7 @@ PtrTag provenance_mem_load_tag(target_ulong addr);
 void provenance_mem_invalidate(target_ulong addr, target_ulong size);
 
 /* ---- Access checking ---- */
-#define BINRADAR_MEMCHECK_POLICY "coverage-v1"
+#define BINRADAR_MEMCHECK_POLICY "coverage-v2"
 
 /* File-backed runtime mappings (libc/loader) use logical summaries rather
  * than application-object checks on implementation overfetch/metadata. */
@@ -266,6 +266,9 @@ bool provenance_memcheck_site(target_ulong pc, ProvenanceFaultSite *site);
 void provenance_memcheck_unmap(target_ulong addr, target_ulong size);
 void provenance_memcheck_protect(target_ulong addr, target_ulong size, int prot);
 bool provenance_memcheck_pc_eligible(target_ulong pc);
+/* Main instruction, or innermost validated main return for a verified DSO
+ * instruction. With no main boundary, retain the verified DSO instruction;
+ * unknown/E9 PCs fail. Resolve while the fault-time call stack is live. */
 bool provenance_memcheck_reference_pc(CPUArchState *env, target_ulong pc,
                                       target_ulong *reference_pc);
 void provenance_memcheck_call(CPUArchState *env, target_ulong callee_pc,
