@@ -19,6 +19,10 @@
 #include "qemu/osdep.h"
 
 #include "qemu.h"
+#include "../tcg/symbolic/symbolic-instrumentation.h"
+#ifdef SYMBOLIC_INSTRUMENTATION
+#include "provenance.h"
+#endif
 
 //#define DEBUG_MMAP
 
@@ -124,6 +128,9 @@ int target_mprotect(abi_ulong start, abi_ulong len, int prot)
             goto error;
     }
     page_set_flags(start, start + len, prot | PAGE_VALID);
+#ifdef SYMBOLIC_INSTRUMENTATION
+    provenance_memcheck_protect(start, len, prot);
+#endif
     mmap_unlock();
     return 0;
 error:
@@ -569,6 +576,9 @@ abi_long target_mmap(abi_ulong start, abi_ulong len, int prot,
  the_end1:
     page_set_flags(start, start + len, prot | PAGE_VALID);
  the_end:
+#ifdef SYMBOLIC_INSTRUMENTATION
+    provenance_memcheck_mapping(start, len, fd, offset);
+#endif
 #ifdef DEBUG_MMAP
     printf("ret=0x" TARGET_ABI_FMT_lx "\n", start);
     page_dump(stdout);
@@ -680,6 +690,9 @@ int target_munmap(abi_ulong start, abi_ulong len)
     }
 
     if (ret == 0) {
+#ifdef SYMBOLIC_INSTRUMENTATION
+        provenance_memcheck_unmap(start, len);
+#endif
         page_set_flags(start, start + len, 0);
         tb_invalidate_phys_range(start, start + len);
     }

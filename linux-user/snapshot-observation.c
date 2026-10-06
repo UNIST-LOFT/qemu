@@ -16,17 +16,45 @@ const char *snapshot_fault_reference_source_name(
 
 void snapshot_exit_info_set_fault_reference(
     SnapshotExitInfo *info, SnapshotFaultReferenceSource source,
-    target_ulong address)
+    target_ulong address, const ProvenanceFaultSite *site)
 {
     bool valid = source == SNAPSHOT_FAULT_REFERENCE_GUEST_SIGNAL ||
                  source == SNAPSHOT_FAULT_REFERENCE_PROVENANCE_ACCESS;
     if (info == NULL) return;
-    info->fault_reference_valid = valid;
+    info->fault_site = valid && site != NULL
+        ? *site : (ProvenanceFaultSite){0};
     info->fault_reference_source = valid
         ? source : SNAPSHOT_FAULT_REFERENCE_UNAVAILABLE;
     /* A zero address is meaningful only for an explicitly valid reference.
      * Unavailable observations use zero as their stable placeholder. */
     info->fault_addr = valid ? address : 0;
+    info->fault_reference_valid = valid;
+}
+
+bool snapshot_fault_reference_equal(uint64_t left_address,
+                                    const ProvenanceFaultSite *left,
+                                    uint64_t right_address,
+                                    const ProvenanceFaultSite *right)
+{
+    if (left->valid != right->valid) return false;
+    if (!left->valid) return left_address == right_address;
+    return left->image_offset == right->image_offset &&
+        memcmp(left->image_id, right->image_id, sizeof(left->image_id)) == 0;
+}
+
+void snapshot_fault_site_image_text(const ProvenanceFaultSite *site,
+                                    char text[65])
+{
+    static const char hex[] = "0123456789abcdef";
+    if (!site->valid) {
+        memcpy(text, "none", 5);
+        return;
+    }
+    for (size_t i = 0; i < sizeof(site->image_id); i++) {
+        text[i * 2] = hex[site->image_id[i] >> 4];
+        text[i * 2 + 1] = hex[site->image_id[i] & 15];
+    }
+    text[64] = '\0';
 }
 
 static int snapshot_observation_compare_primitive(const void *a, const void *b)

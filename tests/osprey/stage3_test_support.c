@@ -12,6 +12,13 @@
 #include "tcg/symbolic/symbolic-struct.h"
 
 unsigned long guest_base = 0;
+unsigned long reserved_va = 0;
+int page_get_flags(target_ulong address) { (void)address; return 0; }
+int page_check_range(target_ulong address, target_ulong length, int flags) {
+    (void)address; (void)flags;
+    return length == 0 ? 0 : -1;
+}
+bool is_in_e9_exclude_region(target_ulong pc) { (void)pc; return false; }
 int binradar_memcheck_enabled = 0;
 uint64_t symbolic_start_code = 0;
 uint64_t symbolic_end_code = 0;

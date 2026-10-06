@@ -24,6 +24,7 @@
 #include <poll.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <inttypes.h>
 #include <limits.h>
 
 #define SNAPSHOT_BT_DEPTH 64
@@ -301,6 +302,7 @@ void check_all_env_var(void) {
     check_env_var("BINRADAR_FORKSERVER_ITERATION_TIMEOUT");
     // Memcheck related
     check_env_var("BINRADAR_MEMCHECK_ENABLE");
+    check_env_var("BINRADAR_MEMCHECK_POLICY");
     // Patch related
     check_env_var("BINRADAR_PATCH_FD_R");
     check_env_var("PATCH_FD"); // Used by brpatch
@@ -477,6 +479,9 @@ void snapshot_init_binradar_patch_shm(uintptr_t key) {
             const char *valid_text = getenv("BINRADAR_POC_FAULT_VALID");
             const char *source_text = getenv("BINRADAR_POC_FAULT_SOURCE");
             const char *fault_text = getenv("BINRADAR_POC_FAULT_ADDR");
+            const char *image_text = getenv("BINRADAR_POC_FAULT_IMAGE");
+            const char *offset_text = getenv("BINRADAR_POC_FAULT_IMAGE_OFFSET");
+            ProvenanceFaultSite site = {0};
             char *end = NULL;
             unsigned long long fault = 0;
             bool valid;
@@ -514,6 +519,39 @@ void snapshot_init_binradar_patch_shm(uintptr_t key) {
                     exit_with_status(1);
                 }
             }
+            /* Offset is mandatory in the current live contract, even when
+             * zero for main/unavailable identities. Do not accept old numeric
+             * configuration as a potentially missing DSO identity. */
+            errno = 0;
+            unsigned long long offset = strtoull(
+                offset_text != NULL ? offset_text : "", &end, 0);
+            if (offset_text == NULL || offset_text[0] < '0' ||
+                offset_text[0] > '9' || errno != 0 ||
+                end == offset_text || *end != '\0') {
+                log_msg("[binradar] [feedback] [error fault-site-configuration]\n");
+                exit_with_status(1);
+            }
+            if (image_text != NULL) {
+                if (!valid || strlen(image_text) != 64) {
+                    log_msg("[binradar] [feedback] [error fault-site-configuration]\n");
+                    exit_with_status(1);
+                }
+                for (size_t i = 0; i < 64; i++) {
+                    char c = image_text[i];
+                    if (!((c >= '0' && c <= '9') ||
+                          (c >= 'a' && c <= 'f'))) {
+                        log_msg("[binradar] [feedback] [error fault-site-configuration]\n");
+                        exit_with_status(1);
+                    }
+                    uint8_t nibble = c <= '9' ? c - '0' : c - 'a' + 10;
+                    site.image_id[i / 2] |= nibble << (i % 2 == 0 ? 4 : 0);
+                }
+                site.valid = true;
+                site.image_offset = offset;
+            } else if (offset != 0) {
+                log_msg("[binradar] [feedback] [error fault-site-configuration]\n");
+                exit_with_status(1);
+            }
             binradar_manager->feedback_dir = g_strdup(feedback_dir);
             binradar_manager->feedback_staged_pairs =
                 g_ptr_array_new_with_free_func(g_free);
@@ -535,9 +573,10 @@ void snapshot_init_binradar_patch_shm(uintptr_t key) {
                 rmdir(stale);
             }
             g_free(stale);
-            binradar_manager->poc_fault_valid = valid;
             binradar_manager->poc_fault_source = source;
             binradar_manager->poc_fault_addr = (target_ulong)fault;
+            binradar_manager->poc_fault_site = site;
+            binradar_manager->poc_fault_valid = valid;
             log_msg("[binradar] [feedback] [enabled] [dir %s] "
                     "[poc-fault-valid %s] [poc-fault-source %s] "
                     "[poc-fault-addr %lx]\n", feedback_dir,
@@ -621,6 +660,14 @@ static void snapshot_load_binradar_env(void) {
     var = getenv("BINRADAR_MEMCHECK_ENABLE");
     if (var) {
         binradar_memcheck_enabled = atoi(var) != 0;
+    }
+    var = getenv("BINRADAR_MEMCHECK_POLICY");
+    if (binradar_memcheck_enabled) {
+        if (var != NULL && strcmp(var, BINRADAR_MEMCHECK_POLICY) != 0) {
+            log_msg("[memcheck] [invalid-policy %s]\n", var);
+            exit_with_status(1);
+        }
+        log_msg("[memcheck] [policy %s]\n", BINRADAR_MEMCHECK_POLICY);
     }
     log_msg("[snapshot-load-binradar] [forkserver %d] [probe-file %s] [query-window-file %s] [memcheck %d]\n",
               binradar_forkserver_enable,
@@ -939,10 +986,14 @@ static void snapshot_emit_fault_reference(const SnapshotExitInfo *info)
              SNAPSHOT_FAULT_REFERENCE_PROVENANCE_ACCESS);
     source = valid ? snapshot_fault_reference_source_name(
         info->fault_reference_source) : "unavailable";
-    log_msg("[snapshot] [fault-reference] [version 2] [valid %s] "
-            "[source %s] [address %lx]\n",
+    char image[65];
+    ProvenanceFaultSite site = valid ? info->fault_site : (ProvenanceFaultSite){0};
+    snapshot_fault_site_image_text(&site, image);
+    log_msg("[snapshot] [fault-reference] [version 3] [valid %s] "
+            "[source %s] [address %lx] [image %s] [image-offset %" PRIx64 "]\n",
             valid ? "true" : "false", source,
-            valid ? info->fault_addr : 0ul);
+            valid ? info->fault_addr : 0ul, image,
+            site.valid ? site.image_offset : 0);
 
     if (binradar_probe_file != NULL) {
         FILE *fp = fopen(binradar_probe_file, "a");
@@ -950,10 +1001,12 @@ static void snapshot_emit_fault_reference(const SnapshotExitInfo *info)
             fprintf(stderr, "Failed to open binradar probe file: %s\n",
                     binradar_probe_file);
         } else {
-            fprintf(fp, "[snapshot] [fault-reference] [version 2] "
-                    "[valid %s] [source %s] [address %lx]\n",
+            fprintf(fp, "[snapshot] [fault-reference] [version 3] "
+                    "[valid %s] [source %s] [address %lx] "
+                    "[image %s] [image-offset %" PRIx64 "]\n",
                     valid ? "true" : "false", source,
-                    valid ? info->fault_addr : 0ul);
+                    valid ? info->fault_addr : 0ul, image,
+                    site.valid ? site.image_offset : 0);
             fclose(fp);
         }
     }
@@ -1002,7 +1055,8 @@ static void snapshot_emit_crash_rows(const SnapshotExitInfo *info)
 static void snapshot_record_guest_crash_with_reference(
     CPUArchState *cpu_env, int target_signal, int host_signal, int si_code,
     uintptr_t host_fault_addr, const char *reason,
-    SnapshotFaultReferenceSource reference_source, target_ulong reference_addr)
+    SnapshotFaultReferenceSource reference_source, target_ulong reference_addr,
+    const ProvenanceFaultSite *reference_site)
 {
     SnapshotExitInfo *info;
 
@@ -1017,11 +1071,19 @@ static void snapshot_record_guest_crash_with_reference(
     info->exit_code = (host_signal > 0) ? (128 + host_signal) : -target_signal;
     info->host_fault_addr = host_fault_addr;
     snapshot_exit_info_capture(info, cpu_env);
+    ProvenanceFaultSite resolved_site = {0};
     if (reference_source == SNAPSHOT_FAULT_REFERENCE_GUEST_SIGNAL) {
         reference_addr = info->guest_pc;
+        reference_site = &resolved_site;
+        if (reference_addr != 0 &&
+            !provenance_memcheck_site(reference_addr, &resolved_site)) {
+            reference_source = SNAPSHOT_FAULT_REFERENCE_UNAVAILABLE;
+        }
     }
+    /* Published provenance findings have already resolved their identity;
+     * site.valid=false there is a proven main reference, including PC zero. */
     snapshot_exit_info_set_fault_reference(info, reference_source,
-                                           reference_addr);
+                                           reference_addr, reference_site);
     char buffer[SNAPSHOT_EXIT_DESC_LEN];
     const char *base = reason ? reason : "unhandled signal";
     const char *host_name = (host_signal > 0) ? strsignal(host_signal) : NULL;
@@ -1033,7 +1095,7 @@ static void snapshot_record_guest_crash_with_reference(
                    base, host_signal, target_signal);
     }
     snapshot_exit_info_set_reason(info, buffer);
-    info->valid = 1;
+    __atomic_store_n(&info->valid, 1, __ATOMIC_RELEASE);
     snapshot_emit_crash_rows(info);
 }
 
@@ -1063,7 +1125,7 @@ void snapshot_record_guest_normal_exit(CPUArchState *cpu_env, int exit_code, con
         snapshot_record_guest_crash_with_reference(
             cpu_env, TARGET_SIGSEGV, 0, SEGV_ACCERR, 0, pf_reason,
             SNAPSHOT_FAULT_REFERENCE_PROVENANCE_ACCESS,
-            fault.payload.access_pc);
+            fault.payload.access_pc, &fault.payload.site);
         return;
 	}
 
@@ -1074,9 +1136,9 @@ void snapshot_record_guest_normal_exit(CPUArchState *cpu_env, int exit_code, con
     info->exit_code = exit_code;
     snapshot_exit_info_capture(info, cpu_env);
     snapshot_exit_info_set_fault_reference(
-        info, SNAPSHOT_FAULT_REFERENCE_UNAVAILABLE, 0);
+        info, SNAPSHOT_FAULT_REFERENCE_UNAVAILABLE, 0, NULL);
     snapshot_exit_info_set_reason(info, reason ? reason : "normal_exit");
-    info->valid = 1;
+    __atomic_store_n(&info->valid, 1, __ATOMIC_RELEASE);
 	log_msg("[snapshot] [exit] [normal] [entrypoint-hit %lu]\n",
 	        binradar_entrypoint_hit_count);
 	snapshot_log_cursor_indices(info);
@@ -1101,7 +1163,7 @@ void snapshot_record_guest_crash(CPUArchState *cpu_env, int target_signal,
         cpu_env, target_signal, host_signal, si_code, host_fault_addr, reason,
         target_signal > 0 ? SNAPSHOT_FAULT_REFERENCE_GUEST_SIGNAL
                           : SNAPSHOT_FAULT_REFERENCE_UNAVAILABLE,
-        0);
+        0, NULL);
 }
 
 static bool reserve_read_access_index(uint32_t *counter, uint32_t capacity,
@@ -2146,9 +2208,7 @@ MemcheckResult snapshot_memcheck_access(target_ulong addr, target_ulong size) {
  * terminate execution itself.  The finding is finalized at guest exit. */
 void snapshot_memcheck_helper(target_ulong addr, target_ulong size, target_ulong pc) {
     if (!binradar_memcheck_enabled) return;
-    if (symbolic_start_code > 0 && (pc < symbolic_start_code || pc >= symbolic_end_code)) {
-        return;
-    }
+    if (!provenance_memcheck_pc_eligible(pc)) return;
     CPUState *cpu = thread_cpu;
     CPUArchState *env = cpu ? cpu->env_ptr : NULL;
     if (!env) return;
@@ -4546,7 +4606,7 @@ static bool report_shared_prov_finding(void *opaque, uint32_t *status_out) {
         info->guest_cs_base = 0;
         snapshot_exit_info_set_fault_reference(
             info, SNAPSHOT_FAULT_REFERENCE_PROVENANCE_ACCESS,
-            f->access_pc);
+            f->access_pc, &f->site);
         info->host_fault_addr = 0;
         info->guest_last_translation_block = last_translation_block;
         info->query_cursor = (fault.finding_query_idx >= 0 &&
@@ -4565,7 +4625,7 @@ static bool report_shared_prov_finding(void *opaque, uint32_t *status_out) {
         g_strlcpy(info->description,
                   pf_reason ? pf_reason : "memcheck: provenance finding",
                   SNAPSHOT_EXIT_DESC_LEN);
-        info->valid = 1;
+        __atomic_store_n(&info->valid, 1, __ATOMIC_RELEASE);
         snapshot_emit_crash_rows(info);
     }
     return true;
@@ -4664,6 +4724,8 @@ static void snapshot_plan_attempt_log(
     char patch_site[8] = "unknown";
     char fault_valid[8] = "unknown";
     char fault_addr[2 + sizeof(target_ulong) * 2 + 1] = "unknown";
+    char fault_image[65] = "unknown";
+    char fault_image_offset[17] = "unknown";
     const char *patch_exit = "unusable";
     const char *fault_source = "unknown";
     const char *retained = "unknown";
@@ -4715,10 +4777,13 @@ static void snapshot_plan_attempt_log(
         if (info->fault_reference_valid) {
             g_snprintf(fault_addr, sizeof(fault_addr), "%lx",
                        (unsigned long)info->fault_addr);
+            snapshot_fault_site_image_text(&info->fault_site, fault_image);
+            g_snprintf(fault_image_offset, sizeof(fault_image_offset), "%llx",
+                       (unsigned long long)info->fault_site.image_offset);
         }
     }
     committed = diagnostic->committed ? "true" : "false";
-    log_msg("[binradar] [plan-attempt] [version 1] [epoch %s] "
+    log_msg("[binradar] [plan-attempt] [version 2] [epoch %s] "
             "[attempt %s] [advisor-id %s] [family-id %s] "
             "[source-ordinal %s] [source-kind %s] "
             "[seed-semantics %s] [source-retained %s] "
@@ -4726,11 +4791,13 @@ static void snapshot_plan_attempt_log(
             "[patch0-read-witness %s] [patch0-site %s] "
             "[patch0-exit %s] [patch0-fault-valid %s] "
             "[patch0-fault-source %s] [patch0-fault-addr %s] "
+            "[patch0-fault-image %s] [patch0-fault-image-offset %s] "
             "[attempt-result %s] [committed %s]\n",
             epoch, attempt_text, advisor_id, family_id, source_ordinal,
             source_kind, seed_semantics, retained, write_count, applied,
             snapshot_plan_attempt_read_witness_name(diagnostic), patch_site,
             patch_exit, fault_valid, fault_source, fault_addr,
+            fault_image, fault_image_offset,
             binradar_forkserver_attempt_result_name((uint32_t)attempt_result),
             committed);
 }

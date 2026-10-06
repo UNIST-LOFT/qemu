@@ -24,6 +24,7 @@ typedef struct SnapshotExitInfo {
     target_ulong guest_cs_base;
     /* Normalized guest instruction identity used by probe/cache/evidence. */
     target_ulong fault_addr;
+    ProvenanceFaultSite fault_site;
     uint32_t fault_reference_valid;
     SnapshotFaultReferenceSource fault_reference_source;
     /* Host/data address remains diagnostic and is never compared to POC PCs. */
@@ -116,7 +117,14 @@ const char *snapshot_fault_reference_source_name(
     SnapshotFaultReferenceSource source);
 void snapshot_exit_info_set_fault_reference(
     SnapshotExitInfo *info, SnapshotFaultReferenceSource source,
-    target_ulong address);
+    target_ulong address, const ProvenanceFaultSite *site);
+bool snapshot_fault_reference_equal(uint64_t left_address,
+                                    const ProvenanceFaultSite *left,
+                                    uint64_t right_address,
+                                    const ProvenanceFaultSite *right);
+/* Writes "none" or the lowercase SHA-256 identity, including terminator. */
+void snapshot_fault_site_image_text(const ProvenanceFaultSite *site,
+                                    char text[65]);
 
 SharedTraceData *snapshot_observation_create_shared(void);
 void snapshot_observation_destroy_shared(SharedTraceData *shared);

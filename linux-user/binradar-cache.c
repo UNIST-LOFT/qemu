@@ -2,6 +2,7 @@
 #include "snapshot-observation.h"
 
 #include <fcntl.h>
+#include <inttypes.h>
 #include <unistd.h>
 #include "qapi/error.h"
 #include "qapi/qmp/qdict.h"
@@ -239,7 +240,11 @@ bool binradar_cache_feedback_write(
     GString *metadata = g_string_new(NULL);
     const bool same_fault = run->is_crash &&
         run->fault_reference_valid && manager->poc_fault_valid &&
-        run->fault_loc == manager->poc_fault_addr;
+        snapshot_fault_reference_equal(run->fault_loc, &run->fault_site,
+            manager->poc_fault_addr, &manager->poc_fault_site);
+    char fault_image[65], poc_fault_image[65];
+    snapshot_fault_site_image_text(&run->fault_site, fault_image);
+    snapshot_fault_site_image_text(&manager->poc_fault_site, poc_fault_image);
     const char *result = !run->is_crash ? "benign" :
         same_fault ? "malicious" : "ignored";
     const uint32_t mutation_writes = mutation != NULL
@@ -256,19 +261,23 @@ bool binradar_cache_feedback_write(
         }
     }
     g_string_append_printf(metadata,
-        "[binradar-feedback] [version 2] [iteration %u] [patch %u] "
+        "[binradar-feedback] [version 3] [iteration %u] [patch %u] "
         "[snapshot-file %s] [snapshot-count %u] [branches %s] "
         "[outcome %s] [fault-addr %lx] [fault-valid %s] "
         "[fault-source %s] [poc-fault-addr %lx] [poc-fault-valid %s] "
         "[poc-fault-source %s] [same-fault %s] [result %s] "
-        "[mutation-writes %u]\n",
+        "[mutation-writes %u] [fault-image %s] [fault-image-offset %" PRIx64 "] "
+        "[poc-fault-image %s] [poc-fault-image-offset %" PRIx64 "]\n",
         iteration, patch_id, snapshot_name, branches->len, branch_text->str,
         run->is_crash ? "crash" : "normal", run->fault_loc,
         run->fault_reference_valid ? "true" : "false",
         snapshot_fault_reference_source_name(run->fault_reference_source),
         manager->poc_fault_addr, manager->poc_fault_valid ? "true" : "false",
         snapshot_fault_reference_source_name(manager->poc_fault_source),
-        same_fault ? "true" : "false", result, mutation_writes);
+        same_fault ? "true" : "false", result, mutation_writes,
+        fault_image, run->fault_site.valid ? run->fault_site.image_offset : 0,
+        poc_fault_image, manager->poc_fault_site.valid
+            ? manager->poc_fault_site.image_offset : 0);
     g_string_free(branch_text, TRUE);
 
     for (uint32_t i = 0; mutation != NULL &&
@@ -482,9 +491,10 @@ void binradar_cache_record_outcome(BinradarManager *manager,
     result->patch_id = patch_id;
     result->representative = patch_id;
     result->is_crash = info->crashed;
-    result->fault_reference_valid = info->fault_reference_valid != 0;
     result->fault_reference_source = info->fault_reference_source;
     result->fault_loc = info->fault_addr;
+    result->fault_site = info->fault_site;
+    result->fault_reference_valid = info->fault_reference_valid != 0;
 }
 
 void binradar_cache_materialize(BinradarManager *manager,
@@ -500,9 +510,10 @@ void binradar_cache_materialize(BinradarManager *manager,
         ? NULL : binradar_clone_branch_vector(branches);
     if (info != NULL && info->valid) {
         result->is_crash = info->crashed;
-        result->fault_reference_valid = info->fault_reference_valid != 0;
         result->fault_reference_source = info->fault_reference_source;
         result->fault_loc = info->fault_addr;
+        result->fault_site = info->fault_site;
+        result->fault_reference_valid = info->fault_reference_valid != 0;
     }
 }
 
@@ -544,6 +555,20 @@ bool binradar_cache_commit(BinradarManager *manager)
                     "[iter %d] [patch %u]\n", cur_iter, patch);
             goto out;
         }
+        PatchedResult *representative_result =
+            &manager->current->patch_results[representative];
+        if ((!result->is_crash && result->fault_site.valid) ||
+            result->is_crash != representative_result->is_crash ||
+            result->fault_reference_valid !=
+                representative_result->fault_reference_valid ||
+            (result->is_crash && !snapshot_fault_reference_equal(
+                result->fault_loc, &result->fault_site,
+                representative_result->fault_loc,
+                &representative_result->fault_site))) {
+            log_msg("[binradar] [evidence] [error inconsistent-group] "
+                    "[iter %d] [patch %u]\n", cur_iter, patch);
+            goto out;
+        }
         if (members[representative] == NULL) {
             members[representative] = g_array_new(FALSE, FALSE,
                                                    sizeof(uint32_t));
@@ -567,6 +592,7 @@ bool binradar_cache_commit(BinradarManager *manager)
             ? BR_EVIDENCE_OUTCOME_CRASH : BR_EVIDENCE_OUTCOME_NORMAL;
         uint8_t flags = result->br_taken == NULL
             ? BR_EVIDENCE_GROUP_BRANCH_NULL : 0;
+        if (result->fault_site.valid) flags |= BR_EVIDENCE_GROUP_FAULT_SITE;
         uint32_t branch_count = result->br_taken != NULL
             ? result->br_taken->len : 0;
 
@@ -577,6 +603,10 @@ bool binradar_cache_commit(BinradarManager *manager)
         br_evidence_append_u64(payload, result->fault_loc);
         br_evidence_append_u32(payload, branch_count);
         br_evidence_append_u32(payload, group->len);
+        if (result->fault_site.valid) {
+            g_byte_array_append(payload, result->fault_site.image_id, 32);
+            br_evidence_append_u64(payload, result->fault_site.image_offset);
+        }
 
         uint8_t packed = 0;
         for (uint32_t branch = 0; branch < branch_count; branch++) {

@@ -22,6 +22,10 @@
 #include "qemu/path.h"
 #include "snapshot.h"
 #include "sem-events.h"
+#include "../tcg/symbolic/symbolic-instrumentation.h"
+#ifdef SYMBOLIC_INSTRUMENTATION
+#include "provenance.h"
+#endif
 #include "osprey.h"
 #include <elf.h>
 #include <endian.h>
@@ -2581,8 +2585,64 @@ static void target_to_host_low_high(abi_ulong tlow,
     *hhigh = (off >> HOST_LONG_BITS / 2) >> HOST_LONG_BITS / 2;
 }
 
-static struct iovec *lock_iovec(int type, abi_ulong target_addr,
-                                abi_ulong count, int copy)
+/* These checks describe established reads, never mutation witnesses. */
+static void memcheck_syscall_read(CPUArchState *env, abi_ulong addr,
+                                  abi_ulong size, int reg)
+{
+#ifdef SYMBOLIC_INSTRUMENTATION
+    if (env && size > 0) {
+        int saved_errno = errno;
+
+        provenance_check_syscall_read(env, addr, size, reg);
+        errno = saved_errno;
+    }
+#endif
+}
+
+/* Write-family syscalls do not change guest pointer shadow. The descriptor's
+ * original value is already captured in guest_bases; this metadata lookup
+ * neither rereads guest payload nor reconstructs a pointer from host memory. */
+static void memcheck_syscall_read_pointer(CPUArchState *env,
+                                          abi_ulong descriptor,
+                                          abi_ulong base, abi_ulong size)
+{
+#ifdef SYMBOLIC_INSTRUMENTATION
+    if (env && size > 0 && binradar_memcheck_enabled) {
+        int saved_errno = errno;
+        PtrTag tag = provenance_mem_load_tag(descriptor);
+        provenance_check_syscall_read_tagged(env, base, size, tag);
+        errno = saved_errno;
+    }
+#endif
+}
+
+static int syscall_buffer_reg(void)
+{
+#if defined(TARGET_X86_64) && !defined(TARGET_ABI32)
+    return R_ESI;
+#else
+    return -1;
+#endif
+}
+
+/* Normal lock_user only preflights mappings.  DEBUG_REMAP additionally
+ * copies the entire input, even if the subsequent syscall fails. */
+static void *lock_syscall_read(CPUArchState *env, abi_ulong addr,
+                               abi_ulong size, int reg)
+{
+    void *p = lock_user(VERIFY_READ, addr, size, 1);
+
+#ifdef DEBUG_REMAP
+    if (p) {
+        memcheck_syscall_read(env, addr, size, reg);
+    }
+#endif
+    return p;
+}
+
+static struct iovec *lock_iovec_checked(CPUArchState *read_env, int type,
+                                        abi_ulong target_addr,
+                                        abi_ulong count, int copy)
 {
     struct target_iovec *target_vec;
     struct iovec *vec;
@@ -2619,6 +2679,11 @@ static struct iovec *lock_iovec(int type, abi_ulong target_addr,
         goto fail2;
     }
 
+#ifdef DEBUG_REMAP
+    memcheck_syscall_read(read_env, target_addr,
+                          count * sizeof(struct target_iovec), syscall_buffer_reg());
+#endif
+
     /* ??? If host page size > target page size, this will result in a
        value larger than what we can actually support.  */
     max_len = 0x7fffffff & TARGET_PAGE_MASK;
@@ -2628,6 +2693,11 @@ static struct iovec *lock_iovec(int type, abi_ulong target_addr,
         abi_ulong base = tswapal(target_vec[i].iov_base);
         abi_long len = tswapal(target_vec[i].iov_len);
 
+#ifndef DEBUG_REMAP
+        memcheck_syscall_read(read_env,
+                              target_addr + i * sizeof(struct target_iovec),
+                              sizeof(struct target_iovec), syscall_buffer_reg());
+#endif
         guest_bases[i] = base;
 
         if (len < 0) {
@@ -2638,6 +2708,13 @@ static struct iovec *lock_iovec(int type, abi_ulong target_addr,
             vec[i].iov_base = 0;
         } else {
             vec[i].iov_base = lock_user(type, base, len, copy);
+#ifdef DEBUG_REMAP
+            if (read_env && type == VERIFY_READ && copy && vec[i].iov_base) {
+                memcheck_syscall_read_pointer(read_env,
+                    target_addr + i * sizeof(struct target_iovec) +
+                    offsetof(struct target_iovec, iov_base), base, len);
+            }
+#endif
             /* If the first buffer pointer is bad, this is a fault.  But
              * subsequent bad buffers will result in a partial write; this
              * is realized by filling the vector with null pointers and
@@ -2675,6 +2752,35 @@ static struct iovec *lock_iovec(int type, abi_ulong target_addr,
     g_free(vec);
     errno = err;
     return NULL;
+}
+
+static struct iovec *lock_iovec(int type, abi_ulong target_addr,
+                                abi_ulong count, int copy)
+{
+    return lock_iovec_checked(NULL, type, target_addr, count, copy);
+}
+
+static void memcheck_syscall_read_iovec(CPUArchState *env, struct iovec *vec,
+                                       abi_ulong target_addr, abi_ulong count,
+                                       abi_long consumed)
+{
+    abi_ulong *guest_bases = (abi_ulong *)(vec + count);
+    target_ulong left;
+
+    if (consumed <= 0) {
+        return;
+    }
+    left = consumed;
+    for (abi_ulong i = 0; i < count && left > 0; i++) {
+        target_ulong n = MIN((target_ulong)vec[i].iov_len, left);
+
+        if (n > 0) {
+            memcheck_syscall_read_pointer(env,
+                target_addr + i * sizeof(struct target_iovec) +
+                offsetof(struct target_iovec, iov_base), guest_bases[i], n);
+            left -= n;
+        }
+    }
 }
 
 static void unlock_iovec(struct iovec *vec, abi_ulong count, int copy)
@@ -7405,10 +7511,12 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
         if (arg2 == 0 && arg3 == 0) {
             return get_errno(safe_write(arg1, 0, 0));
         }
-        if (!(p = lock_user(VERIFY_READ, arg2, arg3, 1)))
+        if (!(p = lock_syscall_read(env, arg2, arg3, syscall_buffer_reg())))
             return -TARGET_EFAULT;
         if (fd_trans_target_to_host_data(arg1)) {
             void *copy = g_malloc(arg3);
+
+            memcheck_syscall_read(env, arg2, arg3, syscall_buffer_reg());
             memcpy(copy, p, arg3);
             ret = fd_trans_target_to_host_data(arg1)(copy, arg3);
             if (ret >= 0) {
@@ -7417,6 +7525,9 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
             g_free(copy);
         } else {
             ret = get_errno(safe_write(arg1, p, arg3));
+            if (ret > 0) {
+                memcheck_syscall_read(env, arg2, ret, syscall_buffer_reg());
+            }
         }
         unlock_user(p, arg2, 0);
         return ret;
@@ -9753,9 +9864,11 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
         return ret;
     case TARGET_NR_writev:
         {
-            struct iovec *vec = lock_iovec(VERIFY_READ, arg2, arg3, 1);
+            struct iovec *vec = lock_iovec_checked(env, VERIFY_READ,
+                                                   arg2, arg3, 1);
             if (vec != NULL) {
                 ret = get_errno(safe_writev(arg1, vec, arg3));
+                memcheck_syscall_read_iovec(env, vec, arg2, arg3, ret);
                 unlock_iovec(vec, arg3, 0);
             } else {
                 ret = -host_to_target_errno(errno);
@@ -9782,12 +9895,14 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
 #if defined(TARGET_NR_pwritev)
     case TARGET_NR_pwritev:
         {
-            struct iovec *vec = lock_iovec(VERIFY_READ, arg2, arg3, 1);
+            struct iovec *vec = lock_iovec_checked(env, VERIFY_READ,
+                                                   arg2, arg3, 1);
             if (vec != NULL) {
                 unsigned long low, high;
 
                 target_to_host_low_high(arg4, arg5, &low, &high);
                 ret = get_errno(safe_pwritev(arg1, vec, arg3, low, high));
+                memcheck_syscall_read_iovec(env, vec, arg2, arg3, ret);
                 unlock_iovec(vec, arg3, 0);
             } else {
                 ret = -host_to_target_errno(errno);
@@ -10210,12 +10325,15 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
             /* Special-case NULL buffer and zero length, which should succeed */
             p = 0;
         } else {
-            p = lock_user(VERIFY_READ, arg2, arg3, 1);
+            p = lock_syscall_read(env, arg2, arg3, syscall_buffer_reg());
             if (!p) {
                 return -TARGET_EFAULT;
             }
         }
         ret = get_errno(pwrite64(arg1, p, arg3, target_offset64(arg4, arg5)));
+        if (ret > 0) {
+            memcheck_syscall_read(env, arg2, ret, syscall_buffer_reg());
+        }
         unlock_user(p, arg2, 0);
         return ret;
 #endif
@@ -12062,8 +12180,6 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
     }
     return ret;
 }
-
-#include "../tcg/symbolic/symbolic-instrumentation.h"
 
 #ifdef SYMBOLIC_INSTRUMENTATION
 #include "../tcg/symbolic/syscall.c"

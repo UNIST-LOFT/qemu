@@ -53,12 +53,19 @@ TESTS := t01_double_free t02_small_double_free t03_uaf_stack t04_uaf_heap \
          t73_store_atomic t74_producer_malloc t75_producer_mov \
          t76_producer_add t77_producer_pop t78_producer_calloc \
          t80_xmm_preentry_forkserver t81_plt_image_identity \
-         t82_unusable_attempt_recovery t83_final_discarded_plan
+         t82_unusable_attempt_recovery t83_final_discarded_plan \
+         t84_syscall_input t85_library_coverage t86_libc_scans
 
 # t83 reuses the t82 guest: every mutation plan for it is discarded, so
 # draining the whole queue exercises the terminal-discarded-plan case.
 $(WORK)/t83_final_discarded_plan: $(GUESTS)/t82_unusable_attempt_recovery.c | $(WORK)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<
+
+$(WORK)/libcoverage.so: $(GUESTS)/coverage-library.S | $(WORK)
+	$(CC) -shared -fPIC -o $@ $<
+
+$(WORK)/t85_library_coverage: $(GUESTS)/t85_library_coverage.c $(WORK)/libcoverage.so
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $< -L$(WORK) -lcoverage -Wl,-rpath,'$$ORIGIN'
 
 GUEST_BINS := $(addprefix $(WORK)/,$(TESTS))
 PLT_FILES  := $(addprefix $(WORK)/,$(addsuffix .plt,$(TESTS)))

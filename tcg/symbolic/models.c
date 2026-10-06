@@ -2,6 +2,7 @@
 
 #define MODEL_PARSE_MAX_INPUT 64
 
+
 /* ---- Guest range validation (Phase 3) ----
  * libc-model bodies must not read or classify guest memory that the real
  * libc call could not complete: a host-side scan over an invalid guest
@@ -75,6 +76,35 @@ static inline size_t prov_str_scan(const char *s, size_t limit, bool bounded,
     }
 }
 
+/* Scan only logically consumed bytes.  Page probes precede each host read;
+ * optimized guest implementations may overfetch, but their summaries do not. */
+static bool prov_compare_scan(target_ulong a, target_ulong b, size_t limit,
+                              bool bounded, bool strings, size_t *width,
+                              int *result)
+{
+    *width = 0;
+    *result = 0;
+    while (!bounded || *width < limit) {
+        size_t i = *width;
+        if (a > (target_ulong)-1 - i || b > (target_ulong)-1 - i)
+            return false;
+        target_ulong aa = a + i, bb = b + i;
+        size_t chunk = MIN(TARGET_PAGE_SIZE - (aa & ~TARGET_PAGE_MASK),
+                            TARGET_PAGE_SIZE - (bb & ~TARGET_PAGE_MASK));
+        if (bounded) chunk = MIN(chunk, limit - i);
+        if (!prov_range_readable(aa, chunk) ||
+            !prov_range_readable(bb, chunk)) return false;
+        const unsigned char *xbytes = g2h(aa), *ybytes = g2h(bb);
+        for (size_t j = 0; j < chunk; ++j) {
+            unsigned char x = xbytes[j], y = ybytes[j];
+            ++*width;
+            *result = (int)x - (int)y;
+            if (x != y || (strings && x == 0)) return true;
+        }
+    }
+    return true;
+}
+
 static Expr* pending_model_return_expr = NULL;
 
 static inline void set_pending_model_return_expr(Expr* expr)
@@ -91,6 +121,7 @@ static inline Expr* take_pending_model_return_expr(void)
 
 static inline void clear_call_args_temps(void)
 {
+    if (!symbolic_mode) return;
     s_temps[temp_idx(tcg_find_temp_arch_reg(tcg_ctx, "rax"))] = 0;
     s_temps[temp_idx(tcg_find_temp_arch_reg(tcg_ctx, "rdi"))] = 0;
     s_temps[temp_idx(tcg_find_temp_arch_reg(tcg_ctx, "rsi"))] = 0;
@@ -109,6 +140,7 @@ static void add_query_with_model(Expr *q, uintptr_t address, MODEL_T model,
 // clear xmm registers
 static inline void clear_xmm_regs(CPUX86State* env)
 {
+    if (!symbolic_mode) return;
     int          i, nb_xmm_regs;
 
     if (env->hflags & HF_CS64_MASK) {
@@ -263,15 +295,13 @@ static inline int model_strcmp(CPUX86State* env, uintptr_t pc, uintptr_t n,
         return 0;
     }
 
-    bool s1_ok = false, s2_ok = false;
-    size_t s1_len = prov_str_scan(s1, n, bounded, &s1_ok);
-    size_t s2_len = prov_str_scan(s2, n, bounded, &s2_ok);
-    if (!s1_ok || !s2_ok) {
-        return 0;
-    }
-    int res = bounded ? strncmp(s1, s2, n) : strcmp(s1, s2);
-    size_t s1_width = !bounded || s1_len < n ? s1_len + 1 : s1_len;
-    size_t s2_width = !bounded || s2_len < n ? s2_len + 1 : s2_len;
+    size_t width;
+    int res;
+    if (!prov_compare_scan((target_ulong)s1, (target_ulong)s2, n, bounded,
+                           true, &width, &res)) return 0;
+    size_t s1_width = width, s2_width = width;
+    size_t s1_len = width - (*(unsigned char *)g2h((target_ulong)s1 + width - 1) == 0);
+    size_t s2_len = width - (*(unsigned char *)g2h((target_ulong)s2 + width - 1) == 0);
     /* memcheck-only: the host string functions read guest memory without
      * interval checks; validate the read ranges here (access pc = caller). */
     if (binradar_memcheck_enabled) {
@@ -281,6 +311,7 @@ static inline int model_strcmp(CPUX86State* env, uintptr_t pc, uintptr_t n,
                                       R_ESI);
     }
 
+    if (!symbolic_mode) return mode;
     bool s1_exprs_allocated = false, s2_exprs_allocated = false;
     Expr** s1_exprs = get_expr_addr_span((uintptr_t)s1, s1_width,
                                          &s1_exprs_allocated);
@@ -345,8 +376,9 @@ static inline int model_strcmp(CPUX86State* env, uintptr_t pc, uintptr_t n,
     return mode;
 }
 
-static inline int model_strlen(CPUX86State* env, uintptr_t pc, uintptr_t n,
-                               bool bounded, int reg)
+static inline int model_strlen_scanned(CPUX86State* env, uintptr_t pc,
+                                       uintptr_t n, bool bounded, int reg,
+                                       size_t s1_len)
 {
     int mode = 2;
     char* s1 = (char *)(uintptr_t)env->regs[reg];
@@ -358,20 +390,13 @@ static inline int model_strlen(CPUX86State* env, uintptr_t pc, uintptr_t n,
         return 0;
     }
 
-    // printf("n: %lu\n", n);
-
-    bool s1_ok = false;
-    size_t s1_len = prov_str_scan(s1, n, bounded, &s1_ok);
-    if (!s1_ok) {
-        return 0;
-    }
     size_t len = !bounded || s1_len < n ? s1_len + 1 : s1_len;
     /* memcheck-only: the host string function reads guest memory without
      * interval checks; validate the read range here (access pc = caller). */
     if (binradar_memcheck_enabled) {
         provenance_model_check_access(env, (target_ulong)s1, len, pc, reg);
     }
-    // printf("LEN: %lu\n", len);
+    if (!symbolic_mode) return mode;
     bool s1_exprs_allocated = false;
     Expr** s1_exprs = get_expr_addr_span((uintptr_t)s1, len,
                                          &s1_exprs_allocated);
@@ -415,6 +440,16 @@ static inline int model_strlen(CPUX86State* env, uintptr_t pc, uintptr_t n,
     return mode;
 }
 
+static inline int model_strlen(CPUX86State* env, uintptr_t pc, uintptr_t n,
+                               bool bounded, int reg)
+{
+    if (bounded && n == 0) return 2;
+    bool ok;
+    size_t len = prov_str_scan((const char *)(uintptr_t)env->regs[reg],
+                               n, bounded, &ok);
+    return ok ? model_strlen_scanned(env, pc, n, bounded, reg, len) : 0;
+}
+
 static inline int model_memchr(CPUX86State* env, uintptr_t pc)
 {
     int mode = 2;
@@ -429,15 +464,27 @@ static inline int model_memchr(CPUX86State* env, uintptr_t pc)
     }
 
     char c = (char)(uintptr_t)env->regs[R_ESI];
-    /* Phase 3 ordering: probe before the host scan and the finding. */
-    if (!prov_range_readable((target_ulong)p, len)) {
-        return 0;
+    void *res = NULL;
+    size_t consumed = 0;
+    while (consumed < len) {
+        if (p > (target_ulong)-1 - consumed) return 0;
+        target_ulong addr = p + consumed;
+        size_t chunk = MIN(TARGET_PAGE_SIZE - (addr & ~TARGET_PAGE_MASK),
+                            len - consumed);
+        if (!prov_range_readable(addr, chunk)) return 0;
+        const unsigned char *bytes = g2h(addr);
+        res = memchr(bytes, (unsigned char)c, chunk);
+        if (res) {
+            consumed += (const unsigned char *)res - bytes + 1;
+            break;
+        }
+        consumed += chunk;
     }
-    void* res = memchr((void*)p, c, len);
-    /* The host scan completed; now classify the successful guest range. */
+    len = consumed;
     if (binradar_memcheck_enabled) {
         provenance_model_check_access(env, (target_ulong)p, len, pc, R_EDI);
     }
+    if (!symbolic_mode) return mode;
 
     bool exprs_allocated = false;
     Expr** exprs = get_expr_addr_span(p, len, &exprs_allocated);
@@ -499,18 +546,18 @@ static inline int model_memcmp(CPUX86State* env, uintptr_t pc)
         return 0;
     }
 
-    /* Phase 3 ordering: probe both ranges before the host scan. */
-    if (!prov_range_readable((target_ulong)s1, n) ||
-        !prov_range_readable((target_ulong)s2, n)) {
-        return 0;
-    }
-    int res = memcmp(s1, s2, n);
+    size_t consumed;
+    int res;
+    if (!prov_compare_scan((target_ulong)s1, (target_ulong)s2, n, true,
+                           false, &consumed, &res)) return 0;
+    n = consumed;
     /* memcheck-only: validate the read ranges here (access pc = caller). */
     if (binradar_memcheck_enabled) {
         provenance_model_check_access(env, (target_ulong)s1, n, pc, R_EDI);
         provenance_model_check_access(env, (target_ulong)s2, n, pc, R_ESI);
     }
 
+    if (!symbolic_mode) return mode;
     bool s1_exprs_allocated = false, s2_exprs_allocated = false;
     Expr** s1_exprs = get_expr_addr_span((uintptr_t)s1, n,
                                          &s1_exprs_allocated);

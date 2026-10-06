@@ -975,8 +975,8 @@ void init_symbolic_mode(void)
     main_thread = pthread_self();
 }
 
-/* Initialize PLT hooks for memcheck-only mode (non-symbolic).
- * Loads the PLT info file so malloc/free/realloc/calloc can be tracked. */
+/* Initialize allocator hooks and logical libc memory summaries for the
+ * concrete memcheck lane, without initializing any symbolic transport. */
 void memcheck_init(void) {
     if (!binradar_memcheck_enabled) return;
     if (plt_info != NULL) return; /* already loaded */
@@ -3749,15 +3749,6 @@ static inline void qemu_load_helper(CPUArchState *env, uintptr_t orig_addr,
 
     SnapshotMemRegion *mr = snapshot_mem_region_search_with_size(addr, size);
 
-    if (binradar_memcheck_enabled && symbolic_start_code > 0 &&
-        current_tb_pc >= symbolic_start_code && current_tb_pc < symbolic_end_code) {
-        /* Non-fatal provenance check; UNKNOWN tag → exact-bounds fallback.
-         * FIX_TRACER.md §8: no _exit() in symbolic mode — finding is
-         * deferred and finalized as a synthetic crash at exit. */
-        PtrTag unknown_tag = {0};
-        provenance_check_access(env, addr, size, current_tb_pc,
-                                unknown_tag, -1, 0);
-    }
 
     if (mr && mr->is_heap) {
         add_symbolic_heap_bounds_query(addr_idx, mr->base, offset, size);
@@ -4269,15 +4260,6 @@ static inline void qemu_store_helper(CPUArchState *env,
 
     SnapshotMemRegion *mr = snapshot_mem_region_search_with_size(addr, size);
 
-    if (binradar_memcheck_enabled && symbolic_start_code > 0 &&
-        current_tb_pc >= symbolic_start_code && current_tb_pc < symbolic_end_code) {
-        /* Non-fatal provenance check; UNKNOWN tag → exact-bounds fallback.
-         * FIX_TRACER.md §8: no _exit() in symbolic mode — finding is
-         * deferred and finalized as a synthetic crash at exit. */
-        PtrTag unknown_tag = {0};
-        provenance_check_access(env, addr, size, current_tb_pc,
-                                unknown_tag, -1, 0);
-    }
 
     if (mr && mr->is_heap) {
         add_symbolic_heap_bounds_query(addr_idx, mr->base, offset, size);
@@ -5708,6 +5690,31 @@ static const uint8_t count_class_binary[256] = {
 
 static int last_open_fp = -1;
 static char* last_open_file = NULL;
+static GHashTable *model_image_fds;
+
+/* This lane owns only loader metadata; it never touches symbolic input,
+ * scratch, expressions, queries or memory shadow.  Save the guest-opened
+ * basename, rather than replacing it with a canonical host symlink name. */
+static void model_image_syscall(SyscallNo nr, uintptr_t a0, uintptr_t a1,
+                                 uintptr_t a2, uintptr_t a4, uintptr_t result)
+{
+    if ((nr == SYS_OPEN || nr == SYS_OPENAT) && (intptr_t)result >= 0) {
+        const char *name = g2h(nr == SYS_OPEN ? a0 : a1);
+        const char *base = strrchr(name, '/');
+        if (!model_image_fds) {
+            model_image_fds = g_hash_table_new_full(g_direct_hash, g_direct_equal,
+                                                   NULL, g_free);
+        }
+        g_hash_table_replace(model_image_fds, (gpointer)result,
+                             g_strdup(base ? base + 1 : name));
+    } else if (nr == SYS_MMAP && (intptr_t)result >= 0 && (a2 & PROT_EXEC)) {
+        char *name = model_image_fds ?
+            g_hash_table_lookup(model_image_fds, (gpointer)a4) : NULL;
+        if (name) load_image(name, result);
+    } else if (nr == SYS_CLOSE && (intptr_t)result == 0 && model_image_fds) {
+        g_hash_table_remove(model_image_fds, (gpointer)a0);
+    }
+}
 
 void qemu_syscall_helper(uintptr_t syscall_no, uintptr_t syscall_arg0,
                          uintptr_t syscall_arg1, uintptr_t syscall_arg2,
@@ -5715,6 +5722,11 @@ void qemu_syscall_helper(uintptr_t syscall_no, uintptr_t syscall_arg0,
                          uintptr_t syscall_arg5, uintptr_t syscall_arg6,
                          uintptr_t ret_val)
 {
+    if (symbolic_mode || binradar_memcheck_enabled) {
+        model_image_syscall((SyscallNo)syscall_no, syscall_arg0, syscall_arg1,
+                             syscall_arg2, syscall_arg4, ret_val);
+    }
+    if (!symbolic_mode) return;
     if (s_config.coverage_tracer) {
         if (syscall_no == SYS_EXIT && ret_val == main_thread) {
 
@@ -5849,9 +5861,6 @@ void qemu_syscall_helper(uintptr_t syscall_no, uintptr_t syscall_arg0,
         case SYS_MMAP: {
             if (ret_val != CONST(MAP_FAILED)) {
                 fp = syscall_arg4;
-                if (fp >= 0 && last_open_fp == fp && syscall_arg2 & PROT_EXEC) {
-                    load_image(last_open_file, ret_val);
-                }
                 if (fp >= 0 && input_fp[fp]) {
                     size_t length = syscall_arg1;
                     int    flags  = (int)syscall_arg3;
@@ -6740,12 +6749,9 @@ static void update_last_translation_block(uintptr_t pc) {
 void memcheck_instrument_tb(TranslationBlock *tb, TCGContext *tcg_ctx,
                             CPUArchState *cpu_env) {
     if (!binradar_memcheck_enabled) return;
-    /* Only instrument TBs within the main binary's code range.
-     * This avoids false positives from library code (e.g., glibc). */
-    if (symbolic_start_code > 0 &&
-        (tb->pc < symbolic_start_code || tb->pc >= symbolic_end_code)) {
-        return;
-    }
+    /* Optimized runtime bodies use logical models; ordinary verified DSO
+     * code receives the same post-access checks as the main image. */
+    if (!provenance_memcheck_pc_eligible(tb->pc)) return;
 
     /* Allocate the helper-arg temps past the current high-water mark.
      * tcg_temp_new_internal() reuses freed guest temps (free_temps pool),
@@ -9128,7 +9134,7 @@ int        parse_translation_block(TranslationBlock* tb, uintptr_t tb_pc,
                             "sem_reg_lea", "sem_reg_lea_dyn",
                             "sem_reg_addsub_imm", "sem_reg_addsub_reg",
                             "sem_reg_xchg", "sem_clobber_caller_saved",
-                            "sem_set_pc", "sem_set_ea", "sem_set_ea_vals",
+                            "sem_set_pc", "sem_syscall_pc", "sem_set_ea", "sem_set_ea_vals",
                             "sem_set_ea_mode", "sem_mem_access",
                             "sem_mem_overwrite",
                             "sem_on_load", "sem_on_store", "sem_call",
@@ -9476,6 +9482,60 @@ int        parse_translation_block(TranslationBlock* tb, uintptr_t tb_pc,
 
 static uintptr_t model_caller_addr = 0;
 
+typedef struct ModelWrite {
+    LIB_MODEL kind;
+    target_ulong src, dst, copied, size;
+} ModelWrite;
+static ModelWrite model_write;
+
+typedef struct ModelFrame {
+    uintptr_t return_pc, entry_pc;
+    target_ulong entry_sp;
+    int body_mode;
+    Expr *return_expr;
+    ProvenancePending pending;
+    ModelWrite write;
+} ModelFrame;
+static GArray *model_frames;
+
+/* Learn only the loader's actual GOT target after a PLT call completed.
+ * IFUNC symbol values are resolver addresses and are never guessed here. */
+static void model_register_resolved_plt(const ModelFrame *frame)
+{
+    target_ulong stub = frame->entry_pc;
+    if (!prov_range_readable(stub, 10)) return;
+    const unsigned char *code = g2h(stub);
+    unsigned int prefix = 0;
+    if (code[0] == 0xf3 && code[1] == 0x0f &&
+        code[2] == 0x1e && code[3] == 0xfa) prefix = 4;
+    if (code[prefix] != 0xff || code[prefix + 1] != 0x25) return;
+    int32_t displacement;
+    memcpy(&displacement, code + prefix + 2, sizeof(displacement));
+    target_ulong slot = stub + prefix + 6 + displacement;
+    if (!prov_range_readable(slot, sizeof(target_ulong))) return;
+    target_ulong resolved;
+    memcpy(&resolved, g2h(slot), sizeof(resolved));
+    if (resolved >= stub && resolved < stub + 16) return;
+    if ((page_get_flags(resolved) & PAGE_EXEC) == 0) return;
+    gpointer kind = g_hash_table_lookup(plt_addrs, (gpointer)stub);
+    if (kind) g_hash_table_insert(plt_addrs, (gpointer)resolved, kind);
+}
+
+static void model_write_complete(CPUArchState *env, ModelWrite *write)
+{
+    if (write->size == 0) return;
+    if (write->kind == MEMSET) {
+        sem_mem_overwrite(env, write->dst, write->size, SEM_OP_LIBC_MODEL);
+    } else {
+        sem_mem_copy(env, write->src, write->dst, write->copied,
+                     SEM_OP_LIBC_MODEL);
+        if (write->copied < write->size) {
+            sem_mem_overwrite(env, write->dst + write->copied,
+                              write->size - write->copied, SEM_OP_LIBC_MODEL);
+        }
+    }
+}
+
 static bool model_memory_copy_preflight(target_ulong src, target_ulong dst,
                                         target_ulong size)
 {
@@ -9488,35 +9548,34 @@ static bool model_memory_fill_preflight(target_ulong dst, target_ulong size)
     return size == 0 || prov_range_writable(dst, size);
 }
 
-/* Successful modeled writes use one ordering everywhere: preflight in the
- * caller, update symbolic shadow, then publish the semantic effect. */
+/* Preflight preserves genuine guest faults.  Symbolic shadow consumes the
+ * entry source snapshot; concrete semantic publication waits for the paired
+ * return, after the real guest operation has completed. */
 static void model_memory_copy_commit(CPUArchState *env, target_ulong src,
                                      target_ulong dst, target_ulong size)
 {
     if (size == 0) return;
-    qemu_memmove(env, (uintptr_t)src, (uintptr_t)dst, size);
-    sem_mem_copy(env, src, dst, size, SEM_OP_LIBC_MODEL);
+    if (symbolic_mode) qemu_memmove(env, (uintptr_t)src, (uintptr_t)dst, size);
+    model_write = (ModelWrite){MEMCPY, src, dst, size, size};
 }
 
 static void model_memory_fill_commit(CPUArchState *env, Expr *value,
                                      target_ulong dst, target_ulong size)
 {
     if (size == 0) return;
-    qemu_memset(value, (uintptr_t)dst, size);
-    sem_mem_overwrite(env, dst, size, SEM_OP_LIBC_MODEL);
+    if (symbolic_mode) qemu_memset(value, (uintptr_t)dst, size);
+    model_write = (ModelWrite){MEMSET, 0, dst, 0, size};
 }
 
 static void model_memory_strncpy_commit(CPUArchState *env, target_ulong src,
                                         target_ulong dst, target_ulong copied,
                                         target_ulong size)
 {
-    qemu_memmove(env, (uintptr_t)src, (uintptr_t)dst, copied);
-    qemu_memset(NULL, (uintptr_t)(dst + copied), size - copied);
-    sem_mem_copy(env, src, dst, copied, SEM_OP_LIBC_MODEL);
-    if (copied < size) {
-        sem_mem_overwrite(env, dst + copied, size - copied,
-                          SEM_OP_LIBC_MODEL);
+    if (symbolic_mode) {
+        qemu_memmove(env, (uintptr_t)src, (uintptr_t)dst, copied);
+        qemu_memset(NULL, (uintptr_t)(dst + copied), size - copied);
     }
+    model_write = (ModelWrite){STRNCPY, src, dst, copied, size};
 }
 
 static void model_memory_check(CPUArchState *env, target_ulong addr,
@@ -9537,14 +9596,27 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
 
     CPUX86State* env = (CPUX86State*) cpu;
     LIB_MODEL model = (LIB_MODEL) g_hash_table_lookup(plt_addrs, (gpointer) pc);
-    if (mode == 0 && model > 0) {
-        uintptr_t rsp = env->regs[R_ESP];
-        model_caller_addr = *((uintptr_t*)rsp);
-        /* In memcheck-only mode, only handle allocation-related models. */
+    target_ulong rsp = env->regs[R_ESP];
+    ModelFrame *top = model_frames && model_frames->len ?
+        &g_array_index(model_frames, ModelFrame, model_frames->len - 1) : NULL;
+    bool returning = top && pc == top->return_pc &&
+        rsp == top->entry_sp + sizeof(target_ulong);
+    if (!returning && model > 0 && (!top || rsp < top->entry_sp)) {
+        /* Numeric/stdio models remain symbolic-only.  A second dispatch at
+         * the same stack depth is the PLT's resolved implementation, not a
+         * nested call. */
         if (!symbolic_mode && model != MALLOC && model != FREE &&
-            model != REALLOC && model != CALLOC) {
-            return 0;
-        }
+            model != REALLOC && model != CALLOC && model != STRCMP &&
+            model != STRNCMP && model != STRLEN && model != STRNLEN &&
+            model != MEMCHR && model != MEMCMP && model != MEMMOVE &&
+            model != MEMCPY && model != MEMSET && model != STRCPY &&
+            model != STRNCPY) return 0;
+        if (!prov_range_readable(rsp, sizeof(target_ulong))) return 0;
+        model_caller_addr = *(target_ulong *)g2h(rsp);
+        mode = 0;
+        model_write = (ModelWrite){0};
+        pending_model_return_expr = NULL;
+        provenance_clear_pending(env);
         // printf("Executing LIB MODEL %d at %lx\n", model, pc);
         if (model == STRCMP) {
             // printf("[0x%lx] strcmp(%s, %s)\n", model_caller_addr, (char *)(uintptr_t)env->regs[R_EDI], (char *)(uintptr_t)env->regs[R_ESI]);
@@ -9731,7 +9803,7 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
             target_ulong len = (target_ulong)env->regs[R_EDX];
             target_ulong dst = (target_ulong)env->regs[R_EDI];
             if (model_memory_fill_preflight(dst, len)) {
-                Expr* value = len == 0 ? NULL : s_temps[temp_idx(
+                Expr* value = !symbolic_mode || len == 0 ? NULL : s_temps[temp_idx(
                     tcg_find_temp_arch_reg(tcg_ctx, "rsi"))];
                 model_memory_fill_commit(env, value, dst, len);
                 /* memcheck-only: validate the full fill interval (see
@@ -9754,7 +9826,8 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
             target_ulong src = (target_ulong)env->regs[R_ESI];
             target_ulong dst = (target_ulong)env->regs[R_EDI];
             if (src_ok && model_memory_fill_preflight(dst, len)) {
-                mode = model_strlen(env, model_caller_addr, 0, false, R_ESI);
+                mode = model_strlen_scanned(env, model_caller_addr, 0, false,
+                                             R_ESI, src_len);
                 if (mode != 0) {
                     model_memory_copy_commit(env, src, dst, len);
                     /* The full successful destination write invalidates
@@ -9780,7 +9853,8 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
             target_ulong src = (target_ulong)env->regs[R_ESI];
             target_ulong dst = (target_ulong)env->regs[R_EDI];
             if (src_ok && model_memory_fill_preflight(dst, n)) {
-                mode = model_strlen(env, model_caller_addr, n, true, R_ESI);
+                mode = model_strlen_scanned(env, model_caller_addr, n, true,
+                                             R_ESI, src_len);
                 if (mode != 0 && n != 0) {
                     target_ulong copied = src_len < n ? src_len + 1 : n;
                     model_memory_strncpy_commit(env, src, dst, copied, n);
@@ -9833,18 +9907,35 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
         } 
         // printf("Return address is %lx [%lx]\n", model_caller_addr, rsp);
         if (mode == 0) {
-            /* A preflight failure declined the model.  The real libc body
-             * will execute and own any target fault; no return hook or stale
-             * caller address remains armed. */
-            model_caller_addr = 0;
-        }
-        if (mode == 2) {
-            return 1; // switch code cache
-        } else {
+            /* Declined preflight: preserve the outer call, if any, and let
+             * the real guest body own its fault. */
+            model_caller_addr = top ? top->return_pc : 0;
+            mode = top ? top->body_mode : 0;
+            pending_model_return_expr = top ? top->return_expr : NULL;
+            provenance_get_reg_shadow(env)->pending = top ? top->pending :
+                (ProvenancePending){0};
             return 0;
         }
+        if (!model_frames) {
+            model_frames = g_array_new(FALSE, FALSE, sizeof(ModelFrame));
+        }
+        ModelFrame frame = {
+            .return_pc = model_caller_addr, .entry_pc = pc, .entry_sp = rsp,
+            .body_mode = mode, .return_expr = pending_model_return_expr,
+            .pending = provenance_get_reg_shadow(env)->pending,
+            .write = model_write,
+        };
+        g_array_append_val(model_frames, frame);
+        return 1; /* repeated/nested calls must reenter dispatch */
     }
-    if (mode > 0 && pc == model_caller_addr) {
+    if (returning) {
+        ModelFrame frame = *top;
+        model_register_resolved_plt(&frame);
+        model_caller_addr = frame.return_pc;
+        pending_model_return_expr = frame.return_expr;
+        provenance_get_reg_shadow(env)->pending = frame.pending;
+        model_write_complete(env, &frame.write);
+        g_array_set_size(model_frames, model_frames->len - 1);
         // printf("Switch mode back\n");
         if (symbolic_mode) {
             Expr* ret_expr = take_pending_model_return_expr();
@@ -9854,10 +9945,6 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
             }
         }
         model_caller_addr = 0;
-        int r = 0;
-        if (mode == 2) {
-            r = 1; // switch code cache
-        }
         mode = 0;
         /* Modeled call boundary: the callee body executed as a model is not
          * fully instrumented, so no transfer/kill was emitted for the real
@@ -9865,7 +9952,8 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
          * RCX, RDX, RSI, RDI, R8-R11) before installing the modeled
          * return; the pending-alloc return tag (below) re-tags RAX. */
         sem_clobber_caller_saved(env);
-        PendingAlloc alloc = snapshot_trace_get_pending_allocs(pc);
+        PendingAlloc alloc = frame.pending.valid ?
+            snapshot_trace_get_pending_allocs(pc) : (PendingAlloc){0};
         target_ulong base = env->regs[R_EAX];
         ProvenancePending pend = provenance_get_pending(env, pc);
 
@@ -10047,7 +10135,23 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
                 }
             }
         }
-        return r;
+        top = model_frames->len ?
+            &g_array_index(model_frames, ModelFrame, model_frames->len - 1) : NULL;
+        model_caller_addr = top ? top->return_pc : 0;
+        pending_model_return_expr = top ? top->return_expr : NULL;
+        provenance_get_reg_shadow(env)->pending = top ? top->pending :
+            (ProvenancePending){0};
+        mode = top ? top->body_mode : 0;
+        return 1;
+    }
+    /* A callback into main text must not inherit the library model's
+     * instrumentation suppression.  Restore it on reentry to the body. */
+    int desired_mode = top ? top->body_mode : 0;
+    if (pc >= symbolic_start_code && pc < symbolic_end_code &&
+        (!top || rsp < top->entry_sp)) desired_mode = 0;
+    if (mode != desired_mode) {
+        mode = desired_mode;
+        return 1;
     }
     return 0;
 }

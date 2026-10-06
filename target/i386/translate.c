@@ -8752,6 +8752,11 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
         break;
 #ifdef TARGET_X86_64
     case 0x105: /* syscall */
+        if (binradar_memcheck_enabled) {
+            TCGv t_pc = tcg_const_tl(pc_start);
+            gen_helper_sem_syscall_pc(cpu_env, t_pc);
+            tcg_temp_free(t_pc);
+        }
         /* XXX: is it usable in real mode ? */
         gen_update_cc_op(s);
         gen_jmp_im(s, pc_start - s->cs_base);

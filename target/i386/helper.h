@@ -256,6 +256,7 @@ DEF_HELPER_FLAGS_6(sem_reg_xchg, TCG_CALL_NO_RWG, void, env, i32, i32, tl, tl, t
 DEF_HELPER_FLAGS_6(sem_on_load, TCG_CALL_NO_RWG, void, env, i32, tl, tl, tl, i32)
 DEF_HELPER_FLAGS_6(sem_on_store, TCG_CALL_NO_RWG, void, env, i32, tl, tl, tl, i32)
 DEF_HELPER_FLAGS_2(sem_set_pc, TCG_CALL_NO_RWG, void, env, tl)
+DEF_HELPER_FLAGS_2(sem_syscall_pc, TCG_CALL_NO_RWG, void, env, tl)
 DEF_HELPER_FLAGS_6(sem_mem_access, TCG_CALL_NO_RWG, void, env, tl, tl, tl, i32, i32)
 DEF_HELPER_FLAGS_4(sem_mem_overwrite, TCG_CALL_NO_RWG, void, env, tl, tl, i32)
 DEF_HELPER_FLAGS_3(sem_mem_unsupported, TCG_CALL_NO_RWG, void, env, tl, i32)

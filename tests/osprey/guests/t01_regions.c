@@ -19,8 +19,8 @@
  *
  * The harness runs the guest three times with distinct PIE load biases
  * (default + two forced BINRADAR_MMAP_START values) and compares the
- * canonical fact dumps byte-identically, then compares against the
- * checked-in exact canonical rows (t01_regions.expected).
+ * canonical fact dumps byte-identically, then checks allocation lifecycle
+ * and activation invariants without pinning incidental event IDs.
  */
 #include <stdlib.h>
 #include <unistd.h>

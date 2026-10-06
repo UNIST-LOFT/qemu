@@ -53,6 +53,7 @@ void helper_sem_reg_xchg(CPUArchState *env, uint32_t dst_idx,
                          target_ulong src_val, target_ulong pc);
 void helper_sem_clobber_caller_saved(CPUArchState *env);
 void helper_sem_set_pc(CPUArchState *env, target_ulong pc);
+void helper_sem_syscall_pc(CPUArchState *env, target_ulong pc);
 void helper_sem_set_ea(CPUArchState *env, uint32_t base_reg,
                        uint32_t index_reg, uint32_t scale,
                        target_ulong disp, uint32_t mode);
@@ -295,6 +296,7 @@ const SemHelperClass sem_helper_class_table[] = {
     { "sem_reg_xchg",        SEM_OP_INTEGER },
     { "sem_clobber_caller_saved", SEM_OP_INTEGER },
     { "sem_set_pc",          SEM_OP_INTEGER },
+    { "sem_syscall_pc",      SEM_OP_INTEGER },
     { "sem_set_ea",          SEM_OP_INTEGER },
     { "sem_set_ea_vals",     SEM_OP_INTEGER },
     { "sem_set_ea_mode",     SEM_OP_INTEGER },
@@ -320,6 +322,7 @@ const char *const sem_emittable_helpers[] = {
     "sem_reg_xchg",
     "sem_clobber_caller_saved",
     "sem_set_pc",
+    "sem_syscall_pc",
     "sem_set_ea",
     "sem_set_ea_vals",
     "sem_set_ea_mode",
@@ -614,10 +617,6 @@ static void sem_prov_set_ea(CPUArchState *env, uint32_t base_reg,
 static void sem_prov_check_access(CPUArchState *env, target_ulong addr,
                                   target_ulong size, target_ulong pc) {
     if (!binradar_memcheck_enabled) return;
-    if (symbolic_start_code > 0 &&
-        (pc < symbolic_start_code || pc >= symbolic_end_code)) {
-        return;
-    }
     PtrRegShadow *shadow = provenance_get_reg_shadow(env);
     int ea_src_reg = -1;
     target_ulong ea_src_val = 0;
@@ -637,6 +636,9 @@ static void sem_prov_check_access(CPUArchState *env, target_ulong addr,
     target_ulong base_val = shadow->ea_meta.base_val;
     target_ulong index_val = shadow->ea_meta.index_val;
     shadow->ea_meta.valid = false;
+    /* Scope rejection must not leave an instruction-local EA armed for a
+     * later main/DSO access or another constituent of a helper operation. */
+    if (!provenance_memcheck_pc_eligible(pc)) return;
     if (have_ea) {
         /* Semantic EA propagation (§6).  Identity requires a 64-bit
          * address size with no segment override.  Constant displacement
@@ -1193,6 +1195,12 @@ void helper_sem_reg_xchg(CPUArchState *env, uint32_t dst_idx,
     }
 }
 
+void helper_sem_syscall_pc(CPUArchState *env, target_ulong pc) {
+    if (binradar_memcheck_enabled) {
+        provenance_get_reg_shadow(env)->syscall_pc = pc;
+    }
+}
+
 void helper_sem_set_pc(CPUArchState *env, target_ulong pc) {
     /* Provenance scratch PC for lea_imm, plus OSPREY's pending raw
      * transfer PC for the two-helper LEA sequence, under independent
@@ -1208,12 +1216,14 @@ void helper_sem_set_pc(CPUArchState *env, target_ulong pc) {
 
 void helper_sem_call(CPUArchState *env, target_ulong callee_pc,
                      target_ulong entry_sp) {
+    provenance_memcheck_call(env, callee_pc, entry_sp);
     if (osprey_collect_enabled) {
         osprey_on_call(env, callee_pc, entry_sp);
     }
 }
 
 void helper_sem_ret(CPUArchState *env, target_ulong pc, target_ulong sp) {
+    provenance_memcheck_ret(env, pc, sp);
     if (osprey_collect_enabled) {
         osprey_on_ret(env, pc, sp);
     }

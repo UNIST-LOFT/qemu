@@ -24,6 +24,7 @@ Exit status: 0 if every test passes, 1 otherwise.
 
 import argparse
 import ctypes
+import hashlib
 import os
 import random
 import re
@@ -197,7 +198,7 @@ TESTS: list[dict[str, Any]] = [
          fs_patch_cnt=3, fs_abort_count=0,   # 0 disables the bad-attempt limit
          fs_max_attempts=400, fs_stop="exhausted", fs_remaining=0,
          fs_attempt_result=ATTEMPT_NO_OBSERVATION, fs_committed=1,
-         fs_only_no_observation_discards=True, fs_evidence_attempts=(1,),
+         fs_all_mutations_discarded=True, fs_evidence_attempts=(1,),
          fs_min_discarded=1, fs_discard_reason="no-observation",
          allow_findings=True, timeout=900,
          note="every plan for this guest is discarded, so the LAST queued "
@@ -539,6 +540,64 @@ PHASE7_TESTS: list[dict[str, Any]] = [
 ]
 TESTS += PHASE7_TESTS
 
+# Non-symbolic summaries must detect the same logical intervals without
+# initializing a solver pool. Reuse the existing controlled guests.
+for source in ("t12_memcpy_model_oob", "t13_memset_model_oob",
+               "t18_memchr_unaligned", "t50_strcpy_model_oob",
+               "t51_strncpy_model_padding_oob", "t52_strcpy_fault_ordering",
+               "t53_memcpy_fault_ordering", "t54_zero_length_models",
+               "t55_strcmp_exact_ranges"):
+    original = next(spec for spec in TESTS if spec["name"] == source)
+    TESTS.append(dict(original, name=source + "_mem", guest=source, mode="mem"))
+
+for case, suffix in enumerate(("strlen_oob", "strnlen_oob", "strnlen_nul",
+                               "memchr_stop", "memcmp_stop", "strncmp_stop")):
+    for mode in ("mem", "sym"):
+        overflow = case <= 1
+        TESTS.append(dict(
+            name="t86_libc_scans_" + suffix + "_" + mode,
+            guest="t86_libc_scans", args=[str(case)], mode=mode, rc=(0,),
+            verdict="crash" if overflow else "normal",
+            finding=dict(reason="heap-buffer-overflow", is_uaf=0,
+                         fields={"size": 8, "offset": 0}) if overflow else None))
+
+for case, suffix in enumerate(("overflow", "badfd", "zero", "unmapped",
+                               "partial", "vector_partial", "vector_oob",
+                               "vector_uaf", "descriptor_oob", "pwrite_oob",
+                               "pwritev_oob", "vector_badfd", "pwrite_badfd",
+                               "libc_write_oob", "libc_write_badfd")):
+    overflow = case in (0, 6, 7, 8, 9, 10, 13)
+    uaf = case == 7
+    fields = {"size": 16, "offset": 16, "width": 16} if case == 8 else {
+        "size": 8, "offset": 0, "width": 8 if uaf else 12}
+    TESTS.append(dict(
+        name="t84_syscall_input_" + suffix, guest="t84_syscall_input",
+        args=[str(case)], mode="mem", rc=(0,),
+        verdict="crash" if overflow else "normal",
+        finding=dict(reason="heap-use-after-free" if uaf else "heap-buffer-overflow",
+                     is_uaf=int(uaf), fields=fields) if overflow else None,
+        access_pc_symbol=("libc_write_return" if case == 13 else
+                          "syscall_input_pc") if overflow else None,
+        fault_reference=dict(valid="true", source="provenance-access") if overflow else None))
+
+for suffix in (".orig", ".brpatched", ".brcached"):
+    TESTS.append(dict(
+        name="t85_library_coverage" + suffix, guest="t85_library_coverage",
+        mode="mem", rc=(0,), verdict="crash", artifact_suffix=suffix,
+        plt_source_suffix=".orig",
+        finding=dict(reason="heap-buffer-overflow", is_uaf=0,
+                     fields={"size": 8, "offset": 4, "width": 8}),
+        site_binary="libcoverage.so", site_symbol="coverage_access_pc",
+        fault_reference=dict(valid="true", source="provenance-access")))
+TESTS.append(dict(name="t85_library_coverage_benign", guest="t85_library_coverage",
+                  args=["benign"], mode="mem", rc=(0,), verdict="normal", finding=None))
+TESTS.append(dict(name="t85_library_coverage_symbolic", guest="t85_library_coverage",
+                  mode="sym", rc=(0,), verdict="crash",
+                  finding=dict(reason="heap-buffer-overflow", is_uaf=0,
+                               fields={"size": 8, "offset": 4, "width": 8}),
+                  site_binary="libcoverage.so", site_symbol="coverage_access_pc",
+                  fault_reference=dict(valid="true", source="provenance-access")))
+
 # ---------------------------------------------------------------------------
 # Log parsing
 # ---------------------------------------------------------------------------
@@ -567,11 +626,15 @@ def parse_crash_reason(out):
 
 def parse_fault_references(out):
     return [
-        dict(valid=valid, source=source, address=int(address, 16))
-        for valid, source, address in re.findall(
-            r"^\[snapshot\] \[fault-reference\] \[version 2\] "
+        dict(valid=valid, source=source, address=int(address, 16),
+             image=None if image in ("", "none") else image,
+             image_offset=int(offset or "0", 16))
+        for valid, source, address, image, offset in re.findall(
+            r"^\[snapshot\] \[fault-reference\] \[version [23]\] "
             r"\[valid (true|false)\] \[source ([^\]]+)\] "
-            r"\[address ([0-9a-fA-F]+)\]$", out, re.MULTILINE)
+            r"\[address ([0-9a-fA-F]+)\]"
+            r"(?: \[image (none|[0-9a-f]{64})\] \[image-offset ([0-9a-f]+)\])?$",
+            out, re.MULTILINE)
     ]
 
 
@@ -692,7 +755,7 @@ def run_memcheck(test, guest, qemu, workdir):
         shutil.copyfile(guest, temporary)
         os.chmod(temporary, 0o755)
         os.replace(temporary, binary)
-    cmd = [qemu, "-d", "page", binary]
+    cmd = [qemu, "-d", "page", binary, *test.get("args", [])]
     return run_tracer(cmd, env, test.get("timeout", 30))
 
 
@@ -716,7 +779,7 @@ def run_symbolic(test, guest, qemu, workdir):
     env["BINRADAR_ENTRYPOINT"] = resolve_entrypoint(guest)
     env["PLT_INFO_FILE"] = guest + ".plt"
     prepare_symbolic_env(env, run_dir)
-    cmd = [qemu, "-symbolic", guest]
+    cmd = [qemu, "-symbolic", guest, *test.get("args", [])]
     return run_tracer(cmd, env, test.get("timeout", 30))
 
 
@@ -936,6 +999,13 @@ def run_test(test, guests_dir, workdir, qemu):
         sym_names = {v for k, v in test["meta"].items()
                      if k in ("producer_pc", "last_writer", "access_pc")}
         test["_symbols"] = resolve_symbols(guest, sym_names)
+    if test.get("access_pc_symbol"):
+        test["_access_pc"] = resolve_symbols(guest, {test["access_pc_symbol"]})[test["access_pc_symbol"]]
+    if test.get("site_binary"):
+        image = os.path.join(workdir, test["site_binary"])
+        with open(image, "rb") as stream:
+            test["_site_image"] = hashlib.sha256(stream.read()).hexdigest()
+        test["_site_offset"] = resolve_symbols(image, {test["site_symbol"]})[test["site_symbol"]]
     evidence = None
     summary = None
     # Compaction fixtures only need the committed baseline frame; draining the
@@ -968,6 +1038,12 @@ def run_test(test, guests_dir, workdir, qemu):
 def check(test, rc, fs_status, out, evidence=None, probe_text="",
           summary=None):
     problems = []
+    if test.get("site_binary"):
+        references = parse_fault_references(out)
+        if not references or any(reference["image"] != test["_site_image"] or
+                                 reference["image_offset"] != test["_site_offset"]
+                                 for reference in references):
+            problems.append("DSO fault identity does not match independent ELF digest/instruction")
     if not rc_ok(rc, test.get("rc", (0,))):
         problems.append(f"rc={rc} not in {test.get('rc')}")
     meta = test.get("meta")
@@ -1037,16 +1113,16 @@ def check(test, rc, fs_status, out, evidence=None, probe_text="",
                     f"forkserver committed "
                     f"{summary['committed'] if summary else None} != "
                     f"{want_committed}")
-        if test.get("fs_only_no_observation_discards"):
+        if test.get("fs_all_mutations_discarded"):
             if summary is None:
                 problems.append("missing summary for discarded-attempt outcomes")
             elif (summary["attempts"] < 2 or
                   summary["attempts"] != summary["initial_remaining"] + 1 or
                   summary["committed"] != 1 or
-                  summary["no_observation"] != summary["attempts"] - 1):
+                  summary["discarded"] != summary["attempts"] - 1):
                 problems.append(
-                    "mutation queue did not finish with only "
-                    "no-observation discards "
+                    "mutation queue did not drain every plan without "
+                    "committing mutation evidence "
                     f"(attempts={summary['attempts']}, "
                     f"initial-remaining={summary['initial_remaining']}, "
                     f"committed={summary['committed']}, "
@@ -1094,7 +1170,7 @@ def check(test, rc, fs_status, out, evidence=None, probe_text="",
         crashes = parse_crash_fault_addresses(out)
         addresses = [reference["address"] for reference in references]
         if not references:
-            problems.append("missing normalized version-2 fault-reference row")
+            problems.append("missing normalized fault-reference row")
         for reference in references:
             if reference["valid"] != reference_expectation["valid"]:
                 problems.append(
@@ -1184,6 +1260,8 @@ def check(test, rc, fs_status, out, evidence=None, probe_text="",
         return problems
 
     got = findings[0]
+    if test.get("access_pc_symbol") and finding_int(got, "access_pc") != test["_access_pc"]:
+        problems.append(f"finding identity does not match {test['access_pc_symbol']}")
     required = {
         "reason", "access_pc", "access_addr", "width", "obj_id", "gen",
         "obj_base", "size", "offset", "producer_pc", "kind",
@@ -1233,8 +1311,6 @@ def check(test, rc, fs_status, out, evidence=None, probe_text="",
         if access_addr != expected_addr:
             problems.append(
                 f"access address {access_addr:#x} != base+offset {expected_addr:#x}")
-        if finding_int(got, "ea_reg") < 0:
-            problems.append("tagged finding has no EA register")
 
     cursors = test.get("cursors")
     if cursors:

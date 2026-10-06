@@ -23,6 +23,7 @@ typedef struct PatchedResult {
     bool fault_reference_valid;
     SnapshotFaultReferenceSource fault_reference_source;
     uint64_t fault_loc;
+    ProvenanceFaultSite fault_site;
 } PatchedResult;
 
 typedef struct BinradarResult {
@@ -138,6 +139,7 @@ typedef struct BinradarManager {
     bool poc_fault_valid;
     SnapshotFaultReferenceSource poc_fault_source;
     target_ulong poc_fault_addr;
+    ProvenanceFaultSite poc_fault_site;
 } BinradarManager;
 
 /* Borrowed only for one synchronous feedback commit. */
@@ -199,16 +201,17 @@ bool br_evidence_write_header(FILE *fp, uint16_t kind);
 #define BR_EVIDENCE_HEADER_SIZE 16u
 #define BR_EVIDENCE_FRAME_HEADER_SIZE 8u
 #define BR_EVIDENCE_MAGIC "BRDATAB1"
-/* FILTER and VERIFIER payloads keep version 1; BINRADAR evidence is version 2
- * because attempt ids may now have gaps after a discarded attempt. */
+/* FILTER and VERIFIER retain v1. BINRADAR v3 carries precise DSO sites
+ * and preserves v2's gapped attempt IDs after discarded attempts. */
 #define BR_EVIDENCE_VERSION 1u
-#define BR_EVIDENCE_VERSION_BINRADAR 2u
+#define BR_EVIDENCE_VERSION_BINRADAR 3u
 #define BR_EVIDENCE_KIND_FILTER 1u
 #define BR_EVIDENCE_KIND_BINRADAR 3u
 #define BR_EVIDENCE_RECORD_FILTER 1u
 #define BR_EVIDENCE_RECORD_BINRADAR_ITERATION 4u
 #define BR_EVIDENCE_MAX_FRAME (256u * 1024u * 1024u)
 #define BR_EVIDENCE_GROUP_BRANCH_NULL 1u
+#define BR_EVIDENCE_GROUP_FAULT_SITE 2u
 #define BR_EVIDENCE_OUTCOME_NORMAL 1u
 #define BR_EVIDENCE_OUTCOME_CRASH 2u
 

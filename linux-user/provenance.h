@@ -91,6 +91,16 @@ typedef struct PtrRegShadow {
      * metadata carries the exact guest instruction PC, not a truncated
      * low-16-bits approximation. */
     target_ulong cur_pc;
+    target_ulong syscall_pc;
+    /* Proven main-image -> external call boundaries. COW-owned, bounded;
+     * no stack scanning or guessed instruction lengths. */
+    struct {
+        target_ulong return_pc;
+        target_ulong entry_sp;
+    } external_calls[64];
+    unsigned external_call_count;
+    bool external_call_overflow;
+    target_ulong external_overflow_sp;
     /* Pending allocator operation for this guest thread (per-CPU, so
      * multithreaded guests keep independent pending ops). */
     ProvenancePending pending;
@@ -135,10 +145,20 @@ typedef enum {
     PROV_FINDING_TAGGED,       /* authoritative tagged identity */
 } ProvFindingQuality;
 
+/* Main images use their normalized PC. DSO sites use verified image
+ * content and image-relative virtual instruction offset, not ASLR PCs. */
+typedef struct ProvenanceFaultSite {
+    bool valid;
+    uint8_t image_id[32];
+    uint64_t image_offset;
+} ProvenanceFaultSite;
+
 /* Finding payload published across the forkserver child/parent boundary. */
 typedef struct {
     ProvFindingQuality quality;
-    target_ulong    access_pc;
+    target_ulong    access_pc;     /* artifact-stable attributed identity */
+    target_ulong    actual_pc;     /* instruction / modeled-call location */
+    ProvenanceFaultSite site;
     target_ulong    access_addr;
     uint32_t        access_width;
     uint64_t        object_id;
@@ -236,6 +256,27 @@ PtrTag provenance_mem_load_tag(target_ulong addr);
 void provenance_mem_invalidate(target_ulong addr, target_ulong size);
 
 /* ---- Access checking ---- */
+#define BINRADAR_MEMCHECK_POLICY "coverage-v1"
+
+/* File-backed runtime mappings (libc/loader) use logical summaries rather
+ * than application-object checks on implementation overfetch/metadata. */
+void provenance_memcheck_mapping(target_ulong addr, target_ulong size, int fd,
+                                 uint64_t file_offset);
+bool provenance_memcheck_site(target_ulong pc, ProvenanceFaultSite *site);
+void provenance_memcheck_unmap(target_ulong addr, target_ulong size);
+void provenance_memcheck_protect(target_ulong addr, target_ulong size, int prot);
+bool provenance_memcheck_pc_eligible(target_ulong pc);
+bool provenance_memcheck_reference_pc(CPUArchState *env, target_ulong pc,
+                                      target_ulong *reference_pc);
+void provenance_memcheck_call(CPUArchState *env, target_ulong callee_pc,
+                              target_ulong entry_sp);
+void provenance_memcheck_ret(CPUArchState *env, target_ulong pc,
+                             target_ulong post_sp);
+void provenance_check_syscall_read(CPUArchState *env, target_ulong addr,
+                                   target_ulong size, int reg);
+void provenance_check_syscall_read_tagged(CPUArchState *env, target_ulong addr,
+                                          target_ulong size, PtrTag tag);
+
 /* Check an access using provenance tag.  Returns MemcheckResult.
  * If tag is UNKNOWN, falls through to exact-bounds on live objects.
  * Records a non-fatal PendingProvenanceFault on OOB/UAF. */

@@ -4420,7 +4420,7 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, CPUArchState *cpu_env)
     if (symbolic_mode) {
         symbolic_force_flush_cache = parse_translation_block(tb, tb->pc, tb->tc.ptr, tcg_ctx, cpu_env);
     }
-    if (binradar_memcheck_enabled && !symbolic_mode) {
+    if (binradar_memcheck_enabled) {
         memcheck_instrument_tb(tb, tcg_ctx, cpu_env);
     }
 #endif

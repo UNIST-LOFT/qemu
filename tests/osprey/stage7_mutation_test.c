@@ -69,6 +69,7 @@
 /* ------------------------------------------------------------------ */
 
 unsigned long guest_base = 0;
+unsigned long reserved_va = 0;
 uint64_t symbolic_start_code = 0;
 uint64_t symbolic_end_code = 0;
 Expr *pool = NULL;
@@ -95,6 +96,10 @@ abi_long target_mmap(abi_ulong start, abi_ulong len, int prot, int flags,
     return test_mmap_result;
 }
 int page_get_flags(target_ulong address) { (void)address; return 0; }
+int page_check_range(target_ulong address, target_ulong length, int flags) {
+    (void)address; (void)flags;
+    return length == 0 ? 0 : -1;
+}
 int walk_memory_regions(void *priv, walk_memory_regions_fn fn) {
     (void)priv; (void)fn;
     return 0;

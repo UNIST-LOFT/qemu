@@ -13,6 +13,8 @@
 #include "tcg/symbolic/symbolic-struct.h"
 #include "exec/helper-head.h"
 #include "qemu/atomic.h"
+#include "qemu/bswap.h"
+#include "elf.h"
 
 int provenance_debug = 0;
 
@@ -523,6 +525,383 @@ void provenance_mem_invalidate(target_ulong addr, target_ulong size) {
 
 /* ---- Access checking ---- */
 
+typedef struct {
+    uint64_t file_start;
+    uint64_t file_end;
+    uint64_t virtual_start;
+} ProvExecSegment;
+
+typedef struct {
+    struct stat stamp;
+    uint8_t image_id[32];
+    GArray *segments;
+    bool hashed;
+    bool verified;
+    bool tainted;
+} ProvImageIdentity;
+
+typedef struct {
+    target_ulong start;
+    target_ulong end;
+    bool runtime;
+    ProvImageIdentity *image;
+    uint64_t image_bias;
+    bool site_valid;
+} ProvCodeMapping;
+
+static GArray *prov_code_mappings;
+static GPtrArray *prov_images;
+
+static bool prov_same_image_stamp(const struct stat *a, const struct stat *b)
+{
+    return a->st_dev == b->st_dev && a->st_ino == b->st_ino &&
+           a->st_size == b->st_size &&
+           a->st_mtim.tv_sec == b->st_mtim.tv_sec && a->st_mtim.tv_nsec == b->st_mtim.tv_nsec &&
+           a->st_ctim.tv_sec == b->st_ctim.tv_sec && a->st_ctim.tv_nsec == b->st_ctim.tv_nsec;
+}
+
+static ProvImageIdentity *prov_image_identity(int fd)
+{
+    struct stat stamp;
+    if (fstat(fd, &stamp) != 0 || !S_ISREG(stamp.st_mode) || stamp.st_size < sizeof(Elf64_Ehdr)) return NULL;
+    if (prov_images == NULL) prov_images = g_ptr_array_new();
+    for (unsigned i = 0; i < prov_images->len; i++) {
+        ProvImageIdentity *image = g_ptr_array_index(prov_images, i);
+        if (prov_same_image_stamp(&image->stamp, &stamp)) return image;
+    }
+    Elf64_Ehdr header;
+    if (pread(fd, &header, sizeof(header), 0) != sizeof(header) ||
+        memcmp(header.e_ident, ELFMAG, SELFMAG) != 0 ||
+        header.e_ident[EI_CLASS] != ELFCLASS64 || header.e_ident[EI_DATA] != ELFDATA2LSB ||
+        le16_to_cpu(header.e_machine) != EM_X86_64 ||
+        le16_to_cpu(header.e_phentsize) != sizeof(Elf64_Phdr)) return NULL;
+    uint64_t offset = le64_to_cpu(header.e_phoff);
+    uint16_t count = le16_to_cpu(header.e_phnum);
+    if (offset > stamp.st_size || (uint64_t)count * sizeof(Elf64_Phdr) > (uint64_t)stamp.st_size - offset) return NULL;
+    ProvImageIdentity *image = g_new0(ProvImageIdentity, 1);
+    image->stamp = stamp;
+    image->segments = g_array_new(false, false, sizeof(ProvExecSegment));
+    for (unsigned i = 0; i < count; i++) {
+        Elf64_Phdr program;
+        if (pread(fd, &program, sizeof(program), offset + i * sizeof(program)) != sizeof(program)) {
+            g_array_free(image->segments, true);
+            g_free(image);
+            return NULL;
+        }
+        if (le32_to_cpu(program.p_type) != PT_LOAD || !(le32_to_cpu(program.p_flags) & PF_X)) continue;
+        uint64_t file_start = le64_to_cpu(program.p_offset);
+        uint64_t file_size = le64_to_cpu(program.p_filesz);
+        uint64_t virtual_start = le64_to_cpu(program.p_vaddr);
+        if (file_start > stamp.st_size || file_size > (uint64_t)stamp.st_size - file_start ||
+            (file_start & ~TARGET_PAGE_MASK) != (virtual_start & ~TARGET_PAGE_MASK)) continue;
+        ProvExecSegment segment = {file_start & TARGET_PAGE_MASK,
+            file_start + file_size, virtual_start & TARGET_PAGE_MASK};
+        g_array_append_val(image->segments, segment);
+    }
+    g_ptr_array_add(prov_images, image);
+    return image;
+}
+
+static void prov_image_hash(ProvImageIdentity *image, int fd)
+{
+    if (image->hashed) return;
+    image->hashed = true;
+    GChecksum *checksum = g_checksum_new(G_CHECKSUM_SHA256);
+    uint8_t bytes[8192];
+    off_t offset = 0;
+    while (offset < image->stamp.st_size) {
+        size_t wanted = MIN(sizeof(bytes), image->stamp.st_size - offset);
+        ssize_t count = pread(fd, bytes, wanted, offset);
+        if (count <= 0) break;
+        g_checksum_update(checksum, bytes, count);
+        offset += count;
+    }
+    struct stat after;
+    if (offset == image->stamp.st_size && fstat(fd, &after) == 0 &&
+        prov_same_image_stamp(&image->stamp, &after)) {
+        gsize digest_size = sizeof(image->image_id);
+        g_checksum_get_digest(checksum, image->image_id, &digest_size);
+        image->verified = digest_size == sizeof(image->image_id);
+    }
+    g_checksum_free(checksum);
+    if (!image->verified) log_msg("[memcheck] [coverage] [unverified-image]\n");
+}
+
+static bool prov_main_pc(target_ulong pc)
+{
+    return symbolic_start_code > 0 && pc >= symbolic_start_code &&
+           pc < symbolic_end_code;
+}
+
+void provenance_memcheck_unmap(target_ulong addr, target_ulong size)
+{
+    if (prov_code_mappings == NULL || size == 0 || addr > (target_ulong)-1 - size) {
+        return;
+    }
+    target_ulong end = addr + size;
+    for (unsigned i = 0; i < prov_code_mappings->len;) {
+        ProvCodeMapping *range = &g_array_index(prov_code_mappings, ProvCodeMapping, i);
+        if (range->end <= addr || range->start >= end) {
+            i++;
+            continue;
+        }
+        if (range->start < addr && range->end > end) {
+            ProvCodeMapping right = *range;
+            right.start = end;
+            range->end = addr;
+            g_array_insert_val(prov_code_mappings, i + 1, right);
+            break;
+        }
+        if (range->start < addr) {
+            range->end = addr;
+            i++;
+        } else if (range->end > end) {
+            range->start = end;
+            break;
+        } else {
+            g_array_remove_index(prov_code_mappings, i);
+        }
+    }
+}
+
+void provenance_memcheck_protect(target_ulong addr, target_ulong size, int prot)
+{
+    if (!(prot & PROT_WRITE) || prov_code_mappings == NULL ||
+        size == 0 || addr > (target_ulong)-1 - size) return;
+    target_ulong end = addr + size;
+    for (unsigned i = 0; i < prov_code_mappings->len; i++) {
+        ProvCodeMapping *range = &g_array_index(prov_code_mappings, ProvCodeMapping, i);
+        if (range->site_valid && range->start < end && range->end > addr) {
+            range->image->tainted = true;
+        }
+    }
+}
+
+void provenance_memcheck_mapping(target_ulong addr, target_ulong size, int fd,
+                                 uint64_t file_offset)
+{
+    /* Compact evidence still needs guest-signal identities with checking
+     * disabled.  Track its mapped images without enabling any access check. */
+    if ((!binradar_memcheck_enabled && getenv("BINRADAR_EVIDENCE_FILE") == NULL) ||
+        size == 0 || addr > (target_ulong)-1 - size) {
+        return;
+    }
+    provenance_memcheck_unmap(addr, size);
+    if (fd < 0) return;
+    char fd_name[64], filename[PATH_MAX + 1];
+    snprintf(fd_name, sizeof(fd_name), "/proc/self/fd/%d", fd);
+    ssize_t length = readlink(fd_name, filename, sizeof(filename) - 1);
+    bool runtime = true;
+    if (length >= 0 && length < sizeof(filename) - 1) {
+        filename[length] = '\0';
+        const char *name = strrchr(filename, '/');
+        name = name ? name + 1 : filename;
+        runtime = strcmp(name, "libc.so.6") == 0 ||
+                  strncmp(name, "libc-", 5) == 0 ||
+                  strncmp(name, "ld-linux-", 9) == 0 ||
+                  strncmp(name, "ld-", 3) == 0;
+    } else {
+        log_msg("[memcheck] [coverage] [unresolved-image] [addr %lx]\n", addr);
+    }
+    if (prov_code_mappings == NULL) {
+        prov_code_mappings = g_array_new(false, false, sizeof(ProvCodeMapping));
+    }
+    ProvCodeMapping range = {.start = addr, .end = addr + size, .runtime = runtime};
+    range.image = prov_image_identity(fd);
+    if (range.image != NULL) {
+        for (unsigned i = 0; i < range.image->segments->len; i++) {
+            const ProvExecSegment *segment = &g_array_index(range.image->segments, ProvExecSegment, i);
+            if (file_offset < segment->file_start || file_offset >= segment->file_end) continue;
+            uint64_t delta = file_offset - segment->file_start;
+            if (segment->virtual_start > addr || delta > addr - segment->virtual_start) continue;
+            range.image_bias = addr - segment->virtual_start - delta;
+            /* The first main executable mapping precedes main-bound setup;
+             * its normalized PCs never need a content-derived identity. */
+            if (symbolic_start_code > 0 && !prov_main_pc(addr)) {
+                prov_image_hash(range.image, fd);
+                range.site_valid = range.image->verified;
+            }
+            break;
+        }
+    }
+    unsigned index = 0;
+    while (index < prov_code_mappings->len &&
+           g_array_index(prov_code_mappings, ProvCodeMapping, index).start < addr) index++;
+    if (range.site_valid && (page_get_flags(addr) & PAGE_WRITE)) range.image->tainted = true;
+    g_array_insert_val(prov_code_mappings, index, range);
+}
+
+static const ProvCodeMapping *prov_code_mapping(target_ulong pc)
+{
+    if (prov_code_mappings == NULL || !(page_get_flags(pc) & PAGE_EXEC)) return NULL;
+    unsigned low = 0, high = prov_code_mappings->len;
+    while (low < high) {
+        unsigned middle = low + (high - low) / 2;
+        const ProvCodeMapping *range = &g_array_index(prov_code_mappings, ProvCodeMapping, middle);
+        if (pc < range->start) high = middle;
+        else if (pc >= range->end) low = middle + 1;
+        else return range;
+    }
+    return NULL;
+}
+
+bool provenance_memcheck_pc_eligible(target_ulong pc)
+{
+    if (!binradar_memcheck_enabled || is_in_e9_exclude_region(pc)) return false;
+    if (prov_main_pc(pc)) return true;
+    const ProvCodeMapping *range = prov_code_mapping(pc);
+    return range != NULL && !range->runtime && range->site_valid && !range->image->tainted;
+}
+
+bool provenance_memcheck_site(target_ulong pc, ProvenanceFaultSite *site)
+{
+    memset(site, 0, sizeof(*site));
+    if (is_in_e9_exclude_region(pc)) return false;
+    if (prov_main_pc(pc)) return true;
+    const ProvCodeMapping *range = prov_code_mapping(pc);
+    if (range == NULL || !range->site_valid || range->image->tainted || pc < range->image_bias) return false;
+    site->valid = true;
+    memcpy(site->image_id, range->image->image_id, sizeof(site->image_id));
+    site->image_offset = pc - range->image_bias;
+    return true;
+}
+
+bool provenance_memcheck_reference_pc(CPUArchState *env, target_ulong pc,
+                                      target_ulong *reference_pc)
+{
+    if (prov_main_pc(pc) && !is_in_e9_exclude_region(pc)) {
+        *reference_pc = pc;
+        return true;
+    }
+    ProvenanceFaultSite site;
+    if (provenance_memcheck_site(pc, &site)) {
+        *reference_pc = pc;
+        return true;
+    }
+    /* Unknown external code is not a whole-main-call identity. */
+    (void)env;
+    return false;
+}
+
+static bool prov_caller_reference_pc(CPUArchState *env, target_ulong *reference_pc)
+{
+    if (env == NULL) return false;
+    PtrRegShadow *shadow = provenance_get_reg_shadow(env);
+    if (shadow->external_call_overflow) {
+        if (env->regs[R_ESP] <= shadow->external_overflow_sp) return false;
+        shadow->external_call_overflow = false;
+    }
+    /* A stack unwind invalidates crossed boundaries, never guesses a new
+     * caller from arbitrary stack contents. */
+    while (shadow->external_call_count &&
+           env->regs[R_ESP] > shadow->external_calls[shadow->external_call_count - 1].entry_sp) {
+        shadow->external_call_count--;
+    }
+    if (!shadow->external_call_count) return false;
+    unsigned index = shadow->external_call_count - 1;
+    target_ulong saved_return;
+    if (!access_ok(VERIFY_READ, shadow->external_calls[index].entry_sp, sizeof(saved_return))) return false;
+    memcpy(&saved_return, g2h(shadow->external_calls[index].entry_sp), sizeof(saved_return));
+    if (saved_return != shadow->external_calls[index].return_pc) return false;
+    *reference_pc = saved_return;
+    return true;
+}
+
+void provenance_memcheck_call(CPUArchState *env, target_ulong callee_pc,
+                              target_ulong entry_sp)
+{
+    if (!binradar_memcheck_enabled) return;
+    /* Main-image PLT calls enter main text before jumping into a DSO, so
+     * the observed return boundary matters even when callee_pc is main. */
+    (void)callee_pc;
+    PtrRegShadow *shadow = provenance_get_reg_shadow(env);
+    if (shadow->external_call_overflow) {
+        if (entry_sp < shadow->external_overflow_sp) return;
+        shadow->external_call_overflow = false;
+    }
+    if (!access_ok(VERIFY_READ, entry_sp, sizeof(target_ulong))) return;
+    target_ulong return_pc;
+    memcpy(&return_pc, g2h(entry_sp), sizeof(return_pc));
+    if (!provenance_memcheck_pc_eligible(return_pc)) return;
+    while (shadow->external_call_count &&
+           entry_sp >= shadow->external_calls[shadow->external_call_count - 1].entry_sp) {
+        shadow->external_call_count--;
+    }
+    if (shadow->external_call_count == ARRAY_SIZE(shadow->external_calls)) {
+        shadow->external_call_overflow = true;
+        shadow->external_overflow_sp = entry_sp;
+        log_msg("[memcheck] [coverage] [call-depth-exhausted]\n");
+        return;
+    }
+    unsigned index = shadow->external_call_count++;
+    shadow->external_calls[index].return_pc = return_pc;
+    shadow->external_calls[index].entry_sp = entry_sp;
+}
+
+void provenance_memcheck_ret(CPUArchState *env, target_ulong pc,
+                             target_ulong post_sp)
+{
+    if (!binradar_memcheck_enabled) return;
+    PtrRegShadow *shadow = provenance_get_reg_shadow(env);
+    if (shadow->external_call_overflow && post_sp > shadow->external_overflow_sp) {
+        shadow->external_call_overflow = false;
+    }
+    while (shadow->external_call_count &&
+           post_sp > shadow->external_calls[shadow->external_call_count - 1].entry_sp) {
+        unsigned index = --shadow->external_call_count;
+        if (pc != shadow->external_calls[index].return_pc) {
+            /* Nonlocal return: crossed frames are no longer evidence. */
+            continue;
+        }
+    }
+}
+
+static bool prov_syscall_read_pc(CPUArchState *env, target_ulong *out)
+{
+    if (!binradar_memcheck_enabled) return false;
+    target_ulong pc = provenance_get_reg_shadow(env)->syscall_pc;
+    /* Runtime wrappers summarize a logical caller access; ordinary DSO
+     * instructions remain identified by their own verified image site. */
+    if (!provenance_memcheck_pc_eligible(pc)) {
+        if (!prov_caller_reference_pc(env, &pc)) return false;
+    }
+    *out = pc;
+    return true;
+}
+
+void provenance_check_syscall_read(CPUArchState *env, target_ulong addr,
+                                   target_ulong size, int reg)
+{
+    target_ulong pc;
+    if (size == 0 || !prov_syscall_read_pc(env, &pc)) return;
+    PtrTag tag = {0};
+    target_ulong value = 0;
+    if (reg >= 0 && reg < CPU_NB_REGS) {
+        tag = provenance_get_reg_tag(env, reg);
+        value = env->regs[reg];
+        if (tag.valid && tag.concrete_value == value) {
+            target_ulong delta = addr >= value ? addr - value : value - addr;
+            if (delta > INT64_MAX || (addr >= value
+                ? __builtin_add_overflow(tag.concrete_offset, (int64_t)delta,
+                                         &tag.concrete_offset)
+                : __builtin_sub_overflow(tag.concrete_offset, (int64_t)delta,
+                                         &tag.concrete_offset))) {
+                tag.valid = false;
+            }
+        }
+    }
+    provenance_check_access(env, addr, size, pc, tag, reg, value);
+}
+
+void provenance_check_syscall_read_tagged(CPUArchState *env, target_ulong addr,
+                                          target_ulong size, PtrTag tag)
+{
+    target_ulong pc;
+    if (size == 0 || !prov_syscall_read_pc(env, &pc)) return;
+    if (tag.concrete_value != addr) tag.valid = false;
+    provenance_check_access(env, addr, size, pc, tag, -1, addr);
+}
+
 /* Publication policy.  A tagged finding is sticky.  It may promote a
  * committed UNKNOWN fallback only for the same PC/address/width.  The two
  * immutable slots ensure a timeout SIGKILL during promotion leaves the
@@ -545,7 +924,7 @@ static ProvPublishedFinding *prov_fault_slot_for_publish(
     }
 
     const ProvFindingRecord *fallback = &pf->fallback.payload;
-    return fallback->access_pc == pc &&
+    return fallback->actual_pc == pc &&
            fallback->access_addr == addr &&
            fallback->access_width == size
         ? &pf->tagged : NULL;
@@ -561,6 +940,12 @@ static void prov_fault_fill(PendingProvenanceFault *pf, CPUArchState *env,
                             PtrProducerKind producer_kind, int ea_base_reg,
                             target_ulong ea_base_reg_val, bool is_uaf,
                             ProvFindingQuality quality) {
+    target_ulong reference_pc;
+    if (!provenance_memcheck_reference_pc(env, pc, &reference_pc)) {
+        log_msg("[memcheck] [unclassified-access] [actual_pc %lx] [addr %lx] [width %u]\n",
+                pc, addr, size);
+        return;
+    }
     ProvPublishedFinding *slot = prov_fault_slot_for_publish(
         pf, quality, pc, addr, size);
     if (slot == NULL) {
@@ -570,7 +955,9 @@ static void prov_fault_fill(PendingProvenanceFault *pf, CPUArchState *env,
     ProvFindingRecord *rec = &slot->payload;
     rec->quality = quality;
     rec->is_uaf = is_uaf;
-    rec->access_pc = pc;
+    rec->access_pc = reference_pc;
+    rec->actual_pc = pc;
+    provenance_memcheck_site(reference_pc, &rec->site);
     rec->access_addr = addr;
     rec->access_width = size;
     rec->object_id = obj_id;
@@ -713,8 +1100,7 @@ MemcheckResult provenance_check_access(CPUArchState *env, target_ulong addr,
     /* UNKNOWN provenance: fall through to exact-bounds on LIVE objects.
      * Do NOT report UAF from numeric quarantine (cannot distinguish stale
      * pointer from valid pointer to reused/untracked allocation). */
-    if (binradar_memcheck_enabled && symbolic_start_code > 0 &&
-        pc >= symbolic_start_code && pc < symbolic_end_code) {
+    if (binradar_memcheck_enabled) {
         /* Check quarantine first (exact-bounds UAF from numeric match).
          * NOTE: we do NOT report UAF for UNKNOWN provenance per the spec.
          * The quarantine check is only for the exact-bounds OOB path. */
@@ -812,8 +1198,8 @@ bool provenance_report_pending_finding(void) {
     }
 
     const ProvFindingRecord *f = &finding.payload;
-    log_msg("[prov] [finalize] [finding] [reason %s] [access_pc %lx] [access_addr %lx] [width %u] [obj_id %lu] [gen %u] [obj_base %lx] [size %lx] [offset %ld] [producer_pc %lx] [kind %d] [last_writer %lx] [is_uaf %d] [ea_reg %d] [query_cursor %ld] [expr_cursor %ld]\n",
-            prov_fault_reason_for(f), f->access_pc, f->access_addr,
+    log_msg("[prov] [finalize] [finding] [reason %s] [access_pc %lx] [actual_pc %lx] [access_addr %lx] [width %u] [obj_id %lu] [gen %u] [obj_base %lx] [size %lx] [offset %ld] [producer_pc %lx] [kind %d] [last_writer %lx] [is_uaf %d] [ea_reg %d] [query_cursor %ld] [expr_cursor %ld]\n",
+            prov_fault_reason_for(f), f->access_pc, f->actual_pc, f->access_addr,
             f->access_width, f->object_id, f->generation,
             f->object_base, f->requested_size, f->tracked_offset,
             f->producer_pc, f->producer_kind, f->last_writer_pc,
