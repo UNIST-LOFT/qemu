@@ -116,16 +116,16 @@ int main(void) {
     __asm__ volatile(
         "subq $16, %%rsp\n\t"
         "call ret16_callee\n\t"
+        ".globl t01_ret16_caller_load\n\t"
+        "t01_ret16_caller_load:\n\t"
         "movq (%%rsp), %%rax\n\t"
         :
         :
         : "rax", "cc", "memory");
 
-    /* _exit: no atexit handlers, no global dtors, no _fini.  The exit
-     * path is bias-dependent (the child can fault at different points
-     * depending on the stack position), so the fixture must not
-     * exercise it: the canonical dump must be byte-identical across
-     * forced PIE biases. */
+    /* _exit avoids atexit handlers/global dtors/_fini. The baseline must
+     * reach this normal exit and record the post-RET caller load under all
+     * three biases; equal truncated crash dumps are not a passing result. */
     _exit(0);
 }
 

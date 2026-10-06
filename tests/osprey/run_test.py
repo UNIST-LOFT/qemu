@@ -91,6 +91,7 @@ TESTS = [
         mode="dump_compare",
         rc=(2,),
         expected=None,
+        expect_log_rows=[("binradar", "[normal] [iter 1] [patch 0]")],
         # Keep cross-ASLR equality and allocation/activation invariants;
         # event IDs and allocator-call frame counts are not API contracts.
         dump_assert={
@@ -101,6 +102,11 @@ TESTS = [
             "realloc_moved": True,      # 16 -> 1 MiB at a distinct base
             "failed_realloc_preserved": True,  # old identity survives
             "zero_size_nonnull": True,  # malloc(0) instance present
+            "access_symbols_expected": {
+                "t01_ret16_caller_load": {
+                    "is_store": 0, "size": 8, "region_kind": 2,
+                },
+            },
         },
         timeout=60,
     ),

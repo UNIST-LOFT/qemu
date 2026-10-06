@@ -1812,14 +1812,13 @@ static int mr_manager_new_cache_index(int prev) {
     return (prev + 1) % SNAPSHOT_MEM_REG_CACHE;
 }
 
-static int mr_manager_search_cache_exact(SnapshotMemRegion **mr_cache, SnapshotMemRegion *query) {
+static void mr_manager_heap_invalidate_cache(target_ulong base) {
     for (int i = 0; i < SNAPSHOT_MEM_REG_CACHE; i++) {
-        SnapshotMemRegion *mr = mr_cache[i];
-        if (mr != NULL && compare_regions(mr, query, NULL) == 0) {
-            return i;
+        SnapshotMemRegion *mr = mr_manager.heap_cache[i];
+        if (mr != NULL && mr->base == base) {
+            mr_manager.heap_cache[i] = NULL;
         }
     }
-    return -1;
 }
 
 static void mr_manager_update_cache(SnapshotMemRegion **mr_cache, SnapshotMemRegion *target, int index) {
@@ -1836,15 +1835,19 @@ static SnapshotMemRegion *mr_manager_get_cache(SnapshotMemRegion **mr_cache, int
 }
 
 static void mr_manager_heap_insert(SnapshotMemRegion *mr) {
-    g_tree_insert(mr_manager.heap_data, mr, mr);
+    /* Cache entries borrow the key. Replace both key and value together:
+     * g_tree_insert frees the incoming key on a duplicate base, which would
+     * leave its identical value dangling. */
+    mr_manager_heap_invalidate_cache(mr->base);
+    g_tree_replace(mr_manager.heap_data, mr, mr);
 }
 
 
 static gint search_region(gconstpointer a, gconstpointer b) {
     const SnapshotMemRegion *region = (const SnapshotMemRegion *)a;
     const target_ulong addr = *(const target_ulong *)b;
-    if (addr < region->base) return 1;
-    if (addr >= region->base + region->size) return -1;
+    if (addr < region->base) return -1;
+    if (addr >= region->base + region->size) return 1;
     return 0;
 }
 
@@ -1888,18 +1891,12 @@ void snapshot_trace_free(target_ulong base, target_ulong pc) {
         heap_quarantine = g_queue_new();
     }
 
-    /* Remove from cache (same as mr_manager_heap_remove). */
-    int query_result = SNAPSHOT_MEM_REG_CACHE;
-    while (query_result >= 0) {
-        query_result = mr_manager_search_cache_exact(mr_manager.heap_cache, &query);
-        mr_manager_update_cache(mr_manager.heap_cache, NULL, query_result);
-    }
+    mr_manager_heap_invalidate_cache(base);
 
-    /* Steal (not remove) from the heap tree so the SnapshotMemRegion is
-     * not freed by g_tree_remove's key-destroy callback.  If the region
-     * is not found, there is nothing to quarantine. */
-    SnapshotMemRegion *mr = g_tree_search(mr_manager.heap_data,
-                                          (GCompareFunc)search_region, &base);
+    /* Free matches an allocation base, not a containing interval: empty
+     * allocations must also retire, and interior pointers must not. Steal
+     * transfers the key/value's ownership to the quarantine queue. */
+    SnapshotMemRegion *mr = g_tree_lookup(mr_manager.heap_data, &query);
     if (mr != NULL) {
         g_tree_steal(mr_manager.heap_data, mr);
         g_queue_push_tail(heap_quarantine, mr);

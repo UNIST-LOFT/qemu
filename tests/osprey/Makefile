@@ -33,6 +33,14 @@ OSPREY_OBJS := ../../build/x86_64-linux-user/linux-user/osprey.o \
                ../../build/x86_64-linux-user/linux-user/sem-events.o
 UNIT_BIN   := $(WORK)/osprey_unit
 UNIT_ASAN_BIN := $(WORK)/osprey_unit_asan
+REGIONS_UNIT_BIN := $(WORK)/snapshot_regions
+REGIONS_ASAN_BIN := $(WORK)/snapshot_regions_asan
+REGIONS_SRCS := snapshot_regions_test.c ../../linux-user/snapshot-mutation.c \
+                ../../linux-user/binradar-cache.c
+REGIONS_DEPS := $(REGIONS_SRCS) ../../linux-user/snapshot.c \
+                ../../linux-user/snapshot.h ../../linux-user/snapshot-mutation.h \
+                ../../linux-user/binradar-cache.h
+REGIONS_GC_FLAGS := -ffunction-sections -fdata-sections -Wl,--gc-sections
 REL_UNIT_BIN := $(WORK)/stage3_relations
 REL_ASAN_BIN := $(WORK)/stage3_relations_asan
 GRAPH_UNIT_BIN := $(WORK)/stage3_graph
@@ -93,8 +101,10 @@ PLT_FILES  := $(addprefix $(WORK)/,$(addsuffix .plt,$(TESTS)))
         unit-stage6-decode unit-stage6-decode-asan \
         unit-stage7-mutation unit-stage7-mutation-asan \
         unit-stage7-runtime unit-stage7-runtime-asan \
-        unit-b1-mutation unit-b1-mutation-asan guests plts clean
-check: inventory run unit unit-asan-osprey unit-stage3-relations \
+        unit-b1-mutation unit-b1-mutation-asan unit-snapshot-regions \
+        unit-snapshot-regions-asan guests plts clean
+check: inventory run unit unit-asan-osprey unit-snapshot-regions \
+       unit-snapshot-regions-asan unit-stage3-relations \
        unit-stage3-relations-asan unit-stage3-graph unit-stage3-graph-asan \
        unit-stage3-rules unit-stage3-rules-asan unit-stage4-exact \
        unit-stage4-exact-asan unit-stage5-bp unit-stage5-bp-asan \
@@ -108,13 +118,24 @@ unit-stage3-rules-asan unit-stage4-exact unit-stage4-exact-asan \
 unit-stage5-bp unit-stage5-bp-asan unit-stage6-decode \
 unit-stage6-decode-asan unit-stage7-mutation \
 unit-stage7-mutation-asan unit-stage7-runtime unit-stage7-runtime-asan \
-unit-b1-mutation unit-b1-mutation-asan: inventory
+unit-b1-mutation unit-b1-mutation-asan unit-snapshot-regions \
+unit-snapshot-regions-asan: inventory
 inventory:
 	@python3 $(INVENTORY)
 run: guests plts
 	@$(RUNNER) $(GUESTS) $(WORK) $(QEMU) --quiet
 unit: $(UNIT_BIN)
 	@$(UNIT_BIN)
+unit-snapshot-regions: $(REGIONS_UNIT_BIN)
+	@BINRADAR_TRACE_FILE=none $(REGIONS_UNIT_BIN)
+unit-snapshot-regions-asan: $(REGIONS_ASAN_BIN)
+	@BINRADAR_TRACE_FILE=none ASAN_OPTIONS=detect_leaks=1 $(REGIONS_ASAN_BIN)
+$(REGIONS_UNIT_BIN): $(REGIONS_DEPS) | $(WORK)
+	$(CC) $(UNIT_CFLAGS) $(REGIONS_GC_FLAGS) -o $@ $(REGIONS_SRCS) \
+		-lglib-2.0 -lpthread -lm
+$(REGIONS_ASAN_BIN): $(REGIONS_DEPS) | $(WORK)
+	$(CC) $(ASAN_CFLAGS) $(REGIONS_GC_FLAGS) -o $@ $(REGIONS_SRCS) \
+		-lglib-2.0 -lpthread -lm
 unit-asan: $(UNIT_ASAN_BIN)
 	@ASAN_OPTIONS=detect_leaks=1 $(UNIT_ASAN_BIN)
 unit-asan-osprey: $(WORK)/osprey_unit_asan_osprey
