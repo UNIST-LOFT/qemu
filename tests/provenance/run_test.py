@@ -422,6 +422,7 @@ BASE_ENV = {
     "BINRADAR_FORKSERVER_ENABLE": "0",
     "E9_EXCLUDE_RANGES": "",
     "BINRADAR_MEMCHECK_ENABLE": "1",
+    "BINRADAR_MEMCHECK_POLICY": "coverage-v2",
 }
 
 # ---------------------------------------------------------------------------
@@ -516,6 +517,27 @@ PHASE6_TESTS: list[dict[str, Any]] = [
     dict(name="t80_xmm_preentry_forkserver", mode="fors", rc=(0,),
          verdict="normal", finding=None,
          note="pre-entry movss under sem-events: banner instead of abort"),
+    # t87: a finding published before BINRADAR_ENTRYPOINT must not become the
+    # reference identity, because no child resumes before the snapshot.
+    # entry_function is the declared window, so early_fault() is pre-window:
+    # it must be reported as a prefix diagnostic and the published reference
+    # must be the in-window entry_fault_pc instead.
+    dict(name="t87_prefix_window_entry", guest="t87_prefix_window",
+         entrypoint_symbol="entry_function", mode="mem", rc=(0,),
+         verdict="crash",
+         prefix_finding_symbol="early_fault_pc",
+         reference_pc_symbol="entry_fault_pc",
+         finding=dict(reason="heap-buffer-overflow", is_uaf=0,
+                      fields={"width": 1}),
+         fault_reference=dict(valid="true", source="provenance-access")),
+    # Control: with the window opened at main, early_fault() is in-window and
+    # remains the reference, exactly as before the rule existed.
+    dict(name="t87_prefix_window_control", guest="t87_prefix_window",
+         entrypoint_symbol="main", mode="mem", rc=(0,),
+         verdict="crash", reference_pc_symbol="early_fault_pc",
+         finding=dict(reason="heap-buffer-overflow", is_uaf=0,
+                      fields={"width": 1}),
+         fault_reference=dict(valid="true", source="provenance-access")),
 ]
 TESTS += PHASE6_TESTS
 
@@ -783,7 +805,12 @@ def run_memcheck(test, guest, qemu, workdir):
     env = dict(os.environ)
     env.update(BASE_ENV)
     env["BINRADAR_PROBE_FILE"] = test.get("probe_file", "")
-    env["BINRADAR_ENTRYPOINT"] = resolve_entrypoint(guest)
+    symbol = test.get("entrypoint_symbol")
+    if symbol:
+        address = resolve_symbols(guest, {symbol})[symbol]
+        env["BINRADAR_ENTRYPOINT"] = "0x%x" % address
+    else:
+        env["BINRADAR_ENTRYPOINT"] = resolve_entrypoint(guest)
     binary = prepare_artifact(test, guest, env)
     cmd = [qemu, "-d", "page", binary, *test.get("args", [])]
     return run_tracer(cmd, env, test.get("timeout", 30))
@@ -1034,6 +1061,9 @@ def run_test(test, guests_dir, workdir, qemu):
     if test.get("reference_pc_symbol"):
         symbol = test["reference_pc_symbol"]
         test["_reference_pc"] = resolve_symbols(guest, {symbol})[symbol]
+    if test.get("prefix_finding_symbol"):
+        symbol = test["prefix_finding_symbol"]
+        test["_prefix_pc"] = resolve_symbols(guest, {symbol})[symbol]
     if test.get("site_binary"):
         image = os.path.join(workdir, test["site_binary"])
         with open(image, "rb") as stream:
@@ -1077,6 +1107,20 @@ def check(test, rc, fs_status, out, evidence=None, probe_text="",
                                  reference["image_offset"] != test["_site_offset"]
                                  for reference in references):
             problems.append("DSO fault identity does not match independent ELF digest/instruction")
+    if test.get("prefix_finding_symbol"):
+        # A pre-window finding must be reported as a diagnostic and must never
+        # be the published identity: no forkserver child can reproduce it.
+        prefix_pcs = [int(pc, 16) for pc in re.findall(
+            r"^\[prov\] \[prefix-finding\] \[access_pc ([0-9a-fA-F]+)\]",
+            out, re.MULTILINE)]
+        wanted = test["_prefix_pc"]
+        if wanted not in prefix_pcs:
+            problems.append(
+                "pre-window finding was not reported as a prefix diagnostic")
+        if wanted in {int(finding.get("access_pc", "0"), 16)
+                      for finding in parse_findings(out)}:
+            problems.append(
+                "pre-window finding must not be published as the reference")
     if test.get("reference_pc_symbol"):
         references = parse_fault_references(out)
         if not references or any(reference["address"] != test["_reference_pc"] or

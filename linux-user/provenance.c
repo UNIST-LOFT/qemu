@@ -45,6 +45,18 @@ extern uint64_t symbolic_end_code;
  * from snapshot_init right after the shared mapping is created. */
 static PendingProvenanceFault *prov_pending_fault = NULL;
 
+/* Findings recorded before the process reaches BINRADAR_ENTRYPOINT execute in
+ * the pre-snapshot prefix.  A whole-run reference pass (PROBE, artifact
+ * preflight) starts at the ELF entry and would otherwise publish such an event
+ * as the POC identity, but every forkserver child resumes at the
+ * patch-function entry — the snapshot precedes that instruction — and can
+ * never re-execute the prefix.  Such an identity can therefore never be
+ * reproduced, so `same-fault` would be unreachable by construction rather than
+ * by filtering.  Prefix events are reported for diagnosis and excluded from
+ * the reference.  With no configured entrypoint there is no window definition
+ * and behavior is unchanged. */
+static bool prov_prefix_finding_logged;
+
 void provenance_set_shared_fault_ptr(PendingProvenanceFault *ptr) {
     prov_pending_fault = ptr;
 }
@@ -952,6 +964,20 @@ static void prov_fault_fill(PendingProvenanceFault *pf, CPUArchState *env,
     if (!provenance_memcheck_reference_pc(env, pc, &reference_pc)) {
         log_msg("[memcheck] [unclassified-access] [actual_pc %lx] [addr %lx] [width %u]\n",
                 pc, addr, size);
+        return;
+    }
+    /* A pre-entry event lies outside every forkserver child's executable
+     * window (the snapshot precedes the entrypoint instruction).  Publish it
+     * as a diagnostic only: it is not reproducible by the sweep, so using it
+     * as the reference would make `same-fault` unreachable by construction. */
+    if (pf == prov_pending_fault && binradar_entrypoint != (target_ulong)-1 &&
+        !binradar_entrypoint_reached) {
+        if (!prov_prefix_finding_logged) {
+            prov_prefix_finding_logged = true;
+            log_msg("[prov] [prefix-finding] [access_pc %lx] [actual_pc %lx] "
+                    "[access_addr %lx] [width %u] [is_uaf %d]\n",
+                    reference_pc, pc, addr, size, is_uaf ? 1 : 0);
+        }
         return;
     }
     ProvPublishedFinding *slot = prov_fault_slot_for_publish(

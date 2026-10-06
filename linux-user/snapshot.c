@@ -52,6 +52,14 @@ extern target_ulong target_brk;
 bool restoring_to_snapshot;
 target_ulong binradar_entrypoint = (target_ulong)-1;
 
+/* Set once the guest reaches BINRADAR_ENTRYPOINT in this process (parent
+ * prefix or a forkserver child).  A deferred finding published before this
+ * point lies in the pre-snapshot prefix: PROBE observes it as the POC's first
+ * fault, but a forkserver child resumes after the snapshot and can never
+ * reproduce it.  Comparing such a child against the PROBE reference is
+ * therefore a structural mismatch, not a filtering decision. */
+bool binradar_entrypoint_reached;
+
 extern Query *query_queue;
 extern Query *next_query;
 extern uint64_t symbolic_start_code;
@@ -705,11 +713,24 @@ static void snapshot_dump_query_window(Query* q, Expr *e) {
 uint8_t snapshot_on_entrypoint_hit(target_ulong pc) {
     snapshot_load_binradar_env();
     binradar_entrypoint_hit_count += 1;
+    /* This process has now entered the patch function.  A finding published
+     * before this point is outside the forkserver child's executable window
+     * (the snapshot precedes the entrypoint instruction, so every child
+     * resumes at or after it); the publication path uses this to keep such a
+     * finding diagnostic instead of an oracle identity.  Set before the
+     * snapshot below, so children inherit the marker. */
+    snapshot_mark_entrypoint_reached();
 
     log_msg("[snapshot] [entrypoint-hit] [pc %lx] [count %lu]\n",
               pc, binradar_entrypoint_hit_count);
 
     return binradar_forkserver_enable && binradar_entrypoint_hit_count == 1;
+}
+
+void snapshot_mark_entrypoint_reached(void) {
+    /* Idempotent.  Called from the guest entrypoint hook and from the
+     * memcheck-only TB pass (PROBE/preflight have no symbolic pass). */
+    binradar_entrypoint_reached = true;
 }
 
 static int use_trace = -1;

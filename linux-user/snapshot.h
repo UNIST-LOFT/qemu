@@ -19,6 +19,7 @@ void log_msg(const char *fmt, ...);
 
 extern bool restoring_to_snapshot;
 extern target_ulong binradar_entrypoint;
+extern bool binradar_entrypoint_reached;
 extern unsigned char afl_fork_child;
 
 #define SNAPSHOT_PAGE_SIZE 4096
@@ -233,5 +234,10 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env, const ArgumentInf
 void snapshot_maybe_forkserver(CPUState *cpu, CPUArchState *cpu_env, target_ulong pc);
 
 uint8_t snapshot_on_entrypoint_hit(target_ulong pc);
+
+/* Record that this process has entered the patch function.  Idempotent;
+ * called by the symbolic entrypoint hook and by the memcheck-only TB pass,
+ * so both execution modes publish the same window boundary. */
+void snapshot_mark_entrypoint_reached(void);
 
 #endif /* BINRADAR_SNAPSHOT_H */

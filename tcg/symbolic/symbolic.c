@@ -6749,6 +6749,27 @@ static void update_last_translation_block(uintptr_t pc) {
 void memcheck_instrument_tb(TranslationBlock *tb, TCGContext *tcg_ctx,
                             CPUArchState *cpu_env) {
     if (!binradar_memcheck_enabled) return;
+    /* Window boundary: record that this process has entered the patch
+     * function.  Findings published before it lie in the pre-snapshot prefix
+     * and can never be reproduced by a forkserver child, so the publication
+     * path excludes them from the reference identity.  The symbolic pass
+     * already emits its own entrypoint hook; this covers the memcheck-only
+     * whole-run reference pass (PROBE/artifact preflight), which has no
+     * symbolic pass.  Emitted before the eligibility gate below: the
+     * entrypoint TB must mark the window even when its own start address is
+     * not itself checked. */
+    if (symbolic_mode == 0 && binradar_entrypoint != (target_ulong)-1 &&
+        binradar_entrypoint >= tb->pc &&
+        binradar_entrypoint < tb->pc + tb->size) {
+        TCGOp *marker_op;
+        QTAILQ_FOREACH(marker_op, &tcg_ctx->ops, link) {
+            if (marker_op->opc == INDEX_op_insn_start &&
+                (target_ulong)marker_op->args[0] == binradar_entrypoint) {
+                add_void_call_0(snapshot_mark_entrypoint_reached, marker_op,
+                                NULL, tcg_ctx);
+            }
+        }
+    }
     /* Optimized runtime bodies use logical models; ordinary verified DSO
      * code receives the same post-access checks as the main image. */
     if (!provenance_memcheck_pc_eligible(tb->pc)) return;
