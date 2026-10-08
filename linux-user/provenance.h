@@ -145,6 +145,11 @@ typedef enum {
     PROV_FINDING_TAGGED,       /* authoritative tagged identity */
 } ProvFindingQuality;
 
+typedef enum {
+    PROV_FINDING_ORIGIN_ACCESS = 0,
+    PROV_FINDING_ORIGIN_SYSCALL_REQUEST = 1,
+} ProvFindingOrigin;
+
 /* Main images use their normalized PC. DSO sites use verified image
  * content and image-relative virtual instruction offset, not ASLR PCs. */
 typedef struct ProvenanceFaultSite {
@@ -156,11 +161,12 @@ typedef struct ProvenanceFaultSite {
 /* Finding payload published across the forkserver child/parent boundary. */
 typedef struct {
     ProvFindingQuality quality;
+    ProvFindingOrigin origin;
     target_ulong    access_pc;     /* artifact-stable attributed identity */
     target_ulong    actual_pc;     /* instruction / modeled-call location */
     ProvenanceFaultSite site;
     target_ulong    access_addr;
-    uint32_t        access_width;
+    target_ulong    access_width;
     uint64_t        object_id;
     uint32_t        generation;
     target_ulong    object_base;
@@ -256,7 +262,7 @@ PtrTag provenance_mem_load_tag(target_ulong addr);
 void provenance_mem_invalidate(target_ulong addr, target_ulong size);
 
 /* ---- Access checking ---- */
-#define BINRADAR_MEMCHECK_POLICY "coverage-v4"
+#define BINRADAR_MEMCHECK_POLICY "coverage-v5"
 
 /* File-backed runtime mappings (libc/loader) use logical summaries rather
  * than application-object checks on implementation overfetch/metadata. */
@@ -283,6 +289,11 @@ void provenance_check_syscall_read(CPUArchState *env, target_ulong addr,
                                    target_ulong size, int reg);
 void provenance_check_syscall_read_tagged(CPUArchState *env, target_ulong addr,
                                           target_ulong size, PtrTag tag);
+/* Metadata-only validation of the original nonzero payload request. */
+void provenance_check_syscall_request(CPUArchState *env, target_ulong addr,
+                                      target_ulong size, int reg);
+void provenance_check_syscall_request_tagged(CPUArchState *env, target_ulong addr,
+                                             target_ulong size, PtrTag tag);
 
 /* Check an access using provenance tag.  Returns MemcheckResult.
  * If tag is UNKNOWN, falls through to exact-bounds on live objects.

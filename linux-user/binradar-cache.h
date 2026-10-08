@@ -201,10 +201,10 @@ bool br_evidence_write_header(FILE *fp, uint16_t kind);
 #define BR_EVIDENCE_HEADER_SIZE 16u
 #define BR_EVIDENCE_FRAME_HEADER_SIZE 8u
 #define BR_EVIDENCE_MAGIC "BRDATAB1"
-/* FILTER and VERIFIER retain v1. BINRADAR v3 carries precise DSO sites
- * and preserves v2's gapped attempt IDs after discarded attempts. */
+/* FILTER and VERIFIER retain v1. BINRADAR v4 stores the fault source in
+ * each group's former reserved u16, retaining v3 DSO sites and v2 gaps. */
 #define BR_EVIDENCE_VERSION 1u
-#define BR_EVIDENCE_VERSION_BINRADAR 3u
+#define BR_EVIDENCE_VERSION_BINRADAR 4u
 #define BR_EVIDENCE_KIND_FILTER 1u
 #define BR_EVIDENCE_KIND_BINRADAR 3u
 #define BR_EVIDENCE_RECORD_FILTER 1u

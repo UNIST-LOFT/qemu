@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
@@ -42,6 +43,7 @@ int main(int argc, char **argv)
     if (!data) return 3;
     memset(data, 'A', size);
     long result;
+    errno = 0;
     if (kind == 0) {
         result = transfer(SYS_write, pipefd[1], data, 12);
         if (result != 12) return 4;
@@ -75,8 +77,11 @@ int main(int argc, char **argv)
         struct iovec vec = {data, 12};
         result = kind == 9 ? transfer(SYS_pwrite64, fd, data, 12)
                           : transfer(SYS_pwritev, fd, &vec, 1);
+        if (result != 12 || lseek(fd, 0, SEEK_CUR) != 0) return 14;
+        char received[12];
+        if (read(fd, received, sizeof(received)) != 12 ||
+            memcmp(received, "AAAAAAAA", 8)) return 18;
         close(fd);
-        if (result != 12) return 14;
     } else if (kind == 12) {
         result = transfer(SYS_pwrite64, -1, data, 12);
         if (result != -EBADF) return 15;
@@ -95,6 +100,16 @@ int main(int argc, char **argv)
         }
         if (result != 4096) return 9;
     }
+    int outcome_errno = errno;
+    if (result > 0 && kind != 9 && kind != 10) {
+        char received[4096];
+        if (read(pipefd[0], received, (size_t)result) != result) return 19;
+        size_t known = kind == 4 || kind == 5 ? 4096 : 8;
+        if (kind != 7) {
+            for (size_t i = 0; i < known; ++i) if (received[i] != 'A') return 20;
+        }
+    }
+    printf("t84 case=%d result=%ld errno=%d\n", kind, result, outcome_errno);
     free(data);
     close(pipefd[0]);
     close(pipefd[1]);

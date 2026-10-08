@@ -550,7 +550,13 @@ bool binradar_cache_commit(BinradarManager *manager)
               (result->fault_reference_source !=
                    SNAPSHOT_FAULT_REFERENCE_GUEST_SIGNAL &&
                result->fault_reference_source !=
-                   SNAPSHOT_FAULT_REFERENCE_PROVENANCE_ACCESS)))) {
+                   SNAPSHOT_FAULT_REFERENCE_PROVENANCE_ACCESS &&
+               result->fault_reference_source !=
+                   SNAPSHOT_FAULT_REFERENCE_SYSCALL_REQUEST))) ||
+            (!result->is_crash &&
+             (result->fault_reference_valid ||
+              result->fault_reference_source !=
+                  SNAPSHOT_FAULT_REFERENCE_UNAVAILABLE))) {
             log_msg("[binradar] [evidence] [error incomplete-result] "
                     "[iter %d] [patch %u]\n", cur_iter, patch);
             goto out;
@@ -561,6 +567,8 @@ bool binradar_cache_commit(BinradarManager *manager)
             result->is_crash != representative_result->is_crash ||
             result->fault_reference_valid !=
                 representative_result->fault_reference_valid ||
+            result->fault_reference_source !=
+                representative_result->fault_reference_source ||
             (result->is_crash && !snapshot_fault_reference_equal(
                 result->fault_loc, &result->fault_site,
                 representative_result->fault_loc,
@@ -599,7 +607,7 @@ bool binradar_cache_commit(BinradarManager *manager)
         br_evidence_append_u32(payload, representative);
         g_byte_array_append(payload, &outcome, 1);
         g_byte_array_append(payload, &flags, 1);
-        br_evidence_append_u16(payload, 0);
+        br_evidence_append_u16(payload, result->fault_reference_source);
         br_evidence_append_u64(payload, result->fault_loc);
         br_evidence_append_u32(payload, branch_count);
         br_evidence_append_u32(payload, group->len);

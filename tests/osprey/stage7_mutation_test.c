@@ -2717,6 +2717,172 @@ static void test_invalid_patch_result(void)
           "out-of-range patch result is fatal rather than silently discarded");
 }
 
+static void test_request_metadata_real_regions(void)
+{
+    const target_ulong base = 0x91000000;
+    const target_ulong pc = 0x400180;
+    const target_ulong wide = ((target_ulong)1 << 32) + 1;
+    uint64_t saved_start = symbolic_start_code;
+    uint64_t saved_end = symbolic_end_code;
+    target_ulong saved_entry = binradar_entrypoint;
+    int saved_memcheck = binradar_memcheck_enabled;
+    CPUArchState *env = g_new0(CPUArchState, 1);
+    ProvPublishedFinding finding = {0};
+    reset_runtime();
+    reset_shared_records();
+    symbolic_start_code = 0x400000;
+    symbolic_end_code = 0x401000;
+    binradar_entrypoint = (target_ulong)-1;
+    binradar_memcheck_enabled = 1;
+    provenance_get_reg_shadow(env)->syscall_pc = pc;
+    provenance_set_shared_fault_ptr(&shared_trace_data->prov_pending_fault);
+    snapshot_trace_alloc(base, 16, pc);
+    PtrTag tag = provenance_create_object(base, 16, pc,
+                                          PROV_PRODUCER_MALLOC_RETURN);
+    tag.concrete_value = base + 8;
+    tag.concrete_offset = 8;
+    shared_trace_data->prim_access_cnt = 17;
+    shared_trace_data->ptr_access_cnt = 19;
+    shared_trace_data->prim_idx = 5;
+    shared_trace_data->ptr_idx = 7;
+    shared_trace_data->mutation_read_witness.state =
+        SNAPSHOT_MUTATION_READ_WITNESS_DIFFERENT_VALUE;
+
+    provenance_check_syscall_request_tagged(env, base + 8, wide, (PtrTag){0});
+    CHECK(provenance_snapshot_pending_finding(&finding) &&
+              finding.payload.quality == PROV_FINDING_FALLBACK &&
+              finding.payload.origin == PROV_FINDING_ORIGIN_SYSCALL_REQUEST &&
+              finding.payload.object_id == 0 &&
+              finding.payload.object_base == base &&
+              finding.payload.access_width == wide,
+          "UNKNOWN request uses the real live interval without reading payload");
+    int64_t first_query = finding.finding_query_idx;
+    int64_t first_expr = finding.finding_expr_idx;
+    provenance_check_access(env, base + 8, wide, pc, tag, -1, base + 8);
+    CHECK(provenance_snapshot_pending_finding(&finding) &&
+              finding.payload.quality == PROV_FINDING_FALLBACK &&
+              finding.payload.origin == PROV_FINDING_ORIGIN_SYSCALL_REQUEST,
+          "an actual access cannot promote a request fallback");
+    provenance_check_syscall_request_tagged(env, base + 8,
+                                             wide + ((target_ulong)1 << 32), tag);
+    CHECK(provenance_snapshot_pending_finding(&finding) &&
+              finding.payload.quality == PROV_FINDING_FALLBACK &&
+              finding.payload.access_width == wide,
+          "equal low 32 bits do not identify the same requested range");
+    provenance_check_syscall_request_tagged(env, base + 8, wide, tag);
+    CHECK(provenance_snapshot_pending_finding(&finding) &&
+              finding.payload.quality == PROV_FINDING_TAGGED &&
+              finding.payload.origin == PROV_FINDING_ORIGIN_SYSCALL_REQUEST &&
+              finding.payload.object_id == tag.object_id &&
+              finding.payload.access_width == wide &&
+              finding.finding_query_idx == first_query &&
+              finding.finding_expr_idx == first_expr,
+          "matching request promotion keeps complete width and first cursors");
+    provenance_clear_pending_fault();
+    provenance_check_access(env, base + 8, wide, pc, (PtrTag){0}, -1, 0);
+    provenance_check_syscall_request_tagged(env, base + 8, wide, tag);
+    CHECK(provenance_snapshot_pending_finding(&finding) &&
+              finding.payload.quality == PROV_FINDING_FALLBACK &&
+              finding.payload.origin == PROV_FINDING_ORIGIN_ACCESS,
+          "a request cannot relabel an earlier actual-access fallback");
+    provenance_clear_pending_fault();
+    provenance_check_syscall_request_tagged(env, base + 16, 1, (PtrTag){0});
+    CHECK(!provenance_snapshot_pending_finding(&finding),
+          "UNKNOWN one-past address does not invent an object identity");
+    provenance_retire_object(base);
+    snapshot_trace_free(base, pc);
+    provenance_check_syscall_request_tagged(env, base, 1, (PtrTag){0});
+    CHECK(!provenance_snapshot_pending_finding(&finding),
+          "UNKNOWN retired numeric address does not become a request UAF");
+    CHECK(shared_trace_data->prim_access_cnt == 17 &&
+              shared_trace_data->ptr_access_cnt == 19 &&
+              shared_trace_data->prim_idx == 5 && shared_trace_data->ptr_idx == 7 &&
+              shared_trace_data->mutation_read_witness.state ==
+                  SNAPSHOT_MUTATION_READ_WITNESS_DIFFERENT_VALUE,
+          "metadata checks preserve load counters and existing witness state");
+
+    reset_shared_records();
+    symbolic_start_code = saved_start;
+    symbolic_end_code = saved_end;
+    binradar_entrypoint = saved_entry;
+    binradar_memcheck_enabled = saved_memcheck;
+    g_free(env);
+}
+
+static void test_cached_request_evidence(void)
+{
+    uint32_t iteration = 1;
+    BinradarManager manager = {0};
+    manager.patch_max_id = 1;
+    manager.patch_cnt = 1;
+    manager.cur_iter = &iteration;
+    manager.current = binradar_cache_new_iteration(&manager);
+    manager.evidence_file = tmpfile();
+    CHECK(manager.evidence_file != NULL, "request evidence opens private stream");
+    if (manager.evidence_file == NULL) {
+        g_free(manager.current->patch_results);
+        g_free(manager.current);
+        return;
+    }
+    CHECK(br_evidence_write_header(manager.evidence_file,
+                                  BR_EVIDENCE_KIND_BINRADAR),
+          "request evidence writes its versioned header");
+    SnapshotExitInfo info = {
+        .valid = 1,
+        .crashed = 1,
+        .fault_reference_valid = 1,
+        .fault_reference_source = SNAPSHOT_FAULT_REFERENCE_SYSCALL_REQUEST,
+        .fault_addr = 0x40001234,
+        .fault_site = { .valid = true, .image_offset = 0x1234 },
+    };
+    memset(info.fault_site.image_id, 0xab, sizeof(info.fault_site.image_id));
+    binradar_cache_record_outcome(&manager, 0, &info);
+    CHECK(binradar_cache_commit(&manager),
+          "a request-source baseline is a usable canonical crash");
+    rewind(manager.evidence_file);
+    uint8_t encoded[128];
+    size_t encoded_size = fread(encoded, 1, sizeof(encoded), manager.evidence_file);
+    CHECK(encoded_size == 101 && br_evidence_read_u16(encoded + 8) == 4 &&
+              br_evidence_read_u16(encoded + 38) == 3 &&
+              encoded[36] == BR_EVIDENCE_OUTCOME_CRASH && encoded[37] == 3 &&
+              memcmp(encoded + 56, info.fault_site.image_id, 32) == 0,
+          "canonical v4 distinguishes a requested DSO crash from an access");
+    CHECK(fseek(manager.evidence_file, 0, SEEK_END) == 0,
+          "request evidence resumes at the committed boundary");
+    long committed_end = ftell(manager.evidence_file);
+
+    iteration = 2;
+    info.fault_reference_source = SNAPSHOT_FAULT_REFERENCE_PROVENANCE_ACCESS;
+    binradar_cache_record_outcome(&manager, 0, &info);
+    info.fault_reference_source = SNAPSHOT_FAULT_REFERENCE_SYSCALL_REQUEST;
+    binradar_cache_record_outcome(&manager, 1, &info);
+    manager.current->patch_results[1].representative = 0;
+    CHECK(!binradar_cache_commit(&manager) &&
+              ftell(manager.evidence_file) == committed_end,
+          "equal sites with differing representative sources cannot commit");
+    for (unsigned i = 0; i < 2; i++) {
+        manager.current->patch_results[i].fault_reference_source =
+            SNAPSHOT_FAULT_REFERENCE_UNAVAILABLE;
+    }
+    CHECK(!binradar_cache_commit(&manager) &&
+              ftell(manager.evidence_file) == committed_end,
+          "an unavailable crash source cannot append a partial frame");
+    for (unsigned i = 0; i < 2; i++) {
+        PatchedResult *result = &manager.current->patch_results[i];
+        result->is_crash = false;
+        result->fault_reference_valid = false;
+        result->fault_site.valid = false;
+        result->fault_reference_source = SNAPSHOT_FAULT_REFERENCE_SYSCALL_REQUEST;
+    }
+    CHECK(!binradar_cache_commit(&manager) &&
+              ftell(manager.evidence_file) == committed_end,
+          "normal outcomes cannot carry a requested-crash source");
+    binradar_cache_clear_iteration(&manager);
+    g_free(manager.current->patch_results);
+    g_free(manager.current);
+    fclose(manager.evidence_file);
+}
+
 static void test_cached_feedback_writer(void)
 {
     GError *error = NULL;
@@ -2733,7 +2899,7 @@ static void test_cached_feedback_writer(void)
     manager.current = binradar_cache_new_iteration(&manager);
     manager.feedback_dir = directory;
     manager.poc_fault_valid = true;
-    manager.poc_fault_source = SNAPSHOT_FAULT_REFERENCE_GUEST_SIGNAL;
+    manager.poc_fault_source = SNAPSHOT_FAULT_REFERENCE_SYSCALL_REQUEST;
     manager.poc_fault_addr = 0x1234;
     manager.cache_bytes = g_byte_array_new();
     const uint8_t snapshot[] = {'B', 'R', 'C', 'H'};
@@ -2770,9 +2936,10 @@ static void test_cached_feedback_writer(void)
         result->representative = patch;
         result->is_crash = crashes[patch - 1];
         result->fault_reference_valid = result->is_crash;
-        result->fault_reference_source = result->is_crash
-            ? SNAPSHOT_FAULT_REFERENCE_GUEST_SIGNAL
-            : SNAPSHOT_FAULT_REFERENCE_UNAVAILABLE;
+        result->fault_reference_source = !result->is_crash
+            ? SNAPSHOT_FAULT_REFERENCE_UNAVAILABLE
+            : patch == 3 ? SNAPSHOT_FAULT_REFERENCE_SYSCALL_REQUEST
+                         : SNAPSHOT_FAULT_REFERENCE_PROVENANCE_ACCESS;
         result->fault_loc = faults[patch - 1];
         CHECK(binradar_cache_feedback_write(
                   &manager, 2, patch, branches, &mutation),
@@ -2801,6 +2968,9 @@ static void test_cached_feedback_writer(void)
                   strstr(metadata, "[value ccdd000000000000]") != NULL,
                   "feedback metadata records every ordered plan write");
             if (patch == 3) {
+                CHECK(strstr(metadata, "[fault-source syscall-request]") != NULL &&
+                      strstr(metadata, "[poc-fault-source syscall-request]") != NULL,
+                      "feedback preserves request origin on both references");
                 sbsv_parser *parser = sbsv_parser_new(SBSV_PARSER_DEFAULT);
                 CHECK(sbsv_parser_add_schema(parser,
                     "[binradar-feedback] [version: int] [iteration: int] "
@@ -5047,6 +5217,8 @@ int main(void)
     test_child_application_does_not_mutate_plan();
     test_forkserver_continuation_policy();
     test_invalid_patch_result();
+    test_request_metadata_real_regions();
+    test_cached_request_evidence();
     test_cached_feedback_writer();
     test_symbolic_feedback_matches_applied_plan();
     test_feedback_requires_representative_child();

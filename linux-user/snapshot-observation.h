@@ -7,10 +7,11 @@
 #define SNAPSHOT_EXIT_DESC_LEN 256
 
 typedef enum SnapshotFaultReferenceSource {
-    /* Only guest-signal and provenance-access can accompany valid=true. */
+    /* Explicit signal, access and request sources can accompany valid=true. */
     SNAPSHOT_FAULT_REFERENCE_UNAVAILABLE = 0,
     SNAPSHOT_FAULT_REFERENCE_GUEST_SIGNAL = 1,
     SNAPSHOT_FAULT_REFERENCE_PROVENANCE_ACCESS = 2,
+    SNAPSHOT_FAULT_REFERENCE_SYSCALL_REQUEST = 3,
 } SnapshotFaultReferenceSource;
 
 typedef struct SnapshotExitInfo {
@@ -115,6 +116,8 @@ typedef struct SnapshotObservationView {
 
 const char *snapshot_fault_reference_source_name(
     SnapshotFaultReferenceSource source);
+SnapshotFaultReferenceSource snapshot_fault_reference_source_for_finding(
+    const ProvFindingRecord *finding);
 void snapshot_exit_info_set_fault_reference(
     SnapshotExitInfo *info, SnapshotFaultReferenceSource source,
     target_ulong address, const ProvenanceFaultSite *site);

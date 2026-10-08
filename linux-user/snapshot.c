@@ -529,6 +529,8 @@ void snapshot_init_binradar_patch_shm(uintptr_t key) {
                 source = SNAPSHOT_FAULT_REFERENCE_GUEST_SIGNAL;
             } else if (strcmp(source_text, "provenance-access") == 0) {
                 source = SNAPSHOT_FAULT_REFERENCE_PROVENANCE_ACCESS;
+            } else if (strcmp(source_text, "syscall-request") == 0) {
+                source = SNAPSHOT_FAULT_REFERENCE_SYSCALL_REQUEST;
             } else if (strcmp(source_text, "unavailable") != 0) {
                 log_msg("[binradar] [feedback] [error configuration]\n");
                 exit_with_status(1);
@@ -1025,7 +1027,9 @@ static void snapshot_emit_fault_reference(const SnapshotExitInfo *info)
         (info->fault_reference_source ==
              SNAPSHOT_FAULT_REFERENCE_GUEST_SIGNAL ||
          info->fault_reference_source ==
-             SNAPSHOT_FAULT_REFERENCE_PROVENANCE_ACCESS);
+             SNAPSHOT_FAULT_REFERENCE_PROVENANCE_ACCESS ||
+         info->fault_reference_source ==
+             SNAPSHOT_FAULT_REFERENCE_SYSCALL_REQUEST);
     source = valid ? snapshot_fault_reference_source_name(
         info->fault_reference_source) : "unavailable";
     char image[65];
@@ -1168,7 +1172,7 @@ void snapshot_record_guest_normal_exit(CPUArchState *cpu_env, int exit_code, con
         }
         snapshot_record_guest_crash_with_reference(
             cpu_env, TARGET_SIGSEGV, 0, SEGV_ACCERR, 0, pf_reason,
-            SNAPSHOT_FAULT_REFERENCE_PROVENANCE_ACCESS,
+            snapshot_fault_reference_source_for_finding(&fault.payload),
             fault.payload.access_pc, &fault.payload.site);
         return;
 	}
@@ -4646,7 +4650,7 @@ static bool report_shared_prov_finding(void *opaque, uint32_t *status_out) {
         info->guest_pc = f->access_pc;
         info->guest_cs_base = 0;
         snapshot_exit_info_set_fault_reference(
-            info, SNAPSHOT_FAULT_REFERENCE_PROVENANCE_ACCESS,
+            info, snapshot_fault_reference_source_for_finding(f),
             f->access_pc, &f->site);
         info->host_fault_addr = 0;
         info->guest_last_translation_block = last_translation_block;

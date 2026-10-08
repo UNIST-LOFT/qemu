@@ -2731,8 +2731,136 @@ static void test_complete_f01_f06_dump_contract(void)
 
 /* ------------------------------------------------------------------ */
 
+/* Requests are object-metadata checks: this unit's page stubs reject every
+ * nonempty guest read, and none of these numeric payloads is backed by memory. */
+static void test_syscall_request_metadata(void)
+{
+    CPUArchState *env = g_malloc0(sizeof(*env));
+    PendingProvenanceFault pending = {0};
+    ProvPublishedFinding finding;
+    uint64_t old_start = symbolic_start_code, old_end = symbolic_end_code;
+    int old_memcheck = binradar_memcheck_enabled;
+    target_ulong old_entry = binradar_entrypoint;
+    bool old_reached = binradar_entrypoint_reached;
+    provenance_init();
+    provenance_set_shared_fault_ptr(&pending);
+    binradar_memcheck_enabled = 1;
+    symbolic_start_code = 0x400000;
+    symbolic_end_code = 0x401000;
+    binradar_entrypoint = (target_ulong)-1;
+    provenance_get_reg_shadow(env)->syscall_pc = 0x400200;
+    PtrTag tag = provenance_create_object(0x10000, 32, 0x400100,
+                                          PROV_PRODUCER_MALLOC_RETURN);
+    provenance_check_syscall_request_tagged(env, 0x10000, 32, tag);
+    CHECK(!provenance_snapshot_pending_finding(&finding),
+          "in-bounds request ignores unreadable payload mapping");
+
+    const target_ulong widths[] = {
+        ((target_ulong)1 << 32) - 1,
+        (target_ulong)1 << 32,
+        ((target_ulong)1 << 32) + 1,
+        (target_ulong)-1,
+    };
+    for (size_t i = 0; i < sizeof(widths) / sizeof(widths[0]); i++) {
+        provenance_clear_pending_fault();
+        provenance_check_syscall_request_tagged(env, 0x10000, widths[i], tag);
+        CHECK(provenance_snapshot_pending_finding(&finding),
+              "full-width metadata request proves OOB without payload read");
+        CHECK(finding.payload.access_width == widths[i] &&
+              finding.payload.origin == PROV_FINDING_ORIGIN_SYSCALL_REQUEST &&
+              finding.payload.actual_pc == 0x400200 &&
+              finding.payload.object_id == tag.object_id && !finding.payload.is_uaf,
+              "request publication retains complete width identity and origin");
+    }
+    provenance_clear_pending_fault();
+    PtrTag wide = provenance_create_object(0x20000, widths[1], 0x400100,
+                                           PROV_PRODUCER_MALLOC_RETURN);
+    provenance_check_syscall_request_tagged(env, 0x20000, widths[1], wide);
+    CHECK(!provenance_snapshot_pending_finding(&finding),
+          "exact 2^32-byte metadata extent remains in bounds");
+    provenance_check_syscall_request_tagged(env, 0x20000, widths[2], wide);
+    CHECK(provenance_snapshot_pending_finding(&finding) &&
+          finding.payload.access_width == widths[2] &&
+          finding.payload.requested_size == widths[1],
+          "one byte beyond wide extent is proved without large allocation");
+    provenance_clear_pending_fault();
+    env->regs[R_ESI] = 0x10000;
+    provenance_set_reg_tag(env, R_ESI, tag);
+    provenance_check_syscall_request(env, 0x10000, widths[2], R_ESI);
+    CHECK(provenance_snapshot_pending_finding(&finding) &&
+          finding.payload.access_width == widths[2] &&
+          finding.payload.ea_base_reg == R_ESI,
+          "register request path retains original tag and full width");
+    provenance_check_syscall_read_tagged(env, 0x10000, 64, tag);
+    CHECK(provenance_snapshot_pending_finding(&finding) &&
+          finding.payload.origin == PROV_FINDING_ORIGIN_SYSCALL_REQUEST &&
+          finding.payload.access_width == widths[2],
+          "first request remains immutable when actual access follows");
+
+    provenance_clear_pending_fault();
+    CHECK(!provenance_snapshot_pending_finding(&finding),
+          "next child reset removes request publication");
+    provenance_check_syscall_read_tagged(env, 0x10000, 64, tag);
+    provenance_check_syscall_request_tagged(env, 0x10000, 64, tag);
+    CHECK(provenance_snapshot_pending_finding(&finding) &&
+          finding.payload.origin == PROV_FINDING_ORIGIN_ACCESS,
+          "first actual access remains immutable when request follows");
+    provenance_clear_pending_fault();
+    provenance_check_access(env, 0x10000, widths[1], 0x400200, tag, -1, 0x10000);
+    CHECK(provenance_snapshot_pending_finding(&finding) &&
+          finding.payload.origin == PROV_FINDING_ORIGIN_ACCESS &&
+          finding.payload.access_width == widths[1],
+          "raw metadata wrapper retains access default and complete width");
+
+    provenance_clear_pending_fault();
+    PtrTag inconsistent = tag;
+    inconsistent.concrete_value++;
+    provenance_check_syscall_request_tagged(env, 0x10000, 64, inconsistent);
+    provenance_check_syscall_request_tagged(env, 0xdead0000, 64, (PtrTag){0});
+    CHECK(!provenance_snapshot_pending_finding(&finding),
+          "inconsistent and untracked request tags cannot fabricate violation");
+    PtrTag end = tag;
+    end.concrete_value += 32;
+    end.concrete_offset = 32;
+    provenance_check_syscall_request_tagged(env, end.concrete_value, 0, end);
+    CHECK(!provenance_snapshot_pending_finding(&finding),
+          "zero one-past request is ignored");
+    provenance_retire_object(0x10000);
+    provenance_check_syscall_request_tagged(env, 0x10000, 0, tag);
+    CHECK(!provenance_snapshot_pending_finding(&finding),
+          "zero freed request is ignored");
+    provenance_check_syscall_request_tagged(env, 0x10000, 1, tag);
+    CHECK(provenance_snapshot_pending_finding(&finding) &&
+          finding.payload.is_uaf &&
+          finding.payload.origin == PROV_FINDING_ORIGIN_SYSCALL_REQUEST,
+          "authoritative nonzero request retains lifetime proof");
+    provenance_clear_pending_fault();
+    provenance_check_syscall_request_tagged(env, 0x10000, 1, (PtrTag){0});
+    CHECK(!provenance_snapshot_pending_finding(&finding),
+          "retired numeric address does not fabricate UNKNOWN UAF");
+
+    binradar_entrypoint = 0x400200;
+    binradar_entrypoint_reached = false;
+    provenance_check_syscall_request_tagged(env, 0x10000, 1, tag);
+    CHECK(!provenance_snapshot_pending_finding(&finding),
+          "pre-window request remains diagnostic only");
+    binradar_entrypoint_reached = true;
+    provenance_check_syscall_request_tagged(env, 0x10000, 1, tag);
+    CHECK(provenance_snapshot_pending_finding(&finding),
+          "in-window request publishes normally");
+    provenance_clear_pending_fault();
+    provenance_set_shared_fault_ptr(NULL);
+    symbolic_start_code = old_start;
+    symbolic_end_code = old_end;
+    binradar_memcheck_enabled = old_memcheck;
+    binradar_entrypoint = old_entry;
+    binradar_entrypoint_reached = old_reached;
+    g_free(env);
+}
+
 int main(void)
 {
+    test_syscall_request_metadata();
     test_overflow_rejection();
     test_bad_arithmetic_rejection();
     test_bad_identity_rejection();
@@ -2789,7 +2917,7 @@ int main(void)
         fprintf(stderr, "%d unit test check(s) FAILED\n", failures);
         return 1;
     }
-    printf("PASS osprey_unit (51/51)\n");
+    printf("PASS osprey_unit (52/52)\n");
     return 0;
 }
 

@@ -8,9 +8,24 @@ const char *snapshot_fault_reference_source_name(
         return "guest-signal";
     case SNAPSHOT_FAULT_REFERENCE_PROVENANCE_ACCESS:
         return "provenance-access";
+    case SNAPSHOT_FAULT_REFERENCE_SYSCALL_REQUEST:
+        return "syscall-request";
     case SNAPSHOT_FAULT_REFERENCE_UNAVAILABLE:
     default:
         return "unavailable";
+    }
+}
+
+SnapshotFaultReferenceSource snapshot_fault_reference_source_for_finding(
+    const ProvFindingRecord *finding)
+{
+    switch (finding->origin) {
+    case PROV_FINDING_ORIGIN_ACCESS:
+        return SNAPSHOT_FAULT_REFERENCE_PROVENANCE_ACCESS;
+    case PROV_FINDING_ORIGIN_SYSCALL_REQUEST:
+        return SNAPSHOT_FAULT_REFERENCE_SYSCALL_REQUEST;
+    default:
+        return SNAPSHOT_FAULT_REFERENCE_UNAVAILABLE;
     }
 }
 
@@ -19,7 +34,8 @@ void snapshot_exit_info_set_fault_reference(
     target_ulong address, const ProvenanceFaultSite *site)
 {
     bool valid = source == SNAPSHOT_FAULT_REFERENCE_GUEST_SIGNAL ||
-                 source == SNAPSHOT_FAULT_REFERENCE_PROVENANCE_ACCESS;
+                 source == SNAPSHOT_FAULT_REFERENCE_PROVENANCE_ACCESS ||
+                 source == SNAPSHOT_FAULT_REFERENCE_SYSCALL_REQUEST;
     if (info == NULL) return;
     info->fault_site = valid && site != NULL
         ? *site : (ProvenanceFaultSite){0};

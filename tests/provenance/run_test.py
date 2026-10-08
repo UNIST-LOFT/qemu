@@ -301,7 +301,7 @@ TESTS: list[dict[str, Any]] = [
          fs_max_attempts=2, timeout=120, fs_compaction_only=True,
          fault_reference=dict(valid="true", source="provenance-access"),
          note="a real forkserver child publishes its deferred access PC in "
-              "compact v2 evidence; the fixture stops once the baseline "
+              "compact v4 evidence; the fixture stops once the baseline "
               "attempt is committed instead of draining 486 mutation plans"),
     dict(name="t48_sticky_first_finding", mode="mem", rc=(0,),
          verdict="crash",
@@ -422,7 +422,7 @@ BASE_ENV = {
     "BINRADAR_FORKSERVER_ENABLE": "0",
     "E9_EXCLUDE_RANGES": "",
     "BINRADAR_MEMCHECK_ENABLE": "1",
-    "BINRADAR_MEMCHECK_POLICY": "coverage-v4",
+    "BINRADAR_MEMCHECK_POLICY": "coverage-v5",
     "E9_RELOCATED_INSTRUCTIONS": "",
     "E9_RELOCATED_CALL_JUMPS": "",
 }
@@ -590,19 +590,31 @@ for case, suffix in enumerate(("overflow", "badfd", "zero", "unmapped",
                                "vector_uaf", "descriptor_oob", "pwrite_oob",
                                "pwritev_oob", "vector_badfd", "pwrite_badfd",
                                "libc_write_oob", "libc_write_badfd")):
-    overflow = case in (0, 6, 7, 8, 9, 10, 13)
+    overflow = case not in (2, 3)
     uaf = case == 7
+    source = "provenance-access" if case == 8 else "syscall-request"
     fields = {"size": 16, "offset": 16, "width": 16} if case == 8 else {
-        "size": 8, "offset": 0, "width": 8 if uaf else 12}
-    TESTS.append(dict(
+        "size": 4096 if case in (4, 5) else 8,
+        "offset": 2048 if case == 5 else 0,
+        "width": 8192 if case == 4 else 4096 if case == 5 else 8 if uaf else 12}
+    expected_result = {0: 12, 1: -9, 2: 0, 3: -14, 4: 4096, 5: 4096,
+                       6: 12, 7: 8, 9: 12, 10: 12, 11: -9, 12: -9,
+                       13: 12, 14: -1}.get(case)
+    spec = dict(
         name="t84_syscall_input_" + suffix, guest="t84_syscall_input",
         args=[str(case)], mode="mem", rc=(0,),
+        production_models=True, production_model_symbols=("malloc",),
         verdict="crash" if overflow else "normal",
         finding=dict(reason="heap-use-after-free" if uaf else "heap-buffer-overflow",
-                     is_uaf=int(uaf), fields=fields) if overflow else None,
-        access_pc_symbol=("libc_write_return" if case == 13 else
+                     origin=source, is_uaf=int(uaf), fields=fields) if overflow else None,
+        access_pc_symbol=("libc_write_return" if case in (13, 14) else
                           "syscall_input_pc") if overflow else None,
-        fault_reference=dict(valid="true", source="provenance-access") if overflow else None))
+        fault_reference=dict(valid="true", source=source) if overflow else None)
+    if expected_result is not None:
+        spec["required_stdout"] = f"t84 case={case} result={expected_result} errno={9 if case == 14 else 0}"
+    TESTS.append(spec)
+    if case in (0, 6, 13):
+        TESTS.append(dict(spec, name=spec["name"] + "_sym", mode="sym"))
 
 for mode in ("mem", "sym"):
     for suffix in (".orig", ".brpatched", ".brcached"):
@@ -642,6 +654,66 @@ for mode in ("mem", "sym"):
                       guest="t85_library_coverage", args=["benign"], mode=mode,
                       rc=(0,), verdict="normal", finding=None))
 
+# Request checks are metadata-only: these protected payloads must never reach
+# a host transfer, and syscall errors/counts remain independently observable.
+for case, result, finding in (
+        ("success", 8, False), ("badfd", -9, False), ("short", 4096, False),
+        ("protected", -14, False), ("oob", -14, True),
+        ("null-oob", -14, True), ("vector-oob", -14, True),
+        ("precedence", -14, True), ("later-precedence", -22, True),
+        ("vector-clamp", -14, True)):
+    spec = dict(name="t92_request_" + case, guest="t92_request_contract",
+                args=[case], mode="mem", rc=(0,),
+                production_models=True, production_model_symbols=("malloc",),
+                verdict="crash" if finding else "normal",
+                finding=dict(reason="heap-buffer-overflow", is_uaf=0,
+                             origin="syscall-request",
+                             fields={"size": 16384, "offset": 0,
+                                     "width": 0x7ffff001 if case == "vector-clamp" else 16385})
+                        if finding else None,
+                required_stdout=f"t92 mode={case} result={result} errno=33 bytes={max(result, 0)}")
+    if finding:
+        spec.update(access_pc_symbol="request_contract_pc",
+                    reference_pc_symbol="request_contract_pc",
+                    fault_reference=dict(valid="true", source="syscall-request"))
+    TESTS.append(spec)
+    if case in ("protected", "vector-oob", "precedence"):
+        TESTS.append(dict(spec, name=spec["name"] + "_sym", mode="sym"))
+
+for case in ("request-first", "access-first", "prefix", "signal", "timeout"):
+    source = "provenance-access" if case == "access-first" else "syscall-request"
+    pc = "request_access_pc" if case == "access-first" else "request_contract_pc"
+    spec = dict(name="t92_request_" + case, guest="t92_request_contract",
+                args=[case], mode="fors" if case == "timeout" else "mem",
+                rc=(-4, 132) if case == "signal" else (0,), verdict="crash",
+                production_models=True, production_model_symbols=("malloc",),
+                finding=dict(reason="heap-buffer-overflow", is_uaf=0, origin=source,
+                             fields={"size": 8, "offset": 8 if case == "access-first" else 0,
+                                     "width": 1 if case == "access-first" else 12}),
+                access_pc_symbol=pc, reference_pc_symbol=(
+                    "request_signal_pc" if case == "signal" else pc),
+                fault_reference=dict(valid="true", source=(
+                    "guest-signal" if case == "signal" else source)))
+    if case == "prefix":
+        spec.update(entrypoint_symbol="request_entry",
+                    prefix_finding_symbol="request_prefix_pc")
+    if case == "timeout":
+        spec.update(fs_child_timeout=1, required_log="[forkserver] [child-timeout]")
+    TESTS.append(spec)
+
+# Commit request-origin evidence in real fork children and authenticate its
+# compact source independently of the normalized text source.
+TESTS.append(dict(name="t92_request_compact_reset", guest="t92_request_contract",
+                 args=["reset"], mode="fors", rc=(2,), verdict="crash",
+                 production_models=True, production_model_symbols=("malloc",),
+                 fs_binradar=True, fs_patch_cnt=1, fs_max_attempts=2,
+                 fs_min_attempts=2, timeout=120, allow_findings=True,
+                 compact_fault_reference=True, compact_normal_control=True,
+                 entrypoint_symbol="request_reset_entry",
+                 raw_finding_origin="syscall-request",
+                 reference_pc_symbol="request_reset_pc", finding=None,
+                 fault_reference=dict(valid="true", source="syscall-request")))
+
 # Exact identity proof must affect publication, never raw instrumentation.
 for enabled in ("0", "1"):
     for unknown in (False, True):
@@ -668,7 +740,7 @@ for case, mode in (("deferred", "mem"), ("deferred", "sym"),
                      raw_pc_symbol="e9_raw_signal" if signal else "e9_raw_model",
                      reference_pc_symbol="e9_original_signal" if signal else "e9_original_model",
                      fault_reference=dict(valid="true", source="guest-signal" if signal else "provenance-access")))
-for policy in ("coverage-v1", "coverage-v2", "coverage-v3"):
+for policy in ("coverage-v1", "coverage-v2", "coverage-v3", "coverage-v4"):
     TESTS.append(dict(name="t88_old_policy_rejected_" + policy, guest="t88_e9_identity",
                      mode="mem", args=["signal"], rc=(1,), verdict=None,
                      finding=None, env={"BINRADAR_MEMCHECK_POLICY": policy},
@@ -835,10 +907,16 @@ def prepare_artifact(test, guest, env):
                        capture_output=True)
         with open(env["PLT_INFO_FILE"], encoding="utf-8") as table:
             rows = [line.strip().split(",") for line in table if line.strip()]
-        if not any(len(row) == 3 and "libc.so" in row[0] and row[1] == "realloc"
-                   for row in rows):
+        if not test.get("production_model_symbols") and not any(
+                len(row) == 3 and "libc.so" in row[0] and row[1] == "realloc"
+                for row in rows):
             raise RuntimeError("production allocator control requires libc realloc metadata")
-        if test.get("guest", test["name"]) != "t91_allocator_saved_alias":
+        for symbol in test.get("production_model_symbols", ()):
+            if not any(len(row) == 3 and "libc.so" in row[0] and row[1] == symbol
+                       for row in rows):
+                raise RuntimeError(f"request control requires libc {symbol} metadata")
+        if (test.get("guest", test["name"]) != "t91_allocator_saved_alias" and
+                not test.get("production_model_symbols")):
             if not any(len(row) == 3 and "libc.so" in row[0] and row[1] == "memcpy"
                        for row in rows):
                 raise RuntimeError("allocator payload control requires libc memcpy metadata")
@@ -991,7 +1069,10 @@ def run_forkserver(test, guest, qemu, workdir):
     env.update(BASE_ENV)
     env["BINRADAR_PROBE_FILE"] = test.get("probe_file", "")
     env["BINRADAR_FORKSERVER_ENABLE"] = "1"
-    env["BINRADAR_ENTRYPOINT"] = resolve_entrypoint(guest)
+    symbol = test.get("entrypoint_symbol")
+    env["BINRADAR_ENTRYPOINT"] = (
+        "0x%x" % resolve_symbols(guest, {symbol})[symbol]
+        if symbol else resolve_entrypoint(guest))
     env["PLT_INFO_FILE"] = guest + ".plt"
     env["BINRADAR_FORKSERVER_CHILD_TIMEOUT"] = str(test.get("fs_child_timeout", 4))
     if test.get("fs_iteration_timeout") is not None:
@@ -1115,6 +1196,11 @@ def run_forkserver(test, guest, qemu, workdir):
                 "fs_evidence_attempts" in test:
             evidence_path = env["BINRADAR_EVIDENCE_FILE"]
             if os.path.isfile(evidence_path):
+                with open(evidence_path, "rb") as stream:
+                    _, version, _, _ = binradar_evidence.HEADER_STRUCT.unpack(
+                        stream.read(binradar_evidence.HEADER_STRUCT.size))
+                if version != 4:
+                    raise RuntimeError(f"coverage-v5 requires compact v4, got v{version}")
                 evidence = list(binradar_evidence.read_binradar(
                     evidence_path))
         return (proc.returncode, child_status, stderr_text, evidence,
@@ -1189,10 +1275,14 @@ def run_test(test, guests_dir, workdir, qemu):
         if test["mode"] == "mem":
             result = run_memcheck(run_spec, guest, qemu, workdir)
             rc, stderr_text = result.returncode, result.stderr.decode(errors="replace")
+            stderr_text += "".join("[guest-stdout] " + line + "\n"
+                                   for line in result.stdout.decode(errors="replace").splitlines())
             fs_status = None
         elif test["mode"] == "sym":
             result = run_symbolic(run_spec, guest, qemu, workdir)
             rc, stderr_text = result.returncode, result.stderr.decode(errors="replace")
+            stderr_text += "".join("[guest-stdout] " + line + "\n"
+                                   for line in result.stdout.decode(errors="replace").splitlines())
             fs_status = None
         else:
             rc, fs_status, stderr_text, evidence, summary = run_forkserver(
@@ -1208,6 +1298,9 @@ def run_test(test, guests_dir, workdir, qemu):
 def check(test, rc, fs_status, out, evidence=None, probe_text="",
           summary=None):
     problems = []
+    if test.get("required_stdout") and (
+            "[guest-stdout] " + test["required_stdout"] + "\n") not in out:
+        problems.append(f"missing guest outcome: {test['required_stdout']}")
     if test.get("required_log") and test["required_log"] not in out:
         problems.append(f"missing required log marker: {test['required_log']}")
     if test.get("raw_pc_symbol"):
@@ -1417,7 +1510,7 @@ def check(test, rc, fs_status, out, evidence=None, probe_text="",
         # signal PC, for every real child rather than only the last row.
         finding_pcs = [finding_int(finding, "access_pc")
                        for finding in parse_findings(out)]
-        if reference_expectation["source"] == "provenance-access":
+        if reference_expectation["source"] in ("provenance-access", "syscall-request"):
             if not finding_pcs or addresses != finding_pcs:
                 problems.append("fault reference does not identify provenance access PC")
         elif reference_expectation["source"] == "guest-signal":
@@ -1450,6 +1543,23 @@ def check(test, rc, fs_status, out, evidence=None, probe_text="",
             for group in iteration.groups
             if group.outcome == "crash"
         ]
+        compact_sources = [
+            group.source for iteration in (evidence or [])
+            for group in iteration.groups if group.outcome == "crash"
+        ]
+        if any(source != test["fault_reference"]["source"] for source in compact_sources):
+            problems.append("compact v4 source disagrees with independent expected origin")
+        if test.get("compact_normal_control"):
+            # This toy has no patch site: the normal second child is correctly
+            # discarded, not committed as invented canonical evidence.
+            reset_rows = re.findall(
+                r"^\[binradar\] \[plan-attempt\].*\[attempt 2\].*$",
+                out, re.MULTILINE)
+            if (len(reset_rows) != 1 or any(field not in reset_rows[0] for field in (
+                    "[patch0-exit normal]", "[patch0-fault-valid false]",
+                    "[patch0-fault-source unavailable]", "[committed false]")) or
+                    "[binradar] [normal] [iter 2] [patch 0]" not in out):
+                problems.append("next child retained a finding or fault-reference source")
         if not compact_faults:
             problems.append("compact evidence has no crash fault group")
         elif not references or any(
@@ -1469,6 +1579,9 @@ def check(test, rc, fs_status, out, evidence=None, probe_text="",
             f"{test['final_expr_min']}")
 
     findings = parse_findings(out)
+    if test.get("raw_finding_origin") and (not findings or any(
+            finding.get("origin") != test["raw_finding_origin"] for finding in findings)):
+        problems.append("raw child finding origin disagrees with expected request origin")
     want = test.get("finding")
     if test.get("no_consistency"):
         # A consistency-mismatch on a changed-byte syscall output means the
@@ -1489,6 +1602,8 @@ def check(test, rc, fs_status, out, evidence=None, probe_text="",
         return problems
 
     got = findings[0]
+    if want.get("origin") and got.get("origin") != want["origin"]:
+        problems.append(f"finding origin {got.get('origin')!r} != {want['origin']!r}")
     if test.get("access_pc_symbol") and finding_int(got, "access_pc") != test["_access_pc"]:
         problems.append(f"finding identity does not match {test['access_pc_symbol']}")
     required = {

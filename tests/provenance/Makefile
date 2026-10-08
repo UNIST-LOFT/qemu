@@ -72,7 +72,7 @@ TESTS := t01_double_free t02_small_double_free t03_uaf_stack t04_uaf_heap \
          t84_syscall_input t85_library_coverage t86_libc_scans \
          t87_prefix_window t88_e9_identity \
          t89_allocator_recycled_realloc t90_realloc_symbolic_payload \
-         t91_allocator_saved_alias
+         t91_allocator_saved_alias t92_request_contract
 
 # t83 reuses the t82 guest: every mutation plan for it is discarded, so
 # draining the whole queue exercises the terminal-discarded-plan case.

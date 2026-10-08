@@ -904,8 +904,14 @@ static bool prov_syscall_read_pc(CPUArchState *env, target_ulong *out)
     return true;
 }
 
-void provenance_check_syscall_read(CPUArchState *env, target_ulong addr,
-                                   target_ulong size, int reg)
+static MemcheckResult prov_check_bounds(CPUArchState *env, target_ulong addr,
+                                        target_ulong size, target_ulong pc,
+                                        PtrTag tag, int reg, target_ulong value,
+                                        ProvFindingOrigin origin);
+
+static void prov_check_syscall(CPUArchState *env, target_ulong addr,
+                               target_ulong size, int reg,
+                               ProvFindingOrigin origin)
 {
     target_ulong pc;
     if (size == 0 || !prov_syscall_read_pc(env, &pc)) return;
@@ -925,25 +931,52 @@ void provenance_check_syscall_read(CPUArchState *env, target_ulong addr,
             }
         }
     }
-    provenance_check_access(env, addr, size, pc, tag, reg, value);
+    prov_check_bounds(env, addr, size, pc, tag, reg, value, origin);
+}
+
+static void prov_check_syscall_tagged(CPUArchState *env, target_ulong addr,
+                                      target_ulong size, PtrTag tag,
+                                      ProvFindingOrigin origin)
+{
+    target_ulong pc;
+    if (size == 0 || !prov_syscall_read_pc(env, &pc)) return;
+    if (tag.concrete_value != addr) tag.valid = false;
+    prov_check_bounds(env, addr, size, pc, tag, -1, addr, origin);
+}
+
+void provenance_check_syscall_read(CPUArchState *env, target_ulong addr,
+                                   target_ulong size, int reg)
+{
+    prov_check_syscall(env, addr, size, reg, PROV_FINDING_ORIGIN_ACCESS);
 }
 
 void provenance_check_syscall_read_tagged(CPUArchState *env, target_ulong addr,
                                           target_ulong size, PtrTag tag)
 {
-    target_ulong pc;
-    if (size == 0 || !prov_syscall_read_pc(env, &pc)) return;
-    if (tag.concrete_value != addr) tag.valid = false;
-    provenance_check_access(env, addr, size, pc, tag, -1, addr);
+    prov_check_syscall_tagged(env, addr, size, tag, PROV_FINDING_ORIGIN_ACCESS);
+}
+
+void provenance_check_syscall_request(CPUArchState *env, target_ulong addr,
+                                      target_ulong size, int reg)
+{
+    prov_check_syscall(env, addr, size, reg, PROV_FINDING_ORIGIN_SYSCALL_REQUEST);
+}
+
+void provenance_check_syscall_request_tagged(CPUArchState *env, target_ulong addr,
+                                             target_ulong size, PtrTag tag)
+{
+    prov_check_syscall_tagged(env, addr, size, tag,
+                              PROV_FINDING_ORIGIN_SYSCALL_REQUEST);
 }
 
 /* Publication policy.  A tagged finding is sticky.  It may promote a
- * committed UNKNOWN fallback only for the same PC/address/width.  The two
+ * committed UNKNOWN fallback only for the same origin/PC/address/width.  The two
  * immutable slots ensure a timeout SIGKILL during promotion leaves the
  * fallback intact and readable. */
 static ProvPublishedFinding *prov_fault_slot_for_publish(
         PendingProvenanceFault *pf, ProvFindingQuality quality,
-        target_ulong pc, target_ulong addr, uint32_t size) {
+        ProvFindingOrigin origin, target_ulong pc, target_ulong addr,
+        target_ulong size) {
     if (pf == NULL || atomic_load_acquire(&pf->tagged.ready) != 0) {
         return NULL;
     }
@@ -959,7 +992,8 @@ static ProvPublishedFinding *prov_fault_slot_for_publish(
     }
 
     const ProvFindingRecord *fallback = &pf->fallback.payload;
-    return fallback->actual_pc == pc &&
+    return fallback->origin == origin &&
+           fallback->actual_pc == pc &&
            fallback->access_addr == addr &&
            fallback->access_width == size
         ? &pf->tagged : NULL;
@@ -968,16 +1002,17 @@ static ProvPublishedFinding *prov_fault_slot_for_publish(
 /* Fill one immutable publication slot.  Captures the last writer PC of the
  * tracked base register for observability; 0 when the register is unknown. */
 static void prov_fault_fill(PendingProvenanceFault *pf, CPUArchState *env,
-                            target_ulong pc, target_ulong addr, uint32_t size,
+                            target_ulong pc, target_ulong addr, target_ulong size,
                             uint64_t obj_id, uint32_t gen,
                             target_ulong obj_base, target_ulong obj_size,
                             int64_t offset, target_ulong producer_pc,
                             PtrProducerKind producer_kind, int ea_base_reg,
                             target_ulong ea_base_reg_val, bool is_uaf,
-                            ProvFindingQuality quality) {
+                            ProvFindingQuality quality,
+                            ProvFindingOrigin origin) {
     target_ulong reference_pc;
     if (!provenance_memcheck_reference_pc(env, pc, &reference_pc)) {
-        log_msg("[memcheck] [unclassified-access] [actual_pc %lx] [addr %lx] [width %u]\n",
+        log_msg("[memcheck] [unclassified-access] [actual_pc %lx] [addr %lx] [width " TARGET_FMT_lu "]\n",
                 pc, addr, size);
         return;
     }
@@ -990,19 +1025,20 @@ static void prov_fault_fill(PendingProvenanceFault *pf, CPUArchState *env,
         if (!prov_prefix_finding_logged) {
             prov_prefix_finding_logged = true;
             log_msg("[prov] [prefix-finding] [access_pc %lx] [actual_pc %lx] "
-                    "[access_addr %lx] [width %u] [is_uaf %d]\n",
+                    "[access_addr %lx] [width " TARGET_FMT_lu "] [is_uaf %d]\n",
                     reference_pc, pc, addr, size, is_uaf ? 1 : 0);
         }
         return;
     }
     ProvPublishedFinding *slot = prov_fault_slot_for_publish(
-        pf, quality, pc, addr, size);
+        pf, quality, origin, pc, addr, size);
     if (slot == NULL) {
         return;
     }
 
     ProvFindingRecord *rec = &slot->payload;
     rec->quality = quality;
+    rec->origin = origin;
     rec->is_uaf = is_uaf;
     rec->access_pc = reference_pc;
     rec->actual_pc = pc;
@@ -1039,10 +1075,11 @@ static void prov_fault_fill(PendingProvenanceFault *pf, CPUArchState *env,
     atomic_store_release(&slot->ready, 1);
 }
 
-MemcheckResult provenance_check_access(CPUArchState *env, target_ulong addr,
-                                       target_ulong size, target_ulong pc,
-                                       PtrTag ea_tag, int ea_base_reg,
-                                       target_ulong ea_base_reg_val) {
+static MemcheckResult prov_check_bounds(CPUArchState *env, target_ulong addr,
+                                        target_ulong size, target_ulong pc,
+                                        PtrTag ea_tag, int ea_base_reg,
+                                        target_ulong ea_base_reg_val,
+                                        ProvFindingOrigin origin) {
     if (ea_tag.valid) {
         ProvenanceObject *obj = provenance_lookup_object(ea_tag.object_id,
                                                          ea_tag.generation);
@@ -1091,9 +1128,9 @@ MemcheckResult provenance_check_access(CPUArchState *env, target_ulong addr,
                                 ea_tag.concrete_offset,
                                 ea_tag.producer_pc, ea_tag.producer_kind,
                                 ea_base_reg, ea_base_reg_val, true,
-                                PROV_FINDING_TAGGED);
+                                PROV_FINDING_TAGGED, origin);
                 if (provenance_debug) {
-                    log_msg("[prov] [uaf] [pc %lx] [addr %lx] [width %u] [obj_id %lu] [gen %u] [base %lx] [size %lx] [offset %ld]\n",
+                    log_msg("[prov] [uaf] [pc %lx] [addr %lx] [width " TARGET_FMT_lu "] [obj_id %lu] [gen %u] [base %lx] [size %lx] [offset %ld]\n",
                             pc, addr, size, obj->object_id, obj->generation,
                             obj->base, obj->requested_size, ea_tag.concrete_offset);
                 }
@@ -1113,9 +1150,9 @@ MemcheckResult provenance_check_access(CPUArchState *env, target_ulong addr,
                                 obj->base, obj->requested_size, offset,
                                 ea_tag.producer_pc, ea_tag.producer_kind,
                                 ea_base_reg, ea_base_reg_val, false,
-                                PROV_FINDING_TAGGED);
+                                PROV_FINDING_TAGGED, origin);
                 if (provenance_debug) {
-                    log_msg("[prov] [oob] [pc %lx] [addr %lx] [width %u] [obj_id %lu] [gen %u] [base %lx] [size %lx] [offset %ld]\n",
+                    log_msg("[prov] [oob] [pc %lx] [addr %lx] [width " TARGET_FMT_lu "] [obj_id %lu] [gen %u] [base %lx] [size %lx] [offset %ld]\n",
                             pc, addr, size, obj->object_id, obj->generation,
                             obj->base, obj->requested_size, offset);
                 }
@@ -1132,9 +1169,9 @@ MemcheckResult provenance_check_access(CPUArchState *env, target_ulong addr,
                                 obj->base, obj->requested_size, offset,
                                 ea_tag.producer_pc, ea_tag.producer_kind,
                                 ea_base_reg, ea_base_reg_val, false,
-                                PROV_FINDING_TAGGED);
+                                PROV_FINDING_TAGGED, origin);
                 if (provenance_debug) {
-                    log_msg("[prov] [oob] [pc %lx] [addr %lx] [width %u] [obj_id %lu] [gen %u] [base %lx] [size %lx] [offset %ld] [remaining %lu]\n",
+                    log_msg("[prov] [oob] [pc %lx] [addr %lx] [width " TARGET_FMT_lu "] [obj_id %lu] [gen %u] [base %lx] [size %lx] [offset %ld] [remaining %lu]\n",
                             pc, addr, size, obj->object_id, obj->generation,
                             obj->base, obj->requested_size, offset, remaining);
                 }
@@ -1150,9 +1187,7 @@ MemcheckResult provenance_check_access(CPUArchState *env, target_ulong addr,
      * Do NOT report UAF from numeric quarantine (cannot distinguish stale
      * pointer from valid pointer to reused/untracked allocation). */
     if (binradar_memcheck_enabled) {
-        /* Check quarantine first (exact-bounds UAF from numeric match).
-         * NOTE: we do NOT report UAF for UNKNOWN provenance per the spec.
-         * The quarantine check is only for the exact-bounds OOB path. */
+        /* Only an existing live half-open interval can prove UNKNOWN OOB. */
         SnapshotMemRegion *mr = mr_manager_heap_search_pub(addr);
         if (mr != NULL) {
             /* Exact-bounds OOB: access starts inside a known region but
@@ -1174,9 +1209,9 @@ MemcheckResult provenance_check_access(CPUArchState *env, target_ulong addr,
                                     (int64_t)(addr - mr->base),
                                     0, PROV_PRODUCER_NONE,
                                     ea_base_reg, ea_base_reg_val, false,
-                                    PROV_FINDING_FALLBACK);
+                                    PROV_FINDING_FALLBACK, origin);
                     if (provenance_debug) {
-                        log_msg("[prov] [oob-exact] [pc %lx] [addr %lx] [width %u] [base %lx] [size %lx]\n",
+                        log_msg("[prov] [oob-exact] [pc %lx] [addr %lx] [width " TARGET_FMT_lu "] [base %lx] [size %lx]\n",
                                 pc, addr, size, mr->base, mr->size);
                     }
                     return MEMCHECK_HEAP_OOB;
@@ -1186,6 +1221,15 @@ MemcheckResult provenance_check_access(CPUArchState *env, target_ulong addr,
     }
 
     return MEMCHECK_OK;
+}
+
+MemcheckResult provenance_check_access(CPUArchState *env, target_ulong addr,
+                                       target_ulong size, target_ulong pc,
+                                       PtrTag ea_tag, int ea_base_reg,
+                                       target_ulong ea_base_reg_val)
+{
+    return prov_check_bounds(env, addr, size, pc, ea_tag, ea_base_reg,
+                              ea_base_reg_val, PROV_FINDING_ORIGIN_ACCESS);
 }
 
 /* Snapshot the preferred committed finding.  Each slot is immutable after
@@ -1247,8 +1291,10 @@ bool provenance_report_pending_finding(void) {
     }
 
     const ProvFindingRecord *f = &finding.payload;
-    log_msg("[prov] [finalize] [finding] [reason %s] [access_pc %lx] [actual_pc %lx] [access_addr %lx] [width %u] [obj_id %lu] [gen %u] [obj_base %lx] [size %lx] [offset %ld] [producer_pc %lx] [kind %d] [last_writer %lx] [is_uaf %d] [ea_reg %d] [query_cursor %ld] [expr_cursor %ld]\n",
-            prov_fault_reason_for(f), f->access_pc, f->actual_pc, f->access_addr,
+    log_msg("[prov] [finalize] [finding] [reason %s] [origin %s] [access_pc %lx] [actual_pc %lx] [access_addr %lx] [width " TARGET_FMT_lu "] [obj_id %lu] [gen %u] [obj_base %lx] [size %lx] [offset %ld] [producer_pc %lx] [kind %d] [last_writer %lx] [is_uaf %d] [ea_reg %d] [query_cursor %ld] [expr_cursor %ld]\n",
+            prov_fault_reason_for(f),
+            f->origin == PROV_FINDING_ORIGIN_SYSCALL_REQUEST
+                ? "syscall-request" : "provenance-access", f->access_pc, f->actual_pc, f->access_addr,
             f->access_width, f->object_id, f->generation,
             f->object_base, f->requested_size, f->tracked_offset,
             f->producer_pc, f->producer_kind, f->last_writer_pc,
