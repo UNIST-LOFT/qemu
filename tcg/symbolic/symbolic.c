@@ -9516,8 +9516,113 @@ typedef struct ModelFrame {
     Expr *return_expr;
     ProvenancePending pending;
     ModelWrite write;
+    LIB_MODEL kind;
+    bool opaque_seen;
+    target_ulong stack_low, old_size;
+    GArray *payload_exprs;
+    SemCopySnapshot *payload_origins;
 } ModelFrame;
 static GArray *model_frames;
+
+typedef struct ModelPayloadExpr {
+    target_ulong offset;
+    Expr *expr;
+} ModelPayloadExpr;
+
+static bool model_is_allocator(LIB_MODEL kind)
+{
+    return kind == MALLOC || kind == CALLOC || kind == REALLOC || kind == FREE;
+}
+
+static void model_allocator_snapshot(CPUArchState *env, ModelFrame *frame)
+{
+    ProvenancePending *pending = &frame->pending;
+    if (frame->kind != REALLOC && frame->kind != FREE) return;
+    ProvenanceObject *old = provenance_lookup_object(pending->old_object_id,
+                                                     pending->old_generation);
+    if (old == NULL || old->state != PROV_OBJ_LIVE) return;
+    frame->old_size = old->requested_size;
+    if (frame->kind != REALLOC) return;
+    target_ulong copied = MIN(frame->old_size, pending->arg_size);
+    frame->payload_origins = sem_copy_snapshot(env, old->base, copied);
+    if (!symbolic_mode) return;
+    /* Only existing symbolic leaves are visited, and storage is allocated
+     * only for live expressions.  Guest realloc may unmap the old payload;
+     * its expressions must be captured before entering libc. */
+    for (target_ulong offset = 0; offset < copied;) {
+        target_ulong addr = old->base + offset;
+        target_ulong size = MIN(copied - offset, 0x10000 - (addr & 0xffff));
+        size_t overflow = 0;
+        Expr **exprs = get_expr_addr(addr, size, 0, &overflow);
+        if (exprs != NULL) {
+            for (target_ulong i = 0; i < size; i++) {
+                if (exprs[i] == NULL) continue;
+                if (frame->payload_exprs == NULL) {
+                    frame->payload_exprs = g_array_new(FALSE, FALSE,
+                                                       sizeof(ModelPayloadExpr));
+                }
+                ModelPayloadExpr saved = {offset + i, exprs[i]};
+                g_array_append_val(frame->payload_exprs, saved);
+            }
+        }
+        offset += size;
+    }
+}
+
+static void model_allocator_clear(CPUArchState *env, target_ulong base,
+                                   target_ulong size)
+{
+    if (size == 0) return;
+    sem_mem_overwrite(env, base, size, SEM_OP_LIBC_MODEL);
+    if (symbolic_mode) {
+        /* Avoid recursive whole-allocation clearing across 64-KiB leaves. */
+        while (size != 0) {
+            target_ulong part = MIN(size, 0x10000 - (base & 0xffff));
+            symbolic_clear_mem(base, part);
+            base += part;
+            size -= part;
+        }
+    }
+}
+
+static void model_allocator_complete(CPUArchState *env, ModelFrame *frame,
+                                     target_ulong base)
+{
+    ProvenancePending *pending = &frame->pending;
+    if (frame->kind == FREE ||
+        (frame->kind == REALLOC && pending->arg_size == 0)) {
+        model_allocator_clear(env, pending->arg_ptr, frame->old_size);
+    } else if (base != 0 && !pending->overflowed) {
+        if (frame->kind == REALLOC && base == pending->arg_ptr) {
+            target_ulong preserved = MIN(frame->old_size, pending->arg_size);
+            /* Unchanged payload cells retain their pointer tags; changed
+             * extent bytes cannot resurrect tags/expressions on later reuse. */
+            model_allocator_clear(env, base + preserved,
+                MAX(frame->old_size, pending->arg_size) - preserved);
+        } else {
+            if (frame->kind == REALLOC) {
+                model_allocator_clear(env, pending->arg_ptr, frame->old_size);
+            }
+            model_allocator_clear(env, base, pending->arg_size);
+        }
+        if (frame->payload_exprs != NULL) {
+            for (guint i = 0; i < frame->payload_exprs->len; i++) {
+                const ModelPayloadExpr *saved = &g_array_index(
+                    frame->payload_exprs, ModelPayloadExpr, i);
+                size_t overflow = 0;
+                Expr **cell = get_expr_addr(base + saved->offset, 1, 1, &overflow);
+                *cell = saved->expr;
+            }
+        }
+        sem_copy_restore(env, frame->payload_origins, base);
+    }
+    if (frame->payload_exprs != NULL) g_array_free(frame->payload_exprs, TRUE);
+    sem_copy_discard(frame->payload_origins);
+    if (frame->opaque_seen) {
+        target_ulong low = frame->stack_low >= 128 ? frame->stack_low - 128 : 0;
+        model_allocator_clear(env, low, frame->entry_sp - low);
+    }
+}
 
 /* Learn only the loader's actual GOT target after a PLT call completed.
  * IFUNC symbol values are resolver addresses and are never guessed here. */
@@ -9622,6 +9727,19 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
         &g_array_index(model_frames, ModelFrame, model_frames->len - 1) : NULL;
     bool returning = top && pc == top->return_pc &&
         rsp == top->entry_sp + sizeof(target_ulong);
+    bool opaque = top && model_is_allocator(top->kind) && !returning &&
+        provenance_runtime_pc(pc);
+    sem_allocator_scope(env, opaque ? &top->stack_low : NULL);
+    if (opaque) {
+        top->opaque_seen = true;
+        /* The outer API summary owns lifecycle and payload effects.  A
+         * runtime-internal malloc/free/memcpy is not another application call. */
+        if (mode != top->body_mode) {
+            mode = top->body_mode;
+            return 1;
+        }
+        return 0;
+    }
     if (!returning && model > 0 && (!top || rsp < top->entry_sp)) {
         /* Numeric/stdio models remain symbolic-only.  A second dispatch at
          * the same stack depth is the PLT's resolved implementation, not a
@@ -9720,19 +9838,14 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
             }
             mode = 2;
         } else if (model == FREE) {
-            if (env->regs[R_EDI] != 0) {
-                if (symbolic_mode) {
-                    symbolic_trace_free(env->regs[R_EDI]);
-                }
-                snapshot_trace_free(env->regs[R_EDI], model_caller_addr);
-                ProvenanceObject *obj =
-                    provenance_lookup_live_by_base(env->regs[R_EDI]);
-                if (obj != NULL) {
-                    osprey_on_free_identity(env, obj->object_id,
-                                            obj->generation,
-                                            model_caller_addr);
-                }
-                provenance_retire_object(env->regs[R_EDI]);
+            provenance_set_pending(env, PROV_OP_FREE, model_caller_addr,
+                                   0, env->regs[R_EDI]);
+            ProvenanceObject *obj =
+                provenance_lookup_live_by_base(env->regs[R_EDI]);
+            if (obj != NULL) {
+                PtrRegShadow *shadow = provenance_get_reg_shadow(env);
+                shadow->pending.old_object_id = obj->object_id;
+                shadow->pending.old_generation = obj->generation;
             }
             if (symbolic_mode) {
                 clear_call_args_temps();
@@ -9944,8 +10057,9 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
             .return_pc = model_caller_addr, .entry_pc = pc, .entry_sp = rsp,
             .body_mode = mode, .return_expr = pending_model_return_expr,
             .pending = provenance_get_reg_shadow(env)->pending,
-            .write = model_write,
+            .write = model_write, .kind = model, .stack_low = rsp,
         };
+        if (model_is_allocator(model)) model_allocator_snapshot(env, &frame);
         g_array_append_val(model_frames, frame);
         return 1; /* repeated/nested calls must reenter dispatch */
     }
@@ -9973,13 +10087,24 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
          * RCX, RDX, RSI, RDI, R8-R11) before installing the modeled
          * return; the pending-alloc return tag (below) re-tags RAX. */
         sem_clobber_caller_saved(env);
-        PendingAlloc alloc = frame.pending.valid ?
+        PendingAlloc alloc = frame.pending.valid && frame.kind != FREE ?
             snapshot_trace_get_pending_allocs(pc) : (PendingAlloc){0};
         target_ulong base = env->regs[R_EAX];
         ProvenancePending pend = provenance_get_pending(env, pc);
 
         if (pend.valid) {
-            if (pend.kind == PROV_OP_REALLOC) {
+            if (pend.kind == PROV_OP_FREE) {
+                if (pend.arg_ptr != 0) {
+                    snapshot_trace_free(pend.arg_ptr, pend.call_pc);
+                    if (pend.old_object_id != 0) {
+                        osprey_on_free_identity(env, pend.old_object_id,
+                                                pend.old_generation, pend.call_pc);
+                    }
+                    provenance_retire_object(pend.arg_ptr);
+                    if (symbolic_mode) symbolic_trace_free(pend.arg_ptr);
+                }
+                provenance_clear_pending(env);
+            } else if (pend.kind == PROV_OP_REALLOC) {
                 if (pend.arg_size == 0) {
                     /* realloc(p, 0): glibc frees p and returns NULL.
                      * Retire the old object; create a zero-size object
@@ -10155,6 +10280,9 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
                                          sym_alloc.size, sym_alloc.pc);
                 }
             }
+        }
+        if (model_is_allocator(frame.kind)) {
+            model_allocator_complete(env, &frame, base);
         }
         top = model_frames->len ?
             &g_array_index(model_frames, ModelFrame, model_frames->len - 1) : NULL;

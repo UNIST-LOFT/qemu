@@ -400,6 +400,16 @@ void osprey_on_free_identity(CPUArchState *env, uint64_t object_id,
 void osprey_on_mem_copy(CPUArchState *env, target_ulong src,
                         target_ulong dst, target_ulong size);
 
+/* Realloc saves entry payload metadata before libc can release its source.
+ * Restore only after a successful result has its new heap identity; discard
+ * on either outcome.  A failed realloc never mutates the saved source. */
+typedef struct OspreyCopySnapshot OspreyCopySnapshot;
+OspreyCopySnapshot *osprey_copy_snapshot(CPUArchState *env, target_ulong src,
+                                        target_ulong size);
+void osprey_copy_restore(CPUArchState *env, OspreyCopySnapshot *copy,
+                         target_ulong dst);
+void osprey_copy_discard(OspreyCopySnapshot *copy);
+
 /* OSPREY consumers of the shared semantic-event layer.  Stage 2.2
  * centralizes dispatch; Stages 2.3–2.4 complete address/value policy.
  * Every accepted Stage 2.3 transfer event carries the raw instruction

@@ -29,6 +29,7 @@ bool e9_original_instruction_pc(target_ulong pc, target_ulong *original)
 target_ulong binradar_entrypoint = (target_ulong)-1;
 bool binradar_entrypoint_reached = false;
 int binradar_memcheck_enabled = 0;
+int symbolic_mode = 0;
 uint64_t symbolic_start_code = 0;
 uint64_t symbolic_end_code = 0;
 Expr *pool = NULL;

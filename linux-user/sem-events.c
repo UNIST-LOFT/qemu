@@ -337,6 +337,25 @@ const char *const sem_emittable_helpers[] = {
     NULL,
 };
 
+bool sem_allocator_body;
+static target_ulong *allocator_stack_low;
+
+void sem_allocator_scope(CPUArchState *env, target_ulong *stack_low)
+{
+    bool active = stack_low != NULL;
+    allocator_stack_low = stack_low;
+    if (active == sem_allocator_body) return;
+    sem_allocator_body = active;
+    if (binradar_memcheck_enabled) {
+        provenance_get_reg_shadow(env)->ea_meta.valid = false;
+    }
+    if (osprey_collect_enabled) {
+        osprey_helper_intervals_reset(env);
+        osprey_sem_transfer_clear(env);
+        osprey_sem_ea_clear(env, true);
+    }
+}
+
 bool sem_events_active(void) {
     return binradar_memcheck_enabled != 0 || osprey_collect_enabled != 0;
 }
@@ -386,6 +405,7 @@ void sem_mem_overwrite(CPUArchState *env, target_ulong addr,
 
 void sem_mem_helper_write_attempt(CPUArchState *env, target_ulong addr,
                                   target_ulong size, SemOpClass cls) {
+    if (sem_allocator_body) return;
     if (!sem_events_active()) {
         return;
     }
@@ -422,6 +442,22 @@ void sem_mem_copy(CPUArchState *env, target_ulong src, target_ulong dst,
             osprey_on_mem_overwrite(env, dst, size);
         }
     }
+}
+
+SemCopySnapshot *sem_copy_snapshot(CPUArchState *env, target_ulong src,
+                                   target_ulong size)
+{
+    return osprey_collect_enabled ? osprey_copy_snapshot(env, src, size) : NULL;
+}
+
+void sem_copy_restore(CPUArchState *env, SemCopySnapshot *copy, target_ulong dst)
+{
+    if (copy != NULL) osprey_copy_restore(env, copy, dst);
+}
+
+void sem_copy_discard(SemCopySnapshot *copy)
+{
+    osprey_copy_discard(copy);
 }
 
 void sem_reg_overwrite(CPUArchState *env, int reg_idx, SemOpClass cls) {
@@ -775,6 +811,7 @@ static inline bool osprey_mode_ok(uint32_t mode) {
 void helper_sem_set_ea(CPUArchState *env, uint32_t base_reg,
                        uint32_t index_reg, uint32_t scale,
                        target_ulong disp, uint32_t mode) {
+    if (sem_allocator_body) return;
     if (binradar_memcheck_enabled) {
         /* Reads env->regs for the snapshots exactly like the old
          * helper_prov_set_ea (behavior preserved verbatim). */
@@ -790,6 +827,7 @@ void helper_sem_set_ea(CPUArchState *env, uint32_t base_reg,
 }
 
 void helper_sem_set_ea_mode(CPUArchState *env, uint32_t mode) {
+    if (sem_allocator_body) return;
     if (!osprey_collect_enabled) {
         return;
     }
@@ -798,6 +836,7 @@ void helper_sem_set_ea_mode(CPUArchState *env, uint32_t mode) {
 
 void helper_sem_set_ea_vals(CPUArchState *env, target_ulong base_val,
                             target_ulong index_val) {
+    if (sem_allocator_body) return;
     if (!osprey_collect_enabled) {
         return;
     }
@@ -810,6 +849,7 @@ void sem_mem_access(CPUArchState *env, target_ulong addr,
                     target_ulong size, target_ulong pc, uint32_t flags,
                     SemOpClass cls, SemIntervalPolicy policy,
                     SemProducerId producer) {
+    if (sem_allocator_body) return;
     bool valid_class = sem_op_class_is_valid(cls);
     bool valid_policy = sem_interval_policy_declared(producer, cls, policy,
                                                      size);
@@ -883,6 +923,7 @@ void helper_sem_mem_access(CPUArchState *env, target_ulong addr,
 
 void helper_sem_mem_overwrite(CPUArchState *env, target_ulong addr,
                               target_ulong size, uint32_t cls) {
+    if (sem_allocator_body) return;
     sem_mem_overwrite(env, addr, size, (SemOpClass)cls);
     if (!sem_op_class_is_valid((SemOpClass)cls)) {
         if (binradar_memcheck_enabled) {
@@ -896,6 +937,7 @@ void helper_sem_mem_overwrite(CPUArchState *env, target_ulong addr,
 
 void helper_sem_mem_unsupported(CPUArchState *env, target_ulong pc,
                                 uint32_t reason) {
+    if (sem_allocator_body) return;
     (void)pc;
     (void)reason;
     if (binradar_memcheck_enabled) {
@@ -926,6 +968,7 @@ void sem_mem_helper_access_part(CPUArchState *env, target_ulong addr,
                                 bool is_store, SemOpClass cls,
                                 SemIntervalPolicy policy,
                                 SemProducerId producer, bool final_part) {
+    if (sem_allocator_body) return;
     bool valid_class = sem_op_class_is_valid(cls);
     bool valid_policy = sem_interval_policy_declared(producer, cls, policy,
                                                      size);
@@ -986,6 +1029,7 @@ void sem_mem_maskmov(CPUArchState *env, target_ulong addr,
                      uint32_t selected_mask, uint32_t width,
                      target_ulong pc, SemOpClass cls,
                      SemIntervalPolicy policy, SemProducerId producer) {
+    if (sem_allocator_body) return;
     bool valid_class = sem_op_class_is_valid(cls);
     bool valid_policy = sem_interval_policy_declared(producer, cls, policy, 1);
     if (binradar_memcheck_enabled && (width == 8 || width == 16)) {
@@ -1032,6 +1076,7 @@ void sem_mem_maskmov(CPUArchState *env, target_ulong addr,
 void helper_sem_on_load(CPUArchState *env, uint32_t dst_idx,
                         target_ulong addr, target_ulong size,
                         target_ulong pc, uint32_t cls) {
+    if (sem_allocator_body) return;
     if (!sem_op_class_is_valid((SemOpClass)cls)) {
         if (binradar_memcheck_enabled) {
             sem_prov_on_load(env, dst_idx, addr, size, pc);
@@ -1060,6 +1105,7 @@ void helper_sem_on_load(CPUArchState *env, uint32_t dst_idx,
 void helper_sem_on_store(CPUArchState *env, uint32_t src_idx,
                          target_ulong addr, target_ulong size,
                          target_ulong src_val, uint32_t cls) {
+    if (sem_allocator_body) return;
     /* OSPREY: the translator rode the pending raw transfer-PC scratch
      * (same protocol as the two-helper LEA sequence) so the store hook
      * can gate F03/F04/slot publication on the main-image producer
@@ -1094,6 +1140,7 @@ void helper_sem_on_store(CPUArchState *env, uint32_t src_idx,
 
 void helper_sem_reg_invalidate(CPUArchState *env, uint32_t reg_idx,
                                target_ulong pc) {
+    if (sem_allocator_body) return;
     if (binradar_memcheck_enabled) {
         sem_prov_invalidate_reg(env, reg_idx, pc);
     }
@@ -1105,6 +1152,7 @@ void helper_sem_reg_invalidate(CPUArchState *env, uint32_t reg_idx,
 void helper_sem_reg_materialize_address(CPUArchState *env, uint32_t dst_idx,
                                         target_ulong value,
                                         target_ulong pc) {
+    if (sem_allocator_body) return;
     /* Provenance branch is a deliberate no-op: the default register-write
      * invalidation already occurred, and an immediate-loaded value is not
      * provenance evidence. */
@@ -1116,6 +1164,7 @@ void helper_sem_reg_materialize_address(CPUArchState *env, uint32_t dst_idx,
 void helper_sem_reg_copy(CPUArchState *env, uint32_t dst_idx,
                          uint32_t src_idx, target_ulong src_val,
                          target_ulong dst_val, target_ulong pc) {
+    if (sem_allocator_body) return;
     if (binradar_memcheck_enabled) {
         sem_prov_reg_copy(env, dst_idx, src_idx, src_val, dst_val, pc);
     }
@@ -1127,6 +1176,7 @@ void helper_sem_reg_copy(CPUArchState *env, uint32_t dst_idx,
 void helper_sem_reg_lea(CPUArchState *env, uint32_t dst_idx,
                         uint32_t base_idx, target_ulong disp,
                         target_ulong dst_val, target_ulong base_val) {
+    if (sem_allocator_body) return;
     if (binradar_memcheck_enabled) {
         sem_prov_reg_lea(env, dst_idx, base_idx, (int64_t)disp,
                          dst_val, base_val);
@@ -1144,6 +1194,7 @@ void helper_sem_reg_lea(CPUArchState *env, uint32_t dst_idx,
 void helper_sem_reg_lea_dyn(CPUArchState *env, uint32_t dst_idx,
                             uint32_t base_idx, target_ulong delta,
                             target_ulong dst_val, target_ulong base_val) {
+    if (sem_allocator_body) return;
     if (binradar_memcheck_enabled) {
         sem_prov_reg_lea(env, dst_idx, base_idx, (int64_t)delta,
                          dst_val, base_val);
@@ -1160,6 +1211,7 @@ void helper_sem_reg_lea_dyn(CPUArchState *env, uint32_t dst_idx,
 void helper_sem_reg_addsub_imm(CPUArchState *env, uint32_t reg_idx,
                                target_ulong delta, target_ulong pre_val,
                                target_ulong post_val, target_ulong pc) {
+    if (sem_allocator_body) return;
     if (binradar_memcheck_enabled) {
         sem_prov_reg_addsub_imm(env, reg_idx, (int64_t)delta, pre_val,
                                 post_val, pc);
@@ -1173,6 +1225,7 @@ void helper_sem_reg_addsub_imm(CPUArchState *env, uint32_t reg_idx,
 void helper_sem_reg_addsub_reg(CPUArchState *env, uint32_t dst_idx,
                                uint32_t src_idx, target_ulong pc,
                                target_ulong dst_val, target_ulong src_val) {
+    if (sem_allocator_body) return;
     if (binradar_memcheck_enabled) {
         sem_prov_reg_addsub_reg(env, dst_idx, src_idx, pc, dst_val,
                                 src_val);
@@ -1187,6 +1240,7 @@ void helper_sem_reg_addsub_reg(CPUArchState *env, uint32_t dst_idx,
 void helper_sem_reg_xchg(CPUArchState *env, uint32_t dst_idx,
                          uint32_t src_idx, target_ulong dst_val,
                          target_ulong src_val, target_ulong pc) {
+    if (sem_allocator_body) return;
     if (binradar_memcheck_enabled) {
         sem_prov_reg_xchg(env, dst_idx, src_idx);
     }
@@ -1202,6 +1256,7 @@ void helper_sem_syscall_pc(CPUArchState *env, target_ulong pc) {
 }
 
 void helper_sem_set_pc(CPUArchState *env, target_ulong pc) {
+    if (sem_allocator_body) return;
     /* Provenance scratch PC for lea_imm, plus OSPREY's pending raw
      * transfer PC for the two-helper LEA sequence, under independent
      * consumer gates. */
@@ -1231,11 +1286,15 @@ void helper_sem_ret(CPUArchState *env, target_ulong pc, target_ulong sp) {
 
 void helper_sem_rsp_update(CPUArchState *env, target_ulong new_sp,
                            target_ulong pc) {
+    if (allocator_stack_low != NULL && new_sp < *allocator_stack_low) {
+        *allocator_stack_low = new_sp;
+    }
     if (osprey_collect_enabled) {
         osprey_on_rsp_update(env, new_sp, pc);
     }
 }
 
 void helper_sem_clobber_caller_saved(CPUArchState *env) {
+    if (sem_allocator_body) return;
     sem_clobber_caller_saved(env);
 }

@@ -164,6 +164,12 @@ extern const char *const sem_emittable_helpers[];
  * startup; safe to gate TB translation on it. */
 bool sem_events_active(void);
 
+/* Single-threaded allocator bodies execute without semantic transfers.  The
+ * model owns this stack watermark until it leaves the body; call/return and
+ * RSP bookkeeping remain active so callbacks and attribution still work. */
+extern bool sem_allocator_body;
+void sem_allocator_scope(CPUArchState *env, target_ulong *stack_low);
+
 /* ------------------------------------------------------------------ */
 /* C API: overwrite events (non-translator producers)                 */
 /* ------------------------------------------------------------------ */
@@ -197,6 +203,15 @@ void sem_mem_helper_write_attempt(CPUArchState *env, target_ulong addr,
  * destination conservatively but publishes no F03/F04. */
 void sem_mem_copy(CPUArchState *env, target_ulong src, target_ulong dst,
                   target_ulong size, SemOpClass cls);
+
+/* Payload metadata retained across an opaque realloc.  Provenance extent
+ * invalidation remains in the allocator summary; the copy consumer retains
+ * its entry source identity until the new destination has been registered. */
+typedef struct OspreyCopySnapshot SemCopySnapshot;
+SemCopySnapshot *sem_copy_snapshot(CPUArchState *env, target_ulong src,
+                                   target_ulong size);
+void sem_copy_restore(CPUArchState *env, SemCopySnapshot *copy, target_ulong dst);
+void sem_copy_discard(SemCopySnapshot *copy);
 
 /* The translator carries the operation class, interval policy, and manifest
  * family on every memory event.  The family is validated independently from

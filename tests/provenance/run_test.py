@@ -422,7 +422,7 @@ BASE_ENV = {
     "BINRADAR_FORKSERVER_ENABLE": "0",
     "E9_EXCLUDE_RANGES": "",
     "BINRADAR_MEMCHECK_ENABLE": "1",
-    "BINRADAR_MEMCHECK_POLICY": "coverage-v3",
+    "BINRADAR_MEMCHECK_POLICY": "coverage-v4",
     "E9_RELOCATED_INSTRUCTIONS": "",
     "E9_RELOCATED_CALL_JUMPS": "",
 }
@@ -668,10 +668,37 @@ for case, mode in (("deferred", "mem"), ("deferred", "sym"),
                      raw_pc_symbol="e9_raw_signal" if signal else "e9_raw_model",
                      reference_pc_symbol="e9_original_signal" if signal else "e9_original_model",
                      fault_reference=dict(valid="true", source="guest-signal" if signal else "provenance-access")))
-TESTS.append(dict(name="t88_old_policy_rejected", guest="t88_e9_identity",
-                 mode="mem", args=["signal"], rc=(1,), verdict=None,
-                 finding=None, env={"BINRADAR_MEMCHECK_POLICY": "coverage-v2"},
-                 required_log="[memcheck] [invalid-policy coverage-v2]"))
+for policy in ("coverage-v1", "coverage-v2", "coverage-v3"):
+    TESTS.append(dict(name="t88_old_policy_rejected_" + policy, guest="t88_e9_identity",
+                     mode="mem", args=["signal"], rc=(1,), verdict=None,
+                     finding=None, env={"BINRADAR_MEMCHECK_POLICY": policy},
+                     required_log=f"[memcheck] [invalid-policy {policy}]"))
+
+# Opaque allocator bodies use production metadata, not guest-only PLT tables.
+# The guest warms memcpy's PLT/GOT to register its resolved libc IFUNC body.
+# t89 is deliberately not skipped on libcs with a different realloc path:
+# movement and all 153 concrete values must be checked natively and traced.
+for mode in ("mem", "sym"):
+    TESTS.append(dict(name="t89_allocator_recycled_realloc_" + mode,
+                     guest="t89_allocator_recycled_realloc", mode=mode,
+                     production_models=True, native_control=True,
+                     rc=(0,), verdict="normal", finding=None,
+                     required_log="allocator-control moved=1 preserved=153 size=1232"))
+    for location in ("register", "stack"):
+        TESTS.append(dict(name="t91_allocator_saved_alias_" + location + "_" + mode,
+                         guest="t91_allocator_saved_alias", mode=mode,
+                         args=[location], production_models=True,
+                         rc=(0,), verdict="crash",
+                         finding=dict(reason="heap-use-after-free", is_uaf=1)))
+
+for case in ("move", "same", "halve", "fail"):
+    for byte, branch in (("A", 0), ("Z", 1)):
+        TESTS.append(dict(name="t90_realloc_payload_" + case + "_" + byte,
+                         guest="t90_realloc_symbolic_payload", mode="sym",
+                         args=[case], symbolic_input=byte, production_models=True,
+                         native_control=True, rc=(branch,), verdict="normal",
+                         finding=None, final_queries=1, final_expr_min=1,
+                         required_log=f"realloc-payload mode={case[0]} branch={branch}"))
 
 # ---------------------------------------------------------------------------
 # Log parsing
@@ -800,6 +827,24 @@ def run_tracer(cmd, env, timeout):
 def prepare_artifact(test, guest, env):
     env["PLT_INFO_FILE"] = guest + ".plt"
     env.update(test.get("env", {}))
+    if test.get("production_models"):
+        env["PLT_INFO_FILE"] = guest + ".models.plt"
+        subprocess.run([sys.executable,
+                        os.path.join(ROOT, "fuzzolic", "find_models_addrs.py"),
+                        "-o", env["PLT_INFO_FILE"], guest], check=True,
+                       capture_output=True)
+        with open(env["PLT_INFO_FILE"], encoding="utf-8") as table:
+            rows = [line.strip().split(",") for line in table if line.strip()]
+        if not any(len(row) == 3 and "libc.so" in row[0] and row[1] == "realloc"
+                   for row in rows):
+            raise RuntimeError("production allocator control requires libc realloc metadata")
+        if test.get("guest", test["name"]) != "t91_allocator_saved_alias":
+            if not any(len(row) == 3 and "libc.so" in row[0] and row[1] == "memcpy"
+                       for row in rows):
+                raise RuntimeError("allocator payload control requires libc memcpy metadata")
+            if not any(len(row) == 3 and row[0] == os.path.basename(guest)
+                       and row[1] == "memcpy" for row in rows):
+                raise RuntimeError("allocator payload control requires resolving memcpy PLT")
     if test.get("e9_identity"):
         names = {"e9_raw_signal", "e9_original_signal", "e9_raw_model", "e9_original_model"}
         symbols = resolve_symbols(guest, names)
@@ -860,7 +905,7 @@ def run_memcheck(test, guest, qemu, workdir):
     return run_tracer(cmd, env, test.get("timeout", 30))
 
 
-def prepare_symbolic_env(env, run_dir):
+def prepare_symbolic_env(env, run_dir, input_bytes="A"):
     """Configure symbolic input while leaving the solver transport local."""
     env["NO_EXTERNAL_SOLVER"] = "1"
     for key in ("EXPR_POOL_SHM_KEY", "QUERY_SHM_KEY", "BITMAP_SHM_KEY",
@@ -869,7 +914,7 @@ def prepare_symbolic_env(env, run_dir):
     env["SYMBOLIC_INJECT_INPUT_MODE"] = "FROM_FILE"
     env["SYMBOLIC_TESTCASE_NAME"] = os.path.join(run_dir, "input")
     with open(env["SYMBOLIC_TESTCASE_NAME"], "w") as f:
-        f.write("A")
+        f.write(input_bytes)
 
 
 def run_symbolic(test, guest, qemu, workdir):
@@ -879,7 +924,7 @@ def run_symbolic(test, guest, qemu, workdir):
     env["BINRADAR_PROBE_FILE"] = test.get("probe_file", "")
     env["BINRADAR_ENTRYPOINT"] = resolve_entrypoint(guest)
     binary = prepare_artifact(test, guest, env)
-    prepare_symbolic_env(env, run_dir)
+    prepare_symbolic_env(env, run_dir, test.get("symbolic_input", "A"))
     cmd = [qemu, "-symbolic", binary, *test.get("args", [])]
     return run_tracer(cmd, env, test.get("timeout", 30))
 
@@ -1097,6 +1142,20 @@ def run_test(test, guests_dir, workdir, qemu):
     guest = os.path.join(workdir, test.get("guest", test["name"]))
     if not os.path.isfile(guest):
         raise FileNotFoundError(f"guest binary missing: {guest} (run 'make guests')")
+    if test.get("native_control"):
+        with tempfile.TemporaryDirectory(prefix="prov-native-") as native_dir:
+            native_env = dict(os.environ)
+            native_input = os.path.join(native_dir, "input")
+            with open(native_input, "w", encoding="utf-8") as stream:
+                stream.write(test.get("symbolic_input", "A"))
+            native_env["SYMBOLIC_TESTCASE_NAME"] = native_input
+            native = subprocess.run([guest, *test.get("args", [])], env=native_env,
+                                    capture_output=True, timeout=test.get("timeout", 30))
+            native_log = native.stderr.decode(errors="replace")
+            if not rc_ok(native.returncode, test["rc"]):
+                raise RuntimeError(f"native allocator control rc={native.returncode}: {native_log}")
+            if test["required_log"] not in native_log:
+                raise RuntimeError(f"native allocator control did not confirm payload/movement: {native_log}")
     if test.get("meta"):
         sym_names = {v for k, v in test["meta"].items()
                      if k in ("producer_pc", "last_writer", "access_pc")}
@@ -1150,7 +1209,7 @@ def check(test, rc, fs_status, out, evidence=None, probe_text="",
           summary=None):
     problems = []
     if test.get("required_log") and test["required_log"] not in out:
-        problems.append("missing required configuration rejection")
+        problems.append(f"missing required log marker: {test['required_log']}")
     if test.get("raw_pc_symbol"):
         if test["fault_reference"]["source"] in ("guest-signal", "unavailable"):
             raw_pcs = [int(pc, 16) for pc in re.findall(

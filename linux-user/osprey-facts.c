@@ -3105,29 +3105,28 @@ void osprey_on_mem_access_class(CPUArchState *env, target_ulong addr,
  * Source/destination outside modeled regions omit the corresponding
  * F03/F04 but still perform destination invalidation and any sound
  * ADDRESS-shadow relocation.  Never splits a large F03 into byte rows. */
-void osprey_on_mem_copy(CPUArchState *env, target_ulong src,
-                        target_ulong dst, target_ulong size) {
+typedef struct OspreyCopiedSlot {
+    target_ulong addr;
+    OspreyMemAddressOrigin slot;
+    bool valid;
+} OspreyCopiedSlot;
+
+struct OspreyCopySnapshot {
+    target_ulong src, size;
+    OspreyChunk source;
+    bool source_valid;
+    GArray *slots;
+};
+
+static void osprey_copy_capture(CPUArchState *env, target_ulong src,
+                                target_ulong size, OspreyCopySnapshot *copy)
+{
     OspreyCpuOriginState *st = osprey_cpu_origin(env);
-    if (size == 0) {
-        return;
-    }
-    if (dst + (size - 1) < dst || src + (size - 1) < src) {
-        /* Wrapping copy interval: no exact overlap can be represented.
-         * Clear the destination shadow conservatively; no fact. */
-        if (st->mem_slots != NULL) {
-            g_hash_table_remove_all(st->mem_slots);
-        }
-        return;
-    }
-    /* 1. Snapshot every source slot fully contained in [src,src+size)
-     * before destination invalidation.  The sparse shadow already
-     * bounds this allocation; a fixed local cap would silently drop
-     * valid tags and even mutate a disjoint source range. */
-    typedef struct OspreyCopiedSlot {
-        target_ulong addr;
-        OspreyMemAddressOrigin slot;
-        bool valid;
-    } OspreyCopiedSlot;
+    copy->src = src;
+    copy->size = size;
+    copy->source_valid = osprey_chunk_of_interval(env, src, size, &copy->source);
+    /* Snapshot before a realloc body can retire/unmap the source or before
+     * an overlapping copy invalidates its destination. */
     GArray *src_slots = g_array_sized_new(
         FALSE, FALSE, sizeof(OspreyCopiedSlot),
         st->mem_slots != NULL ? g_hash_table_size(st->mem_slots) : 0);
@@ -3150,6 +3149,29 @@ void osprey_on_mem_copy(CPUArchState *env, target_ulong src,
                 g_array_append_val(src_slots, saved);
             }
         }
+    }
+    copy->slots = src_slots;
+}
+
+OspreyCopySnapshot *osprey_copy_snapshot(CPUArchState *env, target_ulong src,
+                                        target_ulong size)
+{
+    if (size == 0 || size - 1 > (target_ulong)-1 - src) return NULL;
+    OspreyCopySnapshot *copy = g_new0(OspreyCopySnapshot, 1);
+    osprey_copy_capture(env, src, size, copy);
+    return copy;
+}
+
+void osprey_copy_restore(CPUArchState *env, OspreyCopySnapshot *copy,
+                         target_ulong dst)
+{
+    if (copy == NULL) return;
+    OspreyCpuOriginState *st = osprey_cpu_origin(env);
+    target_ulong src = copy->src, size = copy->size;
+    GArray *src_slots = copy->slots;
+    if (size - 1 > (target_ulong)-1 - dst) {
+        if (st->mem_slots != NULL) g_hash_table_remove_all(st->mem_slots);
+        return;
     }
     /* 2. Validate saved source slots: heap identities must still be
      * live.  The model preflight proved all source bytes readable and
@@ -3195,12 +3217,12 @@ void osprey_on_mem_copy(CPUArchState *env, target_ulong src,
     OspreySharedRun *run = g_shared_run;
     /* 4. One exact F03 for the full copied interval. */
     if (run != NULL) {
-        OspreyChunk s_chunk, d_chunk;
-        if (osprey_chunk_of_interval(env, src, size, &s_chunk) &&
+        OspreyChunk d_chunk;
+        if (copy->source_valid &&
             osprey_chunk_of_interval(env, dst, size, &d_chunk)) {
             OspreyCopyFact fact;
             memset(&fact, 0, sizeof(fact));
-            fact.source = s_chunk;
+            fact.source = copy->source;
             fact.destination = d_chunk;
             fact.sample_support = 1;
             qemu_mutex_lock(&g_shared_mutex);
@@ -3254,7 +3276,29 @@ void osprey_on_mem_copy(CPUArchState *env, target_ulong src,
             }
         }
     }
-    g_array_free(src_slots, TRUE);
+}
+
+void osprey_copy_discard(OspreyCopySnapshot *copy)
+{
+    if (copy == NULL) return;
+    g_array_free(copy->slots, TRUE);
+    g_free(copy);
+}
+
+void osprey_on_mem_copy(CPUArchState *env, target_ulong src,
+                        target_ulong dst, target_ulong size)
+{
+    if (size == 0) return;
+    if (size - 1 > (target_ulong)-1 - src ||
+        size - 1 > (target_ulong)-1 - dst) {
+        OspreyCpuOriginState *st = osprey_cpu_origin(env);
+        if (st->mem_slots != NULL) g_hash_table_remove_all(st->mem_slots);
+        return;
+    }
+    OspreyCopySnapshot copy;
+    osprey_copy_capture(env, src, size, &copy);
+    osprey_copy_restore(env, &copy, dst);
+    g_array_free(copy.slots, TRUE);
 }
 
 /* Sticky error diagnostics (child and parent side). */

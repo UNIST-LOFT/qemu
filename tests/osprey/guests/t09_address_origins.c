@@ -260,7 +260,8 @@ int main(void)
 
     /* Negative: stale heap identity after deterministic same-size
      * tcache reuse.  p3_copy's stack slot keeps the OLD provenance
-     * origin; the reload's liveness check rejects it. */
+     * origin; the reload's liveness check rejects it.  Label the heap
+     * dereference, not the valid stack access used to reload the alias. */
     void *p3 = malloc(64);
     if (!p3) {
         _exit(1);
@@ -273,9 +274,9 @@ int main(void)
     }
     (void)p4;
     __asm__ volatile(
+        "movq %0, %%r12\n\t"
         ".globl t09_no_base_stale\n"
         "t09_no_base_stale:\n\t"
-        "movq %0, %%r12\n\t"
         "movzbl (%%r12), %%eax\n"
         : : "m"(p3_copy) : "rax", "r12", "memory");
 

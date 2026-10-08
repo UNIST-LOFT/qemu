@@ -140,7 +140,7 @@ int main(void)
     call_free(survivor);
     call_free(malloc_zero);
 
-    /* Avoid exit-time libc activity changing the checked-in dump. */
+    /* Keep exit-time libc activity out of the allocator fixture. */
     _exit(0);
 }
 

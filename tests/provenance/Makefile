@@ -11,6 +11,21 @@
 #   make guests     # build guest binaries only
 #   make plts       # generate PLT files only
 #   make clean      # remove build products
+#
+# Allocator opacity controls (after building the integrated tracer):
+#   make guests plts
+#   ./run_test.py guests work $(QEMU) --test t89_allocator_recycled_realloc_mem
+#   ./run_test.py guests work $(QEMU) --test t89_allocator_recycled_realloc_sym
+#   ./run_test.py guests work $(QEMU) --test t90_realloc_payload_move_A
+#   ./run_test.py guests work $(QEMU) --test t90_realloc_payload_move_Z
+# Production libc-inclusive tables are generated at run time by
+# fuzzolic/find_models_addrs.py. Guests resolve memcpy before realloc, so the
+# tracer learns the actual libc IFUNC body rather than a resolver offset.
+# t89 requires actual native AND traced movement, with all 153 values intact;
+# it never silently passes a nonmoving libc path. The specific 10268 internal
+# qsort/recycled-chunk memcpy path was observed with Guix glibc 2.41. Start
+# with system libc; for exact reproduction rebuild guests with CC pointing to
+# that toolchain (and its linked glibc), then rerun both t89 modes.
 
 QEMU      := ../../build/x86_64-linux-user/qemu-x86_64
 RUNNER    := $(CURDIR)/run_test.py
@@ -55,7 +70,9 @@ TESTS := t01_double_free t02_small_double_free t03_uaf_stack t04_uaf_heap \
          t80_xmm_preentry_forkserver t81_plt_image_identity \
          t82_unusable_attempt_recovery t83_final_discarded_plan \
          t84_syscall_input t85_library_coverage t86_libc_scans \
-         t87_prefix_window t88_e9_identity
+         t87_prefix_window t88_e9_identity \
+         t89_allocator_recycled_realloc t90_realloc_symbolic_payload \
+         t91_allocator_saved_alias
 
 # t83 reuses the t82 guest: every mutation plan for it is discarded, so
 # draining the whole queue exercises the terminal-discarded-plan case.

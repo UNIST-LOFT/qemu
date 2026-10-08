@@ -36,6 +36,7 @@ static GHashTable *prov_live_by_base = NULL;   /* base → ObjKey* (LIVE only) *
  * comes from symbolic-instrumentation.h. */
 extern Query *next_query;
 extern Query *query_queue;
+extern int symbolic_mode;
 extern uint64_t symbolic_start_code;
 extern uint64_t symbolic_end_code;
 
@@ -692,9 +693,10 @@ void provenance_memcheck_protect(target_ulong addr, target_ulong size, int prot)
 void provenance_memcheck_mapping(target_ulong addr, target_ulong size, int fd,
                                  uint64_t file_offset)
 {
-    /* Compact evidence still needs guest-signal identities with checking
-     * disabled.  Track its mapped images without enabling any access check. */
-    if ((!binradar_memcheck_enabled && getenv("BINRADAR_EVIDENCE_FILE") == NULL) ||
+    /* Symbolic allocator summaries also need the trusted-runtime boundary;
+     * image tracking never enables raw memcheck on its own. */
+    if ((!binradar_memcheck_enabled && !symbolic_mode &&
+         getenv("BINRADAR_EVIDENCE_FILE") == NULL) ||
         size == 0 || addr > (target_ulong)-1 - size) {
         return;
     }
@@ -755,6 +757,13 @@ static const ProvCodeMapping *prov_code_mapping(target_ulong pc)
         else return range;
     }
     return NULL;
+}
+
+bool provenance_runtime_pc(target_ulong pc)
+{
+    const ProvCodeMapping *range = prov_code_mapping(pc);
+    return range != NULL && range->runtime && range->site_valid &&
+           !range->image->tainted;
 }
 
 bool provenance_memcheck_pc_eligible(target_ulong pc)

@@ -63,6 +63,7 @@ bool binradar_entrypoint_reached = false;
 
 /* Provenance module externs (provenance.o links against these). */
 int binradar_memcheck_enabled = 0;
+int symbolic_mode = 0;
 uint64_t symbolic_start_code = 0;
 uint64_t symbolic_end_code = 0;
 Expr *pool = NULL;
@@ -143,6 +144,7 @@ static void test_value_origin_creation_and_transfer(void);
 static void test_ordinary_f03_f04_publication(void);
 static void test_osprey_shadow_overlap_invalidation(void);
 static void test_modeled_copy_origins_and_facts(void);
+static void test_realloc_copy_snapshot(void);
 static void test_copy_points_merge_and_dump(void);
 
 void helper_sem_on_load(CPUArchState *env, uint32_t dst_idx,
@@ -2780,6 +2782,7 @@ int main(void)
     test_ordinary_f03_f04_publication();
     test_osprey_shadow_overlap_invalidation();
     test_modeled_copy_origins_and_facts();
+    test_realloc_copy_snapshot();
     test_copy_points_merge_and_dump();
 
     if (failures != 0) {
@@ -4931,6 +4934,120 @@ static void test_modeled_copy_origins_and_facts(void)
                               GSIZE_TO_POINTER(0x402d00 + 64 * 8)) != NULL,
           "large modeled copy keeps and relocates the final slot");
 
+    osprey_free(ctx);
+    g_free(run);
+    g_free(env);
+}
+
+/* Realloc captures the old canonical payload before an opaque allocator
+ * body can overwrite its shadow. An in-place return has a new heap identity
+ * and site: F03 must retain the historical source, while restored pointer
+ * slots may target only objects still live after retiring the old one. */
+static void test_realloc_copy_snapshot(void)
+{
+    reset_log();
+    OspreyConfig c;
+    OspreyContext *ctx;
+    OspreySharedRun *run;
+    CPUArchState *env;
+    stage23_setup(&c, &ctx, &run, &env);
+    OspreyCpuOriginState *st = osprey_cpu_origin(env);
+    provenance_init();
+
+    PtrTag old = provenance_create_object(0x10000, 32, 0x400310,
+                                          PROV_PRODUCER_MALLOC_RETURN);
+    PtrTag other = provenance_create_object(0x20000, 32, 0x400320,
+                                            PROV_PRODUCER_MALLOC_RETURN);
+    OspreyAllocatorObservation obs = {
+        .kind = OSPREY_ALLOCATOR_MALLOC,
+        .site_pc = 0x400310,
+        .requested_size = 32,
+    };
+    osprey_on_alloc_success(env, &obs, 0x10000, old.object_id, old.generation);
+    obs.site_pc = 0x400320;
+    osprey_on_alloc_success(env, &obs, 0x20000, other.object_id, other.generation);
+
+    OspreyRegionId target;
+    memset(&target, 0, sizeof(target));
+    target.kind = OSPREY_REGION_HEAP_SITE;
+    target.site_offset = 0x320;
+    install_addr_origin(st, R_R12, 0x20008, &target, 8, 0x320);
+    st->regs[R_R12].address.prov_object_id = other.object_id;
+    st->regs[R_R12].address.prov_generation = other.generation;
+    env->regs[R_R12] = 0x20008;
+    osprey_on_mem_store(env, R_R12, 0x10000, 8, 0x20008, 0x400d00);
+
+    target.site_offset = 0x310;
+    install_addr_origin(st, R_R12, 0x10008, &target, 8, 0x310);
+    st->regs[R_R12].address.prov_object_id = old.object_id;
+    st->regs[R_R12].address.prov_generation = old.generation;
+    env->regs[R_R12] = 0x10008;
+    osprey_on_mem_store(env, R_R12, 0x10008, 8, 0x10008, 0x400d00);
+    CHECK(g_hash_table_size(st->mem_slots) == 2,
+          "realloc source contains live external and self pointer slots");
+
+    OspreyCopySnapshot *snapshot = osprey_copy_snapshot(env, 0x10000, 32);
+    CHECK(snapshot != NULL, "realloc entry captures payload snapshot");
+    osprey_on_mem_overwrite(env, 0x10000, 32);
+    CHECK(g_hash_table_size(st->mem_slots) == 0,
+          "allocator body removes source shadow before return");
+    osprey_on_free_identity(env, old.object_id, old.generation, 0x400330);
+    provenance_retire_object(0x10000);
+    PtrTag replacement = provenance_create_object(0x10000, 64, 0x400330,
+                                                  PROV_PRODUCER_REALLOC_RETURN);
+    obs.kind = OSPREY_ALLOCATOR_REALLOC;
+    obs.site_pc = 0x400330;
+    obs.requested_size = 64;
+    osprey_on_alloc_success(env, &obs, 0x10000,
+                           replacement.object_id, replacement.generation);
+    osprey_copy_restore(env, snapshot, 0x10000);
+    osprey_copy_discard(snapshot);
+
+    CHECK(run->copy_used == 1, "realloc publishes one saved payload flow");
+    OspreyRunIter copies;
+    const void *record;
+    memset(&copies, 0, sizeof(copies));
+    copies.run = run;
+    copies.table = OSPREY_TABLE_COPY;
+    if (osprey_run_iter_next(&copies, &record) == 1) {
+        const OspreyCopyFact *fact = record;
+        CHECK(fact->source.address.region.kind == OSPREY_REGION_HEAP_SITE &&
+              fact->source.address.region.site_offset == 0x310 &&
+              fact->source.address.offset == 0 && fact->source.size == 32 &&
+              fact->destination.address.region.kind == OSPREY_REGION_HEAP_SITE &&
+              fact->destination.address.region.site_offset == 0x330 &&
+              fact->destination.address.offset == 0 && fact->destination.size == 32,
+              "in-place realloc F03 retains old source and new destination sites");
+    } else {
+        CHECK(false, "saved realloc F03 row exists");
+    }
+    OspreyMemAddressOrigin *slot = g_hash_table_lookup(
+        st->mem_slots, GSIZE_TO_POINTER(0x10000));
+    CHECK(slot != NULL && slot->valid && slot->concrete_value == 0x20008 &&
+          slot->prov_object_id == other.object_id &&
+          slot->prov_generation == other.generation &&
+          slot->canonical.region.site_offset == 0x320 && slot->canonical.offset == 8,
+          "realloc restores external live pointer despite body invalidation");
+    CHECK(g_hash_table_lookup(st->mem_slots, GSIZE_TO_POINTER(0x10008)) == NULL,
+          "same-address realloc must not revive pointer to retired source identity");
+
+    OspreyRunIter points;
+    memset(&points, 0, sizeof(points));
+    points.run = run;
+    points.table = OSPREY_TABLE_POINTS;
+    unsigned restored = 0;
+    while (osprey_run_iter_next(&points, &record) == 1) {
+        const OspreyPointsToFact *fact = record;
+        if (fact->pointer_chunk.address.region.site_offset != 0x330) continue;
+        ++restored;
+        CHECK(fact->pointer_chunk.address.offset == 0 &&
+              fact->pointer_chunk.size == 8 &&
+              fact->target.region.site_offset == 0x320 && fact->target.offset == 8,
+              "restored realloc F04 names new cell and still-live external target");
+    }
+    CHECK(restored == 1, "no realloc F04 resurrects retired self target");
+    CHECK(osprey_parent_merge_sample(ctx, run) == OSPREY_OK,
+          "saved realloc facts merge successfully");
     osprey_free(ctx);
     g_free(run);
     g_free(env);

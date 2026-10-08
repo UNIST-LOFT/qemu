@@ -70,6 +70,7 @@
 
 unsigned long guest_base = 0;
 unsigned long reserved_va = 0;
+int symbolic_mode = 0;
 uint64_t symbolic_start_code = 0;
 uint64_t symbolic_end_code = 0;
 Expr *pool = NULL;
