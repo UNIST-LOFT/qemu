@@ -422,7 +422,9 @@ BASE_ENV = {
     "BINRADAR_FORKSERVER_ENABLE": "0",
     "E9_EXCLUDE_RANGES": "",
     "BINRADAR_MEMCHECK_ENABLE": "1",
-    "BINRADAR_MEMCHECK_POLICY": "coverage-v2",
+    "BINRADAR_MEMCHECK_POLICY": "coverage-v3",
+    "E9_RELOCATED_INSTRUCTIONS": "",
+    "E9_RELOCATED_CALL_JUMPS": "",
 }
 
 # ---------------------------------------------------------------------------
@@ -640,6 +642,37 @@ for mode in ("mem", "sym"):
                       guest="t85_library_coverage", args=["benign"], mode=mode,
                       rc=(0,), verdict="normal", finding=None))
 
+# Exact identity proof must affect publication, never raw instrumentation.
+for enabled in ("0", "1"):
+    for unknown in (False, True):
+        spec = dict(name=f"t88_e9_signal_memcheck{enabled}_unknown{int(unknown)}",
+                    guest="t88_e9_identity", mode="mem", args=["signal"],
+                    rc=(-11, 139), verdict="crash", finding=None,
+                    e9_identity=True, e9_unknown=unknown,
+                    env={"BINRADAR_MEMCHECK_ENABLE": enabled},
+                    raw_pc_symbol="e9_raw_signal",
+                    fault_reference=dict(valid="false" if unknown else "true",
+                                         source="unavailable" if unknown else "guest-signal"))
+        if not unknown:
+            spec["reference_pc_symbol"] = "e9_original_signal"
+        TESTS.append(spec)
+for case, mode in (("deferred", "mem"), ("deferred", "sym"),
+                   ("precedence", "sym"), ("timeout", "fors")):
+    signal = case == "precedence"
+    TESTS.append(dict(name=f"t88_e9_{case}_{mode}", guest="t88_e9_identity",
+                     mode=mode, args=[case], e9_identity=True,
+                     rc=(-11, 139) if signal else (0,), verdict="crash",
+                     finding=dict(reason="heap-buffer-overflow", is_uaf=0,
+                                  fields={"size": 8, "offset": 0, "width": 16}),
+                     access_pc_symbol="e9_original_model",
+                     raw_pc_symbol="e9_raw_signal" if signal else "e9_raw_model",
+                     reference_pc_symbol="e9_original_signal" if signal else "e9_original_model",
+                     fault_reference=dict(valid="true", source="guest-signal" if signal else "provenance-access")))
+TESTS.append(dict(name="t88_old_policy_rejected", guest="t88_e9_identity",
+                 mode="mem", args=["signal"], rc=(1,), verdict=None,
+                 finding=None, env={"BINRADAR_MEMCHECK_POLICY": "coverage-v2"},
+                 required_log="[memcheck] [invalid-policy coverage-v2]"))
+
 # ---------------------------------------------------------------------------
 # Log parsing
 # ---------------------------------------------------------------------------
@@ -766,6 +799,17 @@ def run_tracer(cmd, env, timeout):
 
 def prepare_artifact(test, guest, env):
     env["PLT_INFO_FILE"] = guest + ".plt"
+    env.update(test.get("env", {}))
+    if test.get("e9_identity"):
+        names = {"e9_raw_signal", "e9_original_signal", "e9_raw_model", "e9_original_model"}
+        symbols = resolve_symbols(guest, names)
+        pairs = sorted((symbols["e9_raw_" + kind], symbols["e9_original_" + kind])
+                       for kind in ("signal", "model"))
+        env["E9_EXCLUDE_RANGES"] = ",".join(f"0x{raw:x}-0x{raw + 1:x}" for raw, _ in pairs)
+        mapped_pairs = [pair for pair in pairs
+                        if not test.get("e9_unknown") or pair[0] != symbols["e9_raw_signal"]]
+        env["E9_RELOCATED_INSTRUCTIONS"] = ",".join(
+            f"{raw:x}:{original:x}" for raw, original in mapped_pairs)
     if test.get("relocated_call"):
         symbols = resolve_symbols(guest, {"library_relocated_jump", "library_relocated_return"})
         jump = symbols["library_relocated_jump"]
@@ -941,8 +985,9 @@ def run_forkserver(test, guest, qemu, workdir):
         os.set_inheritable(stat_w, True)
         stderr_path = os.path.join(run_dir, "tracer.stderr")
         stderr_fh = open(stderr_path, "w")
+        binary = prepare_artifact(test, guest, env)
         proc = subprocess.Popen(
-            [qemu, "-symbolic", guest],
+            [qemu, "-symbolic", binary, *test.get("args", [])],
             env=env,
             pass_fds=(ctrl_r, stat_w) + ((patch_r,) if patch_r is not None else ()),
             stdout=subprocess.DEVNULL, stderr=stderr_fh,
@@ -1058,6 +1103,9 @@ def run_test(test, guests_dir, workdir, qemu):
         test["_symbols"] = resolve_symbols(guest, sym_names)
     if test.get("access_pc_symbol"):
         test["_access_pc"] = resolve_symbols(guest, {test["access_pc_symbol"]})[test["access_pc_symbol"]]
+    if test.get("raw_pc_symbol"):
+        symbol = test["raw_pc_symbol"]
+        test["_raw_pc"] = resolve_symbols(guest, {symbol})[symbol]
     if test.get("reference_pc_symbol"):
         symbol = test["reference_pc_symbol"]
         test["_reference_pc"] = resolve_symbols(guest, {symbol})[symbol]
@@ -1101,6 +1149,17 @@ def run_test(test, guests_dir, workdir, qemu):
 def check(test, rc, fs_status, out, evidence=None, probe_text="",
           summary=None):
     problems = []
+    if test.get("required_log") and test["required_log"] not in out:
+        problems.append("missing required configuration rejection")
+    if test.get("raw_pc_symbol"):
+        if test["fault_reference"]["source"] in ("guest-signal", "unavailable"):
+            raw_pcs = [int(pc, 16) for pc in re.findall(
+                r"^\[snapshot\] \[crash\].*\[guest_pc ([0-9a-fA-F]+)\]", out, re.MULTILINE)]
+        else:
+            raw_pcs = [int(finding.get("actual_pc", "0"), 16)
+                       for finding in parse_findings(out)]
+        if not raw_pcs or any(pc != test["_raw_pc"] for pc in raw_pcs):
+            problems.append("exact E9 identity overwrote or lost raw diagnostic PC")
     if test.get("site_binary"):
         references = parse_fault_references(out)
         if not references or any(reference["image"] != test["_site_image"] or

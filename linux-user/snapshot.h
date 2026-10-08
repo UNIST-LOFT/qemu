@@ -151,6 +151,8 @@ typedef struct ArgumentInfo {
 void add_exclude_regions(uintptr_t load_bias);
 void parse_e9_exclude_ranges(uintptr_t load_bias);
 bool is_in_e9_exclude_region(target_ulong pc);
+/* Exact artifact-bound identity only; does not authorize instrumentation. */
+bool e9_original_instruction_pc(target_ulong pc, target_ulong *original);
 void parse_e9_relocated_calls(uintptr_t load_bias);
 void check_all_env_var(void);
 

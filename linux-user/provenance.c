@@ -813,10 +813,16 @@ bool provenance_memcheck_reference_pc(CPUArchState *env, target_ulong pc,
                                       target_ulong *reference_pc)
 {
     ProvenanceFaultSite site;
-    /* Do not turn an unknown jump target or E9 trampoline into a guessed
-     * caller fault. Only verified instruction sites can be attributed. */
+    /* Identity proof is separate from raw instrumentation eligibility.
+     * Unknown E9 helpers still fail site validation without caller fallback. */
+    target_ulong original;
+    if (e9_original_instruction_pc(pc, &original)) {
+        if (!prov_main_pc(original)) return false;
+        pc = original;
+    }
     if (!provenance_memcheck_site(pc, &site)) return false;
-    if (site.valid && prov_caller_reference_pc(env, reference_pc, true)) {
+    if (binradar_memcheck_enabled && site.valid &&
+        prov_caller_reference_pc(env, reference_pc, true)) {
         /* Match AFL's innermost main frame, including its return-PC
          * convention. Capture now, not when a deferred finding finalizes. */
         return true;

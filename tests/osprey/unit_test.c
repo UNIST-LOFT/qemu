@@ -51,6 +51,15 @@ int page_check_range(target_ulong address, target_ulong length, int flags) {
     return length == 0 ? 0 : -1;
 }
 bool is_in_e9_exclude_region(target_ulong pc) { (void)pc; return false; }
+/* This unit environment loads no E9 artifact and has no snapshot boundary. */
+bool e9_original_instruction_pc(target_ulong pc, target_ulong *original)
+{
+    (void)pc;
+    (void)original;
+    return false;
+}
+target_ulong binradar_entrypoint = (target_ulong)-1;
+bool binradar_entrypoint_reached = false;
 
 /* Provenance module externs (provenance.o links against these). */
 int binradar_memcheck_enabled = 0;

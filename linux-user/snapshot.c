@@ -83,6 +83,8 @@ unsigned int  afl_forksrv_pid;
 static e9_exclude_region *binradar_exclude_regions = NULL;
 static size_t binradar_exclude_regions_len = 0;
 static size_t binradar_exclude_regions_cap = 0;
+static e9_relocated_instruction *e9_instructions = NULL;
+static size_t e9_instructions_len = 0;
 
 typedef struct e9_relocated_call {
     target_ulong jump_addr;
@@ -326,6 +328,8 @@ void check_all_env_var(void) {
     check_env_var("E9_EXCLUDE_RANGES");
     // E9Patch relocated call jumps (jump-addr:call-site:ret-addr, comma separated)
     check_env_var("E9_RELOCATED_CALL_JUMPS");
+    /* E9_RELOCATED_INSTRUCTIONS is validated once at executable loading;
+     * do not duplicate its potentially large contents in startup logs. */
     // Symbolic transport
     check_env_var("NO_EXTERNAL_SOLVER");
     // Shared memory
@@ -344,6 +348,23 @@ void check_all_env_var(void) {
 
 void add_exclude_regions(uintptr_t load_bias) {
     parse_e9_exclude_ranges(load_bias);
+    const char *value = getenv("E9_RELOCATED_INSTRUCTIONS");
+    if (e9_parse_relocated_instructions(value, load_bias,
+                                        binradar_exclude_regions,
+                                        binradar_exclude_regions_len,
+                                        &e9_instructions,
+                                        &e9_instructions_len) != 0) {
+        log_msg("[snapshot] [e9-relocated-instructions] [invalid-format]\n");
+        exit_with_status(1);
+    }
+}
+
+bool e9_original_instruction_pc(target_ulong pc, target_ulong *original) {
+    uintptr_t mapped;
+    if (!e9_lookup_original_instruction(e9_instructions, e9_instructions_len,
+                                        pc, &mapped)) return false;
+    *original = mapped;
+    return true;
 }
 
 bool is_in_e9_exclude_region(target_ulong pc) {
@@ -1097,8 +1118,7 @@ static void snapshot_record_guest_crash_with_reference(
         reference_addr = info->guest_pc;
         reference_site = &resolved_site;
         if (reference_addr != 0 &&
-            ((binradar_memcheck_enabled &&
-              !provenance_memcheck_reference_pc(cpu_env, reference_addr,
+            ((!provenance_memcheck_reference_pc(cpu_env, reference_addr,
                                                 &reference_addr)) ||
              !provenance_memcheck_site(reference_addr, &resolved_site))) {
             reference_source = SNAPSHOT_FAULT_REFERENCE_UNAVAILABLE;
