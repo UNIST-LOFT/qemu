@@ -262,7 +262,7 @@ PtrTag provenance_mem_load_tag(target_ulong addr);
 void provenance_mem_invalidate(target_ulong addr, target_ulong size);
 
 /* ---- Access checking ---- */
-#define BINRADAR_MEMCHECK_POLICY "coverage-v5"
+#define BINRADAR_MEMCHECK_POLICY "coverage-v6"
 
 /* File-backed runtime mappings (libc/loader) use logical summaries rather
  * than application-object checks on implementation overfetch/metadata. */
@@ -271,6 +271,8 @@ void provenance_memcheck_mapping(target_ulong addr, target_ulong size, int fd,
 bool provenance_memcheck_site(target_ulong pc, ProvenanceFaultSite *site);
 void provenance_memcheck_unmap(target_ulong addr, target_ulong size);
 void provenance_memcheck_protect(target_ulong addr, target_ulong size, int prot);
+/* Raw instruction eligibility: main/application DSO code, plus exact E9
+ * copies of verified main instructions. Inserted E9 code stays excluded. */
 bool provenance_memcheck_pc_eligible(target_ulong pc);
 /* Verified immutable libc/loader code, independent of memcheck enablement. */
 bool provenance_runtime_pc(target_ulong pc);

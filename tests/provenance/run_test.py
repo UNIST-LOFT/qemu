@@ -422,7 +422,7 @@ BASE_ENV = {
     "BINRADAR_FORKSERVER_ENABLE": "0",
     "E9_EXCLUDE_RANGES": "",
     "BINRADAR_MEMCHECK_ENABLE": "1",
-    "BINRADAR_MEMCHECK_POLICY": "coverage-v5",
+    "BINRADAR_MEMCHECK_POLICY": "coverage-v6",
     "E9_RELOCATED_INSTRUCTIONS": "",
     "E9_RELOCATED_CALL_JUMPS": "",
 }
@@ -714,7 +714,15 @@ TESTS.append(dict(name="t92_request_compact_reset", guest="t92_request_contract"
                  reference_pc_symbol="request_reset_pc", finding=None,
                  fault_reference=dict(valid="true", source="syscall-request")))
 
-# Exact identity proof must affect publication, never raw instrumentation.
+# Only exact relocated originals regain memcheck inside an E9 exclusion;
+# identity proof also canonicalizes published evidence independently of OSPREY.
+for mode in ("mem", "sym"):
+    TESTS.append(dict(name="t88_e9_clean_" + mode, guest="t88_e9_identity",
+                     mode=mode, args=["clean"], e9_clean=True,
+                     native_control=True, rc=(0,), verdict="normal", finding=None,
+                     required_log="e9-clean-control value=123456789abcdef0 "
+                                  "stored=123456789abcdef0 helper=0fedcba987654321 "
+                                  "preserved=5"))
 for enabled in ("0", "1"):
     for unknown in (False, True):
         spec = dict(name=f"t88_e9_signal_memcheck{enabled}_unknown{int(unknown)}",
@@ -740,7 +748,7 @@ for case, mode in (("deferred", "mem"), ("deferred", "sym"),
                      raw_pc_symbol="e9_raw_signal" if signal else "e9_raw_model",
                      reference_pc_symbol="e9_original_signal" if signal else "e9_original_model",
                      fault_reference=dict(valid="true", source="guest-signal" if signal else "provenance-access")))
-for policy in ("coverage-v1", "coverage-v2", "coverage-v3", "coverage-v4"):
+for policy in ("coverage-v1", "coverage-v2", "coverage-v3", "coverage-v4", "coverage-v5"):
     TESTS.append(dict(name="t88_old_policy_rejected_" + policy, guest="t88_e9_identity",
                      mode="mem", args=["signal"], rc=(1,), verdict=None,
                      finding=None, env={"BINRADAR_MEMCHECK_POLICY": policy},
@@ -923,6 +931,21 @@ def prepare_artifact(test, guest, env):
             if not any(len(row) == 3 and row[0] == os.path.basename(guest)
                        and row[1] == "memcpy" for row in rows):
                 raise RuntimeError("allocator payload control requires resolving memcpy PLT")
+    if test.get("e9_clean"):
+        symbols = resolve_symbols(guest, {
+            "e9_clean_block_begin", "e9_clean_block_end",
+            "e9_clean_raw_load", "e9_clean_original_load",
+            "e9_clean_raw_store", "e9_clean_original_store",
+        })
+        # One full mixed-TB exclusion, not separate one-byte PC exclusions.
+        # Helpers and ret intentionally have no relocated-instruction entries.
+        begin = symbols["e9_clean_block_begin"]
+        end = symbols["e9_clean_block_end"]
+        env["E9_EXCLUDE_RANGES"] = f"0x{begin:x}-0x{end:x}"
+        env["E9_RELOCATED_INSTRUCTIONS"] = ",".join(
+            f"{symbols['e9_clean_raw_' + kind]:x}:"
+            f"{symbols['e9_clean_original_' + kind]:x}"
+            for kind in ("load", "store"))
     if test.get("e9_identity"):
         names = {"e9_raw_signal", "e9_original_signal", "e9_raw_model", "e9_original_model"}
         symbols = resolve_symbols(guest, names)
@@ -1200,7 +1223,7 @@ def run_forkserver(test, guest, qemu, workdir):
                     _, version, _, _ = binradar_evidence.HEADER_STRUCT.unpack(
                         stream.read(binradar_evidence.HEADER_STRUCT.size))
                 if version != 4:
-                    raise RuntimeError(f"coverage-v5 requires compact v4, got v{version}")
+                    raise RuntimeError(f"coverage-v6 requires compact v4, got v{version}")
                 evidence = list(binradar_evidence.read_binradar(
                     evidence_path))
         return (proc.returncode, child_status, stderr_text, evidence,

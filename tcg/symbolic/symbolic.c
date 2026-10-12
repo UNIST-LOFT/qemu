@@ -6770,33 +6770,23 @@ void memcheck_instrument_tb(TranslationBlock *tb, TCGContext *tcg_ctx,
             }
         }
     }
-    /* Optimized runtime bodies use logical models; ordinary verified DSO
-     * code receives the same post-access checks as the main image. */
-    if (!provenance_memcheck_pc_eligible(tb->pc)) return;
-
-    /* Allocate the helper-arg temps past the current high-water mark.
-     * tcg_temp_new_internal() reuses freed guest temps (free_temps pool),
-     * and a guest temp may still be referenced by ops in this TB (e.g.
-     * the value temp of a qemu_st in a non-atomic RMW sequence).  Reusing
-     * such a temp would clobber the guest value.  Clearing the free pool
-     * forces fresh indices that no op in this TB references. */
-    TCGContext *s = tcg_ctx;
-    TCGTempSet saved_free[TCG_TYPE_COUNT * 2];
-    memcpy(saved_free, s->free_temps, sizeof(saved_free));
-    memset(s->free_temps, 0, sizeof(s->free_temps));
-    TCGTemp *t_size = tcg_temp_new_internal(TCG_TYPE_I64, false);
-    TCGTemp *t_pc = tcg_temp_new_internal(TCG_TYPE_I64, false);
-    TCGTemp *t_addr_copy = tcg_temp_new_internal(TCG_TYPE_I64, false);
-    memcpy(s->free_temps, saved_free, sizeof(saved_free));
-
+    /* An E9 TB can start in inserted code and contain copied original
+     * instructions later, or start at a copy and continue into helpers.
+     * Eligibility belongs to each instruction, not the whole TB. */
+    TCGTemp *t_size = NULL;
+    TCGTemp *t_pc = NULL;
+    TCGTemp *t_addr_copy = NULL;
     TCGOp *op;
     uintptr_t pc = tb->pc;
+    bool eligible = false;
+    bool eligibility_known = false;
 
     QTAILQ_FOREACH(op, &tcg_ctx->ops, link) {
         if (op->opc == INDEX_op_insn_start) {
             /* args[0] is the absolute guest instruction PC
              * (tcg_gen_insn_start(dc->base.pc_next, ...)). */
             pc = (uintptr_t)op->args[0];
+            eligibility_known = false;
             continue;
         }
         switch (op->opc) {
@@ -6804,6 +6794,23 @@ void memcheck_instrument_tb(TranslationBlock *tb, TCGContext *tcg_ctx,
         case INDEX_op_qemu_ld_i64:
         case INDEX_op_qemu_st_i32:
         case INDEX_op_qemu_st_i64: {
+            if (!eligibility_known) {
+                eligible = provenance_memcheck_pc_eligible(pc);
+                eligibility_known = true;
+            }
+            if (!eligible) break;
+            if (t_size == NULL) {
+                /* Do not allocate temps for helper-only TBs. Allocate past
+                 * the high-water mark: reusing a freed guest temp could
+                 * clobber an operand still live across the memory op. */
+                TCGTempSet saved_free[TCG_TYPE_COUNT * 2];
+                memcpy(saved_free, tcg_ctx->free_temps, sizeof(saved_free));
+                memset(tcg_ctx->free_temps, 0, sizeof(tcg_ctx->free_temps));
+                t_size = tcg_temp_new_internal(TCG_TYPE_I64, false);
+                t_pc = tcg_temp_new_internal(TCG_TYPE_I64, false);
+                t_addr_copy = tcg_temp_new_internal(TCG_TYPE_I64, false);
+                memcpy(tcg_ctx->free_temps, saved_free, sizeof(saved_free));
+            }
             /* args[1] is the address temp for both ld and st. */
             TCGTemp *t_addr = arg_temp(op->args[1]);
             TCGMemOp mem_op = get_memop(op->args[2]);

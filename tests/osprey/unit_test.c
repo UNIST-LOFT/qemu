@@ -33,6 +33,7 @@
 #include "osprey-internal.h"
 #include "qemu/thread.h"
 #include "provenance.h"
+#include "e9-ranges.h"
 #include "sem-events.h"
 #include "tcg/symbolic/symbolic-struct.h"
 
@@ -50,13 +51,25 @@ int page_check_range(target_ulong address, target_ulong length, int flags) {
     (void)address; (void)flags;
     return length == 0 ? 0 : -1;
 }
-bool is_in_e9_exclude_region(target_ulong pc) { (void)pc; return false; }
-/* This unit environment loads no E9 artifact and has no snapshot boundary. */
+static e9_exclude_region *test_e9_regions;
+static size_t test_e9_regions_len, test_e9_regions_cap;
+static e9_relocated_instruction *test_e9_instructions;
+static size_t test_e9_instructions_len;
+
+bool is_in_e9_exclude_region(target_ulong pc)
+{
+    return e9_is_in_exclude_region(test_e9_regions, test_e9_regions_len, pc);
+}
+/* No artifact by default; metadata-only cases install exact synthetic maps. */
 bool e9_original_instruction_pc(target_ulong pc, target_ulong *original)
 {
-    (void)pc;
-    (void)original;
-    return false;
+    uintptr_t mapped;
+    if (!e9_lookup_original_instruction(test_e9_instructions,
+                                        test_e9_instructions_len, pc, &mapped)) {
+        return false;
+    }
+    *original = mapped;
+    return true;
 }
 target_ulong binradar_entrypoint = (target_ulong)-1;
 bool binradar_entrypoint_reached = false;
@@ -2731,6 +2744,92 @@ static void test_complete_f01_f06_dump_contract(void)
 
 /* ------------------------------------------------------------------ */
 
+/* Dispatch numeric access metadata only; no guest payload is dereferenced.
+ * The same tagged one-past access must publish the same canonical instruction
+ * through a proved E9 copy, but never through inserted or invalid-map code. */
+static void test_e9_access_metadata(void)
+{
+    CPUArchState *env = g_malloc0(sizeof(*env));
+    PendingProvenanceFault pending = {0};
+    ProvPublishedFinding finding;
+    uint64_t old_start = symbolic_start_code, old_end = symbolic_end_code;
+    int old_memcheck = binradar_memcheck_enabled;
+    int old_osprey = osprey_collect_enabled;
+    target_ulong old_entry = binradar_entrypoint;
+    provenance_init();
+    provenance_set_shared_fault_ptr(&pending);
+    binradar_memcheck_enabled = 1;
+    osprey_collect_enabled = 0;
+    symbolic_start_code = 0x400000;
+    symbolic_end_code = 0x401000;
+    binradar_entrypoint = (target_ulong)-1;
+    CHECK(e9_parse_exclude_ranges("0x600000-0x600100", 0, &test_e9_regions,
+                                   &test_e9_regions_len,
+                                   &test_e9_regions_cap) == 0,
+          "E9 access metadata ranges accepted");
+    CHECK(e9_parse_relocated_instructions("600008:400200,600010:500000", 0,
+                                           test_e9_regions, test_e9_regions_len,
+                                           &test_e9_instructions,
+                                           &test_e9_instructions_len) == 0,
+          "E9 access metadata exact map accepted");
+    PtrTag tag = provenance_create_object(0x10000, 8, 0x400100,
+                                          PROV_PRODUCER_MALLOC_RETURN);
+    const struct {
+        target_ulong pc;
+        bool finding;
+    } cases[] = {
+        {0x400200, true},  /* original instruction */
+        {0x600008, true},  /* its exact relocated copy */
+        {0x600009, false}, /* helper, not a nearest-PC match */
+        {0x600010, false}, /* mapped target is outside main code */
+    };
+    for (size_t i = 0; i < G_N_ELEMENTS(cases); i++) {
+        provenance_clear_pending_fault();
+        PtrRegShadow *shadow = provenance_get_reg_shadow(env);
+        shadow->ea_meta.valid = true;
+        shadow->ea_meta.base_reg = R_EDI;
+        shadow->ea_meta.index_reg = -1;
+        shadow->ea_meta.scale = 0;
+        shadow->ea_meta.disp = 8;
+        shadow->ea_meta.aflags = MO_64;
+        shadow->ea_meta.override = -1;
+        shadow->ea_meta.base_tag = tag;
+        shadow->ea_meta.base_val = tag.concrete_value;
+        sem_mem_access(env, 0x10008, 1, cases[i].pc,
+                       SEM_MEM_F_PROVENANCE_CHECK, SEM_OP_INTEGER,
+                       SEM_INTERVAL_EXACT_WIDTH, SEM_PRODUCER_INTEGER_MODRM);
+        bool published = provenance_snapshot_pending_finding(&finding);
+        CHECK(published == cases[i].finding,
+              "only original instructions publish the tagged access fault");
+        CHECK(!shadow->ea_meta.valid,
+              "excluded helper consumes instruction-local EA metadata");
+        if (published) {
+            CHECK(finding.payload.access_pc == 0x400200 &&
+                  finding.payload.actual_pc == cases[i].pc &&
+                  finding.payload.origin == PROV_FINDING_ORIGIN_ACCESS &&
+                  finding.payload.access_addr == 0x10008 &&
+                  finding.payload.access_width == 1 &&
+                  finding.payload.requested_size == 8 &&
+                  finding.payload.tracked_offset == 8,
+                  "relocated access retains canonical identity and exact bounds");
+        }
+    }
+    provenance_clear_pending_fault();
+    provenance_set_shared_fault_ptr(NULL);
+    free(test_e9_regions);
+    test_e9_regions = NULL;
+    test_e9_regions_len = test_e9_regions_cap = 0;
+    free(test_e9_instructions);
+    test_e9_instructions = NULL;
+    test_e9_instructions_len = 0;
+    symbolic_start_code = old_start;
+    symbolic_end_code = old_end;
+    binradar_memcheck_enabled = old_memcheck;
+    osprey_collect_enabled = old_osprey;
+    binradar_entrypoint = old_entry;
+    g_free(env);
+}
+
 /* Requests are object-metadata checks: this unit's page stubs reject every
  * nonempty guest read, and none of these numeric payloads is backed by memory. */
 static void test_syscall_request_metadata(void)
@@ -2860,6 +2959,7 @@ static void test_syscall_request_metadata(void)
 
 int main(void)
 {
+    test_e9_access_metadata();
     test_syscall_request_metadata();
     test_overflow_rejection();
     test_bad_arithmetic_rejection();

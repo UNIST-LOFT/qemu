@@ -31,6 +31,8 @@ OSPREY_OBJS := ../../build/x86_64-linux-user/linux-user/osprey.o \
                ../../build/x86_64-linux-user/linux-user/osprey-mutation.o \
                ../../build/x86_64-linux-user/linux-user/provenance.o \
                ../../build/x86_64-linux-user/linux-user/sem-events.o
+# Stage 7 compiles e9-ranges.c itself; do not put it in shared OSPREY_OBJS.
+UNIT_E9_OBJ := ../../build/x86_64-linux-user/linux-user/e9-ranges.o
 UNIT_BIN   := $(WORK)/osprey_unit
 UNIT_ASAN_BIN := $(WORK)/osprey_unit_asan
 REGIONS_UNIT_BIN := $(WORK)/snapshot_regions
@@ -67,6 +69,7 @@ OSPREY_SRCS := ../../linux-user/osprey.c \
 OSPREY_HEADERS := ../../linux-user/osprey.h \
                   ../../linux-user/osprey-internal.h \
                   ../../linux-user/provenance.h \
+                  ../../linux-user/e9-ranges.h \
                   ../../linux-user/sem-events.h
 OSPREY_ASAN_OBJS := $(addprefix $(WORK)/,$(notdir $(OSPREY_SRCS:.c=.asan.o)))
 UNIT_CFLAGS := -iquote ../../build/linux-user -iquote ../../tcg \
@@ -224,8 +227,8 @@ $(WORK)/t15_huft_build: $(GUESTS)/t15_huft_build.c | $(WORK)
 $(WORK)/%.plt: $(WORK)/% $(GEN_PLT)
 	python3 $(GEN_PLT) -o $@ $<
 
-$(UNIT_BIN): unit_test.c $(OSPREY_OBJS) | $(WORK)
-	$(CC) $(UNIT_CFLAGS) -o $@ unit_test.c $(OSPREY_OBJS) \
+$(UNIT_BIN): unit_test.c $(OSPREY_OBJS) $(UNIT_E9_OBJ) | $(WORK)
+	$(CC) $(UNIT_CFLAGS) -o $@ unit_test.c $(OSPREY_OBJS) $(UNIT_E9_OBJ) \
 		-lglib-2.0 -lpthread -lm
 
 unit-stage3-relations: $(REL_UNIT_BIN)
@@ -334,15 +337,15 @@ $(DECODE_ASAN_BIN): stage6_decode_test.c stage6_decode_reference.c \
 		stage6_decode_reference.c stage3_test_support.c $(OSPREY_ASAN_OBJS) \
 		-lglib-2.0 -lpthread -lm
 
-$(UNIT_ASAN_BIN): unit_test.c $(OSPREY_OBJS) | $(WORK)
+$(UNIT_ASAN_BIN): unit_test.c $(OSPREY_OBJS) $(UNIT_E9_OBJ) | $(WORK)
 	$(CC) $(UNIT_CFLAGS) -fsanitize=address -fno-omit-frame-pointer \
-		-o $@ unit_test.c $(OSPREY_OBJS) -lglib-2.0 -lpthread -lm
+		-o $@ unit_test.c $(OSPREY_OBJS) $(UNIT_E9_OBJ) -lglib-2.0 -lpthread -lm
 
 # Item 8: the OSPREY translation units themselves are compiled with
 # ASan+UBSan and linked into a dedicated runner, so sanitizer coverage
 # includes the ownership/lifecycle code, not just the stub harness.
-$(WORK)/osprey_unit_asan_osprey: unit_test.c $(OSPREY_ASAN_OBJS) | $(WORK)
-	$(CC) $(ASAN_CFLAGS) -o $@ unit_test.c $(OSPREY_ASAN_OBJS) \
+$(WORK)/osprey_unit_asan_osprey: unit_test.c $(OSPREY_ASAN_OBJS) $(WORK)/e9-ranges.asan.o | $(WORK)
+	$(CC) $(ASAN_CFLAGS) -o $@ unit_test.c $(OSPREY_ASAN_OBJS) $(WORK)/e9-ranges.asan.o \
 		-lglib-2.0 -lpthread -lm
 
 $(WORK)/%.asan.o: ../../linux-user/%.c $(OSPREY_HEADERS) | $(WORK)

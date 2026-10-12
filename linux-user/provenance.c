@@ -768,7 +768,14 @@ bool provenance_runtime_pc(target_ulong pc)
 
 bool provenance_memcheck_pc_eligible(target_ulong pc)
 {
-    if (!binradar_memcheck_enabled || is_in_e9_exclude_region(pc)) return false;
+    if (!binradar_memcheck_enabled) return false;
+    if (is_in_e9_exclude_region(pc)) {
+        target_ulong original;
+        /* Trust only an exact artifact-bound original instruction, never
+         * its surrounding trampoline or a nearby inserted helper. */
+        return e9_original_instruction_pc(pc, &original) &&
+               prov_main_pc(original);
+    }
     if (prov_main_pc(pc)) return true;
     const ProvCodeMapping *range = prov_code_mapping(pc);
     return range != NULL && !range->runtime && range->site_valid && !range->image->tainted;
