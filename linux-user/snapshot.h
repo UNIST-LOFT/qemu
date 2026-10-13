@@ -169,7 +169,9 @@ OrderedMap *ordered_map_init(int max_size);
 OrderedMapEntry *ordered_map_insert(OrderedMap *map, uintptr_t key, void *data);
 OrderedMapEntry* ordered_map_lookup(OrderedMap *map, uintptr_t key);
 
-/* Called only after publishing the capacity terminal and collection status. */
+bool snapshot_is_binradar(void);
+
+/* Non-BINRADAR only: called after publishing the capacity terminal/status. */
 QEMU_NORETURN void snapshot_stop_collection(SymbolicCollectionStopReason reason);
 
 void snapshot_record_guest_normal_exit(CPUArchState *cpu_env, int exit_code, const char *reason);

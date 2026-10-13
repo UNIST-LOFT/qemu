@@ -92,6 +92,7 @@ static inline OPKIND get_eflags_opkind(uintptr_t cc_op, uint8_t flag)
 static void qemu_cc_compute_all(uint64_t packed_idx, uintptr_t dst,
                                 uintptr_t src1, uintptr_t src2, uintptr_t cc_op)
 {
+    if (!symbolic_collection_active()) return;
     uintptr_t ret_idx  = UNPACK_0(packed_idx);
     uintptr_t dst_idx  = UNPACK_1(packed_idx);
     uintptr_t src1_idx = UNPACK_2(packed_idx);
@@ -110,6 +111,7 @@ static void qemu_cc_compute_all(uint64_t packed_idx, uintptr_t dst,
             // src1 ? 0 : CC_Z;
             if (s_temps[src1_idx]) {
                 Expr* e   = new_expr();
+                if (e == NULL) return;
                 e->opkind = ITE_NE_ZERO;
                 e->op1    = s_temps[src1_idx];
                 SET_EXPR_CONST_OP(e->op2, e->op2_is_const, 0);
@@ -126,6 +128,7 @@ static void qemu_cc_compute_all(uint64_t packed_idx, uintptr_t dst,
         case CC_OP_MULQ:
             if (s_temps[src1_idx] || s_temps[dst_idx]) {
                 Expr* e   = new_expr();
+                if (e == NULL) return;
                 e->opkind = EFLAGS_ALL_MUL;
                 SET_EXPR_OP(e->op1, e->op1_is_const, s_temps[dst_idx], dst);
                 SET_EXPR_OP(e->op2, e->op2_is_const, s_temps[src1_idx], src1);
@@ -142,6 +145,7 @@ static void qemu_cc_compute_all(uint64_t packed_idx, uintptr_t dst,
         case CC_OP_ADDQ:
             if (s_temps[src1_idx] || s_temps[dst_idx]) {
                 Expr* e   = new_expr();
+                if (e == NULL) return;
                 e->opkind = EFLAGS_ALL_ADD;
                 SET_EXPR_OP(e->op1, e->op1_is_const, s_temps[dst_idx], dst);
                 SET_EXPR_OP(e->op2, e->op2_is_const, s_temps[src1_idx], src1);
@@ -158,6 +162,7 @@ static void qemu_cc_compute_all(uint64_t packed_idx, uintptr_t dst,
         case CC_OP_ADCQ:
             if (s_temps[src1_idx] || s_temps[src2_idx] || s_temps[dst_idx]) {
                 Expr* e   = new_expr();
+                if (e == NULL) return;
                 e->opkind = get_eflags_opkind(cc_op, 0);
                 SET_EXPR_OP(e->op1, e->op1_is_const, s_temps[dst_idx], dst);
                 SET_EXPR_OP(e->op2, e->op2_is_const, s_temps[src1_idx], src1);
@@ -174,6 +179,7 @@ static void qemu_cc_compute_all(uint64_t packed_idx, uintptr_t dst,
         case CC_OP_SUBQ:
             if (s_temps[src1_idx] || s_temps[dst_idx]) {
                 Expr* e   = new_expr();
+                if (e == NULL) return;
                 e->opkind = EFLAGS_ALL_SUB;
                 SET_EXPR_OP(e->op1, e->op1_is_const, s_temps[dst_idx], dst);
                 SET_EXPR_OP(e->op2, e->op2_is_const, s_temps[src1_idx], src1);
@@ -190,6 +196,7 @@ static void qemu_cc_compute_all(uint64_t packed_idx, uintptr_t dst,
         case CC_OP_SBBQ:
             if (s_temps[src1_idx] || s_temps[dst_idx]) {
                 Expr* e   = new_expr();
+                if (e == NULL) return;
                 e->opkind = get_eflags_opkind(cc_op, 0);
                 SET_EXPR_OP(e->op1, e->op1_is_const, s_temps[dst_idx], dst);
                 SET_EXPR_OP(e->op2, e->op2_is_const, s_temps[src1_idx], src1);
@@ -206,6 +213,7 @@ static void qemu_cc_compute_all(uint64_t packed_idx, uintptr_t dst,
         case CC_OP_LOGICQ:
             if (s_temps[src1_idx] || s_temps[dst_idx]) {
                 Expr* e   = new_expr();
+                if (e == NULL) return;
                 e->opkind = EFLAGS_ALL_LOGIC;
                 SET_EXPR_OP(e->op1, e->op1_is_const, s_temps[dst_idx], dst);
                 SET_EXPR_OP(e->op2, e->op2_is_const, s_temps[src1_idx], src1);
@@ -222,6 +230,7 @@ static void qemu_cc_compute_all(uint64_t packed_idx, uintptr_t dst,
         case CC_OP_INCQ:
             if (s_temps[src1_idx] || s_temps[dst_idx]) {
                 Expr* e   = new_expr();
+                if (e == NULL) return;
                 e->opkind = EFLAGS_ALL_INC;
                 SET_EXPR_OP(e->op1, e->op1_is_const, s_temps[dst_idx], dst);
                 SET_EXPR_OP(e->op2, e->op2_is_const, s_temps[src1_idx], src1);
@@ -238,6 +247,7 @@ static void qemu_cc_compute_all(uint64_t packed_idx, uintptr_t dst,
         case CC_OP_DECQ:
             if (s_temps[src1_idx] || s_temps[dst_idx]) {
                 Expr* e   = new_expr();
+                if (e == NULL) return;
                 e->opkind = EFLAGS_ALL_DEC;
                 SET_EXPR_OP(e->op1, e->op1_is_const, s_temps[dst_idx], dst);
                 SET_EXPR_OP(e->op2, e->op2_is_const, s_temps[src1_idx], src1);
@@ -254,6 +264,7 @@ static void qemu_cc_compute_all(uint64_t packed_idx, uintptr_t dst,
         case CC_OP_SHLQ:
             if (s_temps[src1_idx] || s_temps[dst_idx]) {
                 Expr* e   = new_expr();
+                if (e == NULL) return;
                 e->opkind = EFLAGS_ALL_SHL;
                 SET_EXPR_OP(e->op1, e->op1_is_const, s_temps[dst_idx], dst);
                 SET_EXPR_OP(e->op2, e->op2_is_const, s_temps[src1_idx], src1);
@@ -270,6 +281,7 @@ static void qemu_cc_compute_all(uint64_t packed_idx, uintptr_t dst,
         case CC_OP_SARQ:
             if (s_temps[src1_idx] || s_temps[dst_idx]) {
                 Expr* e   = new_expr();
+                if (e == NULL) return;
                 e->opkind = EFLAGS_ALL_SAR;
                 SET_EXPR_OP(e->op1, e->op1_is_const, s_temps[dst_idx], dst);
                 SET_EXPR_OP(e->op2, e->op2_is_const, s_temps[src1_idx], src1);
@@ -286,6 +298,7 @@ static void qemu_cc_compute_all(uint64_t packed_idx, uintptr_t dst,
         case CC_OP_BMILGQ:
             if (s_temps[src1_idx] || s_temps[dst_idx]) {
                 Expr* e   = new_expr();
+                if (e == NULL) return;
                 e->opkind = EFLAGS_ALL_BMILG;
                 SET_EXPR_OP(e->op1, e->op1_is_const, s_temps[dst_idx], dst);
                 SET_EXPR_OP(e->op2, e->op2_is_const, s_temps[src1_idx], src1);
@@ -301,6 +314,7 @@ static void qemu_cc_compute_all(uint64_t packed_idx, uintptr_t dst,
         case CC_OP_ADCOX:
             if (s_temps[src1_idx] || s_temps[dst_idx]) {
                 Expr* e   = new_expr();
+                if (e == NULL) return;
                 e->opkind = get_eflags_opkind(cc_op, 0);
                 SET_EXPR_OP(e->op1, e->op1_is_const, s_temps[dst_idx], dst);
                 SET_EXPR_OP(e->op2, e->op2_is_const, s_temps[src1_idx], src1);
@@ -319,6 +333,7 @@ static void qemu_cc_compute_all(uint64_t packed_idx, uintptr_t dst,
 static void qemu_cc_compute_c(uint64_t packed_idx, uintptr_t dst,
                               uintptr_t src1, uintptr_t src2, uintptr_t cc_op)
 {
+    if (!symbolic_collection_active()) return;
     uintptr_t ret_idx  = UNPACK_0(packed_idx);
     uintptr_t dst_idx  = UNPACK_1(packed_idx);
     uintptr_t src1_idx = UNPACK_2(packed_idx);
@@ -344,6 +359,7 @@ static void qemu_cc_compute_c(uint64_t packed_idx, uintptr_t dst,
             // src1 & 1;
             if (s_temps[src1_idx]) {
                 Expr* e   = new_expr();
+                if (e == NULL) return;
                 e->opkind = AND;
                 e->op1    = s_temps[src1_idx];
                 SET_EXPR_CONST_OP(e->op2, e->op2_is_const, 1);
@@ -372,6 +388,7 @@ static void qemu_cc_compute_c(uint64_t packed_idx, uintptr_t dst,
             // src1 != 0;
             if (s_temps[src1_idx]) {
                 Expr* e   = new_expr();
+                if (e == NULL) return;
                 e->opkind = NE;
                 e->op1    = s_temps[src1_idx];
                 SET_EXPR_CONST_OP(e->op2, e->op2_is_const, 0);
@@ -393,6 +410,7 @@ static void qemu_cc_compute_c(uint64_t packed_idx, uintptr_t dst,
         case CC_OP_ADDQ:
             if (s_temps[src1_idx] || s_temps[dst_idx]) {
                 Expr* e   = new_expr();
+                if (e == NULL) return;
                 e->opkind = EFLAGS_C_ADD;
                 SET_EXPR_OP(e->op1, e->op1_is_const, s_temps[dst_idx], dst);
                 SET_EXPR_OP(e->op2, e->op2_is_const, s_temps[src1_idx], src1);
@@ -409,6 +427,7 @@ static void qemu_cc_compute_c(uint64_t packed_idx, uintptr_t dst,
         case CC_OP_ADCQ:
             if (s_temps[src1_idx] || s_temps[src2_idx] || s_temps[dst_idx]) {
                 Expr* e   = new_expr();
+                if (e == NULL) return;
                 e->opkind = get_eflags_opkind(cc_op, 1);
                 SET_EXPR_OP(e->op1, e->op1_is_const, s_temps[dst_idx], dst);
                 SET_EXPR_OP(e->op2, e->op2_is_const, s_temps[src1_idx], src1);
@@ -425,6 +444,7 @@ static void qemu_cc_compute_c(uint64_t packed_idx, uintptr_t dst,
         case CC_OP_SUBQ:
             if (s_temps[src1_idx] || s_temps[dst_idx]) {
                 Expr* e   = new_expr();
+                if (e == NULL) return;
                 e->opkind = EFLAGS_C_SUB;
                 SET_EXPR_OP(e->op1, e->op1_is_const, s_temps[dst_idx], dst);
                 SET_EXPR_OP(e->op2, e->op2_is_const, s_temps[src1_idx], src1);
@@ -441,6 +461,7 @@ static void qemu_cc_compute_c(uint64_t packed_idx, uintptr_t dst,
         case CC_OP_SBBQ:
             if (s_temps[src1_idx] || s_temps[dst_idx]) {
                 Expr* e   = new_expr();
+                if (e == NULL) return;
                 e->opkind = get_eflags_opkind(cc_op, 1);
                 SET_EXPR_OP(e->op1, e->op1_is_const, s_temps[dst_idx], dst);
                 SET_EXPR_OP(e->op2, e->op2_is_const, s_temps[src1_idx], src1);
@@ -457,6 +478,7 @@ static void qemu_cc_compute_c(uint64_t packed_idx, uintptr_t dst,
         case CC_OP_SHLQ:
             if (s_temps[src1_idx] || s_temps[dst_idx]) {
                 Expr* e   = new_expr();
+                if (e == NULL) return;
                 e->opkind = EFLAGS_C_SHL;
                 SET_EXPR_OP(e->op1, e->op1_is_const, s_temps[dst_idx], dst);
                 SET_EXPR_OP(e->op2, e->op2_is_const, s_temps[src1_idx], src1);
@@ -473,6 +495,7 @@ static void qemu_cc_compute_c(uint64_t packed_idx, uintptr_t dst,
         case CC_OP_BMILGQ:
             if (s_temps[src1_idx] || s_temps[dst_idx]) {
                 Expr* e   = new_expr();
+                if (e == NULL) return;
                 e->opkind = EFLAGS_C_BMILG;
                 SET_EXPR_OP(e->op1, e->op1_is_const, s_temps[dst_idx], dst);
                 SET_EXPR_OP(e->op2, e->op2_is_const, s_temps[src1_idx], src1);
@@ -491,6 +514,7 @@ static void qemu_cc_compute_c(uint64_t packed_idx, uintptr_t dst,
 static inline Expr* build_concat_expr(Expr** exprs, void* addr, size_t size,
                                       int reversed)
 {
+    if (!symbolic_collection_active()) return NULL;
     Expr* dst_expr = NULL;
     for (size_t i = 0; i < size; i++) {
         size_t idx = i; // reversed ? i : (size - i - 1);
@@ -498,6 +522,7 @@ static inline Expr* build_concat_expr(Expr** exprs, void* addr, size_t size,
             dst_expr = exprs[idx];
             if (dst_expr == NULL) {
                 dst_expr           = new_expr();
+                if (dst_expr == NULL) return NULL;
                 dst_expr->opkind   = IS_CONST;
                 uint8_t* byte_addr = ((uint8_t*)addr) + idx;
                 uint8_t  byte      = *byte_addr;
@@ -505,6 +530,7 @@ static inline Expr* build_concat_expr(Expr** exprs, void* addr, size_t size,
             }
         } else {
             Expr* n_expr   = new_expr();
+            if (n_expr == NULL) return NULL;
             n_expr->opkind = CONCAT8L;
             if (exprs[idx] == NULL) {
                 // fetch the concrete value, embed it in the expr
@@ -638,6 +664,8 @@ static inline void qemu_memmove(CPUArchState *cpu_env, uintptr_t src, uintptr_t 
     trace_mem("[memmoveh] [src %lx] [dst %lx] [size %lx] [val %lx] [is-ptr %d] [src-r %s] [src-rb %lx] [dst-r %s] [dst-rb %lx]\n", src, dst, size, val, is_ptr, snapshot_mem_region_str(mr_src), mr_src ? mr_src->base : 0, snapshot_mem_region_str(mr_dst), mr_dst ? mr_dst->base : 0);
     // Add snapshot_write_access to dst if needed
 
+    if (!symbolic_collection_active()) return;
+
     if (src_exprs == NULL && dst_exprs == NULL) {
         return;
     }
@@ -656,6 +684,7 @@ static inline void qemu_memmove(CPUArchState *cpu_env, uintptr_t src, uintptr_t 
     }
 
     for (size_t i = 0; i < size; i++) {
+        if (!symbolic_collection_active()) return;
         dst_exprs[i] = src_exprs[i];
 #if DEBUG_EXPR_CONSISTENCY
         if (src_exprs[i]) {
@@ -668,6 +697,7 @@ static inline void qemu_memmove(CPUArchState *cpu_env, uintptr_t src, uintptr_t 
 
 static inline void qemu_memset(Expr* value, uintptr_t dst, uintptr_t size)
 {
+    if (!symbolic_collection_active()) return;
     if (size == 0) {
         return;
     }
@@ -735,6 +765,7 @@ static void qemu_xmm_op_internal(uintptr_t opkind, uint8_t* dst_addr,
                                  uint8_t* src_addr, uintptr_t packed_slice_pc,
                                  size_t n_bytes)
 {
+    if (!symbolic_collection_active()) return;
     uintptr_t slice = packed_slice_pc & 0xFF;
     assert(slice <= 16 && slice > 0);
 
@@ -804,6 +835,7 @@ static void qemu_xmm_op_internal(uintptr_t opkind, uint8_t* dst_addr,
 #endif
 
         Expr* e   = new_expr();
+        if (e == NULL) return;
         e->opkind = opkind;
 
         if (src_expr_addr == NULL) {
@@ -825,7 +857,9 @@ static void qemu_xmm_op_internal(uintptr_t opkind, uint8_t* dst_addr,
 
                 if (slice == 16) {
                     Expr* src2 = new_expr();
+                    if (src2 == NULL) return;
                     src2->opkind = SHL;
+                    if (src_slice == NULL) return;
                     src2->op1 = src_slice;
                     SET_EXPR_CONST_OP(src2->op2, src2->op2_is_const, 3);
                     src_slice = src2;
@@ -838,6 +872,7 @@ static void qemu_xmm_op_internal(uintptr_t opkind, uint8_t* dst_addr,
 
             dst_slice =
                 build_concat_expr(&dst_expr_addr[i], &dst_addr[i], slice, 0);
+            if (src_slice == NULL || dst_slice == NULL) return;
 
 #if DEBUG_EXPR_CONSISTENCY
             // printf("XMM_OP_A1:\n");
@@ -854,6 +889,7 @@ static void qemu_xmm_op_internal(uintptr_t opkind, uint8_t* dst_addr,
             }
 #endif
 
+            if (!symbolic_collection_active()) return;
             e->op1 = dst_slice;
             e->op2 = src_slice;
 
@@ -883,6 +919,7 @@ static void qemu_xmm_op_internal(uintptr_t opkind, uint8_t* dst_addr,
 #endif
         }
 
+        if (!symbolic_collection_active()) return;
         SET_EXPR_CONST_OP(e->op3, e->op3_is_const, slice);
 
 #if 0
@@ -892,6 +929,7 @@ static void qemu_xmm_op_internal(uintptr_t opkind, uint8_t* dst_addr,
         if (slice > 1) {
             for (size_t k = 0; k < slice; k++) {
                 Expr* e_byte   = new_expr();
+                if (e_byte == NULL) return;
                 e_byte->opkind = EXTRACT8;
                 e_byte->op1    = e;
                 SET_EXPR_CONST_OP(e_byte->op2, e_byte->op2_is_const, k);
@@ -949,6 +987,7 @@ static void qemu_xmm_shift(uintptr_t opkind, uint64_t* dst_addr,
     Expr* dst_expr = build_concat_expr(dst_expr_addr, dst_addr, XMM_BYTES, 0);
 
     Expr* e   = new_expr();
+    if (e == NULL) return;
     e->opkind = opkind;
     e->op1 = dst_expr; // we need a CONCAT expr when is fully concrete because
                        // it's a 128 bit const
@@ -957,6 +996,7 @@ static void qemu_xmm_shift(uintptr_t opkind, uint64_t* dst_addr,
 
     for (size_t i = 0; i < XMM_BYTES; i++) {
         Expr* e_byte   = new_expr();
+        if (e_byte == NULL) return;
         e_byte->opkind = EXTRACT8;
         e_byte->op1    = e;
         SET_EXPR_CONST_OP(e_byte->op2, e_byte->op2_is_const, i);
@@ -983,6 +1023,7 @@ static inline int is_eip_offset(uintptr_t offset)
 
 static bool qemu_xmm_shadow_read(uintptr_t addr, Expr* exprs[XMM_BYTES])
 {
+    if (!symbolic_collection_active()) return false;
     const size_t shadow_page_size = (size_t)1 << L3_PAGE_BITS;
     const uintptr_t shadow_page_mask = shadow_page_size - 1;
     bool has_expr = false;
@@ -1008,6 +1049,7 @@ static bool qemu_xmm_shadow_read(uintptr_t addr, Expr* exprs[XMM_BYTES])
 static void qemu_xmm_shadow_write(uintptr_t addr,
                                   Expr* const exprs[XMM_BYTES])
 {
+    if (!symbolic_collection_active()) return;
     const size_t shadow_page_size = (size_t)1 << L3_PAGE_BITS;
     const uintptr_t shadow_page_mask = shadow_page_size - 1;
     size_t offset = 0;
@@ -1032,6 +1074,7 @@ static void qemu_xmm_shadow_write(uintptr_t addr,
 static void qemu_xmm_pmovmskb(uintptr_t dst_idx, uint64_t* src_addr,
                               size_t n_bytes)
 {
+    if (!symbolic_collection_active()) return;
     Expr* src_exprs[XMM_BYTES];
     if (!qemu_xmm_shadow_read((uintptr_t)src_addr, src_exprs)) {
         s_temps[dst_idx] = NULL;
@@ -1041,7 +1084,9 @@ static void qemu_xmm_pmovmskb(uintptr_t dst_idx, uint64_t* src_addr,
     printf("Helper qemu_xmm_pmovmskb: symbolic op\n");
 #endif
     Expr* src_expr   = build_concat_expr(src_exprs, src_addr, XMM_BYTES, 0);
+    if (src_expr == NULL) return;
     Expr* e          = new_expr();
+    if (e == NULL) return;
     e->opkind        = PMOVMSKB;
     e->op1           = src_expr;
     s_temps[dst_idx] = e;
@@ -1064,6 +1109,7 @@ static void qemu_xmm_pmovmskb(uintptr_t dst_idx, uint64_t* src_addr,
 
 static void qemu_xmm_mov_mm_T0(uint64_t* dst_addr, uintptr_t src_idx, size_t size)
 {
+    if (!symbolic_collection_active()) return;
     const size_t shadow_page_size = (size_t)1 << L3_PAGE_BITS;
     const uintptr_t shadow_page_mask = shadow_page_size - 1;
     uintptr_t dst = (uintptr_t)dst_addr;
@@ -1083,6 +1129,7 @@ static void qemu_xmm_mov_mm_T0(uint64_t* dst_addr, uintptr_t src_idx, size_t siz
                 continue;
             }
             Expr* e_byte = new_expr();
+            if (e_byte == NULL) return;
             e_byte->opkind = EXTRACT8;
             e_byte->op1 = s_temps[src_idx];
             SET_EXPR_CONST_OP(e_byte->op2, e_byte->op2_is_const,
@@ -1096,6 +1143,7 @@ static void qemu_xmm_mov_mm_T0(uint64_t* dst_addr, uintptr_t src_idx, size_t siz
 static void qemu_xmm_pshuf(uint64_t* dst_addr, uint64_t* src_addr,
                            uintptr_t order, uintptr_t size)
 {
+    if (!symbolic_collection_active()) return;
     Expr* src_exprs[XMM_BYTES];
     Expr* result_exprs[XMM_BYTES] = {0};
 
@@ -1120,6 +1168,7 @@ static void qemu_xmm_pshuf(uint64_t* dst_addr, uint64_t* src_addr,
 static void qemu_xmm_punpck(uint64_t* dst_addr, uint64_t* src_addr,
                             uintptr_t slice, uint8_t lowbytes)
 {
+    if (!symbolic_collection_active()) return;
     Expr* dst_exprs[XMM_BYTES];
     Expr* src_exprs[XMM_BYTES];
     Expr* result_exprs[XMM_BYTES] = {0};
@@ -1157,6 +1206,7 @@ static void qemu_xmm_punpck(uint64_t* dst_addr, uint64_t* src_addr,
 static void qemu_xmm_pack(uint64_t* dst_addr, uint64_t* src_addr,
                           uintptr_t packed_info)
 {
+    if (!symbolic_collection_active()) return;
     Expr* dst_exprs[XMM_BYTES];
     Expr* src_exprs[XMM_BYTES];
     Expr* result_exprs[XMM_BYTES] = {0};
@@ -1182,6 +1232,7 @@ static void qemu_xmm_pack(uint64_t* dst_addr, uint64_t* src_addr,
         unsigned offset        = ((i / packed_size) * unpacked_size);
         Expr*    bytes_to_pack = build_concat_expr(
             dst_exprs + offset,  ((uint8_t*)dst_addr) + offset, unpacked_size, 0);
+        if (bytes_to_pack == NULL) return;
 #if 0
         fprintf(stderr, "PACKING AT %p %p\n",  ((uint8_t*)dst_addr),  ((uint8_t*)dst_addr) + offset);
         printf("DATA: %x\n", *((uint16_t*)(((uint8_t*)dst_addr) + offset)));
@@ -1190,6 +1241,7 @@ static void qemu_xmm_pack(uint64_t* dst_addr, uint64_t* src_addr,
         for (size_t k = 0; k < packed_size; k++) {
 
             Expr* e   = new_expr();
+            if (e == NULL) return;
             e->opkind = opkind;
             e->op1    = bytes_to_pack;
             SET_EXPR_CONST_OP(e->op2, e->op2_is_const, packed_size);
@@ -1205,6 +1257,7 @@ static void qemu_xmm_pack(uint64_t* dst_addr, uint64_t* src_addr,
         unsigned offset        = ((i / packed_size) * unpacked_size);
         Expr*    bytes_to_pack = build_concat_expr(
             src_exprs + offset,  ((uint8_t*)src_addr) + offset, unpacked_size, 0);
+        if (bytes_to_pack == NULL) return;
 #if 0
         printf("DATA: %x\n", *((uint16_t*)((uint8_t*)src_addr) + offset));
 #endif
@@ -1214,6 +1267,7 @@ static void qemu_xmm_pack(uint64_t* dst_addr, uint64_t* src_addr,
         for (size_t k = 0; k < packed_size; k++) {
 
             Expr* e   = new_expr();
+            if (e == NULL) return;
             e->opkind = opkind;
             e->op1    = bytes_to_pack;
             SET_EXPR_CONST_OP(e->op2, e->op2_is_const, packed_size);
@@ -1229,6 +1283,7 @@ static void qemu_xmm_pack(uint64_t* dst_addr, uint64_t* src_addr,
 static inline void atomic_fetch_op(uint64_t packed_info, uintptr_t a_ptr,
                                    uintptr_t b_val)
 {
+    if (!symbolic_collection_active()) return;
     uintptr_t t_out_idx         = UNPACK_0(packed_info);
     uintptr_t t_a_idx           = UNPACK_1(packed_info);
     uintptr_t t_b_idx           = UNPACK_2(packed_info);
@@ -1249,6 +1304,7 @@ static inline void atomic_fetch_op(uint64_t packed_info, uintptr_t a_ptr,
     if (s_temps[t_a_idx]) {
         // ToDo: memory slice
         load_concretization(s_temps[t_a_idx], a_ptr);
+        if (!symbolic_collection_active()) return;
     }
 
     Expr** a_exprs = get_expr_addr(a_ptr, size, 0, NULL);
@@ -1291,11 +1347,13 @@ static inline void atomic_fetch_op(uint64_t packed_info, uintptr_t a_ptr,
         }
     } else {
         e_a = build_concat_expr(a_exprs, (void*)a_ptr, size, 0);
+        if (e_a == NULL) return;
     }
 #if 0
     printf("atomic_fetch_op: expr_a=%p expr_b=%p\n", a_exprs, s_temps[t_b_idx]);
 #endif
     Expr* e   = new_expr();
+    if (e == NULL) return;
     e->opkind = opkind;
     SET_EXPR_OP(e->op1, e->op1_is_const, e_a, a_val);
     SET_EXPR_OP(e->op2, e->op2_is_const, s_temps[t_b_idx], b_val);
@@ -1312,6 +1370,7 @@ static inline void atomic_fetch_op(uint64_t packed_info, uintptr_t a_ptr,
     }
     for (size_t i = 0; i < size; i++) {
         Expr* e_byte   = new_expr();
+        if (e_byte == NULL) return;
         e_byte->opkind = EXTRACT8;
         e_byte->op1    = e;
         SET_EXPR_CONST_OP(e_byte->op2, e_byte->op2_is_const, i);
@@ -1327,6 +1386,7 @@ static inline void atomic_fetch_op(uint64_t packed_info, uintptr_t a_ptr,
 static void cmpxchg_handler(uint64_t packed_info, uintptr_t a_ptr,
                             uintptr_t b_val, uintptr_t pc, uintptr_t addr_to)
 {
+    if (!symbolic_collection_active()) return;
     uintptr_t t_out_idx    = UNPACK_0(packed_info);
     uintptr_t t_a_idx      = UNPACK_1(packed_info);
     uintptr_t t_b_idx      = UNPACK_2(packed_info);
@@ -1338,6 +1398,7 @@ static void cmpxchg_handler(uint64_t packed_info, uintptr_t a_ptr,
     if (s_temps[t_a_idx]) {
         // ToDo: memory slice
         load_concretization(s_temps[t_a_idx], a_ptr);
+        if (!symbolic_collection_active()) return;
     }
 
     Expr** a_exprs = get_expr_addr(a_ptr, size, 0, NULL);
@@ -1378,6 +1439,7 @@ static void cmpxchg_handler(uint64_t packed_info, uintptr_t a_ptr,
     Expr* expr_a = NULL;
     if (a_exprs != NULL && a_is_not_null) {
         expr_a = build_concat_expr(a_exprs, (void*)a_ptr, size, 0);
+        if (expr_a == NULL) return;
     }
 
     if ((a_exprs != NULL && a_is_not_null) || expr_b != NULL) {
@@ -1387,6 +1449,7 @@ static void cmpxchg_handler(uint64_t packed_info, uintptr_t a_ptr,
 #endif
         branch_helper_internal(a_val, b_val, TCG_COND_EQ, expr_a, expr_b, 
                                 size == 8 ? 0 : size, pc, addr_to);
+        if (!symbolic_collection_active()) return;
     }
 
 #if DEBUG_EXPR_CONSISTENCY
@@ -1402,6 +1465,7 @@ static void cmpxchg_handler(uint64_t packed_info, uintptr_t a_ptr,
     }
 #endif
 
+    if (!symbolic_collection_active()) return;
     if (a_val == b_val) {
         if (expr_c == NULL) {
             // clear out memory
@@ -1417,6 +1481,7 @@ static void cmpxchg_handler(uint64_t packed_info, uintptr_t a_ptr,
             }
             for (size_t i = 0; i < size; i++) {
                 Expr* e_byte   = new_expr();
+                if (e_byte == NULL) return;
                 e_byte->opkind = EXTRACT8;
                 e_byte->op1    = expr_c;
                 SET_EXPR_CONST_OP(e_byte->op2, e_byte->op2_is_const, i);
@@ -1437,6 +1502,7 @@ static void cmpxchg_handler(uint64_t packed_info, uintptr_t a_ptr,
 
 static void xchg_handler(uint64_t packed_info, uintptr_t a_ptr)
 {
+    if (!symbolic_collection_active()) return;
     uintptr_t t_out_idx = UNPACK_0(packed_info);
     uintptr_t t_a_idx   = UNPACK_1(packed_info);
     uintptr_t t_b_idx   = UNPACK_2(packed_info);
@@ -1445,6 +1511,7 @@ static void xchg_handler(uint64_t packed_info, uintptr_t a_ptr)
     if (s_temps[t_a_idx]) {
         // ToDo: memory slice
         load_concretization(s_temps[t_a_idx], a_ptr);
+        if (!symbolic_collection_active()) return;
     }
 
     Expr** a_exprs = get_expr_addr(a_ptr, size, 0, NULL);
@@ -1465,6 +1532,7 @@ static void xchg_handler(uint64_t packed_info, uintptr_t a_ptr)
     Expr* expr_a = NULL;
     if (a_exprs != NULL && a_is_not_null) {
         expr_a = build_concat_expr(a_exprs, (void*)a_ptr, size, 0);
+        if (expr_a == NULL) return;
     }
     s_temps[t_out_idx] = expr_a;
 
@@ -1474,6 +1542,7 @@ static void xchg_handler(uint64_t packed_info, uintptr_t a_ptr)
         }
         for (size_t i = 0; i < size; i++) {
             Expr* e_byte   = new_expr();
+            if (e_byte == NULL) return;
             e_byte->opkind = EXTRACT8;
             e_byte->op1    = s_temps[t_b_idx];
             SET_EXPR_CONST_OP(e_byte->op2, e_byte->op2_is_const, i);
@@ -1534,6 +1603,7 @@ static void qemu_fxrstor(CPUX86State* env, uintptr_t ptr)
 static void qemu_rcl(uint64_t packed_idx, CPUX86State* env, uintptr_t t_0,
                      uintptr_t t_1)
 {
+    if (!symbolic_collection_active()) return;
     uintptr_t t_out_idx = UNPACK_0(packed_idx);
     uintptr_t t_0_idx   = UNPACK_1(packed_idx);
     uintptr_t t_1_idx   = UNPACK_2(packed_idx);
@@ -1547,6 +1617,7 @@ static void qemu_rcl(uint64_t packed_idx, CPUX86State* env, uintptr_t t_0,
         // printf("Helper qemu_rcl: symbolic op\n");
 
         Expr* e   = new_expr();
+        if (e == NULL) return;
         e->opkind = RCL;
         SET_EXPR_OP(e->op1, e->op1_is_const, s_temps[t_0_idx], t_0);
         SET_EXPR_OP(e->op2, e->op2_is_const, s_temps[t_1_idx], t_1);
@@ -1554,6 +1625,7 @@ static void qemu_rcl(uint64_t packed_idx, CPUX86State* env, uintptr_t t_0,
         s_temps[t_out_idx] = e;
 
         e         = new_expr();
+        if (e == NULL) return;
         e->opkind = EFLAGS_ALL_RCL;
         SET_EXPR_OP(e->op1, e->op1_is_const, s_temps[t_0_idx], t_0);
         SET_EXPR_OP(e->op2, e->op2_is_const, s_temps[t_1_idx], t_1);
@@ -1567,6 +1639,7 @@ static void qemu_rcl(uint64_t packed_idx, CPUX86State* env, uintptr_t t_0,
 static void qemu_divq_EAX(uint64_t packed_idx, uintptr_t rax, uintptr_t rdx,
                           uintptr_t t0)
 {
+    if (!symbolic_collection_active()) return;
     uintptr_t t_rax_idx = UNPACK_0(packed_idx);
     uintptr_t t_rdx_idx = UNPACK_1(packed_idx);
     uintptr_t t_0_idx   = UNPACK_2(packed_idx);
@@ -1595,16 +1668,19 @@ static void qemu_divq_EAX(uint64_t packed_idx, uintptr_t rax, uintptr_t rdx,
         // print_expr(s_temps[t_rax_idx]);
 
         Expr* rdxrax   = new_expr();
+        if (rdxrax == NULL) return;
         rdxrax->opkind = CONCAT;
         SET_EXPR_OP(rdxrax->op1, rdxrax->op1_is_const, s_temps[t_rdx_idx], rdx);
         SET_EXPR_OP(rdxrax->op2, rdxrax->op2_is_const, s_temps[t_rax_idx], rax);
 
         Expr* d   = new_expr();
+        if (d == NULL) return;
         d->opkind = mode == 0 ? DIVU : DIV;
         d->op1    = rdxrax;
         SET_EXPR_OP(d->op2, d->op2_is_const, s_temps[t_0_idx], t0);
 
         Expr* d2   = new_expr();
+        if (d2 == NULL) return;
         d2->opkind = EXTRACT;
         d2->op1    = d;
         SET_EXPR_CONST_OP(d2->op2, d2->op2_is_const, 63);
@@ -1614,11 +1690,13 @@ static void qemu_divq_EAX(uint64_t packed_idx, uintptr_t rax, uintptr_t rdx,
         // print_expr(d2);
 
         Expr* r   = new_expr();
+        if (r == NULL) return;
         r->opkind = mode == 0 ? REMU : REM;
         r->op1    = rdxrax;
         SET_EXPR_OP(r->op2, r->op2_is_const, s_temps[t_0_idx], t0);
 
         Expr* r2   = new_expr();
+        if (r2 == NULL) return;
         r2->opkind = EXTRACT;
         r2->op1    = r;
         SET_EXPR_CONST_OP(r2->op2, r2->op2_is_const, 63);
@@ -1632,6 +1710,7 @@ static void qemu_divq_EAX(uint64_t packed_idx, uintptr_t rax, uintptr_t rdx,
 static void qemu_divl_EAX(uint64_t packed_idx, uintptr_t rax, uintptr_t rdx,
                           uintptr_t t0)
 {
+    if (!symbolic_collection_active()) return;
     uintptr_t t_rax_idx = UNPACK_0(packed_idx);
     uintptr_t t_rdx_idx = UNPACK_1(packed_idx);
     uintptr_t t_0_idx   = UNPACK_2(packed_idx);
@@ -1660,34 +1739,40 @@ static void qemu_divl_EAX(uint64_t packed_idx, uintptr_t rax, uintptr_t rdx,
         print_expr(s_temps[t_rax_idx]);
 #endif
         Expr* edx   = new_expr();
+        if (edx == NULL) return;
         edx->opkind = EXTRACT;
         SET_EXPR_OP(edx->op1, edx->op1_is_const, s_temps[t_rdx_idx], rdx);
         SET_EXPR_CONST_OP(edx->op2, edx->op2_is_const, 31);
         SET_EXPR_CONST_OP(edx->op3, edx->op3_is_const, 0);
 
         Expr* eax   = new_expr();
+        if (eax == NULL) return;
         eax->opkind = EXTRACT;
         SET_EXPR_OP(eax->op1, eax->op1_is_const, s_temps[t_rax_idx], rax);
         SET_EXPR_CONST_OP(eax->op2, eax->op2_is_const, 31);
         SET_EXPR_CONST_OP(eax->op3, eax->op3_is_const, 0);
 
         Expr* t_0   = new_expr();
+        if (t_0 == NULL) return;
         t_0->opkind = EXTRACT;
         SET_EXPR_OP(t_0->op1, t_0->op1_is_const, s_temps[t_0_idx], t0);
         SET_EXPR_CONST_OP(t_0->op2, t_0->op2_is_const, 31);
         SET_EXPR_CONST_OP(t_0->op3, t_0->op3_is_const, 0);
 
         Expr* edxeax   = new_expr();
+        if (edxeax == NULL) return;
         edxeax->opkind = CONCAT;
         edxeax->op1    = edx;
         edxeax->op2    = eax;
 
         Expr* d   = new_expr();
+        if (d == NULL) return;
         d->opkind = mode == 0 ? DIVU : DIV;
         d->op1    = edxeax;
         d->op2    = t_0;
 
         Expr* d2   = new_expr();
+        if (d2 == NULL) return;
         d2->opkind = EXTRACT;
         d2->op1    = d;
         SET_EXPR_CONST_OP(d2->op2, d2->op2_is_const, 31);
@@ -1695,11 +1780,13 @@ static void qemu_divl_EAX(uint64_t packed_idx, uintptr_t rax, uintptr_t rdx,
         s_temps[t_rax_idx] = d2;
 
         Expr* r   = new_expr();
+        if (r == NULL) return;
         r->opkind = mode == 0 ? REMU : REM;
         r->op1    = edxeax;
         r->op2    = t_0;
 
         Expr* r2   = new_expr();
+        if (r2 == NULL) return;
         r2->opkind = EXTRACT;
         r2->op1    = r;
         SET_EXPR_CONST_OP(r2->op2, r2->op2_is_const, 31);
@@ -1713,6 +1800,7 @@ static void qemu_divl_EAX(uint64_t packed_idx, uintptr_t rax, uintptr_t rdx,
 static void qemu_divw_AX(uint64_t packed_idx, uintptr_t rax, uintptr_t rdx,
                           uintptr_t t0)
 {
+    if (!symbolic_collection_active()) return;
     uintptr_t t_rax_idx = UNPACK_0(packed_idx);
     uintptr_t t_rdx_idx = UNPACK_1(packed_idx);
     uintptr_t t_0_idx   = UNPACK_2(packed_idx);
@@ -1729,34 +1817,40 @@ static void qemu_divw_AX(uint64_t packed_idx, uintptr_t rax, uintptr_t rdx,
         print_expr(s_temps[t_rax_idx]);
 #endif
         Expr* edx   = new_expr();
+        if (edx == NULL) return;
         edx->opkind = EXTRACT;
         SET_EXPR_OP(edx->op1, edx->op1_is_const, s_temps[t_rdx_idx], rdx);
         SET_EXPR_CONST_OP(edx->op2, edx->op2_is_const, 15);
         SET_EXPR_CONST_OP(edx->op3, edx->op3_is_const, 0);
 
         Expr* eax   = new_expr();
+        if (eax == NULL) return;
         eax->opkind = EXTRACT;
         SET_EXPR_OP(eax->op1, eax->op1_is_const, s_temps[t_rax_idx], rax);
         SET_EXPR_CONST_OP(eax->op2, eax->op2_is_const, 15);
         SET_EXPR_CONST_OP(eax->op3, eax->op3_is_const, 0);
 
         Expr* t_0   = new_expr();
+        if (t_0 == NULL) return;
         t_0->opkind = EXTRACT;
         SET_EXPR_OP(t_0->op1, t_0->op1_is_const, s_temps[t_0_idx], t0);
         SET_EXPR_CONST_OP(t_0->op2, t_0->op2_is_const, 15);
         SET_EXPR_CONST_OP(t_0->op3, t_0->op3_is_const, 0);
 
         Expr* edxeax   = new_expr();
+        if (edxeax == NULL) return;
         edxeax->opkind = CONCAT;
         edxeax->op1    = edx;
         edxeax->op2    = eax;
 
         Expr* d   = new_expr();
+        if (d == NULL) return;
         d->opkind = mode == 0 ? DIVU : DIV;
         d->op1    = edxeax;
         d->op2    = t_0;
 
         Expr* d2   = new_expr();
+        if (d2 == NULL) return;
         d2->opkind = EXTRACT;
         d2->op1    = d;
         SET_EXPR_CONST_OP(d2->op2, d2->op2_is_const, 15);
@@ -1764,11 +1858,13 @@ static void qemu_divw_AX(uint64_t packed_idx, uintptr_t rax, uintptr_t rdx,
         s_temps[t_rax_idx] = d2;
 
         Expr* r   = new_expr();
+        if (r == NULL) return;
         r->opkind = mode == 0 ? REMU : REM;
         r->op1    = edxeax;
         r->op2    = t_0;
 
         Expr* r2   = new_expr();
+        if (r2 == NULL) return;
         r2->opkind = EXTRACT;
         r2->op1    = r;
         SET_EXPR_CONST_OP(r2->op2, r2->op2_is_const, 15);
@@ -1783,6 +1879,7 @@ static void qemu_divw_AX(uint64_t packed_idx, uintptr_t rax, uintptr_t rdx,
 static void qemu_divb_AL(uint64_t packed_idx, uintptr_t rax, uintptr_t rdx,
                           uintptr_t t0)
 {
+    if (!symbolic_collection_active()) return;
     uintptr_t t_rax_idx = UNPACK_0(packed_idx);
     uintptr_t t_0_idx   = UNPACK_1(packed_idx);
     uintptr_t mode      = UNPACK_2(packed_idx); // 0: div, 1: idiv
@@ -1796,40 +1893,47 @@ static void qemu_divb_AL(uint64_t packed_idx, uintptr_t rax, uintptr_t rdx,
 #endif
 
         Expr* eax   = new_expr();
+        if (eax == NULL) return;
         eax->opkind = EXTRACT;
         SET_EXPR_OP(eax->op1, eax->op1_is_const, s_temps[t_rax_idx], rax);
         SET_EXPR_CONST_OP(eax->op2, eax->op2_is_const, 15);
         SET_EXPR_CONST_OP(eax->op3, eax->op3_is_const, 0);
 
         Expr* t_0   = new_expr();
+        if (t_0 == NULL) return;
         t_0->opkind = EXTRACT;
         SET_EXPR_OP(t_0->op1, t_0->op1_is_const, s_temps[t_0_idx], t0);
         SET_EXPR_CONST_OP(t_0->op2, t_0->op2_is_const, 7);
         SET_EXPR_CONST_OP(t_0->op3, t_0->op3_is_const, 0);
 
         Expr* d   = new_expr();
+        if (d == NULL) return;
         d->opkind = mode == 0 ? DIVU : DIV;
         d->op1    = eax;
         d->op2    = t_0;
 
         Expr* d2   = new_expr();
+        if (d2 == NULL) return;
         d2->opkind = EXTRACT;
         d2->op1    = d;
         SET_EXPR_CONST_OP(d2->op2, d2->op2_is_const, 7);
         SET_EXPR_CONST_OP(d2->op3, d2->op3_is_const, 0);
 
         Expr* r   = new_expr();
+        if (r == NULL) return;
         r->opkind = mode == 0 ? REMU : REM;
         r->op1    = eax;
         r->op2    = t_0;
 
         Expr* r2   = new_expr();
+        if (r2 == NULL) return;
         r2->opkind = EXTRACT;
         r2->op1    = r;
         SET_EXPR_CONST_OP(r2->op2, r2->op2_is_const, 7);
         SET_EXPR_CONST_OP(r2->op3, r2->op3_is_const, 0);
 
         Expr* r2d2   = new_expr();
+        if (r2d2 == NULL) return;
         r2d2->opkind = CONCAT;
         r2d2->op1    = r2;
         r2d2->op2    = d2;
@@ -1851,6 +1955,7 @@ static inline void xmm_memmove(uint8_t* src, uint8_t* dst, uintptr_t size,
 
     if (s_temps[rdx_idx]) {
         Expr* e   = new_expr();
+        if (e == NULL) return;
         e->opkind = SUB;
         e->op1    = s_temps[rdx_idx];
         SET_EXPR_CONST_OP(e->op2, e->op2_is_const, size);
@@ -1862,6 +1967,7 @@ static inline void xmm_memmove(uint8_t* src, uint8_t* dst, uintptr_t size,
 
     // printf("Memmove\n");
     for (size_t i = 0; i < size; i++) {
+        if (!symbolic_collection_active()) return;
         dst_exprs[i] = src_exprs[i];
         // print_expr(dst_exprs[i]);
     }

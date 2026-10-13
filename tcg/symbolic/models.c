@@ -116,7 +116,7 @@ static inline Expr* take_pending_model_return_expr(void)
 {
     Expr* expr = pending_model_return_expr;
     pending_model_return_expr = NULL;
-    return expr;
+    return symbolic_collection_active() ? expr : NULL;
 }
 
 static inline void clear_call_args_temps(void)
@@ -156,6 +156,7 @@ static inline void clear_xmm_regs(CPUX86State* env)
 
 static inline Expr* build_expr(Expr** exprs, void* addr, size_t size)
 {
+    if (!symbolic_collection_active()) return NULL;
     Expr* dst_expr = NULL;
     for (size_t i = 0; i < size; i++) {
         size_t idx = i; // size - i - 1;
@@ -163,6 +164,7 @@ static inline Expr* build_expr(Expr** exprs, void* addr, size_t size)
             dst_expr = exprs ? exprs[idx] : NULL;
             if (dst_expr == NULL) {
                 dst_expr           = new_expr();
+                if (dst_expr == NULL) return NULL;
                 dst_expr->opkind   = IS_CONST;
                 uint8_t* byte_addr = ((uint8_t*)addr) + idx;
                 uint8_t  byte      = *byte_addr;
@@ -170,6 +172,7 @@ static inline Expr* build_expr(Expr** exprs, void* addr, size_t size)
             }
         } else {
             Expr* n_expr   = new_expr();
+            if (n_expr == NULL) return NULL;
             n_expr->opkind = CONCAT8L;
             if (exprs == NULL || exprs[idx] == NULL) {
                 // fetch the concrete value, embed it in the expr
@@ -272,7 +275,9 @@ static inline Expr* model_build_return_expr(Expr* input_expr,
                                             uintptr_t concrete_value,
                                             uintptr_t meta)
 {
+    if (!symbolic_collection_active()) return NULL;
     Expr* ret_expr = new_expr();
+    if (ret_expr == NULL) return NULL;
     ret_expr->opkind = MODEL;
     ret_expr->op1 = input_expr;
     SET_EXPR_CONST_OP(ret_expr->op2, ret_expr->op2_is_const,
@@ -311,7 +316,7 @@ static inline int model_strcmp(CPUX86State* env, uintptr_t pc, uintptr_t n,
                                       R_ESI);
     }
 
-    if (!symbolic_mode) return mode;
+    if (!symbolic_mode || !symbolic_collection_active()) return mode;
     bool s1_exprs_allocated = false, s2_exprs_allocated = false;
     Expr** s1_exprs = get_expr_addr_span((uintptr_t)s1, s1_width,
                                          &s1_exprs_allocated);
@@ -355,6 +360,8 @@ static inline int model_strcmp(CPUX86State* env, uintptr_t pc, uintptr_t n,
         g_free(s2_exprs);
     }
 
+    if (s1_expr == NULL || s2_expr == NULL) return mode;
+
     uint64_t v = 0;
     v          = PACK_0(v, res);
     v          = PACK_1(v, s1_len);
@@ -362,6 +369,7 @@ static inline int model_strcmp(CPUX86State* env, uintptr_t pc, uintptr_t n,
     v          = PACK_3(v, bounded ? n : 0);
 
     Expr* e = new_expr();
+    if (e == NULL) return mode;
     e->opkind = MODEL;
     e->op1 = s1_expr;
     e->op2 = s2_expr;
@@ -396,7 +404,7 @@ static inline int model_strlen_scanned(CPUX86State* env, uintptr_t pc,
     if (binradar_memcheck_enabled) {
         provenance_model_check_access(env, (target_ulong)s1, len, pc, reg);
     }
-    if (!symbolic_mode) return mode;
+    if (!symbolic_mode || !symbolic_collection_active()) return mode;
     bool s1_exprs_allocated = false;
     Expr** s1_exprs = get_expr_addr_span((uintptr_t)s1, len,
                                          &s1_exprs_allocated);
@@ -422,11 +430,14 @@ static inline int model_strlen_scanned(CPUX86State* env, uintptr_t pc,
         g_free(s1_exprs);
     }
 
+    if (s1_expr == NULL) return mode;
+
     uint64_t v = 0;
     v          = PACK_0(v, s1_len);
     v          = PACK_1(v, bounded ? n : 0);
 
     Expr* e = new_expr();
+    if (e == NULL) return mode;
     e->opkind = MODEL;
     e->op1 = s1_expr;
     SET_EXPR_CONST_OP(e->op2, e->op2_is_const, v);
@@ -484,7 +495,7 @@ static inline int model_memchr(CPUX86State* env, uintptr_t pc)
     if (binradar_memcheck_enabled) {
         provenance_model_check_access(env, (target_ulong)p, len, pc, R_EDI);
     }
-    if (!symbolic_mode) return mode;
+    if (!symbolic_mode || !symbolic_collection_active()) return mode;
 
     bool exprs_allocated = false;
     Expr** exprs = get_expr_addr_span(p, len, &exprs_allocated);
@@ -511,6 +522,8 @@ static inline int model_memchr(CPUX86State* env, uintptr_t pc)
         g_free(exprs);
     }
 
+    if (expr == NULL) return mode;
+
     uint16_t offset = res == NULL ? 0 : (((uintptr_t)res) - p) + 1;
 
     uint64_t v = 0;
@@ -519,6 +532,7 @@ static inline int model_memchr(CPUX86State* env, uintptr_t pc)
     v          = PACK_2(v, c);
 
     Expr* e = new_expr();
+    if (e == NULL) return mode;
     e->opkind = MODEL;
     e->op1 = expr;
     SET_EXPR_CONST_OP(e->op2, e->op2_is_const, v);
@@ -557,7 +571,7 @@ static inline int model_memcmp(CPUX86State* env, uintptr_t pc)
         provenance_model_check_access(env, (target_ulong)s2, n, pc, R_ESI);
     }
 
-    if (!symbolic_mode) return mode;
+    if (!symbolic_mode || !symbolic_collection_active()) return mode;
     bool s1_exprs_allocated = false, s2_exprs_allocated = false;
     Expr** s1_exprs = get_expr_addr_span((uintptr_t)s1, n,
                                          &s1_exprs_allocated);
@@ -601,11 +615,14 @@ static inline int model_memcmp(CPUX86State* env, uintptr_t pc)
         g_free(s2_exprs);
     }
 
+    if (s1_expr == NULL || s2_expr == NULL) return mode;
+
     uint64_t v = 0;
     v          = PACK_0(v, res);
     v          = PACK_1(v, n);
 
     Expr* e = new_expr();
+    if (e == NULL) return mode;
     e->opkind = MODEL;
     e->op1 = s1_expr;
     e->op2 = s2_expr;
@@ -647,6 +664,7 @@ static inline void model_alloc(CPUX86State* env, uintptr_t pc,
     }
 
     Expr* e = new_expr();
+    if (e == NULL) return;
     e->opkind = MODEL;
     e->op1 = size_expr;
     SET_EXPR_CONST_OP(e->op2, e->op2_is_const, size);
@@ -678,6 +696,7 @@ static inline int model_atoi_like(CPUX86State* env, uintptr_t pc,
         result = atoll(s);
     }
 
+    if (!symbolic_collection_active()) return mode;
     size_t span = model_numeric_span(s, 10, &used_base);
     if (span == 0) {
         span = 1;
@@ -696,11 +715,13 @@ static inline int model_atoi_like(CPUX86State* env, uintptr_t pc,
     if (exprs_allocated) {
         g_free(exprs);
     }
+    if (input_expr == NULL) return mode;
     uint64_t meta = 0;
     meta = PACK_0(meta, span);
     meta = PACK_1(meta, used_base);
 
     Expr* q = model_build_return_expr(input_expr, (uintptr_t)result, meta);
+    if (q == NULL) return mode;
     add_query_with_model(q, pc, model_kind, "model_atoi_like");
     set_pending_model_return_expr(q);
     return mode;
@@ -736,6 +757,7 @@ static inline int model_strtol_like(CPUX86State* env, uintptr_t pc,
         clear_mem((uintptr_t)endptr, sizeof(char*));
     }
 
+    if (!symbolic_collection_active()) return mode;
     size_t span = model_numeric_span(nptr, base, &used_base);
     if (span == 0) {
         span = 1;
@@ -755,6 +777,7 @@ static inline int model_strtol_like(CPUX86State* env, uintptr_t pc,
     if (exprs_allocated) {
         g_free(exprs);
     }
+    if (input_expr == NULL) return mode;
     uint64_t meta = 0;
     uintptr_t end_off = 0;
     if (end_local != NULL) {
@@ -765,6 +788,7 @@ static inline int model_strtol_like(CPUX86State* env, uintptr_t pc,
     meta = PACK_2(meta, end_off);
 
     Expr* q = model_build_return_expr(input_expr, concrete_value, meta);
+    if (q == NULL) return mode;
     add_query_with_model(q, pc, model_kind, "model_strtol_like");
     set_pending_model_return_expr(q);
     return mode;

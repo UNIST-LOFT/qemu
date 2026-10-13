@@ -197,6 +197,7 @@ static inline void add_symbolic_heap_bounds_query(uintptr_t addr_idx,
                                                    uintptr_t offset,
                                                    size_t access_size)
 {
+    if (!symbolic_collection_active()) return;
     Expr* addr_expr;
     Expr* offset_expr;
     SymbolicHeapAlloc* alloc;
@@ -217,6 +218,7 @@ static inline void add_symbolic_heap_bounds_query(uintptr_t addr_idx,
 
     if (offset != 0) {
         Expr* addr_with_offset = new_expr();
+        if (addr_with_offset == NULL) return;
         addr_with_offset->opkind = ADD;
         addr_with_offset->op1 = addr_expr;
         SET_EXPR_CONST_OP(addr_with_offset->op2,
@@ -225,12 +227,14 @@ static inline void add_symbolic_heap_bounds_query(uintptr_t addr_idx,
     }
 
     offset_expr = new_expr();
+    if (offset_expr == NULL) return;
     offset_expr->opkind = SUB;
     offset_expr->op1 = addr_expr;
     SET_EXPR_CONST_OP(offset_expr->op2, offset_expr->op2_is_const, base);
 
     if (access_size > 1) {
         Expr* last_byte_expr = new_expr();
+        if (last_byte_expr == NULL) return;
         last_byte_expr->opkind = ADD;
         last_byte_expr->op1 = offset_expr;
         SET_EXPR_CONST_OP(last_byte_expr->op2, last_byte_expr->op2_is_const,
@@ -239,6 +243,7 @@ static inline void add_symbolic_heap_bounds_query(uintptr_t addr_idx,
     }
 
     Expr* q = new_expr();
+    if (q == NULL) return;
     q->opkind = BINRADAR_HEAP_BOUND_CHECK;
     q->op1 = offset_expr;
     q->op2 = alloc->size_expr;
@@ -570,21 +575,38 @@ static void print_query_loc(Query *query, uint64_t pc, const char *msg) {
 static void end_symbolic_mode(void);
 static SymbolicCollectionStopReason collection_stop_reason;
 
-static G_NORETURN void stop_symbolic_collection(
-    SymbolicCollectionStopReason reason)
+bool symbolic_collection_active(void)
 {
-    collection_stop_reason = reason;
-    end_symbolic_mode();
-    snapshot_stop_collection(reason);
+    return collection_stop_reason == SYMBOLIC_COLLECTION_COMPLETE;
 }
 
-static G_NORETURN void stop_expression_collection(void)
+SymbolicCollectionStopReason symbolic_get_collection_stop_reason(void)
+{
+    return collection_stop_reason;
+}
+
+static void stop_symbolic_collection(SymbolicCollectionStopReason reason)
+{
+    if (!symbolic_collection_active()) return;
+    collection_stop_reason = reason;
+    /* Frozen memory DAGs remain available to bounded baseline analysis, but
+     * no subsequent runtime operation may propagate their stale shadow. */
+    memset(s_temps, 0, sizeof(s_temps));
+    last_expr = NULL;
+    end_symbolic_mode();
+    if (!snapshot_is_binradar()) {
+        snapshot_stop_collection(reason);
+    }
+}
+
+static void stop_expression_collection(void)
 {
     stop_symbolic_collection(SYMBOLIC_COLLECTION_EXPR_CAPACITY);
 }
 
-static void check_query_capacity(void)
+static bool check_query_capacity(void)
 {
+    if (!symbolic_collection_active()) return false;
     /* The handshake and terminal have their own slots.  A bad cursor is an
      * engine error, not an ordinary capacity cutoff. */
     uintptr_t cursor = (uintptr_t)next_query;
@@ -597,7 +619,9 @@ static void check_query_capacity(void)
     }
     if (cursor == terminal) {
         stop_symbolic_collection(SYMBOLIC_COLLECTION_QUERY_CAPACITY);
+        return false;
     }
+    return true;
 }
 
 /* Reserve and commit are the only ordinary queue cursor mutation.  Typed
@@ -605,7 +629,7 @@ static void check_query_capacity(void)
  * preserving the exact admitted index needed by S1 observations. */
 static Query *query_reserve(void)
 {
-    check_query_capacity();
+    if (!check_query_capacity()) return NULL;
     memset(next_query, 0, sizeof(*next_query));
     return next_query;
 }
@@ -613,7 +637,7 @@ static Query *query_reserve(void)
 static int64_t query_commit(Query *slot, uintptr_t pc, const char *msg,
                             bool log_location)
 {
-    check_query_capacity();
+    if (!check_query_capacity()) return -1;
     if (slot != next_query) tcg_abort();
     int64_t admitted_index = (int64_t)(slot - query_queue);
     if (log_location) print_query_loc(slot, pc, msg);
@@ -629,7 +653,9 @@ static int64_t query_commit(Query *slot, uintptr_t pc, const char *msg,
 static int64_t publish_ordinary_query(Expr *expression, uintptr_t address,
                                       uintptr_t pc, const char *message)
 {
+    if (expression == NULL) return -1;
     Query *slot = query_reserve();
+    if (slot == NULL) return -1;
     slot->query = expression;
     slot->address = address;
     return query_commit(slot, pc, message, true);
@@ -638,7 +664,9 @@ static int64_t publish_ordinary_query(Expr *expression, uintptr_t address,
 static int64_t publish_model_query(Expr *expression, uintptr_t address,
                                    MODEL_T model, const char *message)
 {
+    if (expression == NULL) return -1;
     Query *slot = query_reserve();
+    if (slot == NULL) return -1;
     slot->query = expression;
     slot->address = address;
     slot->model = model;
@@ -1435,7 +1463,7 @@ static inline void add_void_call_8_after(
     }
 }
 
-static inline void check_pool_expr_capacity(size_t count)
+static inline bool check_pool_expr_capacity(size_t count)
 {
     uintptr_t start = (uintptr_t)pool;
     uintptr_t cursor = (uintptr_t)next_free_expr;
@@ -1444,14 +1472,21 @@ static inline void check_pool_expr_capacity(size_t count)
         (cursor - start) % sizeof(Expr) != 0) {
         tcg_abort();
     }
+    if (count == 0) return true; /* Finalization validates a frozen cursor. */
+    if (!symbolic_collection_active()) return false;
     if (count > (end - cursor) / sizeof(Expr)) {
         stop_expression_collection();
+        return false;
     }
+    return true;
 }
 
 static inline Expr* new_expr(void)
 {
-    check_pool_expr_capacity(1);
+    if (!check_pool_expr_capacity(1)) {
+        last_expr = NULL;
+        return NULL;
+    }
     last_expr = next_free_expr++;
     return last_expr;
 }
@@ -1466,6 +1501,7 @@ void print_reg(void);
 void print_reg(void)
 {
     debug_printf("%s is %ssymbolic\n", s_config.symbolic_exec_reg_name,
+                 symbolic_collection_active() && s_temps[12] != NULL &&
                  s_temps[12]->opkind == IS_SYMBOLIC ? "" : "not ");
 }
 DEF_HELPER_INFO(print_reg);
@@ -1473,6 +1509,7 @@ DEF_HELPER_INFO(print_reg);
 static inline void new_symbolic_expr(void)
 {
     Expr* e   = new_expr();
+    if (e == NULL) return;
     e->opkind = IS_SYMBOLIC;
     e->op1    = 0; // FixMe: assign id based on the specific symbolic input
     debug_printf("Marking expr%lu as symbolic\n", GET_EXPR_IDX(e));
@@ -1660,6 +1697,9 @@ static inline void tcg_load_n(TCGTemp* ts_from, TCGTemp* ts_to,
         // ToDo: add _i32 address mode
         case 8:
             opc = INDEX_op_ld_i64;
+            break;
+        case 4:
+            opc = INDEX_op_ld32u_i64;
             break;
         case 1:
             opc = INDEX_op_ld8u_i64;
@@ -2030,6 +2070,11 @@ static inline void init_reg(size_t reg, TCGOp* op_in, TCGContext* tcg_ctx)
     tcg_movi(t_last_expr, (uintptr_t)&last_expr, 0, op_in, NULL, tcg_ctx);
     tcg_load_n(t_last_expr, t_last_expr, 0, 0, 0, sizeof(uintptr_t), op_in,
                NULL, tcg_ctx);
+    TCGTemp* t_zero = new_non_conflicting_temp(TCG_TYPE_PTR);
+    tcg_movi(t_zero, 0, 0, op_in, NULL, tcg_ctx);
+    TCGLabel* label_no_expr = gen_new_label();
+    tcg_brcond(label_no_expr, t_last_expr, t_zero, TCG_COND_EQ, 0, 1,
+               op_in, NULL, tcg_ctx);
 
     TCGTemp* t_reg_id = new_non_conflicting_temp(TCG_TYPE_PTR);
     tcg_movi(t_reg_id, (uintptr_t)reg, 0, op_in, NULL, tcg_ctx);
@@ -2045,6 +2090,7 @@ static inline void init_reg(size_t reg, TCGOp* op_in, TCGContext* tcg_ctx)
     tcg_movi(t_dst, (uintptr_t)&s_temps[reg], 0, op_in, NULL, tcg_ctx);
     tcg_store_n(t_dst, t_last_expr, 0, 1, 1, sizeof(uintptr_t), op_in, NULL,
                 tcg_ctx);
+    tcg_set_label(label_no_expr, op_in, NULL, tcg_ctx);
 
     CHECK_TEMPS_COUNT(tcg_ctx);
 }
@@ -2084,6 +2130,23 @@ static inline void allocate_new_expr_conditional(TCGTemp* t_out, TCGOp* op_in,
 {
     SAVE_TEMPS_COUNT(tcg_ctx);
     TCGOp* op;
+    assert(label != NULL);
+
+    /* Collection state is runtime-local: cached TBs also execute after a
+     * cutoff, and a later fork can start from an unfrozen parent snapshot. */
+    TCGTemp* t_reason = new_non_conflicting_temp(TCG_TYPE_I64);
+    tcg_movi(t_reason, (uintptr_t)&collection_stop_reason, 0, op_in, &op,
+             tcg_ctx);
+    set_conditional_instrumentation_label(op, label->id);
+    tcg_load_n(t_reason, t_reason, 0, 0, 0, sizeof(collection_stop_reason),
+               op_in, &op, tcg_ctx);
+    set_conditional_instrumentation_label(op, label->id);
+    TCGTemp* t_zero = new_non_conflicting_temp(TCG_TYPE_I64);
+    tcg_movi(t_zero, 0, 0, op_in, &op, tcg_ctx);
+    set_conditional_instrumentation_label(op, label->id);
+    tcg_brcond(label, t_reason, t_zero, TCG_COND_NE, 1, 1, op_in, &op,
+               tcg_ctx);
+    set_conditional_instrumentation_label(op, label->id);
 
     TCGTemp* t_next_free_expr_addr = new_non_conflicting_temp(TCG_TYPE_PTR);
     tcg_movi(t_next_free_expr_addr, (uintptr_t)&next_free_expr, 0, op_in, &op,
@@ -2099,8 +2162,8 @@ static inline void allocate_new_expr_conditional(TCGTemp* t_out, TCGOp* op_in,
         set_conditional_instrumentation_label(op, label->id);
     }
 
-    /* The common path stays inline.  The only helper call is the nonreturning
-     * cutoff, before any Expr store or cursor increment can cross the pool. */
+    /* Check before any Expr store or cursor increment. BINRADAR's cold
+     * cutoff returns to the caller's concrete path; other modes exit. */
     TCGTemp* t_pool_end = new_non_conflicting_temp(TCG_TYPE_PTR);
     tcg_movi(t_pool_end, (uintptr_t)(pool + EXPR_POOL_CAPACITY), 0,
              op_in, &op, tcg_ctx);
@@ -2111,7 +2174,9 @@ static inline void allocate_new_expr_conditional(TCGTemp* t_out, TCGOp* op_in,
     if (label) set_conditional_instrumentation_label(op, label->id);
     add_void_call_0(stop_expression_collection, op_in, &op, tcg_ctx);
     mark_insn_as_instrumentation(op);
-    if (label) set_conditional_instrumentation_label(op, label->id);
+    set_conditional_instrumentation_label(op, label->id);
+    tcg_br(label, op_in, &op, tcg_ctx);
+    set_conditional_instrumentation_label(op, label->id);
     tcg_set_label(label_has_room, op_in, &op, tcg_ctx);
     if (label) set_conditional_instrumentation_label(op, label->id);
 
@@ -2143,9 +2208,9 @@ static inline void allocate_new_expr_conditional(TCGTemp* t_out, TCGOp* op_in,
 }
 
 static inline void allocate_new_expr(TCGTemp* t_out, TCGOp* op_in,
-                                     TCGContext* tcg_ctx)
+                                     TCGContext* tcg_ctx, TCGLabel* cutoff)
 {
-    allocate_new_expr_conditional(t_out, op_in, tcg_ctx, NULL);
+    allocate_new_expr_conditional(t_out, op_in, tcg_ctx, cutoff);
 }
 
 #if DEBUG_EXPR_CONSISTENCY
@@ -2194,6 +2259,7 @@ static inline Expr** debug_expr_addr(uintptr_t addr, size_t size, uint8_t alloca
 int count = 0;
 static void add_consistency_check(Expr* e, uintptr_t value, size_t size, OPKIND opkind)
 {
+    if (!symbolic_collection_active() || e == NULL) return;
 #if 0
 #if 1
     if (GET_QUERY_IDX(next_query - 1) >= 9700) {
@@ -2298,6 +2364,7 @@ static void add_consistency_check(Expr* e, uintptr_t value, size_t size, OPKIND 
         return;
 
     Expr*     consistency_expr = new_expr();
+    if (consistency_expr == NULL) return;
     consistency_expr->opkind   = CONSISTENCY_CHECK;
     consistency_expr->op1      = e;
     SET_EXPR_CONST_OP(consistency_expr->op2, consistency_expr->op2_is_const, value);
@@ -2321,6 +2388,7 @@ static void add_consistency_check(Expr* e, uintptr_t value, size_t size, OPKIND 
 
 static void add_consistency_check_addr(Expr* e, uintptr_t addr, size_t size, OPKIND opkind) 
 {
+    if (!symbolic_collection_active() || e == NULL) return;
     assert(size > 0);
     uintptr_t concrete_value = 0;
     for (size_t i = 0; i < size; i++) {
@@ -2342,6 +2410,7 @@ static inline void move_temp_size_helper(size_t from, size_t to, uintptr_t val, 
 static inline void move_temp_size_helper(size_t from, size_t to, size_t size)
 #endif
 {
+    if (!symbolic_collection_active()) return;
 #if DEBUG_EXPR_CONSISTENCY
     if (s_temps[from]) {
         add_consistency_check(s_temps[from], val, size, MOV);
@@ -2360,6 +2429,7 @@ static inline void move_temp_size_helper(size_t from, size_t to, size_t size)
     if (from_expr && size < sizeof(uintptr_t)) {
         if (!(from_expr->opkind == ZEXT && CONST(from_expr->op2) == 32)) {
             Expr* e   = new_expr();
+            if (e == NULL) return;
             e->opkind = EXTRACT;
             e->op1    = from_expr;
             SET_EXPR_CONST_OP(e->op2, e->op2_is_const, 31);
@@ -2377,6 +2447,7 @@ static inline void move_temp_helper(size_t from, size_t to, uintptr_t val)
 static inline void move_temp_helper(size_t from, size_t to)
 #endif
 {
+    if (!symbolic_collection_active()) return;
 #if 0
     if (*((uint64_t*)0x40007ff0b8) == 0x4000e60700) {
         printf("HERE\n");
@@ -2529,6 +2600,7 @@ static inline void preserve_op_load(TCGTemp* t, TCGOp* op_in,
 static inline void qemu_binop_helper(uintptr_t opkind, uintptr_t packed_idx,
                                      uintptr_t a, uintptr_t b)
 {
+    if (!symbolic_collection_active()) return;
     uintptr_t out_idx = UNPACK_0(packed_idx);
     uintptr_t a_idx   = UNPACK_1(packed_idx);
     uintptr_t b_idx   = UNPACK_2(packed_idx);
@@ -2565,6 +2637,7 @@ static inline void qemu_binop_helper(uintptr_t opkind, uintptr_t packed_idx,
 #endif
 
     Expr* binop_expr   = new_expr();
+    if (binop_expr == NULL) return;
     binop_expr->opkind = (OPKIND)opkind;
 
     if (expr_a)
@@ -2764,6 +2837,7 @@ static inline void qemu_unop_helper(uintptr_t opkind, uintptr_t t_out_idx,
                                     uintptr_t t_op_a_idx, uintptr_t t_op_a,
                                     uintptr_t size)
 {
+    if (!symbolic_collection_active()) return;
     Expr* expr_a = s_temps[t_op_a_idx];
     if (expr_a == NULL) {
         s_temps[t_out_idx] = NULL;
@@ -2771,6 +2845,7 @@ static inline void qemu_unop_helper(uintptr_t opkind, uintptr_t t_out_idx,
     }
 
     Expr* unop_expr   = new_expr();
+    if (unop_expr == NULL) return;
     unop_expr->opkind = (OPKIND)opkind;
     unop_expr->op1    = expr_a;
     SET_EXPR_CONST_OP(unop_expr->op2, unop_expr->op2_is_const, size);
@@ -2870,7 +2945,7 @@ static inline void qemu_pc_write(TCGTemp* t_op_a, TCGOp* op_in,
     TCGTemp* t_out = new_non_conflicting_temp(TCG_TYPE_I64);
 
     // FixMe: we assume that Expr is zero-initialzed!
-    allocate_new_expr(t_out, op_in, tcg_ctx);
+    allocate_new_expr(t_out, op_in, tcg_ctx, label_a_concrete);
 
     TCGTemp* t_opkind = new_non_conflicting_temp(TCG_TYPE_I64);
     tcg_movi(t_opkind, SYMBOLIC_PC, 0, op_in, NULL, tcg_ctx);
@@ -2936,7 +3011,7 @@ static inline void qemu_jump_table(TCGTemp* t_addr, TCGOp* op_in,
     TCGTemp* t_out = new_non_conflicting_temp(TCG_TYPE_I64);
 
     // FixMe: we assume that Expr is zero-initialzed!
-    allocate_new_expr(t_out, op_in, tcg_ctx);
+    allocate_new_expr(t_out, op_in, tcg_ctx, label_a_concrete);
 
     TCGTemp* t_opkind = new_non_conflicting_temp(TCG_TYPE_I64);
     tcg_movi(t_opkind, SYMBOLIC_JUMP_TABLE_ACCESS, 0, op_in, NULL, tcg_ctx);
@@ -3399,6 +3474,7 @@ static inline Expr* get_base_expr(Expr* e)
 static Expr*       last_load_concretization = NULL;
 static inline void load_concretization(Expr* addr_expr, uintptr_t addr)
 {
+    if (!symbolic_collection_active()) return;
 #if 0
     if (CONST(addr_expr) < 0x500000) {
         tcg_abort();
@@ -3409,6 +3485,7 @@ static inline void load_concretization(Expr* addr_expr, uintptr_t addr)
 
     if (last_load_concretization != base_expr) {
         Expr* e   = new_expr();
+        if (e == NULL) return;
         e->opkind = SYMBOLIC_LOAD;
         e->op1    = addr_expr;
         SET_EXPR_CONST_OP(e->op2, e->op2_is_const, addr);
@@ -3429,10 +3506,12 @@ static inline void load_concretization(Expr* addr_expr, uintptr_t addr)
 static Expr*       last_store_concretization = NULL;
 static inline void store_concretization(Expr* addr_expr, uintptr_t addr)
 {
+    if (!symbolic_collection_active()) return;
     Expr* base_expr = get_base_expr(addr_expr);
 
     if (last_store_concretization != base_expr) {
         Expr* e   = new_expr();
+        if (e == NULL) return;
         e->opkind = SYMBOLIC_STORE;
         e->op1    = addr_expr;
         SET_EXPR_CONST_OP(e->op2, e->op2_is_const, addr);
@@ -3454,6 +3533,7 @@ static inline void store_concretization(Expr* addr_expr, uintptr_t addr)
 #if DEBUG_EXPR_CONSISTENCY
 static void add_consistency_check_load(Expr* e, uintptr_t addr, size_t size) 
 {
+    if (!symbolic_collection_active() || e == NULL) return;
     uintptr_t concrete_value = 0;
     for (size_t i = 0; i < size; i++) {
         uintptr_t v = *(((uint8_t*)addr) + i);
@@ -3498,7 +3578,8 @@ static inline void qemu_load_helper(CPUArchState *env, uintptr_t orig_addr,
 #endif
 
 
-    if (addr_idx < TCG_MAX_TEMPS && s_temps[addr_idx]) {
+    if (symbolic_collection_active() &&
+        addr_idx < TCG_MAX_TEMPS && s_temps[addr_idx]) {
 #if 0
         if (CONST(s_temps[addr_idx]) < 0x500000) {
            printf("\nSymbolic Access: %p\n", s_temps[addr_idx]);
@@ -3551,7 +3632,7 @@ static inline void qemu_load_helper(CPUArchState *env, uintptr_t orig_addr,
                     const size_t slice_exprs =
                         (sizeof(uintptr_t) + SLICE_SIZE + sizeof(Expr) - 1) /
                         sizeof(Expr);
-                    check_pool_expr_capacity(slice_exprs);
+                    if (!check_pool_expr_capacity(slice_exprs)) goto load_observation;
                     assert(const_mem_map[idx].base == 0);
                     const_mem_map[idx].status = 1;
                     const_mem_map[idx].used   = 1;
@@ -3586,18 +3667,21 @@ static inline void qemu_load_helper(CPUArchState *env, uintptr_t orig_addr,
                 Expr* offset_addr = s_temps[addr_idx];
                 if (offset > 0) {
                     offset_addr = new_expr();
+                    if (offset_addr == NULL) goto load_observation;
                     offset_addr->opkind = ADD;
                     offset_addr->op1 = s_temps[addr_idx];
                     SET_EXPR_CONST_OP(offset_addr->op2, offset_addr->op2_is_const, offset);
                 }
 
                 Expr* q   = new_expr();
+                if (q == NULL) goto load_observation;
                 q->opkind = MEMORY_SLICE_ACCESS;
                 q->op1    = offset_addr;
                 q->op2    = EXPR_CONST_OP(addr);
                 q->op3    = EXPR_CONST_OP(symbolic_access_id);
 
                 Expr* e   = new_expr();
+                if (e == NULL) goto load_observation;
                 e->opkind = IS_SYMBOLIC;
                 e->op1    = EXPR_CONST_OP(symbolic_access_id);
                 e->op2    = EXPR_CONST_OP(size);
@@ -3623,6 +3707,7 @@ static inline void qemu_load_helper(CPUArchState *env, uintptr_t orig_addr,
                 size_t k = 0;
                 while (slices_addrs[k]) {
                     Expr* s   = new_expr();
+                    if (s == NULL) goto load_observation;
                     s->opkind = MEMORY_SLICE;
                     s->op1    = slices_addrs[k];
                     s->op2    = EXPR_CONST_OP(symbolic_access_id);
@@ -3631,6 +3716,7 @@ static inline void qemu_load_helper(CPUArchState *env, uintptr_t orig_addr,
 
                 if (size < 8) {
                     Expr*     n_expr = new_expr();
+                    if (n_expr == NULL) goto load_observation;
                     uintptr_t opkind = get_mem_op_signextend(mem_op) ? SEXT : ZEXT;
                     n_expr->opkind   = opkind;
                     n_expr->op1      = e;
@@ -3645,9 +3731,10 @@ static inline void qemu_load_helper(CPUArchState *env, uintptr_t orig_addr,
                 }
 
                 symbolic_access_id += 1;
-                s_temps[val_idx] = e;
+                s_temps[val_idx] = symbolic_collection_active() ? e : NULL;
                 
                 publish_ordinary_query(q, 0, current_tb_pc, "qemu_load_helper_1");
+                if (!symbolic_collection_active()) goto load_observation;
                 // next_query[0].query   = q;
                 // next_query[0].address = 0;
                 // next_query++;
@@ -3669,24 +3756,28 @@ static inline void qemu_load_helper(CPUArchState *env, uintptr_t orig_addr,
                     Expr* offset_addr = s_temps[addr_idx];
                     if (offset > 0) {
                         offset_addr = new_expr();
+                        if (offset_addr == NULL) goto load_observation;
                         offset_addr->opkind = ADD;
                         offset_addr->op1 = s_temps[addr_idx];
                         SET_EXPR_CONST_OP(offset_addr->op2, offset_addr->op2_is_const, offset);
                     }
 
                     Expr* q   = new_expr();
+                    if (q == NULL) goto load_observation;
                     q->opkind = MEMORY_INPUT_SLICE_ACCESS;
                     q->op1    = offset_addr;
                     q->op2    = EXPR_CONST_OP(addr);
                     q->op3    = EXPR_CONST_OP(symbolic_access_id);
 
                     Expr* e   = new_expr();
+                    if (e == NULL) goto load_observation;
                     e->opkind = IS_SYMBOLIC;
                     e->op1    = EXPR_CONST_OP(symbolic_access_id);
                     e->op2    = EXPR_CONST_OP(size);
                     e->op3    = EXPR_CONST_OP(addr - input_start_addr);
 
                     Expr* s   = new_expr();
+                    if (s == NULL) goto load_observation;
                     s->opkind = INPUT_SLICE;
                     s->op1    = EXPR_CONST_OP(input_start_addr);
                     s->op2    = EXPR_CONST_OP(input_end_addr);
@@ -3694,6 +3785,7 @@ static inline void qemu_load_helper(CPUArchState *env, uintptr_t orig_addr,
 
                     if (size < 8) {
                         Expr*     n_expr = new_expr();
+                        if (n_expr == NULL) goto load_observation;
                         uintptr_t opkind = get_mem_op_signextend(mem_op) ? SEXT : ZEXT;
                         n_expr->opkind   = opkind;
                         n_expr->op1      = e;
@@ -3702,9 +3794,10 @@ static inline void qemu_load_helper(CPUArchState *env, uintptr_t orig_addr,
                     }
 
                     symbolic_access_id += 1;
-                    s_temps[val_idx] = e;
+                    s_temps[val_idx] = symbolic_collection_active() ? e : NULL;
 
                     publish_ordinary_query(q, 0, current_tb_pc, "qemu_load_helper_2");
+                    if (!symbolic_collection_active()) goto load_observation;
                     // next_query[0].query   = q;
                     // next_query[0].address = 0;
                     // next_query++;
@@ -3728,8 +3821,12 @@ static inline void qemu_load_helper(CPUArchState *env, uintptr_t orig_addr,
 #endif
     }
 
+#if SYMBOLIC_COSTANT_ACCESS
+load_observation:;
+#endif
     uintptr_t  l1_page_idx = addr >> (L1_PAGE_BITS + L2_PAGE_BITS);
-    l2_page_t* l2_page     = s_memory.table.entries[l1_page_idx];
+    l2_page_t* l2_page = symbolic_collection_active()
+        ? s_memory.table.entries[l1_page_idx] : NULL;
     bool early_exit = false;
     Expr*   exprs[8]         = {NULL};
     uint8_t expr_is_not_null = 0;
@@ -3832,7 +3929,7 @@ static inline void qemu_load_helper(CPUArchState *env, uintptr_t orig_addr,
     }
     
     
-    if (early_exit) {
+    if (!symbolic_collection_active() || early_exit) {
         s_temps[val_idx] = NULL;
         return;
     }
@@ -3896,6 +3993,7 @@ static inline void qemu_load_helper(CPUArchState *env, uintptr_t orig_addr,
                 if (exprs[i] == NULL) {
                     // allocate a new expr for the concrete value
                     e                  = new_expr();
+                    if (e == NULL) return;
                     e->opkind          = IS_CONST;
                     uint8_t* byte_addr = ((uint8_t*)addr) + i;
                     uint8_t  byte      = *byte_addr;
@@ -3916,6 +4014,7 @@ static inline void qemu_load_helper(CPUArchState *env, uintptr_t orig_addr,
                 }
             } else {
                 Expr* n_expr   = new_expr();
+                if (n_expr == NULL) return;
                 n_expr->opkind = CONCAT8R;
 
                 n_expr->op1 = e;
@@ -3979,6 +4078,7 @@ static inline void qemu_load_helper(CPUArchState *env, uintptr_t orig_addr,
             !(opkind == e->opkind && CONST(e->op2) <= (8 * size))) {
 
             Expr*     n_expr = new_expr();
+            if (n_expr == NULL) return;
             n_expr->opkind   = opkind;
             n_expr->op1      = e;
             n_expr->op2      = (Expr*)(8 * size);
@@ -3997,6 +4097,7 @@ static inline void qemu_load_helper(CPUArchState *env, uintptr_t orig_addr,
     if (size <= 8 && e != NULL && is_valid_address(addr, true)) {
         // Add query BINRADAR_CONCRETIZATION
         Expr *binradar_e = new_expr();
+        if (binradar_e == NULL) return;
         binradar_e->opkind = BINRADAR_CONCRETIZATION;
         binradar_e->op1 = e;
         binradar_e->op2 = NULL;
@@ -4019,7 +4120,7 @@ static inline void qemu_load_helper(CPUArchState *env, uintptr_t orig_addr,
     //     trace_mem("[tmplog] load symbolic [pc 0x%lx] [addr 0x%lx] [size 0x%lx] %p\n", current_tb_pc, addr, size, e);
     // }
 
-    s_temps[val_idx] = e;
+    s_temps[val_idx] = symbolic_collection_active() ? e : NULL;
 }
 
 static inline void qemu_load(TCGTemp* t_addr, TCGTemp* t_val, uintptr_t offset,
@@ -4083,7 +4184,7 @@ static inline void qemu_load(TCGTemp* t_addr, TCGTemp* t_val, uintptr_t offset,
             tcg_brcond(label_expr_is_not_null, t_exprs[i], t_zero, TCG_COND_NE,
                        0, 0, op_in, NULL, tcg_ctx);
 
-            allocate_new_expr(t_exprs[i], op_in, tcg_ctx);
+            allocate_new_expr(t_exprs[i], op_in, tcg_ctx, label_write_null);
 
             TCGTemp* t_mem_value      = new_non_conflicting_temp(TCG_TYPE_I64);
             TCGTemp* t_mem_value_addr = new_non_conflicting_temp(TCG_TYPE_I64);
@@ -4115,7 +4216,7 @@ static inline void qemu_load(TCGTemp* t_addr, TCGTemp* t_val, uintptr_t offset,
         } else {
             TCGTemp* t_new_expr = new_non_conflicting_temp(TCG_TYPE_PTR);
             // FixMe: pre-allocate size exprs outside the loop
-            allocate_new_expr(t_new_expr, op_in, tcg_ctx);
+            allocate_new_expr(t_new_expr, op_in, tcg_ctx, label_write_null);
 
             TCGTemp* t_opkind = new_non_conflicting_temp(TCG_TYPE_I64);
             tcg_movi(t_opkind, CONCAT8R, 0, op_in, NULL, tcg_ctx);
@@ -4170,7 +4271,7 @@ static inline void qemu_load(TCGTemp* t_addr, TCGTemp* t_val, uintptr_t offset,
     if (size < 8) // FixMe: other archs
     {
         TCGTemp* t_new_expr = new_non_conflicting_temp(TCG_TYPE_PTR);
-        allocate_new_expr(t_new_expr, op_in, tcg_ctx);
+        allocate_new_expr(t_new_expr, op_in, tcg_ctx, label_write_null);
 
         TCGTemp*  t_opkind = new_non_conflicting_temp(TCG_TYPE_I64);
         uintptr_t opkind   = get_mem_op_signextend(mem_op) ? SEXT : ZEXT;
@@ -4226,6 +4327,7 @@ static inline void qemu_multi_page_store(l2_page_t* l2_page, uintptr_t l2_page_i
                                         l3_page_t* l3_page, uintptr_t l3_page_idx,
                                         uintptr_t size, Expr* v, size_t expr_index)
 {
+    if (!symbolic_collection_active()) return;
     uintptr_t pa_size  = 1 << L3_PAGE_BITS;
     ssize_t   new_size = (ssize_t)size;
 
@@ -4237,6 +4339,7 @@ static inline void qemu_multi_page_store(l2_page_t* l2_page, uintptr_t l2_page_i
     } else {
         for (size_t i = l3_page_idx; i < pa_size; i++) {
             Expr* e                           = new_expr();
+            if (e == NULL) return;
             e->opkind                         = EXTRACT8;
             e->op1                            = v;
             size_t idx                        = expr_index;
@@ -4351,6 +4454,8 @@ static inline void qemu_store_helper(CPUArchState *env,
         }
     }
 #endif
+
+    if (!symbolic_collection_active()) return;
 
 #if SYMBOLIC_COSTANT_ACCESS
     uintptr_t norm_addr = (orig_addr / SLICE_SIZE) * SLICE_SIZE;
@@ -4515,6 +4620,7 @@ static inline void qemu_store_helper(CPUArchState *env,
             }
 
             Expr* e    = new_expr();
+            if (e == NULL) return;
             e->opkind  = EXTRACT8;
             e->op1     = expr_a;
             e->op2     = (Expr*)idx;
@@ -4590,7 +4696,7 @@ static inline void qemu_store(TCGTemp* t_addr, TCGTemp* t_val, uintptr_t offset,
         // build EXTRACT expr
         TCGTemp* t_new_expr = new_non_conflicting_temp(TCG_TYPE_PTR);
         // FixMe: pre-allocate size exprs outside the loop
-        allocate_new_expr(t_new_expr, op_in, tcg_ctx);
+        allocate_new_expr(t_new_expr, op_in, tcg_ctx, label_end);
 
         TCGTemp* t_opkind = new_non_conflicting_temp(TCG_TYPE_I64);
         tcg_movi(t_opkind, EXTRACT8, 0, op_in, NULL, tcg_ctx);
@@ -4625,6 +4731,7 @@ static inline void qemu_extend_helper(uintptr_t packed_idx
 #endif
                                         )
 {
+    if (!symbolic_collection_active()) return;
     uintptr_t out_idx = UNPACK_0(packed_idx);
     uintptr_t a_idx   = UNPACK_1(packed_idx);
     uintptr_t extkind = UNPACK_2(packed_idx);
@@ -4671,6 +4778,10 @@ static inline void qemu_extend_helper(uintptr_t packed_idx
     }
 #endif
 
+    if (!symbolic_collection_active() || s_temps[a_idx] == NULL) {
+        s_temps[out_idx] = NULL;
+        return;
+    }
     if (s_temps[a_idx]->opkind == opkind
             && CONST(s_temps[a_idx]->op2) <= opkind_const_param) {
         s_temps[out_idx] = s_temps[a_idx];
@@ -4701,6 +4812,7 @@ static inline void qemu_extend_helper(uintptr_t packed_idx
     }
 
     Expr* e   = new_expr();
+    if (e == NULL) return;
     e->opkind = opkind;
     e->op1    = expr_a;
     SET_EXPR_CONST_OP(e->op2, e->op2_is_const, opkind_const_param);
@@ -5042,6 +5154,7 @@ static TCGCond check_branch_cond_helper(uintptr_t a, uintptr_t b, TCGCond cond)
 static void setcond_helper(uintptr_t a, uintptr_t b, uintptr_t cond,
                            uintptr_t out_idx, uintptr_t a_idx, uintptr_t b_idx)
 {
+    if (!symbolic_collection_active()) return;
     Expr* expr_a = s_temps[a_idx];
     Expr* expr_b = s_temps[b_idx];
     if (expr_a == NULL && expr_b == NULL) {
@@ -5050,6 +5163,7 @@ static void setcond_helper(uintptr_t a, uintptr_t b, uintptr_t cond,
     }
 
     Expr* setcond_expr   = new_expr();
+    if (setcond_expr == NULL) return;
     setcond_expr->opkind = get_opkind_from_cond(cond);
 
     if (expr_a)
@@ -5078,6 +5192,7 @@ static inline void branch_helper_internal(uintptr_t a, uintptr_t b,
                                           Expr* expr_b, size_t size,
                                           uintptr_t pc, uintptr_t addr_to)
 {
+    if (!symbolic_collection_active()) return;
 #if 1
     if (mode > 0) {
         return;
@@ -5097,8 +5212,10 @@ static inline void branch_helper_internal(uintptr_t a, uintptr_t b,
 #endif
 
     Query *branch_query = query_reserve();
+    if (branch_query == NULL) return;
 
     Expr*   branch_expr = new_expr();
+    if (branch_expr == NULL) return;
     TCGCond sat_cond    = check_branch_cond_helper(a, b, cond);
     branch_expr->opkind = get_opkind_from_cond(sat_cond);
     SET_EXPR_OP(branch_expr->op1, branch_expr->op1_is_const, expr_a, a);
@@ -5278,7 +5395,7 @@ static inline void branch(TCGTemp* t_op_a, TCGTemp* t_op_b, TCGCond cond,
     TCGTemp* t_out = new_non_conflicting_temp(TCG_TYPE_I64);
     allocate_new_expr(
         t_out, op_in,
-        tcg_ctx); // FixMe: we assume that Expr is zero-initialzed!
+        tcg_ctx, label_both_concrete);
 
     // set expr opkind
     TCGTemp* t_opkind = new_non_conflicting_temp(TCG_TYPE_I64);
@@ -5355,7 +5472,7 @@ static inline void branch(TCGTemp* t_op_a, TCGTemp* t_op_b, TCGCond cond,
     TCGTemp* t_new_pi_expr = new_non_conflicting_temp(TCG_TYPE_I64);
     allocate_new_expr(
         t_new_pi_expr, op_in,
-        tcg_ctx); // FixMe: we assume that Expr is zero-initialzed!
+        tcg_ctx, label_both_concrete);
 
     t_opkind = new_non_conflicting_temp(TCG_TYPE_I64);
     tcg_movi(t_opkind, AND, 0, op_in, NULL, tcg_ctx);
@@ -5395,7 +5512,7 @@ static inline void branch(TCGTemp* t_op_a, TCGTemp* t_op_b, TCGCond cond,
 
 static inline void read_from_input(intptr_t offset, uintptr_t addr, size_t size)
 {
-    if (size == 0) return;
+    if (size == 0 || !symbolic_collection_active()) return;
     if (symbolic_mode == 0) {
         symbolic_mode = 1;
     }
@@ -5444,6 +5561,7 @@ static inline void read_from_input(intptr_t offset, uintptr_t addr, size_t size)
             Expr* e_byte = input_exprs[offset];
             if (e_byte == NULL) {
                 e_byte              = new_expr();
+                if (e_byte == NULL) return;
                 e_byte->opkind      = IS_SYMBOLIC;
                 e_byte->op1         = (Expr*)(offset); // ID
                 e_byte->op2         = (Expr*)1;        // number of bytes
@@ -5476,6 +5594,46 @@ static inline void read_from_input(intptr_t offset, uintptr_t addr, size_t size)
     }
 }
 
+void symbolic_publish_collection_status(SymbolicCollectionStopReason reason,
+                                        int64_t query_cursor,
+                                        int64_t expr_cursor)
+{
+    if (query_cursor < 1 || query_cursor >= EXPR_QUERY_CAPACITY ||
+        expr_cursor < 0 || expr_cursor > EXPR_POOL_CAPACITY ||
+        reason > SYMBOLIC_COLLECTION_EXPR_CAPACITY ||
+        (reason == SYMBOLIC_COLLECTION_QUERY_CAPACITY &&
+         query_cursor != EXPR_QUERY_CAPACITY - 1)) {
+        tcg_abort();
+    }
+    bool complete = reason == SYMBOLIC_COLLECTION_COMPLETE;
+    const char *reason_name = symbolic_collection_reason_name(reason);
+    size_t queries = (size_t)query_cursor - 1;
+    size_t expr_bytes = (size_t)expr_cursor * sizeof(Expr);
+    const char *status_path = getenv("SYMBOLIC_COLLECTION_STATUS_FILE");
+    if (status_path != NULL && status_path[0] != '\0') {
+        char status[512];
+        int length = snprintf(status, sizeof(status),
+            "{\"version\":1,\"complete\":%s,\"reason\":\"%s\","
+            "\"queries\":%zu,\"expr_bytes\":%zu,\"query_capacity\":%u,"
+            "\"expr_capacity_bytes\":%zu}\n",
+            complete ? "true" : "false", reason_name, queries, expr_bytes,
+            EXPR_QUERY_CAPACITY, sizeof(Expr) * (size_t)EXPR_POOL_CAPACITY);
+        GError *error = NULL;
+        if (length < 0 || (size_t)length >= sizeof(status) ||
+            !g_file_set_contents(status_path, status, length, &error)) {
+            log_msg("[symbolic] [collection-error] [reason status-publication] "
+                    "[detail %s]\n", error != NULL ? error->message : "size");
+            g_clear_error(&error);
+            exit(EXIT_FAILURE);
+        }
+    }
+    log_msg("[symbolic] [collection] [version 1] [complete %u] [reason %s] "
+            "[queries %zu] [expr-bytes %zu] [query-capacity %u] "
+            "[expr-capacity-bytes %zu]\n", complete, reason_name, queries,
+            expr_bytes, EXPR_QUERY_CAPACITY,
+            sizeof(Expr) * (size_t)EXPR_POOL_CAPACITY);
+}
+
 static int finalization_done;
 static void end_symbolic_mode(void)
 {
@@ -5493,7 +5651,6 @@ static void end_symbolic_mode(void)
     size_t queries = (cursor - start) / sizeof(Query);
     size_t expr_bytes = (uintptr_t)next_free_expr - (uintptr_t)pool;
     bool complete = collection_stop_reason == SYMBOLIC_COLLECTION_COMPLETE;
-    const char *reason = symbolic_collection_reason_name(collection_stop_reason);
 
     /* next_query names the first uncommitted slot.  Overwrite any reservation
      * interrupted by expression exhaustion; never publish that partial query. */
@@ -5504,29 +5661,9 @@ static void end_symbolic_mode(void)
                      complete ? FINAL_QUERY : FINAL_QUERY_CAPACITY,
                      __ATOMIC_RELEASE);
 
-    const char *status_path = getenv("SYMBOLIC_COLLECTION_STATUS_FILE");
-    if (status_path != NULL && status_path[0] != '\0') {
-        char status[512];
-        int length = snprintf(status, sizeof(status),
-            "{\"version\":1,\"complete\":%s,\"reason\":\"%s\","
-            "\"queries\":%zu,\"expr_bytes\":%zu,\"query_capacity\":%u,"
-            "\"expr_capacity_bytes\":%zu}\n",
-            complete ? "true" : "false", reason, queries, expr_bytes,
-            EXPR_QUERY_CAPACITY, sizeof(Expr) * (size_t)EXPR_POOL_CAPACITY);
-        GError *error = NULL;
-        if (length < 0 || (size_t)length >= sizeof(status) ||
-            !g_file_set_contents(status_path, status, length, &error)) {
-            log_msg("[symbolic] [collection-error] [reason status-publication] "
-                    "[detail %s]\n", error != NULL ? error->message : "size");
-            g_clear_error(&error);
-            exit(EXIT_FAILURE);
-        }
-    }
-    log_msg("[symbolic] [collection] [version 1] [complete %u] [reason %s] "
-            "[queries %zu] [expr-bytes %zu] [query-capacity %u] "
-            "[expr-capacity-bytes %zu]\n", complete, reason, queries,
-            expr_bytes, EXPR_QUERY_CAPACITY,
-            sizeof(Expr) * (size_t)EXPR_POOL_CAPACITY);
+    symbolic_publish_collection_status(collection_stop_reason,
+                                       next_query - query_queue,
+                                       next_free_expr - pool);
     finalization_done = 1;
     __atomic_store_n(&query_queue[0].query, SHM_DONE, __ATOMIC_RELEASE);
 
@@ -5586,7 +5723,8 @@ static Expr** get_expr_addr(uintptr_t addr, size_t size, uint8_t allocate,
 static Expr** get_expr_addr_span(uintptr_t addr, size_t size, bool *allocated)
 {
     *allocated = false;
-    if (size == 0 || addr > UINTPTR_MAX - (size - 1)) {
+    if (!symbolic_collection_active() || size == 0 ||
+        addr > UINTPTR_MAX - (size - 1)) {
         return NULL;
     }
 
@@ -5622,7 +5760,7 @@ Expr* symbolic_rebuild_load_expr(uintptr_t addr, uint32_t size,
     Expr* exprs[8] = {NULL};
     uint8_t expr_is_not_null = 0;
 
-    if (size == 0 || size > 8) {
+    if (!symbolic_collection_active() || size == 0 || size > 8) {
         return NULL;
     }
 
@@ -5677,6 +5815,7 @@ Expr* symbolic_rebuild_load_expr(uintptr_t addr, uint32_t size,
             if (i == size - 1) {
                 if (exprs[i] == NULL) {
                     Expr* c = new_expr();
+                    if (c == NULL) return NULL;
                     c->opkind = IS_CONST;
                     if (concrete_bytes != NULL) {
                         c->op1 = (Expr*)((uintptr_t)concrete_bytes[i]);
@@ -5692,6 +5831,7 @@ Expr* symbolic_rebuild_load_expr(uintptr_t addr, uint32_t size,
                 }
             } else {
                 Expr* n_expr = new_expr();
+                if (n_expr == NULL) return NULL;
                 n_expr->opkind = CONCAT8R;
                 n_expr->op1 = e;
 
@@ -5726,6 +5866,7 @@ Expr* symbolic_rebuild_load_expr(uintptr_t addr, uint32_t size,
               CONST(e->op2) < (8 * size)) &&
             !(opkind == e->opkind && CONST(e->op2) <= (8 * size))) {
             Expr* n_expr = new_expr();
+            if (n_expr == NULL) return NULL;
             n_expr->opkind = opkind;
             n_expr->op1 = e;
             n_expr->op2 = (Expr*)(uintptr_t)(8 * size);
@@ -6038,6 +6179,7 @@ static inline void qemu_deposit_helper(uintptr_t packed_idx, uintptr_t a,
                                        uintptr_t b,
                                        uintptr_t poslen)
 {
+    if (!symbolic_collection_active()) return;
     uintptr_t out_idx = UNPACK_0(packed_idx);
     uintptr_t a_idx   = UNPACK_1(packed_idx);
     uintptr_t b_idx   = UNPACK_2(packed_idx);
@@ -6072,6 +6214,7 @@ static inline void qemu_deposit_helper(uintptr_t packed_idx, uintptr_t a,
     }
 
     Expr* e   = new_expr();
+    if (e == NULL) return;
     e->opkind = DEPOSIT;
     SET_EXPR_OP(e->op1, e->op1_is_const, expr_a, a);
     SET_EXPR_OP(e->op2, e->op2_is_const, s_temps[b_idx], b);
@@ -6124,7 +6267,7 @@ static inline void qemu_deposit(TCGTemp* t_op_out, TCGTemp* t_op_a,
 
     allocate_new_expr(
         t_out, op_in,
-        tcg_ctx); // FixMe: we assume that Expr is zero-initialzed!
+        tcg_ctx, label_both_concrete);
 
     TCGTemp* t_opkind = new_non_conflicting_temp(TCG_TYPE_I64);
     tcg_movi(t_opkind, DEPOSIT, 0, op_in, NULL, tcg_ctx);
@@ -6194,6 +6337,7 @@ static inline void qemu_deposit(TCGTemp* t_op_out, TCGTemp* t_op_a,
 
 static inline void qemu_extract_helper(uintptr_t packed_idx, uintptr_t a)
 {
+    if (!symbolic_collection_active()) return;
     uintptr_t out_idx = UNPACK_0(packed_idx);
     uintptr_t a_idx   = UNPACK_1(packed_idx);
     uintptr_t pos     = UNPACK_2(packed_idx);
@@ -6205,6 +6349,7 @@ static inline void qemu_extract_helper(uintptr_t packed_idx, uintptr_t a)
     }
 
     Expr* e   = new_expr();
+    if (e == NULL) return;
     e->opkind = QZEXTRACT;
     SET_EXPR_OP(e->op1, e->op1_is_const, s_temps[a_idx], a);
     SET_EXPR_CONST_OP(e->op2, e->op2_is_const, pos);
@@ -6215,6 +6360,7 @@ static inline void qemu_extract_helper(uintptr_t packed_idx, uintptr_t a)
 static inline void qemu_extract2_helper(uintptr_t packed_idx, uintptr_t a,
                                         uintptr_t b)
 {
+    if (!symbolic_collection_active()) return;
     uintptr_t out_idx = UNPACK_0(packed_idx);
     uintptr_t a_idx   = UNPACK_1(packed_idx);
     uintptr_t b_idx   = UNPACK_2(packed_idx);
@@ -6235,6 +6381,7 @@ static inline void qemu_extract2_helper(uintptr_t packed_idx, uintptr_t a,
 #endif
 
     Expr* e   = new_expr();
+    if (e == NULL) return;
     e->opkind = QZEXTRACT2;
     SET_EXPR_OP(e->op1, e->op1_is_const, s_temps[a_idx], a);
     SET_EXPR_OP(e->op2, e->op2_is_const, s_temps[b_idx], b);
@@ -6327,6 +6474,7 @@ static inline void qemu_binop_low_high_helper(OPKIND    opkind,
                                               uintptr_t packed_idx, uintptr_t a,
                                               uintptr_t b)
 {
+    if (!symbolic_collection_active()) return;
 #if 0
     printf("qemu_binop_low_high_helper\n");
 #endif
@@ -6352,6 +6500,7 @@ static inline void qemu_binop_low_high_helper(OPKIND    opkind,
 #endif
 
     Expr* binop_low_expr   = new_expr();
+    if (binop_low_expr == NULL) return;
     binop_low_expr->opkind = (OPKIND)opkind;
 
     if (expr_a) {
@@ -6371,6 +6520,7 @@ static inline void qemu_binop_low_high_helper(OPKIND    opkind,
     s_temps[out_low_idx] = binop_low_expr;
 
     Expr* binop_high_expr   = new_expr();
+    if (binop_high_expr == NULL) return;
     binop_high_expr->opkind = get_high_opkind(opkind);
 
     if (expr_a) {
@@ -6406,6 +6556,7 @@ static inline void qemu_binop_low_high_helper(OPKIND    opkind,
 static inline void qemu_binop_half_helper(OPKIND opkind, uintptr_t packed_idx,
                                           uintptr_t a, uintptr_t b)
 {
+    if (!symbolic_collection_active()) return;
 #if 0
     printf("qemu_binop_half_helper\n");
 #endif
@@ -6431,6 +6582,7 @@ static inline void qemu_binop_half_helper(OPKIND opkind, uintptr_t packed_idx,
 #endif
 
     Expr* binop_low_expr   = new_expr();
+    if (binop_low_expr == NULL) return;
     binop_low_expr->opkind = (OPKIND)opkind;
 
     if (expr_a) {
@@ -6452,6 +6604,7 @@ static inline void qemu_binop_half_helper(OPKIND opkind, uintptr_t packed_idx,
     s_temps[out_low_idx] = binop_low_expr;
 
     Expr* binop_high_expr   = new_expr();
+    if (binop_high_expr == NULL) return;
     binop_high_expr->opkind = get_high_opkind(opkind);
 
     if (expr_a) {
@@ -6522,6 +6675,7 @@ static void register_helpers(void)
 
 static inline void concretize_mem(uintptr_t addr, uintptr_t size)
 {
+    if (!symbolic_collection_active()) return;
     size_t overflow_n_bytes = 0;
     // printf("A overflow_n_bytes: %lu\n", overflow_n_bytes);
     Expr** exprs = get_expr_addr((uintptr_t)addr, size, 0, &overflow_n_bytes);
@@ -6554,6 +6708,7 @@ static inline void concretize_mem(uintptr_t addr, uintptr_t size)
             } else {
 
                 Expr* e_byte   = new_expr();
+                if (e_byte == NULL) return;
                 e_byte->opkind = CONCAT8L;
                 e_byte->op1    = exprs[i];
                 e_byte->op2    = bytes_expr;
@@ -6565,6 +6720,7 @@ static inline void concretize_mem(uintptr_t addr, uintptr_t size)
 
                 if (bytes_count == sizeof(uintptr_t)) {
                     Expr* e   = new_expr();
+                    if (e == NULL) return;
                     e->opkind = MEMORY_CONCRETIZATION;
                     e->op1    = bytes_expr;
                     SET_EXPR_CONST_OP(e->op2, e->op2_is_const, bytes_value);
@@ -6585,6 +6741,7 @@ static inline void concretize_mem(uintptr_t addr, uintptr_t size)
 
     if (bytes_count > 0) {
         Expr* e   = new_expr();
+        if (e == NULL) return;
         e->opkind = MEMORY_CONCRETIZATION;
         e->op1    = bytes_expr;
         SET_EXPR_CONST_OP(e->op2, e->op2_is_const, bytes_value);
@@ -9632,7 +9789,7 @@ static void model_allocator_snapshot(CPUArchState *env, ModelFrame *frame)
     if (frame->kind != REALLOC) return;
     target_ulong copied = MIN(frame->old_size, pending->arg_size);
     frame->payload_origins = sem_copy_snapshot(env, old->base, copied);
-    if (!symbolic_mode) return;
+    if (!symbolic_mode || !symbolic_collection_active()) return;
     /* Only existing symbolic leaves are visited, and storage is allocated
      * only for live expressions.  Guest realloc may unmap the old payload;
      * its expressions must be captured before entering libc. */
@@ -9692,7 +9849,7 @@ static void model_allocator_complete(CPUArchState *env, ModelFrame *frame,
             }
             model_allocator_clear(env, base, pending->arg_size);
         }
-        if (frame->payload_exprs != NULL) {
+        if (symbolic_collection_active() && frame->payload_exprs != NULL) {
             for (guint i = 0; i < frame->payload_exprs->len; i++) {
                 const ModelPayloadExpr *saved = &g_array_index(
                     frame->payload_exprs, ModelPayloadExpr, i);

@@ -3,6 +3,7 @@
 
 #include <stdlib.h>
 #include <assert.h>
+#include <stdbool.h>
 
 // same as tcg_abort()
 #ifndef ABORT
@@ -301,6 +302,13 @@ extern Expr* pool;
 extern Expr* next_free_expr;
 #define GET_EXPR_IDX(e)  (((Expr*)e) - ((Expr*)pool))
 #define GET_QUERY_IDX(q) ((((Query*)q) - ((Query*)query_queue)) - 1)
+
+/* Collection can freeze while BINRADAR concrete observation continues. */
+bool symbolic_collection_active(void);
+SymbolicCollectionStopReason symbolic_get_collection_stop_reason(void);
+void symbolic_publish_collection_status(SymbolicCollectionStopReason reason,
+                                        int64_t query_cursor,
+                                        int64_t expr_cursor);
 
 Expr* symbolic_rebuild_load_expr(uintptr_t addr, uint32_t size,
                                  const uint8_t *concrete_bytes,

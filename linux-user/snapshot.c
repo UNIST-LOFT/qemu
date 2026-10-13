@@ -187,6 +187,11 @@ static bool snapshot_child_read_witness_armed;
 
 static BinradarManager *binradar_manager = NULL;
 
+bool snapshot_is_binradar(void)
+{
+    return binradar_manager != NULL;
+}
+
 static void trace_mem_flush(void);
 static void snapshot_modification_manager_reset(bool analysis_started);
 static void exit_with_status(int status);
@@ -718,9 +723,12 @@ static void snapshot_dump_query_window(Query* q, Expr *e) {
 
     int64_t start_index = GET_QUERY_IDX(next_query);
     int64_t end_index = GET_QUERY_IDX(q);
-    // Preserve query window for first run
-    next_query = q;
-    next_free_expr = e;
+    /* Only DIRECTED adopts the child prefix. BINRADAR's later forks must
+     * retain the original snapshot allocation budget. */
+    if (!snapshot_is_binradar()) {
+        next_query = q;
+        next_free_expr = e;
+    }
 
     FILE *fp = fopen(binradar_query_window_file, "a");
     if (fp == NULL) {
@@ -943,6 +951,7 @@ static SnapshotExitInfo *snapshot_exit_info_ptr(void) {
 
 static void snapshot_exit_info_capture(SnapshotExitInfo *info, CPUArchState *env) {
     if (!info) return;
+    info->collection_stop_reason = symbolic_get_collection_stop_reason();
     info->query_cursor = (next_query != NULL && query_queue != NULL)
         ? (int64_t)(next_query - query_queue) : -1;
     info->expr_cursor = (next_free_expr != NULL && pool != NULL)
@@ -976,6 +985,69 @@ static bool snapshot_expr_cursor_valid(int64_t cursor) {
     return cursor >= 0 && (uint64_t)cursor <= (uint64_t)EXPR_POOL_CAPACITY;
 }
 
+typedef struct SnapshotCollectionStatus {
+    bool known;
+    bool unknown;
+    SymbolicCollectionStopReason reason;
+    int64_t query_cursor;
+    int64_t expr_cursor;
+} SnapshotCollectionStatus;
+
+/* Collection completeness and guest outcome usability are independent. Keep
+ * the first bounded capacity prefix even if a later representative completes
+ * or fails to publish an exit. Never adopt these cursors into parent pools. */
+static void snapshot_collection_status_observe(SnapshotCollectionStatus *status,
+                                               const SnapshotExitInfo *info,
+                                               bool usable)
+{
+    bool bounded = info != NULL &&
+        __atomic_load_n(&info->valid, __ATOMIC_ACQUIRE) != 0 &&
+        snapshot_query_cursor_valid(info->query_cursor) &&
+        info->query_cursor >= 1 && info->query_cursor < EXPR_QUERY_CAPACITY &&
+        snapshot_expr_cursor_valid(info->expr_cursor);
+    bool capacity = bounded &&
+        ((info->collection_stop_reason == SYMBOLIC_COLLECTION_QUERY_CAPACITY &&
+          info->query_cursor == EXPR_QUERY_CAPACITY - 1) ||
+         info->collection_stop_reason == SYMBOLIC_COLLECTION_EXPR_CAPACITY);
+    if (status->known && status->reason != SYMBOLIC_COLLECTION_COMPLETE) {
+        return;
+    }
+    if (capacity) {
+        status->known = true;
+        status->reason = info->collection_stop_reason;
+        status->query_cursor = info->query_cursor;
+        status->expr_cursor = info->expr_cursor;
+    } else if (!bounded || !usable ||
+               info->collection_stop_reason != SYMBOLIC_COLLECTION_COMPLETE) {
+        status->unknown = true;
+    } else {
+        status->known = true;
+        status->reason = SYMBOLIC_COLLECTION_COMPLETE;
+        status->query_cursor = info->query_cursor;
+        status->expr_cursor = info->expr_cursor;
+    }
+}
+
+static void snapshot_collection_status_publish(
+    const SnapshotCollectionStatus *status)
+{
+    if (status->known &&
+        (status->reason != SYMBOLIC_COLLECTION_COMPLETE || !status->unknown)) {
+        symbolic_publish_collection_status(status->reason,
+                                           status->query_cursor,
+                                           status->expr_cursor);
+        return;
+    }
+    /* A last child's sidecar cannot stand in for the entire request when any
+     * representative was unknown. Absence is the version-1 unknown result. */
+    const char *path = getenv("SYMBOLIC_COLLECTION_STATUS_FILE");
+    if (path != NULL && path[0] != '\0' && unlink(path) != 0 && errno != ENOENT) {
+        log_msg("[snapshot] [collection-status] [error unlink] [errno %d]\n",
+                errno);
+        exit_with_status(1);
+    }
+}
+
 static void snapshot_log_cursor_indices(const SnapshotExitInfo *info) {
     log_msg("[snapshot] [cursors] [query_cursor %ld] [expr_cursor %ld]\n",
             snapshot_query_cursor_index(info),
@@ -1002,9 +1074,9 @@ QEMU_NORETURN void snapshot_stop_collection(SymbolicCollectionStopReason reason)
     SnapshotExitInfo *info = snapshot_exit_info_ptr();
     if (info != NULL) {
         memset(info, 0, sizeof(*info));
-        info->collection_stop_reason = (uint32_t)reason;
         snapshot_exit_info_capture(
             info, current_cpu != NULL ? current_cpu->env_ptr : NULL);
+        info->collection_stop_reason = (uint32_t)reason;
         snapshot_exit_info_set_reason(info,
                                       symbolic_collection_reason_name(reason));
         __atomic_store_n(&info->valid, 1, __ATOMIC_RELEASE);
@@ -1022,7 +1094,8 @@ QEMU_NORETURN void snapshot_stop_collection(SymbolicCollectionStopReason reason)
 static bool snapshot_exit_info_should_update(const SnapshotExitInfo *info, bool crashed) {
     if (info == NULL) return false;
     if (!info->valid) return true;
-    if (info->collection_stop_reason != SYMBOLIC_COLLECTION_COMPLETE) {
+    if (!snapshot_is_binradar() &&
+        info->collection_stop_reason != SYMBOLIC_COLLECTION_COMPLETE) {
         return false;
     }
     return crashed;  // Prevent update for exit() after error handling
@@ -4911,6 +4984,7 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
         const uint32_t attempt = driver.attempt;
         uint32_t representative_runs = 0;
         uint32_t remaining_plans = 0;
+        SnapshotCollectionStatus collection_status = {0};
         /* Attempt classification.  A committed sweep is the only result that
          * publishes evidence; every other result discards the attempt. */
         BinradarForkserverAttemptResult attempt_result =
@@ -5040,7 +5114,8 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
             SnapshotExitInfo *exit_info = snapshot_exit_info_ptr();
             bool exit_valid = exit_info != NULL &&
                 __atomic_load_n(&exit_info->valid, __ATOMIC_ACQUIRE) != 0;
-            if (exit_valid && exit_info->collection_stop_reason !=
+            if (!binradar_mode && exit_valid &&
+                exit_info->collection_stop_reason !=
                     SYMBOLIC_COLLECTION_COMPLETE) {
                 int64_t query_cursor = exit_info->query_cursor;
                 int64_t expr_cursor = exit_info->expr_cursor;
@@ -5111,6 +5186,11 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
             }
             bool exit_unusable = exit_info == NULL || !exit_info->valid ||
                 (exit_info->crashed && !exit_info->fault_reference_valid);
+            if (binradar_mode) {
+                snapshot_collection_status_observe(
+                    &collection_status, exit_info,
+                    wait_rc == 0 && !exit_unusable);
+            }
             if (binradar_mode && (wait_rc > 0 || exit_unusable)) {
                 if (wait_rc > 0) {
                     /* A deadline killed this child.  Salvage already gave
@@ -5291,17 +5371,8 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
                 }
                 binradar_cache_feedback_drop(binradar_manager);
                 binradar_cache_clear_iteration(binradar_manager);
-                if (attempt_result == BINRADAR_FORKSERVER_ATTEMPT_CAPACITY) {
-                    binradar_cache_reset_child(binradar_manager);
-                    /* The current plan was attempted; all queued plans remain
-                     * unexecuted.  Do not pop a plan or clear shared cursors. */
-                    remaining_plans = mod_manager != NULL &&
-                        mod_manager->modifications != NULL
-                        ? g_queue_get_length(mod_manager->modifications) : 0;
-                } else {
-                    remaining_plans = attempt == 1
-                        ? 0 : snapshot_advance_modification_plan();
-                }
+                remaining_plans = attempt == 1
+                    ? 0 : snapshot_advance_modification_plan();
             } else {
                 *snapshot_exit_info_ptr() = baseline_exit;
                 if (attempt == 1) {
@@ -5352,6 +5423,9 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
                 &driver, attempt_result, attempt_discarded, deadline_kill,
                 binradar_mode && engine_failure,
                 binradar_mode && attempt == 1, remaining_plans);
+        if (binradar_mode) {
+            snapshot_collection_status_publish(&collection_status);
+        }
         if (!binradar_forkserver_send_summary(
                 &driver, representative_runs, remaining_plans,
                 stop_reason)) {

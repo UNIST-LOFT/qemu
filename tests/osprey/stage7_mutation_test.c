@@ -82,6 +82,21 @@ __thread CPUState *current_cpu = NULL;
 abi_ulong mmap_next_start = 0;
 target_ulong target_brk = 0;
 uint64_t last_translation_block = 0;
+static SymbolicCollectionStopReason test_collection_reason;
+static SnapshotCollectionStatus test_published_collection;
+SymbolicCollectionStopReason symbolic_get_collection_stop_reason(void)
+{
+    return test_collection_reason;
+}
+void symbolic_publish_collection_status(SymbolicCollectionStopReason reason,
+                                        int64_t query_cursor,
+                                        int64_t expr_cursor)
+{
+    test_published_collection = (SnapshotCollectionStatus) {
+        .known = true, .reason = reason,
+        .query_cursor = query_cursor, .expr_cursor = expr_cursor,
+    };
+}
 
 /* Host-environment stubs for snapshot.o's integration points.  The
  * record-level groups exercise the access-record paths only, not page
@@ -4350,6 +4365,156 @@ static void test_capacity_exit_publication(void)
     shared_trace_data->exit_info = saved_exit;
 }
 
+static void test_binradar_frozen_guest_outcomes(void)
+{
+    BinradarManager manager = {0};
+    BinradarManager *saved_manager = binradar_manager;
+    Query queries[4] = {0};
+    Expr expressions[4] = {0};
+    Query *saved_queue = query_queue, *saved_query = next_query;
+    Expr *saved_pool = pool, *saved_expr = next_free_expr;
+    SnapshotExitInfo saved_exit = shared_trace_data->exit_info;
+    reset_runtime();
+    binradar_manager = &manager;
+    query_queue = queries;
+    next_query = queries + 3;
+    pool = expressions;
+    next_free_expr = expressions + 2;
+    for (uint32_t reason = SYMBOLIC_COLLECTION_QUERY_CAPACITY;
+         reason <= SYMBOLIC_COLLECTION_EXPR_CAPACITY; reason++) {
+        memset(&shared_trace_data->exit_info, 0, sizeof(saved_exit));
+        test_collection_reason = reason;
+        provenance_clear_pending_fault();
+        snapshot_record_guest_normal_exit(NULL, 23, "real normal");
+        SnapshotExitInfo *info = &shared_trace_data->exit_info;
+        CHECK(info->valid && !info->crashed && info->exit_code == 23 &&
+                  info->collection_stop_reason == reason &&
+                  info->query_cursor == 3 && info->expr_cursor == 2,
+              "frozen collection accompanies the actual normal exit");
+        snapshot_record_guest_crash_with_reference(
+            NULL, TARGET_SIGSEGV, 0, SEGV_ACCERR, 0, "real crash",
+            SNAPSHOT_FAULT_REFERENCE_PROVENANCE_ACCESS, 0x400180, NULL);
+        CHECK(info->valid && info->crashed &&
+                  info->target_signal == TARGET_SIGSEGV &&
+                  info->fault_reference_valid && info->fault_addr == 0x400180 &&
+                  info->collection_stop_reason == reason,
+              "capacity normal record does not suppress a later actual crash");
+        snapshot_record_guest_normal_exit(NULL, 0, "cleanup");
+        CHECK(info->crashed && info->collection_stop_reason == reason &&
+                  g_str_has_prefix(info->description, "real crash (host=0,"),
+              "normal cleanup cannot overwrite a frozen actual crash");
+    }
+    test_collection_reason = SYMBOLIC_COLLECTION_COMPLETE;
+    binradar_manager = saved_manager;
+    query_queue = saved_queue;
+    next_query = saved_query;
+    pool = saved_pool;
+    next_free_expr = saved_expr;
+    shared_trace_data->exit_info = saved_exit;
+}
+
+static void test_binradar_window_keeps_snapshot_budget(void)
+{
+    Query queries[6] = {0};
+    Expr expressions[6] = {0};
+    Query *saved_queue = query_queue, *saved_query = next_query;
+    Expr *saved_pool = pool, *saved_expr = next_free_expr;
+    BinradarManager manager = {0};
+    BinradarManager *saved_manager = binradar_manager;
+    char *saved_window = binradar_query_window_file;
+    int saved_dumped = binradar_query_window_dumped;
+    char *path = NULL;
+    int fd = g_file_open_tmp("binradar-window-XXXXXX", &path, NULL);
+    CHECK(fd >= 0, "window regression creates a fixture file");
+    if (fd < 0) return;
+    close(fd);
+    query_queue = queries;
+    next_query = queries + 1;
+    pool = expressions;
+    next_free_expr = expressions + 1;
+    binradar_manager = &manager;
+    binradar_query_window_file = path;
+    binradar_query_window_dumped = 0;
+    snapshot_dump_query_window(queries + 4, expressions + 5);
+    int status = 0;
+    pid_t pid = fork();
+    if (pid == 0) {
+        /* A later representative inherits the original snapshot budget,
+         * not the previously analyzed child's expression/query high water. */
+        _exit(next_query == queries + 1 && next_free_expr == expressions + 1
+                  ? 0 : 1);
+    }
+    CHECK(pid > 0 && waitpid(pid, &status, 0) == pid &&
+              WIFEXITED(status) && WEXITSTATUS(status) == 0,
+          "later BINRADAR child inherits independent allocation cursors");
+    binradar_manager = NULL;
+    binradar_query_window_dumped = 0;
+    snapshot_dump_query_window(queries + 4, expressions + 5);
+    CHECK(next_query == queries + 4 && next_free_expr == expressions + 5,
+          "DIRECTED still adopts the retained child prefix");
+    binradar_manager = saved_manager;
+    binradar_query_window_file = saved_window;
+    binradar_query_window_dumped = saved_dumped;
+    query_queue = saved_queue;
+    next_query = saved_query;
+    pool = saved_pool;
+    next_free_expr = saved_expr;
+    unlink(path);
+    g_free(path);
+}
+
+static void test_request_collection_aggregation(void)
+{
+    SnapshotCollectionStatus status = {0};
+    SnapshotExitInfo complete = {
+        .valid = 1, .query_cursor = 3, .expr_cursor = 2,
+    };
+    SnapshotExitInfo capacity = complete;
+    capacity.collection_stop_reason = SYMBOLIC_COLLECTION_EXPR_CAPACITY;
+    capacity.query_cursor = 2;
+    capacity.expr_cursor = 4;
+    snapshot_collection_status_observe(&status, &complete, true);
+    snapshot_collection_status_observe(&status, &capacity, true);
+    snapshot_collection_status_observe(&status, &complete, true);
+    snapshot_collection_status_observe(&status, NULL, false);
+    snapshot_collection_status_publish(&status);
+    CHECK(test_published_collection.reason == SYMBOLIC_COLLECTION_EXPR_CAPACITY &&
+              test_published_collection.query_cursor == 2 &&
+              test_published_collection.expr_cursor == 4,
+          "first capacity representative survives complete and unknown children");
+    capacity.collection_stop_reason = SYMBOLIC_COLLECTION_QUERY_CAPACITY;
+    capacity.query_cursor = EXPR_QUERY_CAPACITY - 1;
+    snapshot_collection_status_observe(&status, &capacity, true);
+    CHECK(status.reason == SYMBOLIC_COLLECTION_EXPR_CAPACITY &&
+              status.query_cursor == 2,
+          "later capacity representatives cannot replace the first prefix");
+
+    char *path = NULL;
+    int fd = g_file_open_tmp("binradar-collection-XXXXXX", &path, NULL);
+    CHECK(fd >= 0, "unknown-status regression creates a sidecar fixture");
+    if (fd >= 0) {
+        close(fd);
+        char *saved_path = g_strdup(getenv("SYMBOLIC_COLLECTION_STATUS_FILE"));
+        setenv("SYMBOLIC_COLLECTION_STATUS_FILE", path, 1);
+        status = (SnapshotCollectionStatus){0};
+        snapshot_collection_status_observe(&status, NULL, false);
+        snapshot_collection_status_observe(&status, &complete, true);
+        snapshot_collection_status_publish(&status);
+        CHECK(access(path, F_OK) != 0 && errno == ENOENT,
+              "unknown representative removes a later complete sidecar");
+        /* A new request starts independent of the earlier unknown child. */
+        status = (SnapshotCollectionStatus){0};
+        snapshot_collection_status_observe(&status, &complete, true);
+        snapshot_collection_status_publish(&status);
+        CHECK(test_published_collection.reason == SYMBOLIC_COLLECTION_COMPLETE,
+              "a new entirely complete request publishes complete");
+        if (saved_path != NULL) setenv("SYMBOLIC_COLLECTION_STATUS_FILE", saved_path, 1);
+        else unsetenv("SYMBOLIC_COLLECTION_STATUS_FILE");
+        g_free(saved_path);
+    }
+    g_free(path);
+}
+
 /* Continuation policy (P2).  One unusable attempt must not end a healthy
  * queue, a long tail of ordinary mutation misses must not trip the failure
  * limit, and a discarded baseline is reported as baseline-unavailable. */
@@ -5278,6 +5443,9 @@ int main(void)
     test_variant_multiwrite_child_observation();
     test_child_application_does_not_mutate_plan();
     test_capacity_exit_publication();
+    test_binradar_frozen_guest_outcomes();
+    test_binradar_window_keeps_snapshot_budget();
+    test_request_collection_aggregation();
     test_forkserver_continuation_policy();
     test_invalid_patch_result();
     test_request_metadata_real_regions();
