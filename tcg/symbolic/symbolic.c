@@ -567,22 +567,37 @@ static void print_query_loc(Query *query, uint64_t pc, const char *msg) {
     }
 }
 
-static bool query_slot_available(void)
+static void end_symbolic_mode(void);
+static SymbolicCollectionStopReason collection_stop_reason;
+
+static G_NORETURN void stop_symbolic_collection(
+    SymbolicCollectionStopReason reason)
 {
-    /* Keep one terminal slot available for end_symbolic_mode().  The old
-     * post-write assert allowed the final branch to write past the queue and
-     * then aborted the tracer, turning a long but valid guest loop into the
-     * misleading pre-entrypoint forkserver EOF. */
-    if (next_query + 1 >= query_queue + EXPR_QUERY_CAPACITY) {
-        static bool reported;
-        if (!reported) {
-            log_msg("[query] [overflow] [capacity %u] [pc %lx]\n",
-                    EXPR_QUERY_CAPACITY, current_tb_pc);
-            reported = true;
-        }
-        return false;
+    collection_stop_reason = reason;
+    end_symbolic_mode();
+    snapshot_stop_collection(reason);
+}
+
+static G_NORETURN void stop_expression_collection(void)
+{
+    stop_symbolic_collection(SYMBOLIC_COLLECTION_EXPR_CAPACITY);
+}
+
+static void check_query_capacity(void)
+{
+    /* The handshake and terminal have their own slots.  A bad cursor is an
+     * engine error, not an ordinary capacity cutoff. */
+    uintptr_t cursor = (uintptr_t)next_query;
+    uintptr_t start = (uintptr_t)(query_queue + 1);
+    uintptr_t terminal =
+        (uintptr_t)(query_queue + EXPR_QUERY_CAPACITY - 1);
+    if (cursor < start || cursor > terminal ||
+        (cursor - start) % sizeof(Query) != 0) {
+        tcg_abort();
     }
-    return true;
+    if (cursor == terminal) {
+        stop_symbolic_collection(SYMBOLIC_COLLECTION_QUERY_CAPACITY);
+    }
 }
 
 /* Reserve and commit are the only ordinary queue cursor mutation.  Typed
@@ -590,7 +605,7 @@ static bool query_slot_available(void)
  * preserving the exact admitted index needed by S1 observations. */
 static Query *query_reserve(void)
 {
-    if (!query_slot_available()) return NULL;
+    check_query_capacity();
     memset(next_query, 0, sizeof(*next_query));
     return next_query;
 }
@@ -598,10 +613,16 @@ static Query *query_reserve(void)
 static int64_t query_commit(Query *slot, uintptr_t pc, const char *msg,
                             bool log_location)
 {
-    assert(slot == next_query);
+    check_query_capacity();
+    if (slot != next_query) tcg_abort();
     int64_t admitted_index = (int64_t)(slot - query_queue);
     if (log_location) print_query_loc(slot, pc, msg);
     next_query++;
+    /* Stop immediately after the last complete record, before its caller can
+     * allocate expressions for another record that could never be admitted. */
+    if (next_query == query_queue + EXPR_QUERY_CAPACITY - 1) {
+        stop_symbolic_collection(SYMBOLIC_COLLECTION_QUERY_CAPACITY);
+    }
     return admitted_index;
 }
 
@@ -609,7 +630,6 @@ static int64_t publish_ordinary_query(Expr *expression, uintptr_t address,
                                       uintptr_t pc, const char *message)
 {
     Query *slot = query_reserve();
-    if (slot == NULL) return -1;
     slot->query = expression;
     slot->address = address;
     return query_commit(slot, pc, message, true);
@@ -619,7 +639,6 @@ static int64_t publish_model_query(Expr *expression, uintptr_t address,
                                    MODEL_T model, const char *message)
 {
     Query *slot = query_reserve();
-    if (slot == NULL) return -1;
     slot->query = expression;
     slot->address = address;
     slot->model = model;
@@ -1416,18 +1435,24 @@ static inline void add_void_call_8_after(
     }
 }
 
-static inline void check_pool_expr_capacity(void)
+static inline void check_pool_expr_capacity(size_t count)
 {
-    assert(next_free_expr >= pool);
-    assert(next_free_expr < pool + EXPR_POOL_CAPACITY);
+    uintptr_t start = (uintptr_t)pool;
+    uintptr_t cursor = (uintptr_t)next_free_expr;
+    uintptr_t end = (uintptr_t)(pool + EXPR_POOL_CAPACITY);
+    if (cursor < start || cursor > end ||
+        (cursor - start) % sizeof(Expr) != 0) {
+        tcg_abort();
+    }
+    if (count > (end - cursor) / sizeof(Expr)) {
+        stop_expression_collection();
+    }
 }
 
 static inline Expr* new_expr(void)
 {
-    // ToDo: use free list
-    check_pool_expr_capacity();
-    next_free_expr += 1;
-    last_expr = next_free_expr - 1;
+    check_pool_expr_capacity(1);
+    last_expr = next_free_expr++;
     return last_expr;
 }
 
@@ -2059,12 +2084,6 @@ static inline void allocate_new_expr_conditional(TCGTemp* t_out, TCGOp* op_in,
 {
     SAVE_TEMPS_COUNT(tcg_ctx);
     TCGOp* op;
-#if 0
-    add_void_call_0(check_pool_expr_capacity, op_in, &op,
-                    tcg_ctx); // ToDo: make inline check
-    mark_insn_as_instrumentation(op);
-#endif
-    // assert(next_free_expr);
 
     TCGTemp* t_next_free_expr_addr = new_non_conflicting_temp(TCG_TYPE_PTR);
     tcg_movi(t_next_free_expr_addr, (uintptr_t)&next_free_expr, 0, op_in, &op,
@@ -2079,6 +2098,22 @@ static inline void allocate_new_expr_conditional(TCGTemp* t_out, TCGOp* op_in,
     if (label) {
         set_conditional_instrumentation_label(op, label->id);
     }
+
+    /* The common path stays inline.  The only helper call is the nonreturning
+     * cutoff, before any Expr store or cursor increment can cross the pool. */
+    TCGTemp* t_pool_end = new_non_conflicting_temp(TCG_TYPE_PTR);
+    tcg_movi(t_pool_end, (uintptr_t)(pool + EXPR_POOL_CAPACITY), 0,
+             op_in, &op, tcg_ctx);
+    if (label) set_conditional_instrumentation_label(op, label->id);
+    TCGLabel* label_has_room = gen_new_label();
+    tcg_brcond(label_has_room, t_next_free_expr, t_pool_end, TCG_COND_LTU,
+               0, 1, op_in, &op, tcg_ctx);
+    if (label) set_conditional_instrumentation_label(op, label->id);
+    add_void_call_0(stop_expression_collection, op_in, &op, tcg_ctx);
+    mark_insn_as_instrumentation(op);
+    if (label) set_conditional_instrumentation_label(op, label->id);
+    tcg_set_label(label_has_room, op_in, &op, tcg_ctx);
+    if (label) set_conditional_instrumentation_label(op, label->id);
 
     tcg_mov(t_out, t_next_free_expr, 0, 0, op_in, &op, tcg_ctx);
     // required to handle a t_out which already has a reg allocated
@@ -3513,6 +3548,10 @@ static inline void qemu_load_helper(CPUArchState *env, uintptr_t orig_addr,
                         }
                     }
 
+                    const size_t slice_exprs =
+                        (sizeof(uintptr_t) + SLICE_SIZE + sizeof(Expr) - 1) /
+                        sizeof(Expr);
+                    check_pool_expr_capacity(slice_exprs);
                     assert(const_mem_map[idx].base == 0);
                     const_mem_map[idx].status = 1;
                     const_mem_map[idx].used   = 1;
@@ -3522,10 +3561,9 @@ static inline void qemu_load_helper(CPUArchState *env, uintptr_t orig_addr,
                     slices_addrs[i] = next_free_expr;
 
                     memcpy(next_free_expr, &norm_addr, sizeof(uintptr_t));
-                    next_free_expr =
-                        (Expr*)(((uint8_t*)next_free_expr) + sizeof(uintptr_t));
-                    memcpy(next_free_expr, (void*)norm_addr, SLICE_SIZE);
-                    next_free_expr += SLICE_SIZE / sizeof(Expr);
+                    memcpy((uint8_t *)next_free_expr + sizeof(uintptr_t),
+                           (void*)norm_addr, SLICE_SIZE);
+                    next_free_expr += slice_exprs;
 #if 0
                     printf("Taking a memory slice #%lu at 0x%lx\n", idx, norm_addr);
 #endif
@@ -5059,7 +5097,6 @@ static inline void branch_helper_internal(uintptr_t a, uintptr_t b,
 #endif
 
     Query *branch_query = query_reserve();
-    if (branch_query == NULL) return;
 
     Expr*   branch_expr = new_expr();
     TCGCond sat_cond    = check_branch_cond_helper(a, b, cond);
@@ -5439,18 +5476,61 @@ static inline void read_from_input(intptr_t offset, uintptr_t addr, size_t size)
     }
 }
 
-static int         finalization_done = 0;
-static inline void end_symbolic_mode(void)
+static int finalization_done;
+static void end_symbolic_mode(void)
 {
-    if (finalization_done) {
-        return;
+    if (finalization_done) return;
+
+    uintptr_t cursor = (uintptr_t)next_query;
+    uintptr_t start = (uintptr_t)(query_queue + 1);
+    uintptr_t terminal =
+        (uintptr_t)(query_queue + EXPR_QUERY_CAPACITY - 1);
+    if (cursor < start || cursor > terminal ||
+        (cursor - start) % sizeof(Query) != 0) {
+        tcg_abort();
     }
+    check_pool_expr_capacity(0);
+    size_t queries = (cursor - start) / sizeof(Query);
+    size_t expr_bytes = (uintptr_t)next_free_expr - (uintptr_t)pool;
+    bool complete = collection_stop_reason == SYMBOLIC_COLLECTION_COMPLETE;
+    const char *reason = symbolic_collection_reason_name(collection_stop_reason);
+
+    /* next_query names the first uncommitted slot.  Overwrite any reservation
+     * interrupted by expression exhaustion; never publish that partial query. */
+    memset(next_query, 0, sizeof(*next_query));
+    next_query->address = expr_bytes;
+    next_query->args64 = collection_stop_reason;
+    __atomic_store_n(&next_query->query,
+                     complete ? FINAL_QUERY : FINAL_QUERY_CAPACITY,
+                     __ATOMIC_RELEASE);
+
+    const char *status_path = getenv("SYMBOLIC_COLLECTION_STATUS_FILE");
+    if (status_path != NULL && status_path[0] != '\0') {
+        char status[512];
+        int length = snprintf(status, sizeof(status),
+            "{\"version\":1,\"complete\":%s,\"reason\":\"%s\","
+            "\"queries\":%zu,\"expr_bytes\":%zu,\"query_capacity\":%u,"
+            "\"expr_capacity_bytes\":%zu}\n",
+            complete ? "true" : "false", reason, queries, expr_bytes,
+            EXPR_QUERY_CAPACITY, sizeof(Expr) * (size_t)EXPR_POOL_CAPACITY);
+        GError *error = NULL;
+        if (length < 0 || (size_t)length >= sizeof(status) ||
+            !g_file_set_contents(status_path, status, length, &error)) {
+            log_msg("[symbolic] [collection-error] [reason status-publication] "
+                    "[detail %s]\n", error != NULL ? error->message : "size");
+            g_clear_error(&error);
+            exit(EXIT_FAILURE);
+        }
+    }
+    log_msg("[symbolic] [collection] [version 1] [complete %u] [reason %s] "
+            "[queries %zu] [expr-bytes %zu] [query-capacity %u] "
+            "[expr-capacity-bytes %zu]\n", complete, reason, queries,
+            expr_bytes, EXPR_QUERY_CAPACITY,
+            sizeof(Expr) * (size_t)EXPR_POOL_CAPACITY);
     finalization_done = 1;
-    //
-    next_query[0].query  = FINAL_QUERY;
-    query_queue[0].query = SHM_DONE;
-    //
-    printf("\nNumber of queries: %lu\n", (next_query - query_queue) - 1);
+    __atomic_store_n(&query_queue[0].query, SHM_DONE, __ATOMIC_RELEASE);
+
+    printf("\nNumber of queries: %zu\n", queries);
     printf("Number of expressions: %lu\n", GET_EXPR_IDX(next_free_expr));
     printf("Number of memory slices: %lu\n", slices_count);
 }

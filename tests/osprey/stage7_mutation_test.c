@@ -78,6 +78,7 @@ Expr *next_free_expr = NULL;
 Query *query_queue = NULL;
 Query *next_query = NULL;
 __thread CPUState *thread_cpu = NULL;
+__thread CPUState *current_cpu = NULL;
 abi_ulong mmap_next_start = 0;
 target_ulong target_brk = 0;
 uint64_t last_translation_block = 0;
@@ -4302,6 +4303,53 @@ static void test_symbolic_mismatched_wrapper_not_bound(void)
 
 /* ------------------------------------------------------------------ */
 
+static void test_capacity_exit_publication(void)
+{
+    Query queries[4] = {0};
+    Expr expressions[4] = {0};
+    Query *saved_queue = query_queue;
+    Query *saved_query = next_query;
+    Expr *saved_pool = pool;
+    Expr *saved_expr = next_free_expr;
+    SnapshotExitInfo saved_exit = shared_trace_data->exit_info;
+    query_queue = queries;
+    next_query = queries + 3;
+    pool = expressions;
+    next_free_expr = expressions + 2;
+    for (uint32_t reason = SYMBOLIC_COLLECTION_QUERY_CAPACITY;
+         reason <= SYMBOLIC_COLLECTION_EXPR_CAPACITY; reason++) {
+        memset(&shared_trace_data->exit_info, 0,
+               sizeof(shared_trace_data->exit_info));
+        int status = 0;
+        pid_t pid = fork();
+        if (pid == 0) {
+            /* No current CPU: pre-entry collection must still publish valid
+             * scalar cursors, not invent a normal/crash guest observation. */
+            thread_cpu = NULL;
+            afl_fork_child = 1;
+            snapshot_stop_collection((SymbolicCollectionStopReason)reason);
+        }
+        CHECK(pid > 0 && waitpid(pid, &status, 0) == pid &&
+                  WIFEXITED(status) && WEXITSTATUS(status) == 0,
+              "capacity child exits cleanly without a guest exit");
+        SnapshotExitInfo *info = &shared_trace_data->exit_info;
+        CHECK(__atomic_load_n(&info->valid, __ATOMIC_ACQUIRE) == 1 &&
+                  info->collection_stop_reason == reason && !info->crashed &&
+                  !info->fault_reference_valid,
+              "capacity publication is distinct from normal and crash");
+        CHECK(info->query_cursor == 3 && info->expr_cursor == 2,
+              "capacity publication captures cursors without a CPU");
+        CHECK(!snapshot_exit_info_should_update(info, false) &&
+                  !snapshot_exit_info_should_update(info, true),
+              "guest outcome writers cannot overwrite a capacity marker");
+    }
+    query_queue = saved_queue;
+    next_query = saved_query;
+    pool = saved_pool;
+    next_free_expr = saved_expr;
+    shared_trace_data->exit_info = saved_exit;
+}
+
 /* Continuation policy (P2).  One unusable attempt must not end a healthy
  * queue, a long tail of ordinary mutation misses must not trip the failure
  * limit, and a discarded baseline is reported as baseline-unavailable. */
@@ -4359,6 +4407,20 @@ static void test_forkserver_continuation_policy(void)
               &fresh, BINRADAR_FORKSERVER_ATTEMPT_UNUSABLE_EXIT, true, false,
               true, false, 3) == BINRADAR_FORKSERVER_STOP_RESOURCE_FAILURE,
           "an unexplained engine death reports resource-failure");
+    /* Capacity is an explicit incomplete terminal, not a bad baseline or an
+     * engine failure, and never advances the consecutive failure counter. */
+    fresh.consecutive_bad_attempts = 7;
+    CHECK(binradar_forkserver_stop_reason(
+              &fresh, BINRADAR_FORKSERVER_ATTEMPT_CAPACITY, true, false,
+              false, true, 0) == BINRADAR_FORKSERVER_STOP_CAPACITY,
+          "capacity baseline stops without baseline-unavailable");
+    CHECK(binradar_forkserver_stop_reason(
+              &fresh, BINRADAR_FORKSERVER_ATTEMPT_CAPACITY, true, false,
+              false, false, 3) == BINRADAR_FORKSERVER_STOP_CAPACITY,
+          "capacity preserves queued work without another sweep");
+    CHECK(fresh.consecutive_bad_attempts == 7 &&
+              fresh.attempt_result == BINRADAR_FORKSERVER_ATTEMPT_CAPACITY,
+          "capacity remains nonfatal and explicitly incomplete");
 }
 
 /* ------------------------------------------------------------------ */
@@ -5215,6 +5277,7 @@ int main(void)
     test_child_multiwrite_atomicity();
     test_variant_multiwrite_child_observation();
     test_child_application_does_not_mutate_plan();
+    test_capacity_exit_publication();
     test_forkserver_continuation_policy();
     test_invalid_patch_result();
     test_request_metadata_real_regions();

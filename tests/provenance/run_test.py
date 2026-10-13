@@ -41,17 +41,19 @@ sys.path.insert(0, os.path.join(ROOT, "fuzzolic"))
 import binradar_evidence
 
 
-HANDSHAKE_EXPECTED = 0x41464C03
-# Mirrors tracer/linux-user/binradar-forkserver.h (protocol v4 enum table).
+HANDSHAKE_EXPECTED = 0x41464C04
+# Mirrors tracer/linux-user/binradar-forkserver.h (protocol v5 enum table).
 STOP_CONTINUE = 0
 STOP_EXHAUSTED = 1
 STOP_BASELINE_UNAVAILABLE = 2
 STOP_FAILURE_LIMIT = 3
 STOP_RESOURCE_FAILURE = 4
+STOP_CAPACITY = 5
 ATTEMPT_COMPLETED = 0
 ATTEMPT_NO_OBSERVATION = 1
 ATTEMPT_UNUSABLE_EXIT = 2
 ATTEMPT_TIMEOUT = 3
+ATTEMPT_CAPACITY = 4
 
 STOP_NAMES = {
     STOP_CONTINUE: "continue",
@@ -59,6 +61,7 @@ STOP_NAMES = {
     STOP_BASELINE_UNAVAILABLE: "baseline-unavailable",
     STOP_FAILURE_LIMIT: "failure-limit",
     STOP_RESOURCE_FAILURE: "resource-failure",
+    STOP_CAPACITY: "capacity",
 }
 LOCAL_SOLVER_MAPPING_SIZES = {
     "expression pool": 8 * 1024 * 1024 * 32,
@@ -1059,7 +1062,7 @@ def check_local_solver_mapping(pid):
 
 
 def _summarize(summaries):
-    """Reduce raw protocol-v4 replies into the fields ``check`` asserts on."""
+    """Reduce raw protocol-v5 replies into the fields ``check`` asserts on."""
     if not summaries:
         return None
     attempts = len(summaries)

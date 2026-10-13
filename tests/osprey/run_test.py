@@ -37,8 +37,8 @@ sys.path.insert(0, str(ROOT / "fuzzolic"))
 import binradar_evidence
 
 
-HANDSHAKE_EXPECTED = 0x41464C03
-# Mirrors the protocol-v4 stop-reason table in binradar-forkserver.h.
+HANDSHAKE_EXPECTED = 0x41464C04
+# Mirrors the protocol-v5 stop-reason table in binradar-forkserver.h.
 STOP_CONTINUE = 0
 STOP_EXHAUSTED = 1
 

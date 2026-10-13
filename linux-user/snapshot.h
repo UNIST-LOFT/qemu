@@ -11,8 +11,7 @@
 #include <stdbool.h>
 #include <stdarg.h>
 
-typedef struct Expr Expr;
-typedef struct Query Query;
+#include "../tcg/symbolic/symbolic-struct.h"
 
 void trace_mem(const char* fmt, ...);
 void log_msg(const char *fmt, ...);
@@ -169,6 +168,9 @@ bool is_valid_address(target_ulong addr, bool for_snapshot);
 OrderedMap *ordered_map_init(int max_size);
 OrderedMapEntry *ordered_map_insert(OrderedMap *map, uintptr_t key, void *data);
 OrderedMapEntry* ordered_map_lookup(OrderedMap *map, uintptr_t key);
+
+/* Called only after publishing the capacity terminal and collection status. */
+QEMU_NORETURN void snapshot_stop_collection(SymbolicCollectionStopReason reason);
 
 void snapshot_record_guest_normal_exit(CPUArchState *cpu_env, int exit_code, const char *reason);
 void snapshot_record_guest_crash(CPUArchState *cpu_env, int target_signal,

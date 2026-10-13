@@ -40,6 +40,7 @@ const char *binradar_forkserver_attempt_result_name(uint32_t result)
     case BINRADAR_FORKSERVER_ATTEMPT_NO_OBSERVATION: return "no-observation";
     case BINRADAR_FORKSERVER_ATTEMPT_UNUSABLE_EXIT: return "unusable-exit";
     case BINRADAR_FORKSERVER_ATTEMPT_TIMEOUT: return "timeout";
+    case BINRADAR_FORKSERVER_ATTEMPT_CAPACITY: return "capacity";
     }
     return "invalid";
 }
@@ -53,6 +54,7 @@ const char *binradar_forkserver_stop_reason_name(uint32_t reason)
         return "baseline-unavailable";
     case BINRADAR_FORKSERVER_STOP_FAILURE_LIMIT: return "failure-limit";
     case BINRADAR_FORKSERVER_STOP_RESOURCE_FAILURE: return "resource-failure";
+    case BINRADAR_FORKSERVER_STOP_CAPACITY: return "capacity";
     }
     return "invalid";
 }
@@ -102,7 +104,7 @@ bool binradar_forkserver_driver_init(BinradarForkserverDriver *driver,
 
 bool binradar_forkserver_handshake(BinradarForkserverDriver *driver)
 {
-    const uint32_t version = BINRADAR_FORKSERVER_PROTOCOL_V4;
+    const uint32_t version = BINRADAR_FORKSERVER_PROTOCOL_V5;
     const uint32_t expected = version ^ UINT32_MAX;
     uint32_t reply = 0;
     return driver != NULL &&
@@ -217,6 +219,9 @@ BinradarForkserverStopReason binradar_forkserver_stop_reason(
 {
     if (driver == NULL) return BINRADAR_FORKSERVER_STOP_EXHAUSTED;
     driver->attempt_result = (uint32_t)attempt_result;
+    if (attempt_result == BINRADAR_FORKSERVER_ATTEMPT_CAPACITY) {
+        return BINRADAR_FORKSERVER_STOP_CAPACITY;
+    }
     if (attempt_result == BINRADAR_FORKSERVER_ATTEMPT_COMPLETED &&
         !deadline_kill) {
         driver->consecutive_bad_attempts = 0;

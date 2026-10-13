@@ -3,7 +3,7 @@
 
 #include "binradar-cache.h"
 
-/* Protocol v4.  The handshake word changes so an old live peer fails before
+/* Protocol v5.  The handshake word changes so an old live peer fails before
  * interpreting packet bytes, and each request is answered with a fixed
  * five-word summary:
  *
@@ -19,7 +19,7 @@
  * a discarded attempt commits nothing, so evidence files may carry gaps.
  * remaining_plans is the number of mutation plans that have not been executed
  * yet, including the plan popped for the next attempt. */
-#define BINRADAR_FORKSERVER_PROTOCOL_V4 0x41464c03u
+#define BINRADAR_FORKSERVER_PROTOCOL_V5 0x41464c04u
 #define BINRADAR_FORKSERVER_SUMMARY_WORDS 5u
 #define BINRADAR_FORKSERVER_BAD_ATTEMPT_DEFAULT 10
 
@@ -34,6 +34,8 @@ typedef enum BinradarForkserverAttemptResult {
     BINRADAR_FORKSERVER_ATTEMPT_UNUSABLE_EXIT = 2,
     /* The child or aggregate attempt deadline killed the child. */
     BINRADAR_FORKSERVER_ATTEMPT_TIMEOUT = 3,
+    /* Collection stopped at a pool boundary; no complete outcome exists. */
+    BINRADAR_FORKSERVER_ATTEMPT_CAPACITY = 4,
 } BinradarForkserverAttemptResult;
 
 typedef enum BinradarForkserverStopReason {
@@ -49,6 +51,8 @@ typedef enum BinradarForkserverStopReason {
     /* A child died from an unexplained host signal without publishing: the
      * engine is broken and must not be forked into again. */
     BINRADAR_FORKSERVER_STOP_RESOURCE_FAILURE = 4,
+    /* Incomplete collection: discard this attempt and never sweep again. */
+    BINRADAR_FORKSERVER_STOP_CAPACITY = 5,
 } BinradarForkserverStopReason;
 
 typedef struct BinradarForkserverDriver {

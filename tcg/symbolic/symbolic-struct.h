@@ -18,6 +18,25 @@
 #define EXPR_POOL_ADDR      ((const void*)0x7f05c8cc7000)
 #define MUTATION_MAX_ITEMS  4096
 #define FINAL_QUERY         ((void*)0xDEAD)
+#define FINAL_QUERY_CAPACITY ((void*)0xDEAE)
+
+typedef enum SymbolicCollectionStopReason {
+    SYMBOLIC_COLLECTION_COMPLETE = 0,
+    SYMBOLIC_COLLECTION_QUERY_CAPACITY = 1,
+    SYMBOLIC_COLLECTION_EXPR_CAPACITY = 2,
+} SymbolicCollectionStopReason;
+
+static inline const char *symbolic_collection_reason_name(
+    SymbolicCollectionStopReason reason)
+{
+    switch (reason) {
+    case SYMBOLIC_COLLECTION_COMPLETE: return "none";
+    case SYMBOLIC_COLLECTION_QUERY_CAPACITY: return "query-capacity";
+    case SYMBOLIC_COLLECTION_EXPR_CAPACITY: return "expr-capacity";
+    }
+    return "invalid";
+}
+
 #define SHM_READY           (0xDEADBEEF)
 #define SHM_DONE            ((void*)0xABCDABCD)
 #define MEM_BARRIER()       asm volatile("" ::: "memory")
@@ -244,6 +263,15 @@ typedef struct Query {
         } args16;
     };
 } Query;
+
+/* Terminal address is the allocated expression-byte high water; args64 is
+ * SymbolicCollectionStopReason.  Its queue index minus one counts committed
+ * ordinary records, excluding the handshake and this reserved terminal. */
+static inline int symbolic_query_is_terminal(const Query *query)
+{
+    return query->query == FINAL_QUERY ||
+           query->query == FINAL_QUERY_CAPACITY;
+}
 
 typedef struct MutationCandidate {
     uintptr_t addr;

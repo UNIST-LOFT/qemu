@@ -942,7 +942,12 @@ static SnapshotExitInfo *snapshot_exit_info_ptr(void) {
 }
 
 static void snapshot_exit_info_capture(SnapshotExitInfo *info, CPUArchState *env) {
-    if (!info || !env) return;
+    if (!info) return;
+    info->query_cursor = (next_query != NULL && query_queue != NULL)
+        ? (int64_t)(next_query - query_queue) : -1;
+    info->expr_cursor = (next_free_expr != NULL && pool != NULL)
+        ? (int64_t)(next_free_expr - pool) : -1;
+    if (!env) return;
     target_ulong pc = 0;
     target_ulong cs_base = 0;
     uint32_t flags = 0;
@@ -950,10 +955,6 @@ static void snapshot_exit_info_capture(SnapshotExitInfo *info, CPUArchState *env
     info->guest_pc = pc;
     info->guest_cs_base = cs_base;
     info->guest_last_translation_block = last_translation_block;
-    info->query_cursor = (next_query != NULL && query_queue != NULL)
-        ? (int64_t)(next_query - query_queue) : -1;
-    info->expr_cursor = (next_free_expr != NULL && pool != NULL)
-        ? (int64_t)(next_free_expr - pool) : -1;
 }
 
 static int64_t snapshot_query_cursor_index(const SnapshotExitInfo *info) {
@@ -990,9 +991,40 @@ static void snapshot_exit_info_set_reason(SnapshotExitInfo *info, const char *re
     g_strlcpy(info->description, reason, SNAPSHOT_EXIT_DESC_LEN);
 }
 
+QEMU_NORETURN void snapshot_stop_collection(SymbolicCollectionStopReason reason)
+{
+    if (reason != SYMBOLIC_COLLECTION_QUERY_CAPACITY &&
+        reason != SYMBOLIC_COLLECTION_EXPR_CAPACITY) {
+        log_msg("[snapshot] [collection-stop] [error invalid-reason]\n");
+        exit_with_status(1);
+        abort();
+    }
+    SnapshotExitInfo *info = snapshot_exit_info_ptr();
+    if (info != NULL) {
+        memset(info, 0, sizeof(*info));
+        info->collection_stop_reason = (uint32_t)reason;
+        snapshot_exit_info_capture(
+            info, current_cpu != NULL ? current_cpu->env_ptr : NULL);
+        snapshot_exit_info_set_reason(info,
+                                      symbolic_collection_reason_name(reason));
+        __atomic_store_n(&info->valid, 1, __ATOMIC_RELEASE);
+    }
+    log_msg("[snapshot] [collection-stop] [reason %s]\n",
+            symbolic_collection_reason_name(reason));
+    trace_mem_flush();
+    log_msg_flush();
+    fflush(NULL);
+    /* Do not finalize a guest exit or run parent-owned cleanup in the child.
+     * The terminal and sidecar have already been published by the caller. */
+    _exit(0);
+}
+
 static bool snapshot_exit_info_should_update(const SnapshotExitInfo *info, bool crashed) {
     if (info == NULL) return false;
     if (!info->valid) return true;
+    if (info->collection_stop_reason != SYMBOLIC_COLLECTION_COMPLETE) {
+        return false;
+    }
     return crashed;  // Prevent update for exit() after error handling
 }
 
@@ -4865,10 +4897,10 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
     bool binradar_mode = binradar_manager != NULL;
     afl_forksrv_pid = getpid();
     if (!binradar_forkserver_handshake(&driver)) {
-        log_msg("[snapshot] [forkserver] [error] protocol-v4 handshake\n");
+        log_msg("[snapshot] [forkserver] [error] protocol-v5 handshake\n");
         exit_with_status(1);
     }
-    log_msg("[forkserver] [start] [protocol 4]\n");
+    log_msg("[forkserver] [start] [protocol 5]\n");
 
     for (;;) {
         uint32_t was_killed;
@@ -5006,6 +5038,44 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
             }
 
             SnapshotExitInfo *exit_info = snapshot_exit_info_ptr();
+            bool exit_valid = exit_info != NULL &&
+                __atomic_load_n(&exit_info->valid, __ATOMIC_ACQUIRE) != 0;
+            if (exit_valid && exit_info->collection_stop_reason !=
+                    SYMBOLIC_COLLECTION_COMPLETE) {
+                int64_t query_cursor = exit_info->query_cursor;
+                int64_t expr_cursor = exit_info->expr_cursor;
+                uint32_t reason = exit_info->collection_stop_reason;
+                if (wait_rc != 0 || !WIFEXITED(child_status) ||
+                    WEXITSTATUS(child_status) != 0 ||
+                    (reason != SYMBOLIC_COLLECTION_QUERY_CAPACITY &&
+                     reason != SYMBOLIC_COLLECTION_EXPR_CAPACITY) ||
+                    query_queue == NULL || pool == NULL ||
+                    !snapshot_query_cursor_valid(query_cursor) ||
+                    query_cursor < 1 || query_cursor >= EXPR_QUERY_CAPACITY ||
+                    (reason == SYMBOLIC_COLLECTION_QUERY_CAPACITY &&
+                     query_cursor != EXPR_QUERY_CAPACITY - 1) ||
+                    !snapshot_expr_cursor_valid(expr_cursor) ||
+                    __atomic_load_n(&query_queue[query_cursor].query,
+                                    __ATOMIC_ACQUIRE) != FINAL_QUERY_CAPACITY ||
+                    query_queue[query_cursor].args64 != reason ||
+                    query_queue[query_cursor].address !=
+                        (uint64_t)expr_cursor * sizeof(Expr)) {
+                    log_msg("[forkserver] [error invalid-capacity-record]\n");
+                    exit_with_status(1);
+                }
+                /* Preserve the child's committed terminal and pool high water
+                 * even without a query-window file (notably DIRECTED mode).
+                 * Never initialize mutation analysis from this partial run. */
+                next_query = query_queue + query_cursor;
+                next_free_expr = pool + expr_cursor;
+                attempt_result = BINRADAR_FORKSERVER_ATTEMPT_CAPACITY;
+                attempt_discarded = true;
+                log_msg("[binradar] [attempt-discarded] [iter %u] "
+                        "[reason capacity] [collection-reason %s] [patch %u]\n",
+                        attempt, symbolic_collection_reason_name(reason),
+                        selected_patch);
+                break;
+            }
             if (binradar_mode && selected_patch == 0) {
                 bool applied = shared_trace_data != NULL &&
                     __atomic_load_n(&shared_trace_data->mutation_plan_applied,
@@ -5221,8 +5291,17 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
                 }
                 binradar_cache_feedback_drop(binradar_manager);
                 binradar_cache_clear_iteration(binradar_manager);
-                remaining_plans = attempt == 1
-                    ? 0 : snapshot_advance_modification_plan();
+                if (attempt_result == BINRADAR_FORKSERVER_ATTEMPT_CAPACITY) {
+                    binradar_cache_reset_child(binradar_manager);
+                    /* The current plan was attempted; all queued plans remain
+                     * unexecuted.  Do not pop a plan or clear shared cursors. */
+                    remaining_plans = mod_manager != NULL &&
+                        mod_manager->modifications != NULL
+                        ? g_queue_get_length(mod_manager->modifications) : 0;
+                } else {
+                    remaining_plans = attempt == 1
+                        ? 0 : snapshot_advance_modification_plan();
+                }
             } else {
                 *snapshot_exit_info_ptr() = baseline_exit;
                 if (attempt == 1) {

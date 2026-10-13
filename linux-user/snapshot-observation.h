@@ -17,6 +17,8 @@ typedef enum SnapshotFaultReferenceSource {
 typedef struct SnapshotExitInfo {
     uint32_t valid;
     uint32_t crashed;
+    /* Nonzero means collection stopped incomplete, never a guest outcome. */
+    uint32_t collection_stop_reason;
     int32_t target_signal;
     int32_t host_signal;
     int32_t si_code;
