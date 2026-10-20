@@ -38,7 +38,7 @@ from typing import Any
 
 ROOT = os.path.realpath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 sys.path.insert(0, ROOT)
-from fuzzolic import binradar_evidence
+from binradar import binradar_evidence
 
 
 HANDSHAKE_EXPECTED = 0x41464C04
@@ -913,7 +913,7 @@ def prepare_artifact(test, guest, env):
     if test.get("production_models"):
         env["PLT_INFO_FILE"] = guest + ".models.plt"
         subprocess.run([sys.executable,
-                        os.path.join(ROOT, "fuzzolic", "find_models_addrs.py"),
+                        os.path.join(ROOT, "binradar", "find_models_addrs.py"),
                         "-o", env["PLT_INFO_FILE"], guest], check=True,
                        capture_output=True)
         with open(env["PLT_INFO_FILE"], encoding="utf-8") as table:

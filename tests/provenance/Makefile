@@ -19,7 +19,7 @@
 #   ./run_test.py guests work $(QEMU) --test t90_realloc_payload_move_A
 #   ./run_test.py guests work $(QEMU) --test t90_realloc_payload_move_Z
 # Production libc-inclusive tables are generated at run time by
-# fuzzolic/find_models_addrs.py. Guests resolve memcpy before realloc, so the
+# binradar/find_models_addrs.py. Guests resolve memcpy before realloc, so the
 # tracer learns the actual libc IFUNC body rather than a resolver offset.
 # t89 requires actual native AND traced movement, with all 153 values intact;
 # it never silently passes a nonmoving libc path. The specific 10268 internal

@@ -10,7 +10,7 @@ to the guest's first executable LOAD segment (== symbolic_start_code), and
 the address must be the *PLT stub* address, NOT the GOT/JUMP_SLOT address
 (the guest executes the stub, and the dispatch lookup uses the executed PC).
 
-This script replicates fuzzolic/find_models_addrs.py `process_plt` exactly:
+This script replicates binradar/find_models_addrs.py `process_plt` exactly:
 
   base = first address of `objdump -d` output (the binary's lowest text
          address; for `-no-pie` guests this is the first R E LOAD segment)

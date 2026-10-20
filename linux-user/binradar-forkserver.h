@@ -11,7 +11,7 @@
  *      stop_reason)
  *
  * attempt_result and stop_reason are one shared enum table, mirrored by
- * ``fuzzolic/binradar_runtime.py`` and pinned by
+ * ``binradar/binradar_runtime.py`` and pinned by
  * ``tests/test_binradar_forkserver_protocol.py`` against this header.
  *
  * An attempt is one complete logical sweep: the patch-0 baseline sub-run plus

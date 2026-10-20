@@ -416,7 +416,7 @@ static GSList* plt_info = NULL;
 static GHashTable* plt_addrs = NULL;
 
 /* PLT_INFO_FILE rows are keyed by the basename of the executable the model
- * table was generated from (fuzzolic/find_models_addrs.py uses
+ * table was generated from (binradar/find_models_addrs.py uses
  * os.path.basename(binary)).  BinRadar executes derived artifacts of that
  * same executable - <binary>.brpatched / <binary>.brcached - which differ
  * only by patching: the executable LOAD layout, and therefore every PLT
