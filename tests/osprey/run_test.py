@@ -32,9 +32,9 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
-sys.path.insert(0, str(ROOT / "fuzzolic"))
+sys.path.insert(0, str(ROOT))
 
-import binradar_evidence
+from fuzzolic import binradar_evidence
 
 
 HANDSHAKE_EXPECTED = 0x41464C04

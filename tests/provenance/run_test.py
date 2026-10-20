@@ -37,8 +37,8 @@ import time
 from typing import Any
 
 ROOT = os.path.realpath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
-sys.path.insert(0, os.path.join(ROOT, "fuzzolic"))
-import binradar_evidence
+sys.path.insert(0, ROOT)
+from fuzzolic import binradar_evidence
 
 
 HANDSHAKE_EXPECTED = 0x41464C04
