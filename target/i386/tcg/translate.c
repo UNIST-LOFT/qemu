@@ -4238,22 +4238,24 @@ static void gen_sse(CPUX86State *env, DisasContext *s, int b,
         case 0x03a:
         case 0x13a:
             b = modrm;
-            modrm = x86_ldub_code(env, s);
-            rm = modrm & 7;
-            reg = ((modrm >> 3) & 7) | rex_r;
-            mod = (modrm >> 6) & 3;
             if (b1 >= 2) {
                 goto unknown_op;
             }
 
             if (b == 0xf2 && use_qasan) {
-                /* QASAN backdoor */
+                /* The QASAN backdoor is exactly three bytes, with no ModRM.
+                 * Consuming one here eats the next instruction's REX prefix
+                 * and corrupts its destination register in optimized guests. */
                 gen_helper_qasan_fake_instr(cpu_regs[R_EAX], cpu_env,
                                             cpu_regs[R_EAX], cpu_regs[R_EDI],
                                             cpu_regs[R_ESI], cpu_regs[R_EDX]);
                 break;
             }
 
+            modrm = x86_ldub_code(env, s);
+            rm = modrm & 7;
+            reg = ((modrm >> 3) & 7) | rex_r;
+            mod = (modrm >> 6) & 3;
             sse_fn_eppi = sse_op_table7[b].op[b1];
             if (!sse_fn_eppi) {
                 goto unknown_op;
@@ -5190,7 +5192,16 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
             if (binradar_trace_is_enabled()) {
                 TCGv pc_v = tcg_const_tl(pc_start);
                 TCGv ret_v = tcg_const_tl(s->cs_base + next_eip);
-                gen_helper_binradar_trace_call(pc_v, ret_v, s->T0);
+                TCGv stack_v = tcg_temp_new();
+                tcg_gen_subi_tl(stack_v, cpu_regs[R_ESP],
+                                1 << mo_pushpop(s, s->dflag));
+                if (mo_stacksize(s) == MO_16) {
+                    tcg_gen_ext16u_tl(stack_v, stack_v);
+                } else if (mo_stacksize(s) == MO_32) {
+                    tcg_gen_ext32u_tl(stack_v, stack_v);
+                }
+                gen_helper_binradar_trace_call(pc_v, ret_v, s->T0, stack_v);
+                tcg_temp_free(stack_v);
                 tcg_temp_free(pc_v);
                 tcg_temp_free(ret_v);
             }
@@ -5226,13 +5237,19 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                 tcg_gen_ext16u_tl(s->T0, s->T0);
             }
             if (binradar_trace_is_enabled()) {
-                target_ulong call_site, ret_addr;
+                target_ulong call_site, ret_addr, source;
                 if (binradar_trace_e9_relocated_call_info(pc_start, &call_site, &ret_addr)) {
                     TCGv site_v = tcg_const_tl(call_site);
                     TCGv ret_v = tcg_const_tl(ret_addr);
-                    gen_helper_binradar_trace_relocated_call(s->T0, site_v, ret_v);
+                    gen_helper_binradar_trace_relocated_call(s->T0, site_v, ret_v,
+                                                             cpu_regs[R_ESP]);
                     tcg_temp_free(site_v);
                     tcg_temp_free(ret_v);
+                } else if ((source = binradar_trace_tail_candidate(pc_start, 0))) {
+                    TCGv pc_v = tcg_const_tl(source);
+                    gen_helper_binradar_trace_tail_indirect(pc_v, s->T0,
+                                                            cpu_regs[R_ESP]);
+                    tcg_temp_free(pc_v);
                 }
             }
             gen_op_jmp_v(s->T0);
@@ -6765,7 +6782,16 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                 TCGv pc_v = tcg_const_tl(pc_start);
                 TCGv ret_v = tcg_const_tl(s->cs_base + next_eip);
                 TCGv entry_v = tcg_const_tl(s->cs_base + tval);
-                gen_helper_binradar_trace_call(pc_v, ret_v, entry_v);
+                TCGv stack_v = tcg_temp_new();
+                tcg_gen_subi_tl(stack_v, cpu_regs[R_ESP],
+                                1 << mo_pushpop(s, s->dflag));
+                if (mo_stacksize(s) == MO_16) {
+                    tcg_gen_ext16u_tl(stack_v, stack_v);
+                } else if (mo_stacksize(s) == MO_32) {
+                    tcg_gen_ext32u_tl(stack_v, stack_v);
+                }
+                gen_helper_binradar_trace_call(pc_v, ret_v, entry_v, stack_v);
+                tcg_temp_free(stack_v);
                 tcg_temp_free(pc_v);
                 tcg_temp_free(ret_v);
                 tcg_temp_free(entry_v);
@@ -6803,15 +6829,23 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
             tval &= 0xffffffff;
         }
         if (binradar_trace_is_enabled()) {
-            target_ulong call_site, ret_addr;
+            target_ulong call_site, ret_addr, source;
             if (binradar_trace_e9_relocated_call_info(pc_start, &call_site, &ret_addr)) {
                 TCGv entry_v = tcg_const_tl(s->cs_base + tval);
                 TCGv site_v = tcg_const_tl(call_site);
                 TCGv ret_v = tcg_const_tl(ret_addr);
-                gen_helper_binradar_trace_relocated_call(entry_v, site_v, ret_v);
+                gen_helper_binradar_trace_relocated_call(entry_v, site_v, ret_v,
+                                                         cpu_regs[R_ESP]);
                 tcg_temp_free(entry_v);
                 tcg_temp_free(site_v);
                 tcg_temp_free(ret_v);
+            } else if ((source = binradar_trace_tail_candidate(pc_start,
+                                                               s->cs_base + tval))) {
+                TCGv pc_v = tcg_const_tl(source);
+                TCGv entry_v = tcg_const_tl(s->cs_base + tval);
+                gen_helper_binradar_trace_tail(pc_v, entry_v, cpu_regs[R_ESP]);
+                tcg_temp_free(pc_v);
+                tcg_temp_free(entry_v);
             }
         }
         gen_bnd_jmp(s);
@@ -6836,6 +6870,17 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
         tval += s->pc - s->cs_base;
         if (dflag == MO_16) {
             tval &= 0xffff;
+        }
+        if (binradar_trace_is_enabled()) {
+            target_ulong source = binradar_trace_tail_candidate(pc_start,
+                                                                s->cs_base + tval);
+            if (source) {
+                TCGv pc_v = tcg_const_tl(source);
+                TCGv entry_v = tcg_const_tl(s->cs_base + tval);
+                gen_helper_binradar_trace_tail(pc_v, entry_v, cpu_regs[R_ESP]);
+                tcg_temp_free(pc_v);
+                tcg_temp_free(entry_v);
+            }
         }
         gen_jmp(s, tval);
         break;

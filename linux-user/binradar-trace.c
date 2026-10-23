@@ -9,6 +9,7 @@
 typedef struct BinradarFrame {
     target_ulong entry;
     target_ulong return_addr;
+    target_ulong stack_addr;
     bool has_entry;
     bool saw_patch_hit;
 } BinradarFrame;
@@ -74,6 +75,101 @@ static uint64_t reads_before_patch;
 static uint64_t reads_after_patch;
 static uint64_t next_group_id = 1;
 static target_ulong pending_patch_pc;
+
+typedef struct BinradarFunction {
+    target_ulong entry;
+    target_ulong end;
+} BinradarFunction;
+
+static GArray *functions;
+static GArray *unwind_functions;
+static const BinradarFunction *find_function(target_ulong pc);
+
+void binradar_trace_add_unwind_function(target_ulong entry, target_ulong size)
+{
+    const BinradarFunction *known = find_function(entry);
+    BinradarFunction fn = { entry, entry + size };
+
+    /* A secondary FDE within a sized ELF function is not a new owner. */
+    if (!size || fn.end <= entry || (known && known->entry != entry)) {
+        return;
+    }
+    if (!unwind_functions) {
+        unwind_functions = g_array_new(false, false, sizeof(fn));
+    }
+    g_array_append_val(unwind_functions, fn);
+}
+
+void binradar_trace_add_function(target_ulong entry, target_ulong size)
+{
+    BinradarFunction fn = { entry, entry + size };
+
+    if (!trace_enabled || !size || fn.end <= entry) {
+        return;
+    }
+    if (!functions) {
+        functions = g_array_new(false, false, sizeof(fn));
+    }
+    g_array_append_val(functions, fn);
+}
+
+static int compare_function(const void *a, const void *b)
+{
+    const BinradarFunction *x = a, *y = b;
+    if (x->entry != y->entry) {
+        return x->entry < y->entry ? -1 : 1;
+    }
+    return x->end < y->end ? -1 : x->end != y->end;
+}
+
+void binradar_trace_sort_functions(void)
+{
+    if (unwind_functions && unwind_functions->len) {
+        if (!functions) {
+            functions = g_array_new(false, false, sizeof(BinradarFunction));
+        }
+        g_array_append_vals(functions, unwind_functions->data,
+                            unwind_functions->len);
+        g_array_set_size(unwind_functions, 0);
+    }
+    if (functions) {
+        g_array_sort(functions, compare_function);
+    }
+}
+
+static const BinradarFunction *find_function(target_ulong pc)
+{
+    size_t lo = 0, hi = functions ? functions->len : 0;
+    const BinradarFunction *fn;
+
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        fn = &g_array_index(functions, BinradarFunction, mid);
+        if (fn->entry <= pc) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    if (!lo) {
+        return NULL;
+    }
+    fn = &g_array_index(functions, BinradarFunction, lo - 1);
+    return pc < fn->end ? fn : NULL;
+}
+
+/* entry == 0 denotes an indirect jump: only its source can be resolved now. */
+target_ulong binradar_trace_tail_candidate(target_ulong pc, target_ulong entry)
+{
+    const BinradarFunction *source = find_function(pc);
+    const BinradarFunction *dest;
+
+    if (!source) {
+        return false;
+    }
+    dest = entry ? find_function(entry) : NULL;
+    return !entry || (dest && dest->entry == entry) ? source->entry : 0;
+}
 
 static BinradarFrame *frames;
 static size_t frames_len;
@@ -270,12 +366,14 @@ static void ensure_frames(size_t needed)
     frames = g_realloc(frames, frames_cap * sizeof(*frames));
 }
 
-static void push_frame(target_ulong entry, bool has_entry, target_ulong return_addr)
+static void push_frame(target_ulong entry, bool has_entry, target_ulong return_addr,
+                       target_ulong stack_addr)
 {
     ensure_frames(frames_len + 1);
     frames[frames_len++] = (BinradarFrame){
         .entry = entry,
         .return_addr = return_addr,
+        .stack_addr = stack_addr,
         .has_entry = has_entry,
         .saw_patch_hit = false,
     };
@@ -284,7 +382,7 @@ static void push_frame(target_ulong entry, bool has_entry, target_ulong return_a
 static void reset_runtime(target_ulong root_entry)
 {
     frames_len = 0;
-    push_frame(root_entry, root_entry != 0, 0);
+    push_frame(root_entry, root_entry != 0, 0, 0);
     patch_hits = 0;
     patch_unknown_hits = 0;
     patch_covered = false;
@@ -431,7 +529,7 @@ void binradar_trace_insn_hit(target_ulong pc)
 }
 
 void binradar_trace_call(target_ulong pc, target_ulong return_addr,
-                         target_ulong entry)
+                         target_ulong entry, target_ulong stack_addr)
 {
     (void)pc;
     if (!trace_enabled) {
@@ -442,7 +540,35 @@ void binradar_trace_call(target_ulong pc, target_ulong return_addr,
      * the function containing PATCH_LOC and replay naturally reaches the
      * patched call and its dest() action. */
     flush_pending_patch();
-    push_frame(entry, entry != 0, return_addr);
+    push_frame(entry, entry != 0, return_addr, stack_addr);
+}
+
+static BinradarFrame *tail_frame(target_ulong source, target_ulong sp)
+{
+    BinradarFrame *frame;
+
+    /* A jump at PATCH_LOC belongs to the old owner, even when it transfers
+     * to another function.  Returning later must retain the original caller. */
+    flush_pending_patch();
+    if (!trace_enabled || !frames_len) {
+        return NULL;
+    }
+    frame = &frames[frames_len - 1];
+    if (!frame->stack_addr || frame->stack_addr != sp ||
+        !frame->has_entry || frame->entry != source) {
+        return NULL;
+    }
+    return frame;
+}
+
+void binradar_trace_tail(target_ulong source, target_ulong entry, target_ulong sp)
+{
+    BinradarFrame *frame = tail_frame(source, sp);
+
+    if (frame) {
+        frame->entry = entry;
+        frame->saw_patch_hit = false;
+    }
 }
 
 void binradar_trace_ret(target_ulong pc, target_ulong return_addr)
@@ -461,7 +587,7 @@ void binradar_trace_ret(target_ulong pc, target_ulong return_addr)
 }
 
 void binradar_trace_relocated_call(target_ulong entry, target_ulong call_site,
-                                   target_ulong ret_addr)
+                                   target_ulong ret_addr, target_ulong stack_addr)
 {
     if (!trace_enabled) {
         return;
@@ -472,7 +598,7 @@ void binradar_trace_relocated_call(target_ulong entry, target_ulong call_site,
      * instruction still belongs to the current (caller) frame, so consume
      * its pending patch hit before pushing the relocated callee frame. */
     flush_pending_patch();
-    push_frame(entry, entry != 0, ret_addr);
+    push_frame(entry, entry != 0, ret_addr, stack_addr);
 }
 
 static BinradarGroup *new_group(void)
@@ -1022,16 +1148,41 @@ void HELPER(binradar_trace_insn)(target_ulong pc)
 }
 
 void HELPER(binradar_trace_call)(target_ulong pc, target_ulong return_addr,
-                                target_ulong entry)
+                                target_ulong entry, target_ulong stack_addr)
 {
-    binradar_trace_call(pc, return_addr, entry);
+    binradar_trace_call(pc, return_addr, entry, stack_addr);
 }
 
 void HELPER(binradar_trace_relocated_call)(target_ulong entry,
                                            target_ulong call_site,
-                                           target_ulong ret_addr)
+                                           target_ulong ret_addr,
+                                           target_ulong stack_addr)
 {
-    binradar_trace_relocated_call(entry, call_site, ret_addr);
+    binradar_trace_relocated_call(entry, call_site, ret_addr, stack_addr);
+}
+
+void HELPER(binradar_trace_tail)(target_ulong source, target_ulong entry,
+                                target_ulong sp)
+{
+    binradar_trace_tail(source, entry, sp);
+}
+
+void HELPER(binradar_trace_tail_indirect)(target_ulong source, target_ulong entry,
+                                         target_ulong sp)
+{
+    BinradarFrame *frame = tail_frame(source, sp);
+    const BinradarFunction *dest;
+
+    /* Switch dispatch and other ordinary indirect branches usually retain
+     * locals on the stack: reject them before touching the boundary index. */
+    if (!frame) {
+        return;
+    }
+    dest = find_function(entry);
+    if (dest && dest->entry == entry) {
+        frame->entry = entry;
+        frame->saw_patch_hit = false;
+    }
 }
 
 void HELPER(binradar_trace_ret)(target_ulong pc, target_ulong return_addr)

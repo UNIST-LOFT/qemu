@@ -2928,6 +2928,11 @@ static void load_elf_image(const char *image_name, int image_fd,
     if (qemu_log_enabled() || binradar_trace_symbols_enabled()) {
         load_symbols(ehdr, image_fd, load_bias);
     }
+    if (binradar_trace_is_enabled()) {
+        binradar_trace_sort_functions();
+        binradar_trace_load_elf(image_fd, load_bias);
+        binradar_trace_sort_functions();
+    }
 
     mmap_unlock();
 
@@ -3044,7 +3049,14 @@ static void load_symbols(struct elfhdr *hdr, int fd, abi_ulong load_bias)
         }
     }
 
-    /* There will be no symbol table if the file was stripped.  */
+    /* Stripped dynamic images can still expose sized function entries. */
+    for (i = 0; i < shnum; ++i) {
+        if (shdr[i].sh_type == SHT_DYNSYM) {
+            sym_idx = i;
+            str_idx = shdr[i].sh_link;
+            goto found;
+        }
+    }
     return;
 
  found:
@@ -3089,6 +3101,7 @@ static void load_symbols(struct elfhdr *hdr, int fd, abi_ulong load_bias)
             syms[i].st_value &= ~(target_ulong)1;
 #endif
             syms[i].st_value += load_bias;
+            binradar_trace_add_function(syms[i].st_value, syms[i].st_size);
             i++;
         }
     }

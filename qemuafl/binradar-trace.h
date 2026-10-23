@@ -26,13 +26,20 @@ int binradar_trace_suppress_write_fd(int fd);
 
 void binradar_trace_after_load(target_ulong entry, target_ulong start_code,
                                target_ulong end_code, const char *binary);
+/* ELF evidence is collected once at load time, never from guest memory. */
+void binradar_trace_load_elf(int fd, target_ulong load_bias);
+void binradar_trace_add_function(target_ulong entry, target_ulong size);
+void binradar_trace_add_unwind_function(target_ulong entry, target_ulong size);
+void binradar_trace_sort_functions(void);
+target_ulong binradar_trace_tail_candidate(target_ulong pc, target_ulong entry);
+void binradar_trace_tail(target_ulong source, target_ulong entry, target_ulong sp);
 void binradar_trace_start(target_ulong pc);
 void binradar_trace_record_bb(target_ulong pc);
 void binradar_trace_insn_hit(target_ulong pc);
 void binradar_trace_call(target_ulong pc, target_ulong return_addr,
-                         target_ulong entry);
+                         target_ulong entry, target_ulong stack_addr);
 void binradar_trace_relocated_call(target_ulong entry, target_ulong call_site,
-                                   target_ulong ret_addr);
+                                   target_ulong ret_addr, target_ulong stack_addr);
 void binradar_trace_ret(target_ulong pc, target_ulong return_addr);
 
 void binradar_trace_post_syscall(void *cpu_env, int num, target_long ret,

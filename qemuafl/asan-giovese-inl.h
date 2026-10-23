@@ -197,6 +197,38 @@ int asan_giovese_store8(void* ptr) {
 
 }
 
+/* Only complete application granules reach this scan. Read words without
+   alignment/aliasing assumptions and never beyond the requested shadow range.
+   Fault reporting still scans the original access to locate the first byte. */
+static inline int asan_giovese_shadow_nonzero(uintptr_t h, size_t granules) {
+
+  const uint8_t* shadow = (const uint8_t*)(h >> 3) + SHADOW_OFFSET;
+  /* Align before batching so a word never straddles a shadow mapping boundary
+     and faults in the next mapping before observing poison in this one. */
+  while (granules && ((uintptr_t)shadow & (sizeof(uintptr_t) - 1))) {
+
+    if (*shadow++) return 1;
+    --granules;
+
+  }
+  while (granules >= sizeof(uintptr_t)) {
+
+    uintptr_t word;
+    __builtin_memcpy(&word, shadow, sizeof(word));
+    if (word) return 1;
+    shadow += sizeof(word);
+    granules -= sizeof(word);
+
+  }
+  while (granules--) {
+
+    if (*shadow++) return 1;
+
+  }
+  return 0;
+
+}
+
 int asan_giovese_loadN(void* ptr, size_t n) {
 
   if (!n) return 0;
@@ -228,12 +260,10 @@ int asan_giovese_loadN(void* ptr, size_t n) {
 
   }
 
-  while (start < last_8) {
+  if (start < last_8) {
 
-    uintptr_t h = start;
-    int8_t*   shadow_addr = (int8_t*)(h >> 3) + SHADOW_OFFSET;
-    if (*shadow_addr) return 1;
-    start += 8;
+    if (asan_giovese_shadow_nonzero(start, (last_8 - start) >> 3)) return 1;
+    start = last_8;
 
   }
 
@@ -282,12 +312,10 @@ int asan_giovese_storeN(void* ptr, size_t n) {
 
   }
 
-  while (start < last_8) {
+  if (start < last_8) {
 
-    uintptr_t h = start;
-    int8_t*   shadow_addr = (int8_t*)(h >> 3) + SHADOW_OFFSET;
-    if (*shadow_addr) return 1;
-    start += 8;
+    if (asan_giovese_shadow_nonzero(start, (last_8 - start) >> 3)) return 1;
+    start = last_8;
 
   }
 
@@ -336,12 +364,13 @@ int asan_giovese_guest_loadN(target_ulong addr, size_t n) {
 
   }
 
-  while (start < last_8) {
+  if (start < last_8) {
 
-    uintptr_t h = (uintptr_t)AFL_G2H(start);
-    int8_t*   shadow_addr = (int8_t*)(h >> 3) + SHADOW_OFFSET;
-    if (*shadow_addr) return 1;
-    start += 8;
+    /* AFL_G2H adds guest_base, so consecutive guest granules have consecutive
+       shadow bytes; translate once instead of once per granule. */
+    if (asan_giovese_shadow_nonzero((uintptr_t)AFL_G2H(start),
+                                    (last_8 - start) >> 3)) return 1;
+    start = last_8;
 
   }
 
@@ -390,12 +419,13 @@ int asan_giovese_guest_storeN(target_ulong addr, size_t n) {
 
   }
 
-  while (start < last_8) {
+  if (start < last_8) {
 
-    uintptr_t h = (uintptr_t)AFL_G2H(start);
-    int8_t*   shadow_addr = (int8_t*)(h >> 3) + SHADOW_OFFSET;
-    if (*shadow_addr) return 1;
-    start += 8;
+    /* AFL_G2H adds guest_base, so consecutive guest granules have consecutive
+       shadow bytes; translate once instead of once per granule. */
+    if (asan_giovese_shadow_nonzero((uintptr_t)AFL_G2H(start),
+                                    (last_8 - start) >> 3)) return 1;
+    start = last_8;
 
   }
 
@@ -1298,8 +1328,6 @@ int asan_giovese_report_and_crash(int access_type, target_ulong addr, size_t n,
                                   target_ulong pc, target_ulong bp,
                                   target_ulong sp) {
 
-  struct call_context ctx;
-  asan_giovese_populate_context(&ctx, pc);
   target_ulong fault_addr = 0;
   const char*  error_type;
 
@@ -1309,7 +1337,10 @@ int asan_giovese_report_and_crash(int access_type, target_ulong addr, size_t n,
     binradar_trace_report_qasan_crash(pc, fault_addr, SIGSEGV);
     _exit(1);
   }
-  
+
+  struct call_context ctx;
+  asan_giovese_populate_context(&ctx, pc);
+
   fprintf(stderr,
           "=================================================================\n"
           ANSI_COLOR_HRED "==%d==ERROR: " ASAN_NAME_STR ": %s on address 0x"
