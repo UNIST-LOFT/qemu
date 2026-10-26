@@ -148,6 +148,7 @@ QemuMutexTrylockFunc qemu_mutex_trylock_func = NULL;
 
 static void test_sem_manifest_integrity(void);
 static void test_sem_overwrite_fail_closed(void);
+static void test_provenance_mem_invalidate_overlap(void);
 static void test_sem_access_class_and_flags(void);
 static void test_address_origin_channels_and_producers(void);
 static void test_address_shadow_reload(void);
@@ -3001,6 +3002,7 @@ int main(void)
     test_canonical_dump();
     test_sem_manifest_integrity();
     test_sem_overwrite_fail_closed();
+    test_provenance_mem_invalidate_overlap();
     test_sem_access_class_and_flags();
     test_address_origin_channels_and_producers();
     test_address_shadow_reload();
@@ -3017,7 +3019,7 @@ int main(void)
         fprintf(stderr, "%d unit test check(s) FAILED\n", failures);
         return 1;
     }
-    printf("PASS osprey_unit (52/52)\n");
+    printf("PASS osprey_unit (53/53)\n");
     return 0;
 }
 
@@ -3230,6 +3232,133 @@ static void test_sem_overwrite_fail_closed(void)
     sem_reg_overwrite(NULL, 0, SEM_OP_UNKNOWN);
     sem_context_replace(NULL);
     osprey_collect_enabled = 0;
+}
+
+/* Pointer-memory shadow invalidation must drop exactly the overlapping
+ * aligned slots.  The sparse/dense traversal split is an implementation
+ * detail, so both arms are driven through the production entrypoint with
+ * real tags and compared on surviving tags only. */
+static PtrTag test_tag(uint64_t object_id)
+{
+    PtrTag tag;
+    memset(&tag, 0, sizeof(tag));
+    tag.valid = true;
+    tag.object_id = object_id;
+    tag.generation = 1;
+    tag.concrete_value = 0x10000 + object_id;
+    tag.producer_pc = 0x400300;
+    tag.producer_kind = PROV_PRODUCER_MALLOC_RETURN;
+    return tag;
+}
+
+static void test_tag_slot(uint64_t addr, uint64_t object_id)
+{
+    provenance_mem_store_tag(addr, test_tag(object_id));
+}
+
+static bool test_tag_present(uint64_t addr, uint64_t object_id)
+{
+    PtrTag tag = provenance_mem_load_tag(addr);
+    return tag.valid && tag.object_id == object_id;
+}
+
+static void test_provenance_mem_invalidate_overlap(void)
+{
+    provenance_init();
+    /* Drop tags left by earlier cases so the traversal-arm choice below
+     * reflects this fixture, not runner history.  The top-of-space slot, if
+     * any, is excluded by this interval's aligned end. */
+    provenance_mem_invalidate(0, 0x01000000);
+    provenance_mem_invalidate(UINT64_MAX - 7, 8);
+
+    /* Dense arm: the write interval is narrower than the live shadow, so
+     * the direct aligned-key probe path runs. */
+    for (uint64_t i = 0; i < 64; i++) {
+        test_tag_slot(0x100000 + i * 8, i + 1);
+    }
+    provenance_mem_invalidate(0x100008, 8);
+    CHECK(!test_tag_present(0x100008, 2), "dense: exact slot invalidated");
+    CHECK(test_tag_present(0x100000, 1), "dense: preceding slot retained");
+    CHECK(test_tag_present(0x100010, 3), "dense: following slot retained");
+
+    /* Unaligned write touches every aligned slot its bytes overlap. */
+    provenance_mem_invalidate(0x100017, 2);
+    CHECK(!test_tag_present(0x100010, 3), "unaligned: first slot dropped");
+    CHECK(!test_tag_present(0x100018, 4), "unaligned: second slot dropped");
+    CHECK(test_tag_present(0x100020, 5), "unaligned: next slot retained");
+
+    /* Zero-length write is a no-op; the adjacent interval is untouched. */
+    provenance_mem_invalidate(0x100020, 0);
+    CHECK(test_tag_present(0x100020, 5), "zero-length preserves tags");
+    provenance_mem_invalidate(0x100028, 8);
+    CHECK(test_tag_present(0x100020, 5), "adjacent interval preserved");
+
+    /* Sparse arm: one live tag, an interval covering far more candidate
+     * slots than the table holds (the allocator-initialization shape). */
+    for (uint64_t i = 0; i < 64; i++) {
+        provenance_mem_invalidate(0x100000 + i * 8, 8);
+    }
+    CHECK(!test_tag_present(0x100000, 1) && !test_tag_present(0x101f8, 64),
+          "dense fixture cleared");
+    test_tag_slot(0x200000, 101);
+    test_tag_slot(0x200000 + 0x8000, 102);
+    provenance_mem_invalidate(0x200000, 0x4000);
+    CHECK(!test_tag_present(0x200000, 101), "sparse: covered slot dropped");
+    CHECK(test_tag_present(0x200000 + 0x8000, 102),
+          "sparse: uncovered slot retained");
+
+    /* Same sparse arm with the payload beyond the range: nothing is live
+     * inside the interval, so the table keeps every entry. */
+    provenance_mem_invalidate(0x300000, 348378032);
+    CHECK(test_tag_present(0x200000 + 0x8000, 102),
+          "sparse: large disjoint range preserves live tags");
+
+    /* Unaligned, non-empty write that starts inside a tagged slot and ends
+     * in an untagged gap still drops that partial slot. */
+    provenance_mem_invalidate(0x200000 + 0x8003, 3);
+    CHECK(!test_tag_present(0x200000 + 0x8000, 102),
+          "sparse: partial first-slot overlap invalidated");
+
+    /* Top-of-space slot: its span wraps, so it covers any write whose end is
+     * at or past the slot start; the table is walked live-entry-wise here
+     * because the candidate count exceeds the live shadow. */
+    test_tag_slot(UINT64_MAX - 7, 201);
+    provenance_mem_invalidate(UINT64_MAX - 8, 8);
+    CHECK(!test_tag_present(UINT64_MAX - 7, 201),
+          "top-of-space slot invalidated by its own write");
+    test_tag_slot(UINT64_MAX - 7, 202);
+    provenance_mem_invalidate(0, 0x100);
+    CHECK(test_tag_present(UINT64_MAX - 7, 202),
+          "top-of-space slot retained by a low interval");
+
+    /* Wrapping interval keeps the established contract: only the starting
+     * aligned slot is invalidated, never a sweep to UINT64_MAX. */
+    test_tag_slot(0x500000, 301);
+    test_tag_slot(0x500008, 302);
+    provenance_mem_invalidate(0x500008, (target_ulong)-4);
+    CHECK(!test_tag_present(0x500008, 302),
+          "wrapping range invalidates start slot");
+    CHECK(test_tag_present(0x500000, 301),
+          "wrapping range leaves other slots");
+
+    /* A reused allocation must not resurrect a stale pointer tag: the
+     * shadow entry survives only if the overwrite did not cover it. */
+    test_tag_slot(0x600000, 401);
+    provenance_mem_invalidate(0x600000, 16);
+    CHECK(!test_tag_present(0x600000, 401),
+          "reused allocation drops stale tag");
+    test_tag_slot(0x600010, 402);
+    test_tag_slot(0x700000, 403);
+    provenance_mem_invalidate(0x600010, 8);
+    CHECK(!test_tag_present(0x600010, 402),
+          "reused allocation clears its own slot only");
+    CHECK(test_tag_present(0x700000, 403),
+          "unrelated live tag survives reuse invalidation");
+
+    /* Large disjoint range keeps unrelated tags. */
+    provenance_mem_invalidate(0x800000, 0x100000);
+    CHECK(test_tag_present(0x700000, 403),
+          "large disjoint range keeps unrelated tag");
 }
 
 static void test_sem_access_class_and_flags(void)

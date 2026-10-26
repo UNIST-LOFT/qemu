@@ -67,6 +67,14 @@ void provenance_set_shared_fault_ptr(PendingProvenanceFault *ptr) {
  * We keep entries for all aligned pointer-sized slots. */
 static GHashTable *prov_mem_shadow = NULL;
 
+/* Intervals spanning at most this many aligned slots are always invalidated by
+ * probing the candidate keys.  Every ordinary guest scalar store (1, 2, 4, 8,
+ * 16 bytes) lands here without consulting the table size, which keeps the
+ * common path at one hash lookup per touched slot.  Wider intervals compare
+ * their candidate count against live shadow occupancy and walk the live
+ * entries instead when that is cheaper. */
+#define PROV_INVALIDATE_PROBE_MAX 8
+
 /* ---- Helpers ---- */
 
 static guint obj_key_hash(gconstpointer key) {
@@ -511,28 +519,58 @@ PtrTag provenance_mem_load_tag(target_ulong addr) {
 void provenance_mem_invalidate(target_ulong addr, target_ulong size) {
     if (prov_mem_shadow == NULL) return;
     if (size == 0) return;
+    const target_ulong align = sizeof(target_ulong);
     /* Overflow-safe interval: [addr, addr+size) may wrap in the guest
      * address space.  A wrapped range is bogus (no real mapping spans the
      * address-space wrap); invalidate only the aligned slots actually
      * touched before the wrap and stop — never sweep to UINT64_MAX. */
-    target_ulong start = addr & ~(target_ulong)(sizeof(target_ulong) - 1);
+    target_ulong start = addr & ~(target_ulong)(align - 1);
     target_ulong last = addr + size - 1;
-    target_ulong end;
     if (last < addr) {
-        end = (target_ulong)-1 - sizeof(target_ulong) + 1;  /* clamp: no wrap */
         /* The range is invalid; invalidate just the start slot. */
-        g_hash_table_remove(prov_mem_shadow,
-                            GINT_TO_POINTER((uintptr_t)start));
+        g_hash_table_remove(prov_mem_shadow, GSIZE_TO_POINTER(start));
         return;
     }
-    end = last & ~(target_ulong)(sizeof(target_ulong) - 1);
+    target_ulong end = last & ~(target_ulong)(align - 1);
+
+    /* Slots are aligned fixed-width keys, so an ordinary scalar write covers
+     * at most a few candidate keys and probing them directly is cheapest.  A
+     * bulk overwrite (allocator initialization of a large buffer, a copy)
+     * must not cost one host hash lookup per aligned slot in the interval:
+     * once the interval spans more candidate slots than the live shadow
+     * holds, one walk over the live entries is strictly cheaper.  Both paths
+     * use the same overlap predicate, so partially covered first/last slots
+     * and the top-of-space slot (whose end wraps) stay invalidated exactly as
+     * the scalar path invalidates them. */
+    uint64_t span = (uint64_t)(end - start);   /* multiple of align, no wrap */
+    if (span > (uint64_t)(PROV_INVALIDATE_PROBE_MAX - 1) * align) {
+        guint live_slots = g_hash_table_size(prov_mem_shadow);
+        if (live_slots == 0) return;
+        if (span / align + 1 > live_slots) {
+            GHashTableIter it;
+            gpointer key, value;
+            g_hash_table_iter_init(&it, prov_mem_shadow);
+            while (g_hash_table_iter_next(&it, &key, &value)) {
+                target_ulong slot = (target_ulong)GPOINTER_TO_SIZE(key);
+                /* Overlap: slot start at or before the inclusive write end AND
+                 * write start strictly before the slot end
+                 * [slot, slot + align).  `slot` is aligned, so slot + align
+                 * wraps only for the single top-of-space slot, whose span
+                 * reaches 2^64 and therefore covers any write whose end is at
+                 * or past the slot start. */
+                if (slot > end) continue;
+                target_ulong slot_end = slot + align;
+                if (addr < slot_end || slot_end < slot) {
+                    g_hash_table_iter_remove(&it);
+                }
+            }
+            return;
+        }
+    }
     for (target_ulong a = start;;) {
-        g_hash_table_remove(prov_mem_shadow,
-                            GINT_TO_POINTER((uintptr_t)a));
+        g_hash_table_remove(prov_mem_shadow, GSIZE_TO_POINTER(a));
         if (a == end) break;
-        /* Stop before a wraps or passes end. */
-        if (a > end - sizeof(target_ulong)) break;
-        a += sizeof(target_ulong);
+        a += align;
     }
 }
 
