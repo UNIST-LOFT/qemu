@@ -150,6 +150,7 @@ static void test_sem_manifest_integrity(void);
 static void test_sem_overwrite_fail_closed(void);
 static void test_provenance_mem_invalidate_overlap(void);
 static void test_provenance_lookup_lifetime(void);
+static void test_sem_raw_first_lifetime(void);
 static void test_sem_access_class_and_flags(void);
 static void test_address_origin_channels_and_producers(void);
 static void test_address_shadow_reload(void);
@@ -3005,6 +3006,7 @@ int main(void)
     test_sem_overwrite_fail_closed();
     test_provenance_mem_invalidate_overlap();
     test_provenance_lookup_lifetime();
+    test_sem_raw_first_lifetime();
     test_sem_access_class_and_flags();
     test_address_origin_channels_and_producers();
     test_address_shadow_reload();
@@ -3021,7 +3023,7 @@ int main(void)
         fprintf(stderr, "%d unit test check(s) FAILED\n", failures);
         return 1;
     }
-    printf("PASS osprey_unit (54/54)\n");
+    printf("PASS osprey_unit (55/55)\n");
     return 0;
 }
 
@@ -3425,6 +3427,69 @@ static void test_provenance_lookup_lifetime(void)
     CHECK(provenance_retire_object(base) &&
           provenance_retire_object(base + 0x1000), "lookup fixtures retired");
     provenance_invalidate_all_regs(&env_b);
+}
+
+/* Numeric-only accesses use the real semantic/provenance consumers.  UNKNOWN
+ * cannot identify a freed object: the second event must still run its tagged
+ * check, even at the same address/PC as the earlier successful event. */
+static void test_sem_raw_first_lifetime(void)
+{
+    CPUArchState *env = g_new0(CPUArchState, 1);
+    PendingProvenanceFault pending = {0};
+    ProvPublishedFinding finding;
+    const target_ulong base = 0x930000, pc = 0x400180;
+    uint64_t saved_start = symbolic_start_code, saved_end = symbolic_end_code;
+    target_ulong saved_entry = binradar_entrypoint;
+    int saved_memcheck = binradar_memcheck_enabled;
+    int saved_osprey = osprey_collect_enabled;
+    provenance_init();
+    provenance_set_shared_fault_ptr(&pending);
+    binradar_memcheck_enabled = 1;
+    osprey_collect_enabled = 0;
+    symbolic_start_code = 0x400000;
+    symbolic_end_code = 0x401000;
+    binradar_entrypoint = (target_ulong)-1;
+    PtrTag tag = provenance_create_object(base, 8, pc,
+                                          PROV_PRODUCER_MALLOC_RETURN);
+    PtrRegShadow *shadow = provenance_get_reg_shadow(env);
+    for (unsigned pass = 0; pass < 2; ++pass) {
+        shadow->ea_meta = (struct ProvEAMeta){
+            .valid = true, .base_reg = R_EDI, .index_reg = -1,
+            .aflags = MO_64, .override = -1,
+            .base_val = base, .base_tag = tag,
+        };
+        sem_mem_access(env, base, 8, pc,
+                       SEM_MEM_F_RAW_FIRST | SEM_MEM_F_PROVENANCE_CHECK,
+                       SEM_OP_INTEGER, SEM_INTERVAL_EXACT_WIDTH,
+                       SEM_PRODUCER_INTEGER_MODRM);
+        CHECK(!shadow->ea_meta.valid, "fused event consumes its EA snapshot");
+        if (pass == 0) {
+            CHECK(!provenance_snapshot_pending_finding(&finding),
+                  "first live fused access is safe");
+            CHECK(provenance_retire_object(base), "fused fixture retired");
+        } else {
+            CHECK(provenance_snapshot_pending_finding(&finding) &&
+                  finding.payload.is_uaf &&
+                  finding.payload.object_id == tag.object_id &&
+                  finding.payload.access_width == 8 &&
+                  finding.payload.access_pc == pc,
+                  "same-PC fused access rechecks lifetime after raw UNKNOWN");
+        }
+    }
+    provenance_clear_pending_fault();
+    sem_mem_access(env, base, 8, pc,
+                   SEM_MEM_F_RAW_FIRST | SEM_MEM_F_PROVENANCE_CHECK,
+                   SEM_OP_INTEGER, SEM_INTERVAL_EXACT_WIDTH,
+                   SEM_PRODUCER_INTEGER_MODRM);
+    CHECK(!provenance_snapshot_pending_finding(&finding),
+          "consumed EA cannot leak a freed identity into the next event");
+    provenance_set_shared_fault_ptr(NULL);
+    symbolic_start_code = saved_start;
+    symbolic_end_code = saved_end;
+    binradar_entrypoint = saved_entry;
+    binradar_memcheck_enabled = saved_memcheck;
+    osprey_collect_enabled = saved_osprey;
+    g_free(env);
 }
 
 static void test_sem_access_class_and_flags(void)

@@ -968,6 +968,7 @@ static bool prov_syscall_read_pc(CPUArchState *env, target_ulong *out)
 static MemcheckResult prov_check_bounds(CPUArchState *env, target_ulong addr,
                                         target_ulong size, target_ulong pc,
                                         const PtrTag *tag, int reg, target_ulong value,
+                                        bool check_unknown,
                                         ProvFindingOrigin origin);
 
 static void prov_check_syscall(CPUArchState *env, target_ulong addr,
@@ -992,7 +993,7 @@ static void prov_check_syscall(CPUArchState *env, target_ulong addr,
             }
         }
     }
-    prov_check_bounds(env, addr, size, pc, &tag, reg, value, origin);
+    prov_check_bounds(env, addr, size, pc, &tag, reg, value, true, origin);
 }
 
 static void prov_check_syscall_tagged(CPUArchState *env, target_ulong addr,
@@ -1002,7 +1003,7 @@ static void prov_check_syscall_tagged(CPUArchState *env, target_ulong addr,
     target_ulong pc;
     if (size == 0 || !prov_syscall_read_pc(env, &pc)) return;
     if (tag.concrete_value != addr) tag.valid = false;
-    prov_check_bounds(env, addr, size, pc, &tag, -1, addr, origin);
+    prov_check_bounds(env, addr, size, pc, &tag, -1, addr, true, origin);
 }
 
 void provenance_check_syscall_read(CPUArchState *env, target_ulong addr,
@@ -1140,6 +1141,7 @@ static MemcheckResult prov_check_bounds(CPUArchState *env, target_ulong addr,
                                         target_ulong size, target_ulong pc,
                                         const PtrTag *ea_tag, int ea_base_reg,
                                         target_ulong ea_base_reg_val,
+                                        bool check_unknown,
                                         ProvFindingOrigin origin) {
     if (ea_tag != NULL && ea_tag->valid) {
         ProvenanceObject *obj = provenance_lookup_object(ea_tag->object_id,
@@ -1245,7 +1247,7 @@ static MemcheckResult prov_check_bounds(CPUArchState *env, target_ulong addr,
     /* UNKNOWN provenance: fall through to exact-bounds on LIVE objects.
      * Do NOT report UAF from numeric quarantine (cannot distinguish stale
      * pointer from valid pointer to reused/untracked allocation). */
-    if (binradar_memcheck_enabled) {
+    if (check_unknown && binradar_memcheck_enabled) {
         /* Only an existing live half-open interval can prove UNKNOWN OOB. */
         SnapshotMemRegion *mr = mr_manager_heap_search_pub(addr);
         if (mr != NULL) {
@@ -1288,7 +1290,19 @@ MemcheckResult provenance_check_access(CPUArchState *env, target_ulong addr,
                                        target_ulong ea_base_reg_val)
 {
     return prov_check_bounds(env, addr, size, pc, ea_tag, ea_base_reg,
-                              ea_base_reg_val, PROV_FINDING_ORIGIN_ACCESS);
+                              ea_base_reg_val, true, PROV_FINDING_ORIGIN_ACCESS);
+}
+
+void provenance_check_tagged_access(CPUArchState *env, target_ulong addr,
+                                    target_ulong size, target_ulong pc,
+                                    const PtrTag *ea_tag, int ea_base_reg,
+                                    target_ulong ea_base_reg_val)
+{
+    /* The same successful access already ran UNKNOWN checking synchronously.
+     * Still validate identity/value and invalidate a stale authoritative GPR;
+     * only the repeated UNKNOWN fallback is unnecessary. */
+    prov_check_bounds(env, addr, size, pc, ea_tag, ea_base_reg,
+                      ea_base_reg_val, false, PROV_FINDING_ORIGIN_ACCESS);
 }
 
 /* Snapshot the preferred committed finding.  Each slot is immutable after

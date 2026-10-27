@@ -306,6 +306,16 @@ MemcheckResult provenance_check_access(CPUArchState *env, target_ulong addr,
                                        const PtrTag *ea_tag, int ea_base_reg,
                                        target_ulong ea_base_reg_val);
 
+/* Tagged half of a fused successful access. The caller must have completed
+ * UNKNOWN checking for the SAME PC/address/full width immediately beforehand,
+ * with no guest operation or object-lifetime change between the checks. This
+ * still checks identity/value/lifetime and invalidates inconsistent GPR tags;
+ * it does not repeat UNKNOWN fallback. No state is retained across accesses. */
+void provenance_check_tagged_access(CPUArchState *env, target_ulong addr,
+                                    target_ulong size, target_ulong pc,
+                                    const PtrTag *ea_tag, int ea_base_reg,
+                                    target_ulong ea_base_reg_val);
+
 /* C API for libc-model bodies: check an access whose pointer lives in a
  * named register (no EA scratch involved). */
 void provenance_model_check_access(CPUArchState *env, target_ulong addr,

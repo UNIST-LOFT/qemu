@@ -652,7 +652,8 @@ static void sem_prov_set_ea(CPUArchState *env, uint32_t base_reg,
 }
 
 static void sem_prov_check_access(CPUArchState *env, target_ulong addr,
-                                  target_ulong size, target_ulong pc) {
+                                  target_ulong size, target_ulong pc,
+                                  bool raw_first) {
     if (!binradar_memcheck_enabled) return;
     PtrRegShadow *shadow = provenance_get_reg_shadow(env);
     struct ProvEAMeta *ea = &shadow->ea_meta;
@@ -662,8 +663,16 @@ static void sem_prov_check_access(CPUArchState *env, target_ulong addr,
      * even a self-overwriting load keeps its address-producing state. */
     ea->valid = false;
     if (!provenance_memcheck_pc_eligible(pc)) return;
-    if (!have_ea || ea->aflags != MO_64 || ea->override >= 0) {
+    if (raw_first) {
+        /* Fused only when the TCG pass proved no observable work between
+         * the successful raw access and this event. Preserve UNKNOWN-first
+         * publication and its original cursors, even if a tag is in bounds. */
         provenance_check_access(env, addr, size, pc, NULL, -1, 0);
+    }
+    if (!have_ea || ea->aflags != MO_64 || ea->override >= 0) {
+        if (!raw_first) {
+            provenance_check_access(env, addr, size, pc, NULL, -1, 0);
+        }
         return;
     }
 
@@ -675,7 +684,9 @@ static void sem_prov_check_access(CPUArchState *env, target_ulong addr,
         ea->base_tag.valid) {
         if (ea->index_reg >= 0 && ea->index_tag.valid) {
             /* Two tagged inputs have no sound merge rule (§6). */
-            provenance_check_access(env, addr, size, pc, NULL, -1, 0);
+            if (!raw_first) {
+                provenance_check_access(env, addr, size, pc, NULL, -1, 0);
+            }
             return;
         }
         ea_src_reg = ea->base_reg;
@@ -719,9 +730,18 @@ static void sem_prov_check_access(CPUArchState *env, target_ulong addr,
         /* Only the consumed EA snapshot is folded, never its source GPR. */
         tag->concrete_offset = offset;
     }
-    /* NULL is UNKNOWN, including unsupported forms or failed arithmetic. */
-    provenance_check_access(env, addr, size, pc, tag,
-                            ea_src_reg, ea_src_val);
+    /* NULL is UNKNOWN, including unsupported forms or failed arithmetic.
+     * A fused event already performed that check; only tag-specific work
+     * remains. This is synchronous sharing, never a cached access verdict. */
+    if (raw_first) {
+        if (tag != NULL) {
+            provenance_check_tagged_access(env, addr, size, pc, tag,
+                                           ea_src_reg, ea_src_val);
+        }
+    } else {
+        provenance_check_access(env, addr, size, pc, tag,
+                                ea_src_reg, ea_src_val);
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -780,7 +800,15 @@ void sem_mem_access(CPUArchState *env, target_ulong addr,
                     target_ulong size, target_ulong pc, uint32_t flags,
                     SemOpClass cls, SemIntervalPolicy policy,
                     SemProducerId producer) {
-    if (sem_allocator_body) return;
+    if (sem_allocator_body) {
+        /* Allocator opacity suppresses the semantic consumer, not the raw
+         * coverage owned by this fused event. Keep its independent gate. */
+        if ((flags & SEM_MEM_F_RAW_FIRST) && binradar_memcheck_enabled &&
+            provenance_memcheck_pc_eligible(pc)) {
+            provenance_check_access(env, addr, size, pc, NULL, -1, 0);
+        }
+        return;
+    }
     /* The provenance access check runs only at sites that emitted it
      * historically (check bit set): those are exactly the EA-decomposed
      * sites.  F01-only sites (SIMD/x87/atomic/paired) must not add new
@@ -788,7 +816,8 @@ void sem_mem_access(CPUArchState *env, target_ulong addr,
      * even when OSPREY is disabled. */
     if ((flags & SEM_MEM_F_PROVENANCE_CHECK) &&
         binradar_memcheck_enabled) {
-        sem_prov_check_access(env, addr, size, pc);
+        sem_prov_check_access(env, addr, size, pc,
+                              (flags & SEM_MEM_F_RAW_FIRST) != 0);
     }
     if (!osprey_collect_enabled) {
         return;
@@ -911,7 +940,7 @@ void sem_mem_helper_access_part(CPUArchState *env, target_ulong addr,
     if (binradar_memcheck_enabled) {
         PtrRegShadow *shadow = provenance_get_reg_shadow(env);
         if (shadow->ea_meta.valid) {
-            sem_prov_check_access(env, addr, size, pc);
+            sem_prov_check_access(env, addr, size, pc, false);
         }
     }
     if (!osprey_collect_enabled) {

@@ -43,6 +43,7 @@
 #include "osprey-internal.h"
 #include "snapshot.h"
 #include "provenance.h"
+#include "sem-events.h"
 #include "qemu/thread.h"
 #include "tcg/symbolic/symbolic-struct.h"
 #include "stage7_mutation_reference.h"
@@ -2731,6 +2732,100 @@ static void test_invalid_patch_result(void)
     CHECK(pid > 0 && waitpid(pid, &status, 0) == pid &&
               WIFEXITED(status) && WEXITSTATUS(status) == 1,
           "out-of-range patch result is fatal rather than silently discarded");
+}
+
+/* Deliberately disagreeing live raw/tagged bounds expose ordering: a safe
+ * authoritative tag must not erase the earlier UNKNOWN exact-bounds fault.
+ * All interval lookup and publication below use the production managers. */
+static void test_raw_first_real_regions(void)
+{
+    const target_ulong base = 0x92000000, pc = 0x400190;
+    uint64_t saved_start = symbolic_start_code, saved_end = symbolic_end_code;
+    target_ulong saved_entry = binradar_entrypoint;
+    int saved_memcheck = binradar_memcheck_enabled;
+    int saved_osprey = osprey_collect_enabled;
+    Query queries[8] = {0};
+    Expr expressions[8] = {0};
+    Query *saved_queue = query_queue, *saved_query = next_query;
+    Expr *saved_pool = pool, *saved_expr = next_free_expr;
+    CPUArchState *env = g_new0(CPUArchState, 1);
+    ProvPublishedFinding finding;
+    reset_runtime();
+    reset_shared_records();
+    symbolic_start_code = 0x400000;
+    symbolic_end_code = 0x401000;
+    binradar_entrypoint = (target_ulong)-1;
+    binradar_memcheck_enabled = 1;
+    osprey_collect_enabled = 0;
+    query_queue = queries;
+    pool = expressions;
+    provenance_set_shared_fault_ptr(&shared_trace_data->prov_pending_fault);
+    snapshot_trace_alloc(base, 16, pc);
+    PtrTag tag = provenance_create_object(base, 32, pc,
+                                          PROV_PRODUCER_MALLOC_RETURN);
+    PtrRegShadow *shadow = provenance_get_reg_shadow(env);
+    const target_ulong widths[] = {16, ((target_ulong)1 << 32) + 16};
+    for (unsigned pass = 0; pass < 3; ++pass) {
+        provenance_clear_pending_fault();
+        next_query = queries + 2;
+        next_free_expr = expressions + 3;
+        shadow->ea_meta = (struct ProvEAMeta){
+            .valid = true, .base_reg = R_EDI, .index_reg = -1,
+            .disp = 8, .aflags = MO_64, .override = -1,
+            .base_val = base, .base_tag = tag,
+        };
+        target_ulong width = widths[pass == 2];
+        if (pass == 1) {
+            /* Public allocator scope suppresses semantic checking, not raw. */
+            target_ulong stack_low = 0x700000;
+            sem_allocator_scope(env, &stack_low);
+            sem_mem_access(env, base + 8, width, pc,
+                           SEM_MEM_F_RAW_FIRST | SEM_MEM_F_PROVENANCE_CHECK,
+                           SEM_OP_INTEGER, SEM_INTERVAL_EXACT_WIDTH,
+                           SEM_PRODUCER_INTEGER_MODRM);
+            sem_allocator_scope(env, NULL);
+        } else {
+            sem_mem_access(env, base + 8, width, pc,
+                           SEM_MEM_F_RAW_FIRST | SEM_MEM_F_PROVENANCE_CHECK,
+                           SEM_OP_INTEGER, SEM_INTERVAL_EXACT_WIDTH,
+                           SEM_PRODUCER_INTEGER_MODRM);
+        }
+        CHECK(provenance_snapshot_pending_finding(&finding) &&
+                  finding.payload.quality == (pass == 2
+                      ? PROV_FINDING_TAGGED : PROV_FINDING_FALLBACK) &&
+                  finding.payload.object_id == (pass == 2 ? tag.object_id : 0) &&
+                  finding.payload.access_addr == base + 8 &&
+                  finding.payload.access_width == width &&
+                  finding.finding_query_idx == 2 && finding.finding_expr_idx == 3,
+              "raw-first retains raw OOB before safe tag/opaque consumer or promotes matching wide fault");
+        CHECK(shared_trace_data->prov_pending_fault.fallback.ready &&
+                  shared_trace_data->prov_pending_fault.fallback.payload.object_id == 0 &&
+                  shared_trace_data->prov_pending_fault.fallback.finding_query_idx == 2 &&
+                  shared_trace_data->prov_pending_fault.fallback.finding_expr_idx == 3,
+              "UNKNOWN publication remains committed beneath tagged promotion");
+        CHECK(!shadow->ea_meta.valid, "raw-first consumes EA including opaque scope");
+        next_query = queries + 6;
+        next_free_expr = expressions + 7;
+        /* A later access cannot steal the first event's retained cursors. */
+        provenance_check_access(env, base + 8, width, pc, NULL, -1, 0);
+        CHECK(provenance_snapshot_pending_finding(&finding) &&
+                  finding.finding_query_idx == 2 && finding.finding_expr_idx == 3,
+              "repeated same-PC access preserves first finding cursors");
+    }
+    provenance_clear_pending_fault();
+    provenance_retire_object(base);
+    snapshot_trace_free(base, pc);
+    reset_shared_records();
+    symbolic_start_code = saved_start;
+    symbolic_end_code = saved_end;
+    binradar_entrypoint = saved_entry;
+    binradar_memcheck_enabled = saved_memcheck;
+    osprey_collect_enabled = saved_osprey;
+    query_queue = saved_queue;
+    next_query = saved_query;
+    pool = saved_pool;
+    next_free_expr = saved_expr;
+    g_free(env);
 }
 
 static void test_request_metadata_real_regions(void)
@@ -5448,6 +5543,7 @@ int main(void)
     test_request_collection_aggregation();
     test_forkserver_continuation_policy();
     test_invalid_patch_result();
+    test_raw_first_real_regions();
     test_request_metadata_real_regions();
     test_cached_request_evidence();
     test_cached_feedback_writer();

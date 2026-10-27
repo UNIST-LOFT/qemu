@@ -6971,8 +6971,125 @@ static void update_last_translation_block(uintptr_t pc) {
     last_translation_block = pc;
 }
 
-/* Lightweight TCG pass for non-symbolic mode: insert a helper call
- * AFTER each qemu_ld/qemu_st to check heap bounds (QASAN-like).
+/* Resolve a local constant at its use, not TCGTemp.val (which is register
+ * allocator state, not a reaching definition).  Never cross control flow or
+ * an instruction boundary.  Calls may precede the access, but cannot define
+ * the local value being resolved. */
+static bool memcheck_local_constant(TCGOp *use, TCGTemp *temp,
+                                    uint64_t *value)
+{
+    for (TCGOp *op = QTAILQ_PREV(use, link); op;
+         op = QTAILQ_PREV(op, link)) {
+        if (temp->temp_global || temp->fixed_reg ||
+            op->opc == INDEX_op_insn_start ||
+            op->opc == INDEX_op_set_label ||
+            (tcg_op_defs[op->opc].flags & TCG_OPF_BB_END)) {
+            return false;
+        }
+        unsigned outputs = op->opc == INDEX_op_call ? TCGOP_CALLO(op) :
+                           tcg_op_defs[op->opc].nb_oargs;
+        for (unsigned i = 0; i < outputs; ++i) {
+            if (arg_temp(op->args[i]) != temp) {
+                continue;
+            }
+            if (op->opc == INDEX_op_movi_i32 ||
+                op->opc == INDEX_op_movi_i64) {
+                *value = op->opc == INDEX_op_movi_i32 ?
+                         (uint32_t)op->args[1] : (uint64_t)op->args[1];
+                return true;
+            }
+            if ((op->opc == INDEX_op_mov_i32 ||
+                 op->opc == INDEX_op_mov_i64) &&
+                arg_temp(op->args[1])->type == temp->type) {
+                temp = arg_temp(op->args[1]);
+                break;
+            }
+            return false;
+        }
+    }
+    return false;
+}
+
+/* The raw UNKNOWN check may move only into the first post-success semantic
+ * event for this very access.  In particular, a PC match alone proves nothing:
+ * multipart accesses and self-overwriting load addresses must stay separate.
+ * Only local constant/copy preparation is transparent; even a semantic helper
+ * or an architectural register write is an ordering boundary. */
+static TCGOp *memcheck_fused_event(TCGOp *access, uintptr_t pc, size_t size,
+                                  TCGContext *tcg_ctx, uint32_t *flags_out)
+{
+#if TCG_TARGET_REG_BITS == 64 && TARGET_LONG_BITS == 64
+    TCGOp *event = QTAILQ_NEXT(access, link);
+    for (; event; event = QTAILQ_NEXT(event, link)) {
+        if (event->opc == INDEX_op_call) {
+            break;
+        }
+        if (event->opc != INDEX_op_mov_i32 &&
+            event->opc != INDEX_op_mov_i64 &&
+            event->opc != INDEX_op_movi_i32 &&
+            event->opc != INDEX_op_movi_i64) {
+            return NULL;
+        }
+        TCGTemp *dest = arg_temp(event->args[0]);
+        if (dest->temp_global || dest->fixed_reg) {
+            return NULL;
+        }
+    }
+    /* Six C arguments on this ABI: env, address, size, PC, flags, class.
+     * The helper lookup uses the same variable call layout as the symbolic
+     * pass; no assumptions about function-pointer/name table ordering. */
+    if (!event || TCGOP_CALLO(event) != 0 || TCGOP_CALLI(event) != 6 ||
+        arg_temp(event->args[0]) != tcgv_ptr_temp(cpu_env)) {
+        return NULL;
+    }
+    const char *name = tcg_find_helper(tcg_ctx, event->args[6]);
+    if (!name || strcmp(name, "sem_mem_access") != 0) {
+        return NULL;
+    }
+    uint64_t event_size, event_pc, flags, cls;
+    if (!memcheck_local_constant(event, arg_temp(event->args[2]), &event_size) ||
+        !memcheck_local_constant(event, arg_temp(event->args[3]), &event_pc) ||
+        !memcheck_local_constant(event, arg_temp(event->args[4]), &flags) ||
+        !memcheck_local_constant(event, arg_temp(event->args[5]), &cls) ||
+        event_size != size || event_pc != pc || cls != SEM_OP_INTEGER ||
+        !(flags & SEM_MEM_F_PROVENANCE_CHECK) ||
+        (flags & (SEM_MEM_F_NO_EA | SEM_MEM_F_RAW_FIRST)) ||
+        (flags & SEM_MEM_POLICY_MASK) !=
+            (SEM_INTERVAL_EXACT_WIDTH << SEM_MEM_POLICY_SHIFT)) {
+        return NULL;
+    }
+    bool store = access->opc == INDEX_op_qemu_st_i32 ||
+                 access->opc == INDEX_op_qemu_st_i64;
+    if (!!(flags & SEM_MEM_F_STORE) != store) {
+        return NULL;
+    }
+    /* Trace the event's address back through transparent full-width copies
+     * to its value immediately after the memory op.  A load can redefine its
+     * own address temp, so compare against the pre-access value separately. */
+    TCGTemp *address = arg_temp(event->args[1]);
+    for (TCGOp *op = QTAILQ_PREV(event, link); op != access;
+         op = QTAILQ_PREV(op, link)) {
+        if (arg_temp(op->args[0]) == address) {
+            if (op->opc != INDEX_op_mov_i64) {
+                return NULL;
+            }
+            address = arg_temp(op->args[1]);
+        }
+    }
+    if (address != arg_temp(access->args[1]) ||
+        (!store && address == arg_temp(access->args[0]))) {
+        return NULL;
+    }
+    *flags_out = (uint32_t)flags | SEM_MEM_F_RAW_FIRST;
+    return event;
+#else
+    return NULL;
+#endif
+}
+
+/* Raw memcheck pass: check AFTER each eligible qemu_ld/qemu_st succeeds.
+ * A proven same-access semantic event can perform the raw UNKNOWN check first
+ * instead of a separate call; all unproved shapes retain the original helper.
  * Gated by binradar_memcheck_enabled.  Independent of symbolic_mode.
  *
  * Exception ordering (§4/§9): the check is inserted after the guest
@@ -7013,6 +7130,7 @@ void memcheck_instrument_tb(TranslationBlock *tb, TCGContext *tcg_ctx,
     TCGTemp *t_size = NULL;
     TCGTemp *t_pc = NULL;
     TCGTemp *t_addr_copy = NULL;
+    TCGTemp *t_fused_flags = NULL;
     TCGOp *op;
     uintptr_t pc = tb->pc;
     bool eligible = false;
@@ -7036,6 +7154,31 @@ void memcheck_instrument_tb(TranslationBlock *tb, TCGContext *tcg_ctx,
                 eligibility_known = true;
             }
             if (!eligible) break;
+            TCGMemOp mem_op = get_memop(op->args[2]);
+            size_t size = get_mem_op_size(mem_op);
+            uint32_t fused_flags;
+            TCGOp *event = memcheck_fused_event(op, pc, size, tcg_ctx,
+                                               &fused_flags);
+            if (event) {
+                if (!t_fused_flags) {
+                    /* Do not reuse a guest temp or mutate the reaching flags
+                     * constant: it may have other users in this instruction. */
+                    TCGTempSet saved_free[TCG_TYPE_COUNT * 2];
+                    memcpy(saved_free, tcg_ctx->free_temps, sizeof(saved_free));
+                    memset(tcg_ctx->free_temps, 0, sizeof(tcg_ctx->free_temps));
+                    t_fused_flags = tcg_temp_new_internal(TCG_TYPE_I32, false);
+                    memcpy(tcg_ctx->free_temps, saved_free, sizeof(saved_free));
+                }
+                TCGOp *flags_op = tcg_op_insert_before(tcg_ctx, event,
+                                                       INDEX_op_movi_i32);
+                flags_op->args[0] = temp_arg(t_fused_flags);
+                flags_op->args[1] = fused_flags;
+                event->args[4] = temp_arg(t_fused_flags);
+                /* Liveness has already run.  This dedicated input has exactly
+                 * one use per definition, independent of the old flags' life. */
+                mark_dead_arg_temp(event, 4);
+                break;
+            }
             if (t_size == NULL) {
                 /* Do not allocate temps for helper-only TBs. Allocate past
                  * the high-water mark: reusing a freed guest temp could
@@ -7050,8 +7193,6 @@ void memcheck_instrument_tb(TranslationBlock *tb, TCGContext *tcg_ctx,
             }
             /* args[1] is the address temp for both ld and st. */
             TCGTemp *t_addr = arg_temp(op->args[1]);
-            TCGMemOp mem_op = get_memop(op->args[2]);
-            size_t size = get_mem_op_size(mem_op);
 
             tcg_movi(t_size, (uintptr_t)size, 0, op, NULL, tcg_ctx);
             tcg_movi(t_pc, (uintptr_t)pc, 0, op, NULL, tcg_ctx);

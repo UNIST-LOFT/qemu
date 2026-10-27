@@ -45,6 +45,9 @@
 #include "../../linux-user/osprey.h"
 #include "../../linux-user/sem-events.h"
 
+/* Runtime mode is owned by the symbolic engine, not the semantic consumers. */
+extern int symbolic_mode;
+
 /* Declared here so the provenance helper wrappers below can pass register
  * values as explicit helper args (env->regs may be stale inside helpers). */
 static TCGv cpu_regs[CPU_NB_REGS];
@@ -699,7 +702,8 @@ static void gen_eob(DisasContext *s);
 static void gen_jr(DisasContext *s, TCGv dest);
 static void gen_jmp(DisasContext *s, target_ulong eip);
 static void gen_jmp_tb(DisasContext *s, target_ulong eip, int tb_num);
-static void gen_op(DisasContext *s1, int op, TCGMemOp ot, int d);
+static void gen_op(DisasContext *s1, int op, TCGMemOp ot, int d,
+                   bool check_after_load);
 
 /* i386 arith/logic operations */
 enum {
@@ -1752,7 +1756,7 @@ static inline void gen_scas(DisasContext *s, TCGMemOp ot)
     gen_sem_set_ea(s, R_EDI, -1, 0, 0);
     gen_op_ld_v(s, ot, s->T1, s->A0);
     gen_sem_mem_access(s->A0, ot, s->pc_start, false);
-    gen_op(s, OP_CMPL, ot, R_EAX);
+    gen_op(s, OP_CMPL, ot, R_EAX, false);
     gen_op_movl_T0_Dshift(s, ot);
     gen_op_add_reg_T0(s, s->aflag, R_EDI);
 }
@@ -1768,7 +1772,7 @@ static inline void gen_cmps(DisasContext *s, TCGMemOp ot)
     gen_sem_set_ea(s, R_ESI, -1, 0, 0);
     gen_op_ld_v(s, ot, s->T0, s->A0);
     gen_sem_mem_access(s->A0, ot, s->pc_start, false);
-    gen_op(s, OP_CMPL, ot, OR_TMP0);
+    gen_op(s, OP_CMPL, ot, OR_TMP0, false);
     gen_op_movl_T0_Dshift(s, ot);
     gen_op_add_reg_T0(s, s->aflag, R_ESI);
     gen_op_add_reg_T0(s, s->aflag, R_EDI);
@@ -1951,7 +1955,8 @@ static void gen_illegal_opcode(DisasContext *s)
 }
 
 /* if d == OR_TMP0, it means memory operand (address in A0) */
-static void gen_op(DisasContext *s1, int op, TCGMemOp ot, int d)
+static void gen_op(DisasContext *s1, int op, TCGMemOp ot, int d,
+                   bool check_after_load)
 {
     bool atomic = d == OR_TMP0 && (s1->prefix & PREFIX_LOCK);
     if (atomic) {
@@ -1969,6 +1974,13 @@ static void gen_op(DisasContext *s1, int op, TCGMemOp ot, int d)
             s1->sem_skip_f01_load = true;
         }
         gen_op_ld_v(s1, ot, s1->T0, s1->A0);
+        if (check_after_load) {
+            /* Memcheck-only CMP has no expression/fact producer whose cursor
+             * ordering must be retained. Put its existing check at the load
+             * boundary, before condition-code writes, so the raw pass can
+             * prove same-access fusion without crossing architectural state. */
+            gen_sem_mem_access(s1->A0, ot, s1->pc_start, false);
+        }
     }
     switch(op) {
     case OP_ADCL:
@@ -5577,10 +5589,13 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                     (op == OP_ADDL || op == OP_SUBL)) {
                     s->prov_skip_invalidate = true;
                 }
-                gen_op(s, op, ot, opreg);
-                /* Access check AFTER the memory op (load+store) completed,
-                 * so a faulting access records nothing. */
-                if (opreg == OR_TMP0) {
+                bool check_after_load = opreg == OR_TMP0 && op == OP_CMPL &&
+                    !(s->prefix & PREFIX_LOCK) && binradar_memcheck_enabled &&
+                    !symbolic_mode && !osprey_collect_enabled;
+                gen_op(s, op, ot, opreg, check_after_load);
+                /* Other consumers retain their existing post-operation
+                 * event/cursor order; faulting accesses publish nothing. */
+                if (opreg == OR_TMP0 && !check_after_load) {
                     gen_sem_mem_access(s->A0, ot, s->pc_start, true);
                 }
                 /* reg-reg ADD/SUB provenance propagation (after write-back:
@@ -5614,7 +5629,7 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                     (op == OP_ADDL || op == OP_SUBL)) {
                     s->prov_skip_invalidate = true;
                 }
-                gen_op(s, op, ot, reg);
+                gen_op(s, op, ot, reg, false);
                 /* reg-reg ADD/SUB provenance propagation (after write-back).
                  * Only for register Ev sources (mod == 3): a memory source
                  * value carries no register provenance to fold. */
@@ -5637,7 +5652,7 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                     s->prov_pre_snapshot = tcg_temp_new();
                     tcg_gen_mov_tl(s->prov_pre_snapshot, cpu_regs[OR_EAX]);
                 }
-                gen_op(s, op, ot, OR_EAX);
+                gen_op(s, op, ot, OR_EAX, false);
                 if (sem_events_active() && ot == MO_64 &&
                     (op == OP_ADDL || op == OP_SUBL)) {
                     int64_t imm = (int64_t)(int32_t)(uint32_t)val;
@@ -5707,10 +5722,13 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                 s->prov_pre_snapshot = tcg_temp_new();
                 tcg_gen_mov_tl(s->prov_pre_snapshot, cpu_regs[opreg]);
             }
-            gen_op(s, op, ot, opreg);
-            /* Access check AFTER the memory op (load+store) completed,
-             * so a faulting access records nothing. */
-            if (opreg == OR_TMP0) {
+            bool check_after_load = opreg == OR_TMP0 && op == OP_CMPL &&
+                !(s->prefix & PREFIX_LOCK) && binradar_memcheck_enabled &&
+                !symbolic_mode && !osprey_collect_enabled;
+            gen_op(s, op, ot, opreg, check_after_load);
+            /* Other consumers retain their existing post-operation
+             * event/cursor order; faulting accesses publish nothing. */
+            if (opreg == OR_TMP0 && !check_after_load) {
                 gen_sem_mem_access(s->A0, ot, s->pc_start, true);
             }
             /* Provenance: add/sub reg, imm preserves tag (offset += val).

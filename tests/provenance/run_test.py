@@ -783,6 +783,31 @@ for case in ("move", "same", "halve", "fail"):
                          finding=None, final_queries=1, final_expr_min=1,
                          required_log=f"realloc-payload mode={case[0]} branch={branch}"))
 
+# Memory-immediate CMP is fusible without an intervening architectural write.
+# Repeating its exact PC must not reuse the live access verdict after free;
+# SIMD load remains raw-only and a faulting CMP publishes no access.
+for mode in ("mem", "sym"):
+    TESTS.append(dict(name="t93_raw_first_lifetime_" + mode,
+                     guest="t93_raw_first_compare", args=["lifetime"], mode=mode,
+                     rc=(0,), verdict="crash",
+                     finding=dict(reason="heap-use-after-free", is_uaf=1,
+                                  fields={"obj_id": 1, "gen": 1, "size": 16,
+                                          "offset": 8, "width": 8}),
+                     access_pc_symbol="raw_first_compare_pc",
+                     required_stdout="same-PC compare completed"))
+    TESTS.append(dict(name="t93_raw_only_compare_" + mode,
+                     guest="t93_raw_first_compare", args=["raw"], mode=mode,
+                     rc=(0,), verdict="crash",
+                     finding=dict(reason="heap-buffer-overflow", is_uaf=0,
+                                  fields={"obj_id": 0, "gen": 0, "size": 12,
+                                          "offset": 8, "width": 8}),
+                     access_pc_symbol="raw_only_compare_pc",
+                     required_stdout="raw-only compare completed"))
+    TESTS.append(dict(name="t93_faulting_compare_" + mode,
+                     guest="t93_raw_first_compare", args=["fault"], mode=mode,
+                     rc=(-11, 139), verdict="crash",
+                     reason="unhandled_target_signal", finding=None))
+
 # ---------------------------------------------------------------------------
 # Log parsing
 # ---------------------------------------------------------------------------

@@ -118,6 +118,10 @@ typedef enum SemProducerId {
 #define SEM_MEM_F_PROVENANCE_CHECK (1u << 1) /* run provenance EA check */
 #define SEM_MEM_F_OSPREY_SKIP_F01 (1u << 2) /* provenance-only follow-up */
 #define SEM_MEM_F_NO_EA           (1u << 3) /* plain F01; no EA decomposition */
+/* Set only by the raw TCG pass after proving this semantic event immediately
+ * follows the same successful raw access through side-effect-free temp prep.
+ * Preserve the raw UNKNOWN check before consuming the semantic tagged check. */
+#define SEM_MEM_F_RAW_FIRST       (1u << 4)
 #define SEM_MEM_POLICY_SHIFT 8
 #define SEM_MEM_POLICY_MASK  (0x7u << SEM_MEM_POLICY_SHIFT)
 #define SEM_MEM_PRODUCER_SHIFT 11
