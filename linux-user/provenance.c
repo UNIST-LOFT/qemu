@@ -29,6 +29,10 @@ typedef struct {
 } ObjKey;
 static GHashTable *prov_object_table = NULL;   /* ObjKey → ProvenanceObject* */
 static GHashTable *prov_live_by_base = NULL;   /* base → ObjKey* (LIVE only) */
+/* Object records and identities persist for the process lifetime, including
+ * FREED objects.  Cache records, never their current bounds/lifetime verdict.
+ * Any future table teardown must also clear these borrowed pointers. */
+static ProvenanceObject *prov_object_cache[4];
 
 /* Solver pool cursors (shared/fork-inherited): captured as stable indices at
  * finding time so the timeout path can reconstruct the finding boundary.
@@ -143,13 +147,18 @@ void provenance_init(void) {
     }
 }
 
-/* Per-CPU register shadow is stored as a pointer at a fixed offset in
- * CPUArchState.  We use a GHashTable keyed by env pointer for simplicity
- * and to avoid modifying the CPUX86State struct.  For single-threaded
- * guest programs (the common case in this tracer), this is equivalent. */
+/* Process-lifetime register shadows are keyed by CPUArchState.  The last-CPU
+ * cache borrows the table's record and inherits through fork/COW, just like
+ * the table.  Context invalidation mutates the record rather than freeing it;
+ * any future table teardown must clear the cache as well. */
 static GHashTable *prov_reg_shadows = NULL;  /* env* → PtrRegShadow* */
+static CPUArchState *prov_cached_env;
+static PtrRegShadow *prov_cached_shadow;
 
 PtrRegShadow *provenance_get_reg_shadow(CPUArchState *env) {
+    if (prov_cached_shadow != NULL && prov_cached_env == env) {
+        return prov_cached_shadow;
+    }
     if (prov_reg_shadows == NULL) {
         prov_reg_shadows = g_hash_table_new_full(g_direct_hash, g_direct_equal,
                                                   NULL, g_free);
@@ -159,6 +168,8 @@ PtrRegShadow *provenance_get_reg_shadow(CPUArchState *env) {
         shadow = g_new0(PtrRegShadow, 1);
         g_hash_table_insert(prov_reg_shadows, env, shadow);
     }
+    prov_cached_env = env;
+    prov_cached_shadow = shadow;
     return shadow;
 }
 
@@ -224,8 +235,18 @@ bool provenance_retire_object(target_ulong base) {
 ProvenanceObject *provenance_lookup_object(uint64_t object_id,
                                            uint32_t generation) {
     if (prov_object_table == NULL) return NULL;
+    size_t slot = object_id % G_N_ELEMENTS(prov_object_cache);
+    ProvenanceObject *obj = prov_object_cache[slot];
+    if (obj != NULL && obj->object_id == object_id &&
+        obj->generation == generation) {
+        return obj;
+    }
     ObjKey key = { .object_id = object_id, .generation = generation };
-    return g_hash_table_lookup(prov_object_table, &key);
+    obj = g_hash_table_lookup(prov_object_table, &key);
+    if (obj != NULL) {
+        prov_object_cache[slot] = obj;
+    }
+    return obj;
 }
 
 ProvenanceObject *provenance_lookup_live_by_base(target_ulong base) {
@@ -516,14 +537,28 @@ PtrTag provenance_mem_load_tag(target_ulong addr) {
     return entry->tag;
 }
 
+typedef struct {
+    target_ulong first;
+    target_ulong last;
+} ProvShadowRange;
+
+static gboolean prov_shadow_in_range(gpointer key, gpointer value,
+                                      gpointer opaque) {
+    const ProvShadowRange *range = opaque;
+    target_ulong slot = (target_ulong)GPOINTER_TO_SIZE(key);
+
+    /* Keys are aligned pointer slots; the inclusive aligned endpoints also
+     * cover partial first/last slots without computing a wrapping slot end. */
+    return slot >= range->first && slot <= range->last;
+}
+
 void provenance_mem_invalidate(target_ulong addr, target_ulong size) {
     if (prov_mem_shadow == NULL) return;
     if (size == 0) return;
     const target_ulong align = sizeof(target_ulong);
-    /* Overflow-safe interval: [addr, addr+size) may wrap in the guest
-     * address space.  A wrapped range is bogus (no real mapping spans the
-     * address-space wrap); invalidate only the aligned slots actually
-     * touched before the wrap and stop — never sweep to UINT64_MAX. */
+    /* A wrapping inclusive endpoint is invalid: preserve the starting-slot
+     * fallback.  A range ending exactly at the address-space boundary is
+     * valid here and includes the final aligned slot. */
     target_ulong start = addr & ~(target_ulong)(align - 1);
     target_ulong last = addr + size - 1;
     if (last < addr) {
@@ -533,37 +568,18 @@ void provenance_mem_invalidate(target_ulong addr, target_ulong size) {
     }
     target_ulong end = last & ~(target_ulong)(align - 1);
 
-    /* Slots are aligned fixed-width keys, so an ordinary scalar write covers
-     * at most a few candidate keys and probing them directly is cheapest.  A
-     * bulk overwrite (allocator initialization of a large buffer, a copy)
-     * must not cost one host hash lookup per aligned slot in the interval:
-     * once the interval spans more candidate slots than the live shadow
-     * holds, one walk over the live entries is strictly cheaper.  Both paths
-     * use the same overlap predicate, so partially covered first/last slots
-     * and the top-of-space slot (whose end wraps) stay invalidated exactly as
-     * the scalar path invalidates them. */
+    /* Probe short writes directly.  For wide sparse ranges, scan the table
+     * rather than every address slot.  foreach_remove may compact afterward;
+     * iterator removal would retain high-water bucket capacity and make later
+     * small disjoint scans expensive even with only one live tag. */
     uint64_t span = (uint64_t)(end - start);   /* multiple of align, no wrap */
     if (span > (uint64_t)(PROV_INVALIDATE_PROBE_MAX - 1) * align) {
         guint live_slots = g_hash_table_size(prov_mem_shadow);
         if (live_slots == 0) return;
         if (span / align + 1 > live_slots) {
-            GHashTableIter it;
-            gpointer key, value;
-            g_hash_table_iter_init(&it, prov_mem_shadow);
-            while (g_hash_table_iter_next(&it, &key, &value)) {
-                target_ulong slot = (target_ulong)GPOINTER_TO_SIZE(key);
-                /* Overlap: slot start at or before the inclusive write end AND
-                 * write start strictly before the slot end
-                 * [slot, slot + align).  `slot` is aligned, so slot + align
-                 * wraps only for the single top-of-space slot, whose span
-                 * reaches 2^64 and therefore covers any write whose end is at
-                 * or past the slot start. */
-                if (slot > end) continue;
-                target_ulong slot_end = slot + align;
-                if (addr < slot_end || slot_end < slot) {
-                    g_hash_table_iter_remove(&it);
-                }
-            }
+            ProvShadowRange range = { .first = start, .last = end };
+            g_hash_table_foreach_remove(prov_mem_shadow, prov_shadow_in_range,
+                                        &range);
             return;
         }
     }
@@ -951,7 +967,7 @@ static bool prov_syscall_read_pc(CPUArchState *env, target_ulong *out)
 
 static MemcheckResult prov_check_bounds(CPUArchState *env, target_ulong addr,
                                         target_ulong size, target_ulong pc,
-                                        PtrTag tag, int reg, target_ulong value,
+                                        const PtrTag *tag, int reg, target_ulong value,
                                         ProvFindingOrigin origin);
 
 static void prov_check_syscall(CPUArchState *env, target_ulong addr,
@@ -976,7 +992,7 @@ static void prov_check_syscall(CPUArchState *env, target_ulong addr,
             }
         }
     }
-    prov_check_bounds(env, addr, size, pc, tag, reg, value, origin);
+    prov_check_bounds(env, addr, size, pc, &tag, reg, value, origin);
 }
 
 static void prov_check_syscall_tagged(CPUArchState *env, target_ulong addr,
@@ -986,7 +1002,7 @@ static void prov_check_syscall_tagged(CPUArchState *env, target_ulong addr,
     target_ulong pc;
     if (size == 0 || !prov_syscall_read_pc(env, &pc)) return;
     if (tag.concrete_value != addr) tag.valid = false;
-    prov_check_bounds(env, addr, size, pc, tag, -1, addr, origin);
+    prov_check_bounds(env, addr, size, pc, &tag, -1, addr, origin);
 }
 
 void provenance_check_syscall_read(CPUArchState *env, target_ulong addr,
@@ -1122,12 +1138,12 @@ static void prov_fault_fill(PendingProvenanceFault *pf, CPUArchState *env,
 
 static MemcheckResult prov_check_bounds(CPUArchState *env, target_ulong addr,
                                         target_ulong size, target_ulong pc,
-                                        PtrTag ea_tag, int ea_base_reg,
+                                        const PtrTag *ea_tag, int ea_base_reg,
                                         target_ulong ea_base_reg_val,
                                         ProvFindingOrigin origin) {
-    if (ea_tag.valid) {
-        ProvenanceObject *obj = provenance_lookup_object(ea_tag.object_id,
-                                                         ea_tag.generation);
+    if (ea_tag != NULL && ea_tag->valid) {
+        ProvenanceObject *obj = provenance_lookup_object(ea_tag->object_id,
+                                                         ea_tag->generation);
         if (obj == NULL) {
             /* Identity absent: the tag is stale.  Invalidate the
              * authoritative register shadow (§7) and fall through to
@@ -1138,14 +1154,13 @@ static MemcheckResult prov_check_bounds(CPUArchState *env, target_ulong addr,
                     ? provenance_get_reg_shadow(env)->last_writer_pc[ea_base_reg]
                     : 0;
                 log_msg("[prov] [consistency] object not found [id %lu] [gen %u] [pc %lx] [ea_reg %d] [last_writer %lx] [producer_pc %lx] [kind %d]\n",
-                        ea_tag.object_id, ea_tag.generation, pc, ea_base_reg,
-                        writer, ea_tag.producer_pc, ea_tag.producer_kind);
+                        ea_tag->object_id, ea_tag->generation, pc, ea_base_reg,
+                        writer, ea_tag->producer_pc, ea_tag->producer_kind);
             }
             if (ea_base_reg >= 0 && ea_base_reg < CPU_NB_REGS) {
                 provenance_get_reg_shadow(env)->gpr[ea_base_reg].valid = false;
             }
-            ea_tag.valid = false;
-        } else if (ea_tag.concrete_value != ea_base_reg_val) {
+        } else if (ea_tag->concrete_value != ea_base_reg_val) {
             /* Value-consistency failure: tag's concrete_value doesn't match
              * the actual register value.  Invalidate the authoritative
              * register shadow (§7) and fall through to UNKNOWN. */
@@ -1155,13 +1170,12 @@ static MemcheckResult prov_check_bounds(CPUArchState *env, target_ulong addr,
                     ? provenance_get_reg_shadow(env)->last_writer_pc[ea_base_reg]
                     : 0;
                 log_msg("[prov] [consistency] tag value mismatch [tag %lx] [reg %lx] [pc %lx] [ea_reg %d] [last_writer %lx] [producer_pc %lx] [kind %d]\n",
-                        ea_tag.concrete_value, ea_base_reg_val, pc, ea_base_reg,
-                        writer, ea_tag.producer_pc, ea_tag.producer_kind);
+                        ea_tag->concrete_value, ea_base_reg_val, pc, ea_base_reg,
+                        writer, ea_tag->producer_pc, ea_tag->producer_kind);
             }
             if (ea_base_reg >= 0 && ea_base_reg < CPU_NB_REGS) {
                 provenance_get_reg_shadow(env)->gpr[ea_base_reg].valid = false;
             }
-            ea_tag.valid = false;
         } else {
             /* Tag is authoritative. */
             if (obj->state == PROV_OBJ_FREED) {
@@ -1170,14 +1184,14 @@ static MemcheckResult prov_check_bounds(CPUArchState *env, target_ulong addr,
                 prov_fault_fill(pf, env, pc, addr, size,
                                 obj->object_id, obj->generation,
                                 obj->base, obj->requested_size,
-                                ea_tag.concrete_offset,
-                                ea_tag.producer_pc, ea_tag.producer_kind,
+                                ea_tag->concrete_offset,
+                                ea_tag->producer_pc, ea_tag->producer_kind,
                                 ea_base_reg, ea_base_reg_val, true,
                                 PROV_FINDING_TAGGED, origin);
                 if (provenance_debug) {
                     log_msg("[prov] [uaf] [pc %lx] [addr %lx] [width " TARGET_FMT_lu "] [obj_id %lu] [gen %u] [base %lx] [size %lx] [offset %ld]\n",
                             pc, addr, size, obj->object_id, obj->generation,
-                            obj->base, obj->requested_size, ea_tag.concrete_offset);
+                            obj->base, obj->requested_size, ea_tag->concrete_offset);
                 }
                 return MEMCHECK_HEAP_UAF;
             }
@@ -1185,7 +1199,7 @@ static MemcheckResult prov_check_bounds(CPUArchState *env, target_ulong addr,
             /* LIVE: overflow-safe bounds check.  Compare the nonnegative
              * offset against the size in unsigned arithmetic so sizes
              * above INT64_MAX are not misclassified by a signed cast. */
-            int64_t offset = ea_tag.concrete_offset;
+            int64_t offset = ea_tag->concrete_offset;
             if (offset < 0 ||
                 (uint64_t)offset > obj->requested_size) {
                 /* OOB. */
@@ -1193,7 +1207,7 @@ static MemcheckResult prov_check_bounds(CPUArchState *env, target_ulong addr,
                 prov_fault_fill(pf, env, pc, addr, size,
                                 obj->object_id, obj->generation,
                                 obj->base, obj->requested_size, offset,
-                                ea_tag.producer_pc, ea_tag.producer_kind,
+                                ea_tag->producer_pc, ea_tag->producer_kind,
                                 ea_base_reg, ea_base_reg_val, false,
                                 PROV_FINDING_TAGGED, origin);
                 if (provenance_debug) {
@@ -1212,7 +1226,7 @@ static MemcheckResult prov_check_bounds(CPUArchState *env, target_ulong addr,
                 prov_fault_fill(pf, env, pc, addr, size,
                                 obj->object_id, obj->generation,
                                 obj->base, obj->requested_size, offset,
-                                ea_tag.producer_pc, ea_tag.producer_kind,
+                                ea_tag->producer_pc, ea_tag->producer_kind,
                                 ea_base_reg, ea_base_reg_val, false,
                                 PROV_FINDING_TAGGED, origin);
                 if (provenance_debug) {
@@ -1270,7 +1284,7 @@ static MemcheckResult prov_check_bounds(CPUArchState *env, target_ulong addr,
 
 MemcheckResult provenance_check_access(CPUArchState *env, target_ulong addr,
                                        target_ulong size, target_ulong pc,
-                                       PtrTag ea_tag, int ea_base_reg,
+                                       const PtrTag *ea_tag, int ea_base_reg,
                                        target_ulong ea_base_reg_val)
 {
     return prov_check_bounds(env, addr, size, pc, ea_tag, ea_base_reg,
@@ -1380,14 +1394,11 @@ void provenance_model_check_access(CPUArchState *env, target_ulong addr,
                                    int reg) {
     if (!binradar_memcheck_enabled) return;
     PtrRegShadow *shadow = provenance_get_reg_shadow(env);
-    PtrTag tag = {0};
+    const PtrTag *tag = NULL;
     target_ulong reg_val = 0;
     if (reg >= 0 && reg < CPU_NB_REGS) {
-        tag = shadow->gpr[reg];
+        tag = &shadow->gpr[reg];
         reg_val = env->regs[reg];
-        if (!tag.valid) {
-            tag = (PtrTag){0};
-        }
     }
     provenance_check_access(env, addr, size, pc, tag, reg, reg_val);
 }

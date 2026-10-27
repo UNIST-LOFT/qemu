@@ -2362,13 +2362,12 @@ void snapshot_memcheck_helper(target_ulong addr, target_ulong size, target_ulong
     CPUState *cpu = thread_cpu;
     CPUArchState *env = cpu ? cpu->env_ptr : NULL;
     if (!env) return;
-    PtrTag unknown_tag = {0};
     /* The finding is recorded as non-fatal (pending).  Do not _exit here:
      * the raw-TCG pass inserts this helper AFTER the qemu_ld/st, so a
      * faulting access has already raised before this helper runs (§4/§9).
      * The deferred finalize path converts pending findings to synthetic
      * crashes at guest exit. */
-    provenance_check_access(env, addr, size, pc, unknown_tag, -1, 0);
+    provenance_check_access(env, addr, size, pc, NULL, -1, 0);
 }
 
 /* Forward declaration: defined in tcg/symbolic/symbolic.c */

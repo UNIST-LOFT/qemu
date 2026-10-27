@@ -207,11 +207,9 @@ static void gen_sem_on_load(int dst_idx, TCGv t_addr, TCGMemOp ot,
 static void gen_sem_on_store_class(int src_idx, TCGv t_addr, TCGMemOp ot,
                                    SemOpClass cls, target_ulong pc) {
     if (!sem_events_active()) return;
-    /* Ride the pending raw transfer-PC scratch (same protocol as the
-     * two-helper LEA sequence): the store helper consumes the
-     * instruction PC so OSPREY can gate F03/F04 publication on the
-     * main-image producer gate. */
-    {
+    /* Store transfer-PC scratch is consumed only by OSPREY.  Provenance's
+     * LEA scratch is set separately by the LEA emitter. */
+    if (osprey_collect_enabled) {
         TCGv t_pc = tcg_const_tl(pc);
         gen_helper_sem_set_pc(cpu_env, t_pc);
         tcg_temp_free(t_pc);
@@ -282,7 +280,10 @@ static SemProducerId sem_default_producer(SemOpClass cls)
 static void gen_sem_mem_access_flags_class_producer(
     TCGv t_addr, TCGMemOp ot, target_ulong pc, uint32_t flags,
     SemOpClass cls, SemProducerId producer) {
-    if (!sem_events_active()) return;
+    if (!osprey_collect_enabled &&
+        !(binradar_memcheck_enabled && (flags & SEM_MEM_F_PROVENANCE_CHECK))) {
+        return;
+    }
     TCGv t_size = tcg_const_tl(1 << (ot & MO_SIZE));
     TCGv t_pc = tcg_const_tl(pc);
     TCGv_i32 t_flags = tcg_const_i32(SEM_MEM_FLAGS_WITH_POLICY(
@@ -326,7 +327,7 @@ static void gen_sem_mem_access(TCGv t_addr, TCGMemOp ot,
 static void gen_sem_mem_access_f01_raw_class_policy(
     TCGv t_addr, target_ulong size, target_ulong pc, bool is_store,
     SemOpClass cls, SemIntervalPolicy policy, SemProducerId producer) {
-    if (!sem_events_active()) return;
+    if (!osprey_collect_enabled) return;
     TCGv t_size = tcg_const_tl(size);
     TCGv t_pc = tcg_const_tl(pc);
     TCGv_i32 t_flags = tcg_const_i32(SEM_MEM_FLAGS_WITH_POLICY(
@@ -548,7 +549,7 @@ struct DisasContext {
 /* Mode-only EA record for F01-only sites (no provenance EA record, no
  * OSPREY base facts): records aflags/override for the OSPREY F01 gate. */
 static void gen_sem_set_ea_mode(DisasContext *s) {
-    if (!sem_events_active()) return;
+    if (!osprey_collect_enabled) return;
     uint32_t mode = (uint32_t)s->aflag |
                     (((uint32_t)s->override + 1) << 8);
     TCGv_i32 t_mode = tcg_const_i32(mode);
@@ -579,19 +580,20 @@ static void gen_sem_set_ea(DisasContext *s, int base_reg, int index_reg,
     tcg_temp_free_i32(t_scale);
     tcg_temp_free(t_disp);
     tcg_temp_free_i32(t_mode);
-    /* Explicit base/index concrete values for the OSPREY EA record
-     * (env->regs may be stale inside helpers). */
-    TCGv t_base_val = tcg_const_tl(0);
-    TCGv t_index_val = tcg_const_tl(0);
-    if (base_reg >= 0 && base_reg < CPU_NB_REGS) {
-        tcg_gen_mov_tl(t_base_val, cpu_regs[base_reg]);
+    if (osprey_collect_enabled) {
+        /* Explicit OSPREY values: env->regs may be stale inside helpers. */
+        TCGv t_base_val = tcg_const_tl(0);
+        TCGv t_index_val = tcg_const_tl(0);
+        if (base_reg >= 0 && base_reg < CPU_NB_REGS) {
+            tcg_gen_mov_tl(t_base_val, cpu_regs[base_reg]);
+        }
+        if (index_reg >= 0 && index_reg < CPU_NB_REGS) {
+            tcg_gen_mov_tl(t_index_val, cpu_regs[index_reg]);
+        }
+        gen_helper_sem_set_ea_vals(cpu_env, t_base_val, t_index_val);
+        tcg_temp_free(t_base_val);
+        tcg_temp_free(t_index_val);
     }
-    if (index_reg >= 0 && index_reg < CPU_NB_REGS) {
-        tcg_gen_mov_tl(t_index_val, cpu_regs[index_reg]);
-    }
-    gen_helper_sem_set_ea_vals(cpu_env, t_base_val, t_index_val);
-    tcg_temp_free(t_base_val);
-    tcg_temp_free(t_index_val);
     s->sem_ea_pending = true;
 }
 

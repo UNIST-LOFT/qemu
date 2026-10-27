@@ -149,6 +149,7 @@ QemuMutexTrylockFunc qemu_mutex_trylock_func = NULL;
 static void test_sem_manifest_integrity(void);
 static void test_sem_overwrite_fail_closed(void);
 static void test_provenance_mem_invalidate_overlap(void);
+static void test_provenance_lookup_lifetime(void);
 static void test_sem_access_class_and_flags(void);
 static void test_address_origin_channels_and_producers(void);
 static void test_address_shadow_reload(void);
@@ -2906,7 +2907,7 @@ static void test_syscall_request_metadata(void)
           finding.payload.origin == PROV_FINDING_ORIGIN_ACCESS,
           "first actual access remains immutable when request follows");
     provenance_clear_pending_fault();
-    provenance_check_access(env, 0x10000, widths[1], 0x400200, tag, -1, 0x10000);
+    provenance_check_access(env, 0x10000, widths[1], 0x400200, &tag, -1, 0x10000);
     CHECK(provenance_snapshot_pending_finding(&finding) &&
           finding.payload.origin == PROV_FINDING_ORIGIN_ACCESS &&
           finding.payload.access_width == widths[1],
@@ -3003,6 +3004,7 @@ int main(void)
     test_sem_manifest_integrity();
     test_sem_overwrite_fail_closed();
     test_provenance_mem_invalidate_overlap();
+    test_provenance_lookup_lifetime();
     test_sem_access_class_and_flags();
     test_address_origin_channels_and_producers();
     test_address_shadow_reload();
@@ -3019,7 +3021,7 @@ int main(void)
         fprintf(stderr, "%d unit test check(s) FAILED\n", failures);
         return 1;
     }
-    printf("PASS osprey_unit (53/53)\n");
+    printf("PASS osprey_unit (54/54)\n");
     return 0;
 }
 
@@ -3298,7 +3300,7 @@ static void test_provenance_mem_invalidate_overlap(void)
     for (uint64_t i = 0; i < 64; i++) {
         provenance_mem_invalidate(0x100000 + i * 8, 8);
     }
-    CHECK(!test_tag_present(0x100000, 1) && !test_tag_present(0x101f8, 64),
+    CHECK(!test_tag_present(0x100000, 1) && !test_tag_present(0x1001f8, 64),
           "dense fixture cleared");
     test_tag_slot(0x200000, 101);
     test_tag_slot(0x200000 + 0x8000, 102);
@@ -3313,19 +3315,29 @@ static void test_provenance_mem_invalidate_overlap(void)
     CHECK(test_tag_present(0x200000 + 0x8000, 102),
           "sparse: large disjoint range preserves live tags");
 
-    /* Unaligned, non-empty write that starts inside a tagged slot and ends
-     * in an untagged gap still drops that partial slot. */
-    provenance_mem_invalidate(0x200000 + 0x8003, 3);
-    CHECK(!test_tag_present(0x200000 + 0x8000, 102),
+    /* A wide unaligned write forces the sparse traversal and touches partial
+     * slots at both ends.  Adjacent full slots must survive. */
+    test_tag_slot(0x207ff8, 103);
+    test_tag_slot(0x208048, 104);
+    test_tag_slot(0x208050, 105);
+    provenance_mem_invalidate(0x208003, 72);
+    CHECK(!test_tag_present(0x208000, 102),
           "sparse: partial first-slot overlap invalidated");
+    CHECK(!test_tag_present(0x208048, 104),
+          "sparse: partial last-slot overlap invalidated");
+    CHECK(test_tag_present(0x207ff8, 103) &&
+          test_tag_present(0x208050, 105),
+          "sparse: adjacent slots retained");
 
-    /* Top-of-space slot: its span wraps, so it covers any write whose end is
-     * at or past the slot start; the table is walked live-entry-wise here
-     * because the candidate count exceeds the live shadow. */
+    /* The write ends exactly at the address-space boundary, without wrapping
+     * its inclusive endpoint.  Its 128 candidate slots force sparse removal. */
     test_tag_slot(UINT64_MAX - 7, 201);
-    provenance_mem_invalidate(UINT64_MAX - 8, 8);
+    test_tag_slot(UINT64_MAX - 1031, 204);
+    provenance_mem_invalidate(UINT64_MAX - 1023, 1024);
     CHECK(!test_tag_present(UINT64_MAX - 7, 201),
-          "top-of-space slot invalidated by its own write");
+          "sparse: final address-space slot invalidated");
+    CHECK(test_tag_present(UINT64_MAX - 1031, 204),
+          "sparse: slot preceding high interval retained");
     test_tag_slot(UINT64_MAX - 7, 202);
     provenance_mem_invalidate(0, 0x100);
     CHECK(test_tag_present(UINT64_MAX - 7, 202),
@@ -3359,6 +3371,60 @@ static void test_provenance_mem_invalidate_overlap(void)
     provenance_mem_invalidate(0x800000, 0x100000);
     CHECK(test_tag_present(0x700000, 403),
           "large disjoint range keeps unrelated tag");
+}
+
+static void test_provenance_lookup_lifetime(void)
+{
+    static CPUArchState env_a, env_b;
+    const target_ulong base = 0x910000;
+    provenance_init();
+    PtrTag old = provenance_create_object(base, 64, 0x400200,
+                                           PROV_PRODUCER_MALLOC_RETURN);
+    PtrTag other = provenance_create_object(base + 0x1000, 32, 0x400210,
+                                             PROV_PRODUCER_MALLOC_RETURN);
+    provenance_set_reg_tag(&env_a, R_EAX, old);
+    provenance_set_reg_tag(&env_b, R_EAX, other);
+    CHECK(provenance_get_reg_tag(&env_a, R_EAX).object_id == old.object_id &&
+          provenance_get_reg_tag(&env_b, R_EAX).object_id == other.object_id,
+          "register shadows remain keyed by CPU");
+    provenance_invalidate_all_regs(&env_a);
+    CHECK(!provenance_get_reg_tag(&env_a, R_EAX).valid &&
+          provenance_get_reg_tag(&env_b, R_EAX).valid,
+          "context invalidation cannot clear another CPU's shadow");
+
+    CHECK(provenance_check_access(&env_a, base, 8, 0x400220, &old, -1, base) ==
+          MEMCHECK_OK, "live object access primes identity lookup");
+    CHECK(provenance_lookup_object(old.object_id, old.generation + 1) == NULL,
+          "identity lookup does not alias a different generation");
+    CHECK(provenance_retire_object(base), "old object retired");
+    CHECK(provenance_check_access(&env_a, base, 8, 0x400230, &old, -1, base) ==
+          MEMCHECK_HEAP_UAF, "cached identity observes retirement");
+
+    PtrTag reused = provenance_create_object(base, 4, 0x400240,
+                                              PROV_PRODUCER_MALLOC_RETURN);
+    CHECK(provenance_check_access(&env_a, base, 8, 0x400250, &reused, -1, base) ==
+          MEMCHECK_HEAP_OOB, "reused address has the new object's bounds");
+    CHECK(provenance_check_access(&env_a, base, 4, 0x400250, &reused, -1, base) ==
+          MEMCHECK_OK, "lookup reuse does not cache an access verdict");
+    CHECK(provenance_check_access(&env_a, base, 4, 0x400250, &old, -1, base) ==
+          MEMCHECK_HEAP_UAF, "address reuse does not revive the old identity");
+
+    /* Exercise more identities than the bounded hot lookup cache retains. */
+    for (unsigned i = 0; i < 16; ++i) {
+        target_ulong addr = base + 0x2000 + i * 0x100;
+        PtrTag tag = provenance_create_object(addr, i + 1, 0x400260,
+                                               PROV_PRODUCER_MALLOC_RETURN);
+        CHECK(provenance_check_access(&env_a, addr, i + 1, 0x400270, &tag, -1, addr) == MEMCHECK_OK,
+              "distinct allocation retains its own bounds");
+        CHECK(provenance_retire_object(addr), "temporary object retired");
+    }
+    CHECK(provenance_check_access(&env_a, base, 4, 0x400280, &reused, -1, base) ==
+          MEMCHECK_OK, "identity survives hot-cache replacement");
+    CHECK(provenance_check_access(&env_a, base, 4, 0x400280, &old, -1, base) ==
+          MEMCHECK_HEAP_UAF, "retired identity survives hot-cache replacement");
+    CHECK(provenance_retire_object(base) &&
+          provenance_retire_object(base + 0x1000), "lookup fixtures retired");
+    provenance_invalidate_all_regs(&env_b);
 }
 
 static void test_sem_access_class_and_flags(void)

@@ -617,8 +617,7 @@ static void sem_prov_on_store(CPUArchState *env, uint32_t src_idx,
     }
 }
 
-/* EA metadata + access check (moved verbatim from helper_prov_set_ea /
- * helper_prov_check_access). */
+/* Pre-access EA snapshots, consumed only after a successful guest access. */
 static void sem_prov_set_ea(CPUArchState *env, uint32_t base_reg,
                             uint32_t index_reg, uint32_t scale,
                             target_ulong disp, uint32_t mode) {
@@ -632,20 +631,22 @@ static void sem_prov_set_ea(CPUArchState *env, uint32_t base_reg,
     /* Snapshot the pre-access concrete values and tags.  The check runs
      * AFTER the guest load/store; a load whose destination overwrites its
      * own EA base/index register must not make the check observe the
-     * loaded value/tag instead of the address-producing state (§6). */
+     * loaded value/tag instead of the address-producing state (§6).
+     * For an absent register only tag validity is meaningful; do not clear
+     * the unused tag payload on every access. */
     if (base_reg < CPU_NB_REGS) {
         shadow->ea_meta.base_val = env->regs[base_reg];
         shadow->ea_meta.base_tag = shadow->gpr[base_reg];
     } else {
         shadow->ea_meta.base_val = 0;
-        shadow->ea_meta.base_tag = (PtrTag){0};
+        shadow->ea_meta.base_tag.valid = false;
     }
     if (index_reg < CPU_NB_REGS) {
         shadow->ea_meta.index_val = env->regs[index_reg];
         shadow->ea_meta.index_tag = shadow->gpr[index_reg];
     } else {
         shadow->ea_meta.index_val = 0;
-        shadow->ea_meta.index_tag = (PtrTag){0};
+        shadow->ea_meta.index_tag.valid = false;
     }
     shadow->ea_meta.valid = true;
 }
@@ -654,143 +655,73 @@ static void sem_prov_check_access(CPUArchState *env, target_ulong addr,
                                   target_ulong size, target_ulong pc) {
     if (!binradar_memcheck_enabled) return;
     PtrRegShadow *shadow = provenance_get_reg_shadow(env);
-    int ea_src_reg = -1;
-    target_ulong ea_src_val = 0;
-    /* Consume the EA metadata: copy into locals, then clear so a stale
-     * record can never be misread by a later instruction. */
-    bool have_ea = shadow->ea_meta.valid;
-    int base_reg = shadow->ea_meta.base_reg;
-    int index_reg = shadow->ea_meta.index_reg;
-    int scale = shadow->ea_meta.scale;
-    target_long disp = shadow->ea_meta.disp;
-    uint32_t aflags = shadow->ea_meta.aflags;
-    int override = shadow->ea_meta.override;
-    /* Pre-access snapshots taken by sem_set_ea (before the guest
-     * load/store), so a self-overwriting load cannot corrupt them. */
-    PtrTag base_tag = shadow->ea_meta.base_tag;
-    PtrTag index_tag = shadow->ea_meta.index_tag;
-    target_ulong base_val = shadow->ea_meta.base_val;
-    target_ulong index_val = shadow->ea_meta.index_val;
-    shadow->ea_meta.valid = false;
-    /* Scope rejection must not leave an instruction-local EA armed for a
-     * later main/DSO access or another constituent of a helper operation. */
+    struct ProvEAMeta *ea = &shadow->ea_meta;
+    bool have_ea = ea->valid;
+    /* Consume before scope rejection or any checker call. The synchronous
+     * check borrows this private pre-access snapshot, not the current GPRs;
+     * even a self-overwriting load keeps its address-producing state. */
+    ea->valid = false;
     if (!provenance_memcheck_pc_eligible(pc)) return;
-    if (have_ea) {
-        /* Semantic EA propagation (§6).  Identity requires a 64-bit
-         * address size with no segment override.  Constant displacement
-         * forms propagate directly.  For benchmark compatibility, a
-         * tagged base plus an untagged runtime index also propagates only
-         * after exact target-width EA reconstruction succeeds; two tagged
-         * inputs remain UNKNOWN.  Truncating address modes, unmodeled
-         * segment bases, and a tagged scaled index remain UNKNOWN and use
-         * exact-bounds fallback only. */
-        if (aflags != MO_64 || override >= 0) {
-            provenance_check_access(env, addr, size, pc, (PtrTag){0},
-                                    -1, 0);
-            return;
-        }
-        if (base_reg >= 0 && base_reg < CPU_NB_REGS) {
-            if (index_reg < 0 && base_tag.valid) {
-                /* [base + disp]: the access address must equal
-                 * base_val + disp (semantic, translation-time disp).
-                 * x86 address arithmetic wraps mod 2^64, so the
-                 * expected address is computed with wrapping unsigned
-                 * arithmetic (a negative displacement is a full-width
-                 * sign-extended value, not an overflow); only the
-                 * tracked-offset fold below uses checked overflow. */
-                target_ulong expect = base_val + (target_ulong)disp;
-                if (expect == addr) {
-                    int64_t new_offset;
-                    if (__builtin_add_overflow(base_tag.concrete_offset,
-                                               (int64_t)disp, &new_offset)) {
-                        base_tag.valid = false;  /* overflow → UNKNOWN */
-                    } else {
-                        base_tag.concrete_offset = new_offset;
-                    }
-                } else {
-                    base_tag.valid = false;
-                }
-                ea_src_reg = base_reg;
-                ea_src_val = base_val;
-                provenance_check_access(env, addr, size, pc, base_tag,
-                                        ea_src_reg, ea_src_val);
-                return;
-            }
-            if (index_reg >= 0 && base_tag.valid) {
-                /* base + index: two-register form.  If BOTH carry valid
-                 * tags there is no sound merge rule — UNKNOWN.  If only
-                 * the base is tagged, the index is a pure integer
-                 * offset: the address must match the semantic
-                 * decomposition exactly (scale is the SIB shift 0..3),
-                 * and only then is the runtime delta addr - base_val
-                 * folded into the tracked offset with checked
-                 * arithmetic.  This is a verified arithmetic fold, not
-                 * a numeric proximity guess (§6). */
-                if (index_tag.valid) {
-                    /* Two tagged inputs: no sound merge (§6). */
-                    provenance_check_access(env, addr, size, pc,
-                                            (PtrTag){0}, -1, 0);
-                    return;
-                }
-                /* Untagged index: semantic exact-match, then fold the
-                 * runtime delta into the tracked offset (checked).
-                 * Expected-address arithmetic is wrapping (x86 mod
-                 * 2^64); only the offset fold is overflow-checked. */
-                target_ulong expect = base_val +
-                    ((target_ulong)index_val << scale) +
-                    (target_ulong)disp;
-                if (expect == addr) {
-                    int64_t delta;
-                    int64_t new_offset;
-                    if (__builtin_sub_overflow((int64_t)addr,
-                                               (int64_t)base_val, &delta) ||
-                        __builtin_add_overflow(base_tag.concrete_offset,
-                                               delta, &new_offset)) {
-                        base_tag.valid = false;  /* overflow → UNKNOWN */
-                    } else {
-                        base_tag.concrete_offset = new_offset;
-                    }
-                } else {
-                    base_tag.valid = false;
-                }
-                ea_src_reg = base_reg;
-                ea_src_val = base_val;
-                provenance_check_access(env, addr, size, pc, base_tag,
-                                        ea_src_reg, ea_src_val);
-                return;
-            }
-        }
-        if (index_reg >= 0 && index_reg < CPU_NB_REGS) {
-            /* Index carries the provenance and the base is untagged or
-             * absent.  Only scale 1 is sound (§6): the address must
-             * equal index_val + disp (wrapping arithmetic). */
-            if (index_tag.valid && scale == 0) {
-                target_ulong expect = index_val + (target_ulong)disp;
-                if (expect == addr) {
-                    int64_t new_offset;
-                    if (__builtin_add_overflow(index_tag.concrete_offset,
-                                               (int64_t)disp, &new_offset)) {
-                        index_tag.valid = false;
-                    } else {
-                        index_tag.concrete_offset = new_offset;
-                    }
-                } else {
-                    index_tag.valid = false;
-                }
-                ea_src_reg = index_reg;
-                ea_src_val = index_val;
-                provenance_check_access(env, addr, size, pc, index_tag,
-                                        ea_src_reg, ea_src_val);
-                return;
-            }
-        }
-        /* All unsupported forms → UNKNOWN provenance (exact-bounds
-         * fallback only). */
-        provenance_check_access(env, addr, size, pc, (PtrTag){0},
-                                ea_src_reg, ea_src_val);
+    if (!have_ea || ea->aflags != MO_64 || ea->override >= 0) {
+        provenance_check_access(env, addr, size, pc, NULL, -1, 0);
         return;
     }
-    provenance_check_access(env, addr, size, pc, (PtrTag){0}, -1, 0);
+
+    PtrTag *tag = NULL;
+    int ea_src_reg = -1;
+    target_ulong ea_src_val = 0;
+    int64_t offset;
+    if (ea->base_reg >= 0 && ea->base_reg < CPU_NB_REGS &&
+        ea->base_tag.valid) {
+        if (ea->index_reg >= 0 && ea->index_tag.valid) {
+            /* Two tagged inputs have no sound merge rule (§6). */
+            provenance_check_access(env, addr, size, pc, NULL, -1, 0);
+            return;
+        }
+        ea_src_reg = ea->base_reg;
+        ea_src_val = ea->base_val;
+        if (ea->index_reg < 0) {
+            /* Expected x86 addresses wrap; tracked offsets must not. */
+            target_ulong expect = ea->base_val + (target_ulong)ea->disp;
+            if (expect == addr &&
+                !__builtin_add_overflow(ea->base_tag.concrete_offset,
+                                        (int64_t)ea->disp, &offset)) {
+                tag = &ea->base_tag;
+            }
+        } else {
+            /* An untagged runtime index propagates only after exact EA
+             * reconstruction, never from numeric proximity (§6). */
+            target_ulong expect = ea->base_val +
+                (ea->index_val << ea->scale) + (target_ulong)ea->disp;
+            int64_t delta;
+            if (expect == addr &&
+                !__builtin_sub_overflow((int64_t)addr,
+                                        (int64_t)ea->base_val, &delta) &&
+                !__builtin_add_overflow(ea->base_tag.concrete_offset,
+                                        delta, &offset)) {
+                tag = &ea->base_tag;
+            }
+        }
+    } else if (ea->index_reg >= 0 && ea->index_reg < CPU_NB_REGS &&
+               ea->index_tag.valid && ea->scale == 0) {
+        /* An index-only identity requires scale one and exact reconstruction.
+         * A nonzero untagged base therefore cannot silently disappear. */
+        ea_src_reg = ea->index_reg;
+        ea_src_val = ea->index_val;
+        target_ulong expect = ea->index_val + (target_ulong)ea->disp;
+        if (expect == addr &&
+            !__builtin_add_overflow(ea->index_tag.concrete_offset,
+                                    (int64_t)ea->disp, &offset)) {
+            tag = &ea->index_tag;
+        }
+    }
+    if (tag != NULL) {
+        /* Only the consumed EA snapshot is folded, never its source GPR. */
+        tag->concrete_offset = offset;
+    }
+    /* NULL is UNKNOWN, including unsupported forms or failed arithmetic. */
+    provenance_check_access(env, addr, size, pc, tag,
+                            ea_src_reg, ea_src_val);
 }
 
 /* ------------------------------------------------------------------ */
@@ -850,10 +781,6 @@ void sem_mem_access(CPUArchState *env, target_ulong addr,
                     SemOpClass cls, SemIntervalPolicy policy,
                     SemProducerId producer) {
     if (sem_allocator_body) return;
-    bool valid_class = sem_op_class_is_valid(cls);
-    bool valid_policy = sem_interval_policy_declared(producer, cls, policy,
-                                                     size);
-    uint32_t is_store = flags & SEM_MEM_F_STORE;
     /* The provenance access check runs only at sites that emitted it
      * historically (check bit set): those are exactly the EA-decomposed
      * sites.  F01-only sites (SIMD/x87/atomic/paired) must not add new
@@ -866,6 +793,10 @@ void sem_mem_access(CPUArchState *env, target_ulong addr,
     if (!osprey_collect_enabled) {
         return;
     }
+    bool valid_class = sem_op_class_is_valid(cls);
+    bool valid_policy = sem_interval_policy_declared(producer, cls, policy,
+                                                     size);
+    uint32_t is_store = flags & SEM_MEM_F_STORE;
     /* Any memory event is a later semantic boundary than a LEA scratch;
      * it must not leave an unconsumed producer PC for another instruction. */
     osprey_sem_transfer_clear(env);

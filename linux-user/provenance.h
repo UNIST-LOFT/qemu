@@ -81,8 +81,8 @@ typedef struct {
     target_ulong           calloc_element_size;
 } ProvenancePending;
 
-/* Per-CPU register shadow.  Stored as a pointer inside CPUArchState
- * (allocated lazily) so it is automatically copy-on-write across fork. */
+/* Per-CPU register shadow.  Lazily allocated in a CPUArchState-keyed table;
+ * both the table and its lookup cache inherit copy-on-write across fork. */
 typedef struct PtrRegShadow {
     PtrTag       gpr[CPU_NB_REGS];
     target_ulong last_writer_pc[CPU_NB_REGS];
@@ -297,12 +297,13 @@ void provenance_check_syscall_request(CPUArchState *env, target_ulong addr,
 void provenance_check_syscall_request_tagged(CPUArchState *env, target_ulong addr,
                                              target_ulong size, PtrTag tag);
 
-/* Check an access using provenance tag.  Returns MemcheckResult.
- * If tag is UNKNOWN, falls through to exact-bounds on live objects.
- * Records a non-fatal PendingProvenanceFault on OOB/UAF. */
+/* Check an access using a borrowed tag (not retained). Returns MemcheckResult.
+ * A NULL or invalid tag is UNKNOWN: exact-bounds on live objects only.
+ * Records a non-fatal PendingProvenanceFault on OOB/UAF; inconsistent
+ * identity/value still invalidates the named GPR's authoritative tag. */
 MemcheckResult provenance_check_access(CPUArchState *env, target_ulong addr,
                                        target_ulong size, target_ulong pc,
-                                       PtrTag ea_tag, int ea_base_reg,
+                                       const PtrTag *ea_tag, int ea_base_reg,
                                        target_ulong ea_base_reg_val);
 
 /* C API for libc-model bodies: check an access whose pointer lives in a

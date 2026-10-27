@@ -2774,7 +2774,7 @@ static void test_request_metadata_real_regions(void)
           "UNKNOWN request uses the real live interval without reading payload");
     int64_t first_query = finding.finding_query_idx;
     int64_t first_expr = finding.finding_expr_idx;
-    provenance_check_access(env, base + 8, wide, pc, tag, -1, base + 8);
+    provenance_check_access(env, base + 8, wide, pc, &tag, -1, base + 8);
     CHECK(provenance_snapshot_pending_finding(&finding) &&
               finding.payload.quality == PROV_FINDING_FALLBACK &&
               finding.payload.origin == PROV_FINDING_ORIGIN_SYSCALL_REQUEST,
@@ -2795,7 +2795,7 @@ static void test_request_metadata_real_regions(void)
               finding.finding_expr_idx == first_expr,
           "matching request promotion keeps complete width and first cursors");
     provenance_clear_pending_fault();
-    provenance_check_access(env, base + 8, wide, pc, (PtrTag){0}, -1, 0);
+    provenance_check_access(env, base + 8, wide, pc, NULL, -1, 0);
     provenance_check_syscall_request_tagged(env, base + 8, wide, tag);
     CHECK(provenance_snapshot_pending_finding(&finding) &&
               finding.payload.quality == PROV_FINDING_FALLBACK &&
