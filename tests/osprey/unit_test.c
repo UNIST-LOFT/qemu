@@ -2865,7 +2865,17 @@ static void test_syscall_request_metadata(void)
     };
     for (size_t i = 0; i < sizeof(widths) / sizeof(widths[0]); i++) {
         provenance_clear_pending_fault();
+        reset_log();
         provenance_check_syscall_request_tagged(env, 0x10000, widths[i], tag);
+        CHECK(strstr(g_test_log,
+                     "[prov] [pending-finding] [version 1] [origin syscall-request] [quality tagged]") != NULL &&
+              strstr(g_test_log, "[site_kind main] [site_image none] [site_offset 0]") != NULL &&
+              strstr(g_test_log, "[finalize]") == NULL && !pending.reported,
+              "committed request is logged immediately without terminal reporting");
+        size_t committed_log_len = g_test_log_len;
+        provenance_check_syscall_request_tagged(env, 0x10000, widths[i], tag);
+        CHECK(g_test_log_len == committed_log_len,
+              "repeated tagged request does not emit another diagnostic");
         CHECK(provenance_snapshot_pending_finding(&finding),
               "full-width metadata request proves OOB without payload read");
         CHECK(finding.payload.access_width == widths[i] &&
@@ -2960,8 +2970,55 @@ static void test_syscall_request_metadata(void)
     g_free(env);
 }
 
+/* Model interruption after ordinary tagged payload stores but before its
+ * release publication. Readers and terminal reporting must retain the prior
+ * immutable fallback, never the plausible but uncommitted tagged identity. */
+static void test_partial_pending_publication(void)
+{
+    PendingProvenanceFault pending = {0};
+    ProvPublishedFinding finding;
+    provenance_set_shared_fault_ptr(&pending);
+    pending.fallback.payload = (ProvFindingRecord){
+        .quality = PROV_FINDING_FALLBACK,
+        .origin = PROV_FINDING_ORIGIN_ACCESS,
+        .access_pc = 0x400200, .actual_pc = 0x600008,
+        .access_addr = 0x10008, .access_width = 8,
+        .object_base = 0x10000, .requested_size = 12,
+        .tracked_offset = 8, .ea_base_reg = -1,
+    };
+    pending.fallback.finding_query_idx = 17;
+    pending.fallback.finding_expr_idx = 23;
+    __atomic_store_n(&pending.fallback.ready, 1, __ATOMIC_RELEASE);
+    pending.tagged.payload = (ProvFindingRecord){
+        .quality = PROV_FINDING_TAGGED, .object_id = 999,
+        .access_pc = 0xdeadbeef, .is_uaf = true,
+    };
+    pending.tagged.finding_query_idx = 99;
+    reset_log();
+    CHECK(provenance_snapshot_pending_finding(&finding) &&
+          finding.payload.quality == PROV_FINDING_FALLBACK &&
+          finding.payload.object_id == 0 &&
+          finding.payload.actual_pc == 0x600008 &&
+          finding.finding_query_idx == 17 && finding.finding_expr_idx == 23,
+          "partial tagged publication preserves committed fallback and cursors");
+    CHECK(provenance_finalize_fault(NULL) && !pending.reported &&
+          g_test_log_len == 0,
+          "snapshot/finalization does not emit uncommitted diagnostics");
+    CHECK(provenance_report_pending_finding() &&
+          strstr(g_test_log, "[obj_id 0]") != NULL &&
+          strstr(g_test_log, "deadbeef") == NULL &&
+          strstr(g_test_log, "[pending-finding]") == NULL,
+          "terminal report reads only committed fallback, not partial promotion");
+    provenance_clear_pending_fault();
+    CHECK(!provenance_snapshot_pending_finding(&finding) && !pending.reported &&
+          !pending.tagged.ready && !pending.fallback.ready,
+          "fresh child reset removes both slots and report state");
+    provenance_set_shared_fault_ptr(NULL);
+}
+
 int main(void)
 {
+    test_partial_pending_publication();
     test_e9_access_metadata();
     test_syscall_request_metadata();
     test_overflow_rejection();

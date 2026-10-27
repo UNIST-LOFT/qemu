@@ -81,9 +81,12 @@ int main(int argc, char **argv)
 {
     if (argc != 2) return 2;
     const char *mode = argv[1];
-    if (!strcmp(mode, "prefix")) {
+    if (!strcmp(mode, "clean-timeout")) {
+        for (;;) __asm__ volatile("" ::: "memory");
+    }
+    if (!strcmp(mode, "prefix") || !strcmp(mode, "prefix-only")) {
         prefix_request();
-        request_entry(mode);
+        if (!strcmp(mode, "prefix")) request_entry(mode);
         return 0;
     }
     if (!strcmp(mode, "reset")) {

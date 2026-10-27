@@ -1061,6 +1061,48 @@ static ProvPublishedFinding *prov_fault_slot_for_publish(
         ? &pf->tagged : NULL;
 }
 
+/* Diagnostic only: never marks the terminal finding reported or selects a
+ * verdict.  Called once by the publisher, after release publication; consume
+ * only the committed slot, not a concurrently preferred/promoting slot.
+ * log_msg uses a bounded stack buffer and write(2), so no stdio flush or
+ * finalization is needed for a later killed standalone guest. */
+static void prov_log_committed_finding(const ProvPublishedFinding *slot)
+{
+    if (atomic_load_acquire(&slot->ready) == 0) {
+        return;
+    }
+    int saved_errno = errno;
+    const ProvFindingRecord *f = &slot->payload;
+    char image[65];
+    static const char hex[] = "0123456789abcdef";
+    if (f->site.valid) {
+        for (size_t i = 0; i < sizeof(f->site.image_id); i++) {
+            image[i * 2] = hex[f->site.image_id[i] >> 4];
+            image[i * 2 + 1] = hex[f->site.image_id[i] & 15];
+        }
+        image[64] = '\0';
+    } else {
+        memcpy(image, "none", 5);
+    }
+    log_msg("[prov] [pending-finding] [version 1] [origin %s] [quality %s] "
+            "[site_kind %s] [site_image %s] [site_offset %lx] "
+            "[access_pc %lx] [actual_pc %lx] [access_addr %lx] "
+            "[width " TARGET_FMT_lu "] [obj_id %lu] [gen %u] "
+            "[obj_base %lx] [size %lx] [offset %ld] [producer_pc %lx] "
+            "[kind %d] [last_writer %lx] [is_uaf %d] [ea_reg %d] "
+            "[ea_base_reg_val %lx] [query_cursor %ld] [expr_cursor %ld]\n",
+            f->origin == PROV_FINDING_ORIGIN_SYSCALL_REQUEST
+                ? "syscall-request" : "provenance-access",
+            f->quality == PROV_FINDING_TAGGED ? "tagged" : "fallback",
+            f->site.valid ? "dso" : "main", image,
+            f->site.image_offset, f->access_pc, f->actual_pc, f->access_addr,
+            f->access_width, f->object_id, f->generation, f->object_base,
+            f->requested_size, f->tracked_offset, f->producer_pc,
+            f->producer_kind, f->last_writer_pc, f->is_uaf, f->ea_base_reg,
+            f->ea_base_reg_val, slot->finding_query_idx, slot->finding_expr_idx);
+    errno = saved_errno;
+}
+
 /* Fill one immutable publication slot.  Captures the last writer PC of the
  * tracked base register for observability; 0 when the register is unknown. */
 static void prov_fault_fill(PendingProvenanceFault *pf, CPUArchState *env,
@@ -1135,6 +1177,7 @@ static void prov_fault_fill(PendingProvenanceFault *pf, CPUArchState *env,
     }
 
     atomic_store_release(&slot->ready, 1);
+    prov_log_committed_finding(slot);
 }
 
 static MemcheckResult prov_check_bounds(CPUArchState *env, target_ulong addr,

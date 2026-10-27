@@ -250,7 +250,7 @@ TESTS: list[dict[str, Any]] = [
     dict(name="t39_failed_access_ordering", mode="mem", rc=(-11, 139),
          verdict="crash", reason="unhandled_target_signal", finding=None),
     dict(name="t39b_failed_access_success", mode="mem", rc=(0,),
-         verdict="crash",
+         verdict="crash", pending_qualities=["fallback", "tagged"],
          finding=dict(reason="heap-buffer-overflow", is_uaf=0,
                       fields={"obj_id": 2, "gen": 1, "width": 8}),
          note="successful crossing load promotes fallback to tagged "
@@ -313,7 +313,7 @@ TESTS: list[dict[str, Any]] = [
          note="first tagged finding is sticky: a later tagged UAF at a "
               "different address must not displace it"),
     dict(name="t49_sticky_unknown_fallback", mode="mem", rc=(0,),
-         verdict="crash",
+         verdict="crash", pending_qualities=["fallback"],
          finding=dict(reason="heap-buffer-overflow", is_uaf=0,
                       fields={"obj_id": 0, "gen": 0, "width": 8}),
          note="UNKNOWN fallback is sticky: a later tagged UAF at a "
@@ -704,6 +704,21 @@ for case in ("request-first", "access-first", "prefix", "signal", "timeout"):
         spec.update(fs_child_timeout=1, required_log="[forkserver] [child-timeout]")
     TESTS.append(spec)
 
+# A standalone SIGKILL never runs finalization. These diagnostics must already
+# exist, but neither the text parser nor probe evidence may admit a reference.
+for case, pending_count in (("timeout", 1), ("clean-timeout", 0)):
+    TESTS.append(dict(name="t92_standalone_" + case,
+                     guest="t92_request_contract", args=[case], mode="mem",
+                     rc=(-9,), verdict=None, finding=None, timeout=2,
+                     standalone_timeout=True, pending_count=pending_count,
+                     production_models=True, production_model_symbols=("malloc",)))
+TESTS.append(dict(name="t92_request_prefix_only", guest="t92_request_contract",
+                 args=["prefix-only"], mode="mem", rc=(0,), verdict="normal",
+                 entrypoint_symbol="request_entry",
+                 prefix_finding_symbol="request_prefix_pc", finding=None,
+                 pending_count=0, production_models=True,
+                 production_model_symbols=("malloc",)))
+
 # Commit request-origin evidence in real fork children and authenticate its
 # compact source independently of the normalized text source.
 TESTS.append(dict(name="t92_request_compact_reset", guest="t92_request_contract",
@@ -869,6 +884,84 @@ def parse_findings(out):
     return findings
 
 
+def parse_pending_findings(out):
+    """Diagnostic records are deliberately separate from terminal findings."""
+    return [dict(re.findall(r"\[([a-z_]+) ([^\]]+)\]", row))
+            for row in re.findall(r"^\[prov\] \[pending-finding\](.*)$",
+                                  out, re.MULTILINE)]
+
+
+def check_pending_findings(test, out, probe_text):
+    problems = []
+    pending = parse_pending_findings(out)
+    required = {
+        "version", "origin", "quality", "site_kind", "site_image", "site_offset",
+        "access_pc", "actual_pc", "access_addr", "width", "obj_id", "gen",
+        "obj_base", "size", "offset", "producer_pc", "kind", "last_writer",
+        "is_uaf", "ea_reg", "ea_base_reg_val", "query_cursor", "expr_cursor",
+    }
+    for row in pending:
+        if required - row.keys():
+            problems.append("pending diagnostic missing payload or canonical site fields")
+            continue
+        if (row["version"] != "1" or
+                row["quality"] not in ("fallback", "tagged") or
+                row["origin"] not in ("provenance-access", "syscall-request")):
+            problems.append("invalid pending diagnostic version/origin/quality")
+        if row["site_kind"] == "dso":
+            if not re.fullmatch(r"[0-9a-f]{64}", row["site_image"]):
+                problems.append("pending DSO site lacks complete image digest")
+            if test.get("site_binary") and (
+                    row["site_image"] != test["_site_image"] or
+                    int(row["site_offset"], 16) != test["_site_offset"]):
+                problems.append("pending DSO site disagrees with independent ELF identity")
+        elif (row["site_kind"] != "main" or row["site_image"] != "none" or
+              row["site_offset"] != "0"):
+            problems.append("pending main site does not use canonical main PC")
+        if test.get("prefix_finding_symbol") and (
+                int(row["access_pc"], 16) == test["_prefix_pc"]):
+            problems.append("prefix event leaked into committed pending diagnostics")
+
+    # Each terminal report must have been preceded by its committed diagnostic.
+    # This also bounds hot-path emission to one fallback and one tagged slot per
+    # child and verifies promotion preserves the original identity and cursors.
+    slots = []
+    for line in out.splitlines():
+        if line.startswith("[prov] [pending-finding]"):
+            row = parse_pending_findings(line)[0]
+            if slots:
+                if ([item.get("quality") for item in slots] != ["fallback"] or
+                        row.get("quality") != "tagged"):
+                    problems.append("pending slot emitted repeatedly or out of order")
+                for key in ("origin", "actual_pc", "access_pc", "access_addr", "width",
+                            "query_cursor", "expr_cursor"):
+                    if slots[0].get(key) != row.get(key):
+                        problems.append("promotion changed first-event identity/cursors")
+            slots.append(row)
+        elif line.startswith("[prov] [finalize] [finding]"):
+            terminal = parse_findings(line)[0]
+            if not slots:
+                problems.append("terminal finding lacks immediate committed diagnostic")
+            else:
+                for key in terminal.keys() & required - {"version"}:
+                    if terminal[key] != slots[-1].get(key):
+                        problems.append("terminal finding differs from preferred committed slot")
+            slots = []
+    if "pending_qualities" in test and [row.get("quality") for row in pending] != test["pending_qualities"]:
+        problems.append("pending fallback/tagged diagnostic sequence differs from committed slots")
+    if "pending_count" in test and len(pending) != test["pending_count"]:
+        problems.append(f"pending diagnostic count {len(pending)} != {test['pending_count']}")
+    if test.get("compact_normal_control") and slots:
+        problems.append("fresh normal child retained a pending finding")
+    if test.get("standalone_timeout"):
+        if (parse_exit_line(out)[0] is not None or parse_fault_references(out) or
+                parse_findings(out) or probe_text.strip()):
+            problems.append("managed timeout diagnostic was misread as terminal evidence")
+    elif not test.get("allow_findings") and test.get("finding") is None and pending:
+        problems.append("unexpected committed pending diagnostic in clean/signal-only guest")
+    return problems
+
+
 def parse_symbolic_counts(out):
     query = re.search(r"^Number of queries: ([0-9]+)$", out, re.MULTILINE)
     expr = re.search(r"^Number of expressions: ([0-9]+)$", out, re.MULTILINE)
@@ -1031,7 +1124,18 @@ def run_memcheck(test, guest, qemu, workdir):
         env["BINRADAR_ENTRYPOINT"] = resolve_entrypoint(guest)
     binary = prepare_artifact(test, guest, env)
     cmd = [qemu, "-d", "page", binary, *test.get("args", [])]
-    return run_tracer(cmd, env, test.get("timeout", 30))
+    try:
+        result = run_tracer(cmd, env, test.get("timeout", 30))
+    except subprocess.TimeoutExpired as exc:
+        if not test.get("standalone_timeout"):
+            raise
+        # subprocess.run has killed and reaped the child. Keep its drained
+        # diagnostics as diagnostics only; no terminal/reference row is made.
+        return subprocess.CompletedProcess(cmd, -9, exc.stdout or b"",
+                                           exc.stderr or b"")
+    if test.get("standalone_timeout"):
+        raise RuntimeError("standalone loop completed before its managed timeout")
+    return result
 
 
 def prepare_symbolic_env(env, run_dir, input_bytes="A"):
@@ -1348,7 +1452,7 @@ def run_test(test, guests_dir, workdir, qemu):
 
 def check(test, rc, fs_status, out, evidence=None, probe_text="",
           summary=None):
-    problems = []
+    problems = check_pending_findings(test, out, probe_text)
     if test.get("required_stdout") and (
             "[guest-stdout] " + test["required_stdout"] + "\n") not in out:
         problems.append(f"missing guest outcome: {test['required_stdout']}")
