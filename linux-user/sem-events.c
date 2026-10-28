@@ -73,6 +73,7 @@ void helper_sem_on_load(CPUArchState *env, uint32_t dst_idx,
 void helper_sem_on_store(CPUArchState *env, uint32_t src_idx,
                          target_ulong addr, target_ulong size,
                          target_ulong src_val, uint32_t cls);
+void helper_sem_signal_start(CPUArchState *env);
 void helper_sem_call(CPUArchState *env, target_ulong callee_pc,
                      target_ulong entry_sp);
 void helper_sem_ret(CPUArchState *env, target_ulong pc, target_ulong sp);
@@ -1227,6 +1228,10 @@ void helper_sem_set_pc(CPUArchState *env, target_ulong pc) {
     if (osprey_collect_enabled) {
         osprey_sem_transfer_set(env, pc);
     }
+}
+
+void helper_sem_signal_start(CPUArchState *env) {
+    provenance_signal_start(env);
 }
 
 void helper_sem_call(CPUArchState *env, target_ulong callee_pc,

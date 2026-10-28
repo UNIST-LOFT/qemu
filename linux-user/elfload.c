@@ -25,6 +25,7 @@
 #include "../tcg/symbolic/symbolic-instrumentation.h"
 #include "snapshot.h"
 #include "osprey.h"
+#include "provenance.h"
 
 /* from personality.h */
 
@@ -2852,6 +2853,10 @@ int load_elf_binary(struct linux_binprm *bprm, struct image_info *info)
     bprm->p = create_elf_tables(bprm->p, bprm->argc, bprm->envc, &elf_ex,
                                 info, (elf_interpreter ? &interp_info : NULL));
     info->start_stack = bprm->p;
+
+    /* Signal shadow frames start at the executed main ELF entry, not the
+     * interpreter entry or the BINRADAR snapshot entrypoint. */
+    provenance_main_entry = info->entry;
 
     /* If we have an interpreter, set that as the program's entry point.
        Copy the load_bias as well, to help PPC64 interpret the entry

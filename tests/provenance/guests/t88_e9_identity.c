@@ -73,7 +73,9 @@ int main(int argc, char **argv)
         return clean_control();
     }
     if (argc > 1 && strcmp(argv[1], "signal") == 0) {
-        __asm__ volatile("xor %%eax,%%eax\n call e9_raw_signal" ::: "rax", "memory");
+        __asm__ volatile("xor %%eax,%%eax\n call e9_raw_signal\n"
+                         ".global e9_signal_return\ne9_signal_return:"
+                         ::: "rax", "memory");
     } else {
         char *p = malloc(8);
         if (!p) return 0;

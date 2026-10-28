@@ -72,12 +72,19 @@ TESTS := t01_double_free t02_small_double_free t03_uaf_stack t04_uaf_heap \
          t84_syscall_input t85_library_coverage t86_libc_scans \
          t87_prefix_window t88_e9_identity \
          t89_allocator_recycled_realloc t90_realloc_symbolic_payload \
-         t91_allocator_saved_alias t92_request_contract t93_raw_first_compare
+         t91_allocator_saved_alias t92_request_contract t93_raw_first_compare \
+         t94_signal_shadow
 
 # t83 reuses the t82 guest: every mutation plan for it is discarded, so
 # draining the whole queue exercises the terminal-discarded-plan case.
 $(WORK)/t83_final_discarded_plan: $(GUESTS)/t82_unusable_attempt_recovery.c | $(WORK)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<
+
+$(WORK)/libsignal.so: $(GUESTS)/signal-library.S | $(WORK)
+	$(CC) -shared -fPIC -o $@ $<
+
+$(WORK)/t94_signal_shadow: $(GUESTS)/t94_signal_shadow.c $(WORK)/libsignal.so
+	$(CC) $(CFLAGS) $(LDFLAGS) -nostartfiles -Wl,-e,signal_root_entry -o $@ $< -L$(WORK) -lsignal -Wl,-rpath,'$$ORIGIN'
 
 $(WORK)/libcoverage.so: $(GUESTS)/coverage-library.S | $(WORK)
 	$(CC) -shared -fPIC -o $@ $<

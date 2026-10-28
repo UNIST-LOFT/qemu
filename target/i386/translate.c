@@ -10197,6 +10197,9 @@ static void i386_tr_insn_start(DisasContextBase *dcbase, CPUState *cpu)
         TCGv eip = tcg_const_tl(dc->base.pc_next);
         tcg_gen_st_tl(eip, cpu_env, offsetof(CPUX86State, eip));
         tcg_temp_free(eip);
+        if (dc->base.pc_next == provenance_main_entry) {
+            gen_helper_sem_signal_start(cpu_env);
+        }
     }
 }
 

@@ -17,6 +17,7 @@
 #include "elf.h"
 
 int provenance_debug = 0;
+target_ulong provenance_main_entry = (target_ulong)-1;
 
 /* ---- Allocation object table ---- */
 
@@ -155,13 +156,22 @@ static GHashTable *prov_reg_shadows = NULL;  /* env* → PtrRegShadow* */
 static CPUArchState *prov_cached_env;
 static PtrRegShadow *prov_cached_shadow;
 
+static void prov_reg_shadow_free(gpointer data)
+{
+    PtrRegShadow *shadow = data;
+    if (shadow->signal_frames != NULL) {
+        g_array_free(shadow->signal_frames, TRUE);
+    }
+    g_free(shadow);
+}
+
 PtrRegShadow *provenance_get_reg_shadow(CPUArchState *env) {
     if (prov_cached_shadow != NULL && prov_cached_env == env) {
         return prov_cached_shadow;
     }
     if (prov_reg_shadows == NULL) {
         prov_reg_shadows = g_hash_table_new_full(g_direct_hash, g_direct_equal,
-                                                  NULL, g_free);
+                                                NULL, prov_reg_shadow_free);
     }
     PtrRegShadow *shadow = g_hash_table_lookup(prov_reg_shadows, env);
     if (shadow == NULL) {
@@ -879,6 +889,54 @@ static bool prov_caller_reference_pc(CPUArchState *env, target_ulong *reference_
     return false;
 }
 
+void provenance_signal_start(CPUArchState *env)
+{
+    if (!binradar_memcheck_enabled) return;
+    PtrRegShadow *shadow = provenance_get_reg_shadow(env);
+    shadow->signal_root_pc = provenance_main_entry;
+    if (shadow->signal_frames != NULL) {
+        g_array_set_size(shadow->signal_frames, 0);
+    }
+}
+
+static bool prov_signal_main_pc(target_ulong pc, target_ulong *reference_pc)
+{
+    target_ulong original;
+    if (e9_original_instruction_pc(pc, &original)) pc = original;
+    if (is_in_e9_exclude_region(pc) || !prov_main_pc(pc)) return false;
+    *reference_pc = pc;
+    return true;
+}
+
+bool provenance_signal_reference_pc(CPUArchState *env, target_ulong pc,
+                                    target_ulong *reference_pc)
+{
+    if (prov_signal_main_pc(pc, reference_pc)) return true;
+    if (binradar_memcheck_enabled && env != NULL) {
+        /* No allocation or guest-stack reads while handling the signal.
+         * A data PC need not have an instruction identity to use an observed
+         * caller, just as AFL print_stacktrace walks its shadow frames. */
+        PtrRegShadow *shadow = prov_cached_env == env ? prov_cached_shadow :
+            (prov_reg_shadows ? g_hash_table_lookup(prov_reg_shadows, env) : NULL);
+        if (shadow != NULL) {
+            GArray *frames = shadow->signal_frames;
+            for (guint n = frames ? frames->len : 0; n > 0; n--) {
+                const ProvenanceSignalFrame *frame = &g_array_index(
+                    frames, ProvenanceSignalFrame, n - 1);
+                target_ulong caller = frame->return_pc ? frame->return_pc : frame->entry;
+                if (prov_signal_main_pc(caller, reference_pc)) return true;
+            }
+            if (prov_signal_main_pc(shadow->signal_root_pc, reference_pc)) return true;
+        }
+    }
+    /* With no tracked main frame, keep a verified DSO identity. Unknown
+     * external PCs still have no reference; never substitute PATCH_LOC. */
+    ProvenanceFaultSite site;
+    if (!provenance_memcheck_site(pc, &site)) return false;
+    *reference_pc = pc;
+    return true;
+}
+
 bool provenance_memcheck_reference_pc(CPUArchState *env, target_ulong pc,
                                       target_ulong *reference_pc)
 {
@@ -907,17 +965,25 @@ void provenance_memcheck_call(CPUArchState *env, target_ulong callee_pc,
                               target_ulong entry_sp)
 {
     if (!binradar_memcheck_enabled) return;
-    /* Main-image PLT calls enter main text before jumping into a DSO, so
-     * the observed return boundary matters even when callee_pc is main. */
-    (void)callee_pc;
+    /* Capture after the executed call's return-address push. Signal frames
+     * include runtime/DSO calls and do not trust the guest return word again. */
     PtrRegShadow *shadow = provenance_get_reg_shadow(env);
+    if (!access_ok(VERIFY_READ, entry_sp, sizeof(target_ulong))) return;
+    target_ulong return_pc;
+    memcpy(&return_pc, g2h(entry_sp), sizeof(return_pc));
+    if (shadow->signal_frames == NULL) {
+        shadow->signal_frames = g_array_sized_new(
+            FALSE, FALSE, sizeof(ProvenanceSignalFrame), 64);
+    }
+    ProvenanceSignalFrame frame = { .entry = callee_pc, .return_pc = return_pc };
+    g_array_append_val(shadow->signal_frames, frame);
+
+    /* Deferred access/syscall attribution retains its separately validated
+     * boundaries; widening signal reporting must not widen access checks. */
     if (shadow->external_call_overflow) {
         if (entry_sp < shadow->external_overflow_sp) return;
         shadow->external_call_overflow = false;
     }
-    if (!access_ok(VERIFY_READ, entry_sp, sizeof(target_ulong))) return;
-    target_ulong return_pc;
-    memcpy(&return_pc, g2h(entry_sp), sizeof(return_pc));
     if (!provenance_memcheck_pc_eligible(return_pc)) return;
     while (shadow->external_call_count &&
            entry_sp >= shadow->external_calls[shadow->external_call_count - 1].entry_sp) {
@@ -939,6 +1005,18 @@ void provenance_memcheck_ret(CPUArchState *env, target_ulong pc,
 {
     if (!binradar_memcheck_enabled) return;
     PtrRegShadow *shadow = provenance_get_reg_shadow(env);
+    GArray *frames = shadow->signal_frames;
+    if (frames != NULL) {
+        guint count = frames->len;
+        while (count > 0) {
+            ProvenanceSignalFrame *frame = &g_array_index(
+                frames, ProvenanceSignalFrame, --count);
+            if (frame->return_pc == pc) break;
+        }
+        /* An unmatched/corrupted RET drops all call frames, retaining the
+         * separately stored executed ELF-entry root, matching AFL. */
+        g_array_set_size(frames, count);
+    }
     if (shadow->external_call_overflow && post_sp > shadow->external_overflow_sp) {
         shadow->external_call_overflow = false;
     }

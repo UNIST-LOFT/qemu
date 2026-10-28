@@ -425,7 +425,7 @@ BASE_ENV = {
     "BINRADAR_FORKSERVER_ENABLE": "0",
     "E9_EXCLUDE_RANGES": "",
     "BINRADAR_MEMCHECK_ENABLE": "1",
-    "BINRADAR_MEMCHECK_POLICY": "coverage-v6",
+    "BINRADAR_MEMCHECK_POLICY": "coverage-v7",
     "E9_RELOCATED_INSTRUCTIONS": "",
     "E9_RELOCATED_CALL_JUMPS": "",
 }
@@ -649,9 +649,12 @@ for mode in ("mem", "sym"):
                 spec["reference_pc_symbol"] = return_symbol
                 if not signal:
                     spec["access_pc_symbol"] = return_symbol
+            elif signal:
+                # The executed ELF entry survives as the signal shadow root;
+                # deferred no-caller findings still require validated frames.
+                spec["reference_pc_symbol"] = "coverage_start_entry"
             else:
-                spec.update(site_binary="libcoverage.so", site_symbol=(
-                    "coverage_signal_pc" if signal else "coverage_access_pc"))
+                spec.update(site_binary="libcoverage.so", site_symbol="coverage_access_pc")
             TESTS.append(spec)
     TESTS.append(dict(name="t85_library_coverage_benign_" + mode,
                       guest="t85_library_coverage", args=["benign"], mode=mode,
@@ -749,10 +752,12 @@ for enabled in ("0", "1"):
                     e9_identity=True, e9_unknown=unknown,
                     env={"BINRADAR_MEMCHECK_ENABLE": enabled},
                     raw_pc_symbol="e9_raw_signal",
-                    fault_reference=dict(valid="false" if unknown else "true",
-                                         source="unavailable" if unknown else "guest-signal"))
+                    fault_reference=dict(valid="false" if unknown and enabled == "0" else "true",
+                                         source="unavailable" if unknown and enabled == "0" else "guest-signal"))
         if not unknown:
             spec["reference_pc_symbol"] = "e9_original_signal"
+        elif enabled == "1":
+            spec["reference_pc_symbol"] = "e9_signal_return"
         TESTS.append(spec)
 for case, mode in (("deferred", "mem"), ("deferred", "sym"),
                    ("precedence", "sym"), ("timeout", "fors")):
@@ -766,11 +771,43 @@ for case, mode in (("deferred", "mem"), ("deferred", "sym"),
                      raw_pc_symbol="e9_raw_signal" if signal else "e9_raw_model",
                      reference_pc_symbol="e9_original_signal" if signal else "e9_original_model",
                      fault_reference=dict(valid="true", source="guest-signal" if signal else "provenance-access")))
-for policy in ("coverage-v1", "coverage-v2", "coverage-v3", "coverage-v4", "coverage-v5"):
+for policy in ("coverage-v1", "coverage-v2", "coverage-v3", "coverage-v4", "coverage-v5", "coverage-v6"):
     TESTS.append(dict(name="t88_old_policy_rejected_" + policy, guest="t88_e9_identity",
                      mode="mem", args=["signal"], rc=(1,), verdict=None,
                      finding=None, env={"BINRADAR_MEMCHECK_POLICY": policy},
                      required_log=f"[memcheck] [invalid-policy {policy}]"))
+
+# Signal-only AFL-style frames are independent of deferred-access validation.
+# Data contains only UD2, so either NX SIGSEGV or decoded UD2 SIGILL is valid;
+# in either case guest_pc must remain the exact data symbol, never the caller.
+for mode in ("mem", "sym"):
+    for case, reference in (
+            ("data", "signal_data_return"),
+            ("main", "signal_main_pc"),
+            ("corrupt", "signal_corrupt_return"),
+            ("unmatched", "signal_root_entry"),
+            ("returned", "signal_patch_return"),
+            ("nested", "signal_callback_return"),
+            ("long", "signal_deep_leaf_return")):
+        TESTS.append(dict(
+            name=f"t94_signal_{case}_{mode}", guest="t94_signal_shadow",
+            args=[case], mode=mode, rc=(-4, 132) if case == "main" else (-11, 139, -4, 132),
+            verdict="crash", finding=None,
+            raw_pc_symbol="signal_main_pc" if case == "main" else "signal_data_pc",
+            reference_pc_symbol=reference, distinct_raw_reference=(case != "main"),
+            fault_reference=dict(valid="true", source="guest-signal")))
+    TESTS.append(dict(
+        name=f"t94_signal_zero_{mode}", guest="t94_signal_shadow", args=["zero"],
+        mode=mode, rc=(-11, 139), verdict="crash", finding=None, raw_pc=0,
+        reference_pc_symbol="signal_zero_return", distinct_raw_reference=True,
+        fault_reference=dict(valid="true", source="guest-signal")))
+    # A different configured patch function entry cannot choose the caller.
+    TESTS.append(dict(
+        name=f"t94_signal_data_root_entry_{mode}", guest="t94_signal_shadow",
+        args=["data"], mode=mode, rc=(-11, 139, -4, 132), verdict="crash", finding=None,
+        entrypoint_symbol="signal_root_entry", raw_pc_symbol="signal_data_pc",
+        reference_pc_symbol="signal_data_return", distinct_raw_reference=True,
+        fault_reference=dict(valid="true", source="guest-signal")))
 
 # Opaque allocator bodies use production metadata, not guest-only PLT tables.
 # The guest warms memcpy's PLT/GOT to register its resolved libc IFUNC body.
@@ -1001,7 +1038,7 @@ def resolve_entrypoint(guest):
     raise RuntimeError(f"no 'main' symbol in {guest}")
 
 
-def resolve_symbols(guest, names):
+def resolve_symbols(guest, names, *, data_symbols=()):
     """Resolve named guest symbols to absolute addresses via nm.
 
     The Phase 5 metadata tests express their PC contracts as named labels
@@ -1014,6 +1051,8 @@ def resolve_symbols(guest, names):
     for line in nm.stdout.splitlines():
         parts = line.split()
         if len(parts) == 3 and parts[2] in names:
+            if parts[2] in data_symbols and parts[1] not in ("D", "d", "B", "b"):
+                raise RuntimeError(f"expected data-region symbol {parts[2]} in {guest}, got {parts[1]}")
             addrs[parts[2]] = int(parts[0], 16)
     missing = sorted(names - addrs.keys())
     if missing:
@@ -1155,7 +1194,10 @@ def run_symbolic(test, guest, qemu, workdir):
     env = dict(os.environ)
     env.update(BASE_ENV)
     env["BINRADAR_PROBE_FILE"] = test.get("probe_file", "")
-    env["BINRADAR_ENTRYPOINT"] = resolve_entrypoint(guest)
+    symbol = test.get("entrypoint_symbol")
+    env["BINRADAR_ENTRYPOINT"] = (
+        "0x%x" % resolve_symbols(guest, {symbol})[symbol]
+        if symbol else resolve_entrypoint(guest))
     binary = prepare_artifact(test, guest, env)
     prepare_symbolic_env(env, run_dir, test.get("symbolic_input", "A"))
     cmd = [qemu, "-symbolic", binary, *test.get("args", [])]
@@ -1355,7 +1397,7 @@ def run_forkserver(test, guest, qemu, workdir):
                     _, version, _, _ = binradar_evidence.HEADER_STRUCT.unpack(
                         stream.read(binradar_evidence.HEADER_STRUCT.size))
                 if version != 4:
-                    raise RuntimeError(f"coverage-v6 requires compact v4, got v{version}")
+                    raise RuntimeError(f"coverage-v7 requires compact v4, got v{version}")
                 evidence = list(binradar_evidence.read_binradar(
                     evidence_path))
         return (proc.returncode, child_status, stderr_text, evidence,
@@ -1405,7 +1447,11 @@ def run_test(test, guests_dir, workdir, qemu):
         test["_access_pc"] = resolve_symbols(guest, {test["access_pc_symbol"]})[test["access_pc_symbol"]]
     if test.get("raw_pc_symbol"):
         symbol = test["raw_pc_symbol"]
-        test["_raw_pc"] = resolve_symbols(guest, {symbol})[symbol]
+        test["_raw_pc"] = resolve_symbols(
+            guest, {symbol},
+            data_symbols={symbol} if test.get("distinct_raw_reference") else ())[symbol]
+    if "raw_pc" in test:
+        test["_raw_pc"] = test["raw_pc"]
     if test.get("reference_pc_symbol"):
         symbol = test["reference_pc_symbol"]
         test["_reference_pc"] = resolve_symbols(guest, {symbol})[symbol]
@@ -1458,7 +1504,7 @@ def check(test, rc, fs_status, out, evidence=None, probe_text="",
         problems.append(f"missing guest outcome: {test['required_stdout']}")
     if test.get("required_log") and test["required_log"] not in out:
         problems.append(f"missing required log marker: {test['required_log']}")
-    if test.get("raw_pc_symbol"):
+    if test.get("raw_pc_symbol") or "raw_pc" in test:
         if test["fault_reference"]["source"] in ("guest-signal", "unavailable"):
             raw_pcs = [int(pc, 16) for pc in re.findall(
                 r"^\[snapshot\] \[crash\].*\[guest_pc ([0-9a-fA-F]+)\]", out, re.MULTILINE)]
@@ -1466,7 +1512,9 @@ def check(test, rc, fs_status, out, evidence=None, probe_text="",
             raw_pcs = [int(finding.get("actual_pc", "0"), 16)
                        for finding in parse_findings(out)]
         if not raw_pcs or any(pc != test["_raw_pc"] for pc in raw_pcs):
-            problems.append("exact E9 identity overwrote or lost raw diagnostic PC")
+            problems.append("canonical identity overwrote or lost raw diagnostic PC")
+        if test.get("distinct_raw_reference") and test["_raw_pc"] == test["_reference_pc"]:
+            problems.append("fixture does not distinguish raw data PC from canonical main PC")
     if test.get("site_binary"):
         references = parse_fault_references(out)
         if not references or any(reference["image"] != test["_site_image"] or

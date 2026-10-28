@@ -1226,10 +1226,9 @@ static void snapshot_record_guest_crash_with_reference(
     if (reference_source == SNAPSHOT_FAULT_REFERENCE_GUEST_SIGNAL) {
         reference_addr = info->guest_pc;
         reference_site = &resolved_site;
-        if (reference_addr != 0 &&
-            ((!provenance_memcheck_reference_pc(cpu_env, reference_addr,
-                                                &reference_addr)) ||
-             !provenance_memcheck_site(reference_addr, &resolved_site))) {
+        if (!provenance_signal_reference_pc(cpu_env, reference_addr,
+                                            &reference_addr) ||
+            !provenance_memcheck_site(reference_addr, &resolved_site)) {
             reference_source = SNAPSHOT_FAULT_REFERENCE_UNAVAILABLE;
         }
     }

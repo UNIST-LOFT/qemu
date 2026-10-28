@@ -1,0 +1,60 @@
+/* Harmless signal-attribution diagnostics. The .data region contains only
+ * UD2: NX faults at its address, or an executable mapping traps there instead.
+ * Custom ELF entry makes root fallback deterministic without CRT/libc frames
+ * or host-dependent compiler prologues. */
+__asm__(".data\n"
+        ".global signal_data_pc\nsignal_data_pc: .byte 0x0f,0x0b\n"
+        ".text\n"
+        ".global signal_root_entry\nsignal_root_entry:\n"
+        "movq 16(%rsp),%rax\n movzbl (%rax),%r12d\n"
+        "call main\n"
+        ".global signal_patch_return\nsignal_patch_return: ud2\n"
+        ".global main\nmain:\n subq $8,%rsp\n"
+        "cmpb $'m',%r12b\n je signal_main_case\n"
+        "cmpb $'c',%r12b\n je signal_corrupt_case\n"
+        "cmpb $'u',%r12b\n je signal_unmatched_case\n"
+        "cmpb $'r',%r12b\n je signal_returned_case\n"
+        "cmpb $'n',%r12b\n je signal_nested_case\n"
+        "cmpb $'l',%r12b\n je signal_long_case\n"
+        "cmpb $'z',%r12b\n je signal_zero_case\n"
+        "call signal_transfer\n"
+        ".global signal_data_return\nsignal_data_return: ud2\n"
+        "signal_zero_case: call signal_zero_transfer\n"
+        ".global signal_zero_return\nsignal_zero_return: ud2\n"
+        "signal_zero_transfer: xor %eax,%eax\n jmp *%rax\n"
+        "signal_main_case: call signal_main_trap\n"
+        "signal_main_return: ud2\n"
+        "signal_corrupt_case: call signal_corrupt\n"
+        ".global signal_corrupt_return\nsignal_corrupt_return: ud2\n"
+        "signal_unmatched_case: call signal_unmatched\n"
+        "signal_unmatched_return: ud2\n"
+        "signal_returned_case: call signal_returned\n"
+        "jmp signal_data_pc\n"
+        "signal_nested_case:\n"
+        "movq $signal_data_pc,%rdi\n movq $signal_callback,%rsi\n"
+        "call signal_dso_outer@PLT\n"
+        "signal_outer_return: ud2\n"
+        "signal_callback:\n"
+        "subq $8,%rsp\n call signal_dso_leaf@PLT\n"
+        ".global signal_callback_return\nsignal_callback_return: ud2\n"
+        /* The final distinct return label proves calls beyond 64 frames are
+         * retained, rather than accidentally accepting a repeated caller PC. */
+        "signal_long_case: movl $96,%r13d\n call signal_recurse\n"
+        "signal_long_outer_return: ud2\n"
+        "signal_recurse: decl %r13d\n jnz signal_recurse_again\n"
+        "call signal_transfer\n"
+        ".global signal_deep_leaf_return\nsignal_deep_leaf_return: ud2\n"
+        "signal_recurse_again: call signal_recurse\n"
+        "signal_recursive_return: ud2\n"
+        "signal_transfer: jmp signal_data_pc\n"
+        "signal_main_trap:\n"
+        ".global signal_main_pc\nsignal_main_pc: ud2\n"
+        /* A jump leaves the executed CALL frame live even after the guest
+         * return word changes. Signal attribution must not reread that word. */
+        "signal_corrupt: movq $signal_data_pc,(%rsp)\n jmp signal_data_pc\n"
+        /* This RET has no matching captured return PC. AFL discards unmatched
+         * frames, retaining its ELF-entry root rather than a stale caller. */
+        "signal_unmatched: movq $signal_root_transfer,(%rsp)\n ret\n"
+        "signal_root_transfer: jmp signal_data_pc\n"
+        "signal_returned: ret\n"
+        ".section .note.GNU-stack,\"\",@progbits\n");

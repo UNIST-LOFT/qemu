@@ -81,6 +81,11 @@ typedef struct {
     target_ulong           calloc_element_size;
 } ProvenancePending;
 
+typedef struct {
+    target_ulong entry;
+    target_ulong return_pc;
+} ProvenanceSignalFrame;
+
 /* Per-CPU register shadow.  Lazily allocated in a CPUArchState-keyed table;
  * both the table and its lookup cache inherit copy-on-write across fork. */
 typedef struct PtrRegShadow {
@@ -101,6 +106,10 @@ typedef struct PtrRegShadow {
     unsigned external_call_count;
     bool external_call_overflow;
     target_ulong external_overflow_sp;
+    /* AFL-style signal attribution is independent of validated access
+     * boundaries: shadow return PCs survive guest stack corruption. */
+    GArray *signal_frames; /* ProvenanceSignalFrame, COW-owned */
+    target_ulong signal_root_pc;
     /* Pending allocator operation for this guest thread (per-CPU, so
      * multithreaded guests keep independent pending ops). */
     ProvenancePending pending;
@@ -262,7 +271,7 @@ PtrTag provenance_mem_load_tag(target_ulong addr);
 void provenance_mem_invalidate(target_ulong addr, target_ulong size);
 
 /* ---- Access checking ---- */
-#define BINRADAR_MEMCHECK_POLICY "coverage-v6"
+#define BINRADAR_MEMCHECK_POLICY "coverage-v7"
 
 /* File-backed runtime mappings (libc/loader) use logical summaries rather
  * than application-object checks on implementation overfetch/metadata. */
@@ -276,7 +285,15 @@ void provenance_memcheck_protect(target_ulong addr, target_ulong size, int prot)
 bool provenance_memcheck_pc_eligible(target_ulong pc);
 /* Verified immutable libc/loader code, independent of memcheck enablement. */
 bool provenance_runtime_pc(target_ulong pc);
-/* Main instruction, or innermost validated main return for a verified DSO
+/* Main ELF entry is configured by the loader; the runtime helper resets
+ * only when that instruction executes, independently of snapshot entry. */
+extern target_ulong provenance_main_entry;
+void provenance_signal_start(CPUArchState *env);
+/* Genuine signals use AFL-style shadow frames even for a data/unmapped PC.
+ * Exact E9 originals normalize first; raw guest_pc remains diagnostic. */
+bool provenance_signal_reference_pc(CPUArchState *env, target_ulong pc,
+                                    target_ulong *reference_pc);
+/* Deferred access: main instruction, or validated main return for a DSO
  * instruction. With no main boundary, retain the verified DSO instruction;
  * proved E9 instruction copies normalize first, unknown helpers fail.
  * Caller attribution requires memcheck; identity normalization does not.
