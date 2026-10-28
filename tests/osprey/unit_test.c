@@ -154,11 +154,13 @@ static void test_sem_raw_first_lifetime(void);
 static void test_sem_access_class_and_flags(void);
 static void test_address_origin_channels_and_producers(void);
 static void test_address_shadow_reload(void);
+static void test_cpu_origin_cache_lifetime(void);
 static void test_f02_ea_selection(void);
 static void test_base_fact_producer_merge(void);
 static void test_value_origin_creation_and_transfer(void);
 static void test_ordinary_f03_f04_publication(void);
 static void test_osprey_shadow_overlap_invalidation(void);
+static void test_osprey_shadow_sparse_churn(void);
 static void test_modeled_copy_origins_and_facts(void);
 static void test_realloc_copy_snapshot(void);
 static void test_copy_points_merge_and_dump(void);
@@ -3067,11 +3069,13 @@ int main(void)
     test_sem_access_class_and_flags();
     test_address_origin_channels_and_producers();
     test_address_shadow_reload();
+    test_cpu_origin_cache_lifetime();
     test_f02_ea_selection();
     test_base_fact_producer_merge();
     test_value_origin_creation_and_transfer();
     test_ordinary_f03_f04_publication();
     test_osprey_shadow_overlap_invalidation();
+    test_osprey_shadow_sparse_churn();
     test_modeled_copy_origins_and_facts();
     test_realloc_copy_snapshot();
     test_copy_points_merge_and_dump();
@@ -3080,7 +3084,7 @@ int main(void)
         fprintf(stderr, "%d unit test check(s) FAILED\n", failures);
         return 1;
     }
-    printf("PASS osprey_unit (55/55)\n");
+    printf("PASS osprey_unit (56/56)\n");
     return 0;
 }
 
@@ -4154,6 +4158,60 @@ static void test_address_origin_channels_and_producers(void)
     g_free(env);
 }
 
+/* Last-env caching must isolate CPU state and preserve it across fact-suffix
+ * resets, but not outlive the origin table.  Reuse env addresses after teardown
+ * so allocator reuse of an origin-state address cannot hide stale contents. */
+static void test_cpu_origin_cache_lifetime(void)
+{
+    reset_log();
+    OspreyConfig c;
+    OspreyContext *ctx;
+    OspreySharedRun *run;
+    CPUArchState *env;
+    stage23_setup(&c, &ctx, &run, &env);
+    CPUArchState *other = g_malloc0(sizeof(CPUArchState));
+    OspreyCpuOriginState *first = osprey_cpu_origin(env);
+    first->regs[R_EAX].address.valid = 1;
+    first->regs[R_EAX].address.concrete_value = 0x1234;
+    OspreyCpuOriginState *second = osprey_cpu_origin(other);
+    CHECK(first != second && !second->regs[R_EAX].address.valid,
+          "switching env creates independent origin state");
+    second->regs[R_EAX].address.valid = 1;
+    second->regs[R_EAX].address.concrete_value = 0x5678;
+    CHECK(osprey_cpu_origin(other) == second &&
+          osprey_cpu_origin(env) == first &&
+          first->regs[R_EAX].address.concrete_value == 0x1234,
+          "cache hits and CPU switches retain the correct origin state");
+
+    CHECK(osprey_shared_run_freeze_prefix(ctx, run), "freeze empty prefix");
+    osprey_shared_run_prepare(ctx, run, 2);
+    osprey_child_use_shared_run(ctx, run);
+    CHECK(osprey_cpu_origin(env) == first &&
+          first->regs[R_EAX].address.valid &&
+          first->regs[R_EAX].address.concrete_value == 0x1234,
+          "preparing a child fact suffix preserves snapshot origins");
+    CHECK(osprey_cpu_origin(other) == second &&
+          second->regs[R_EAX].address.concrete_value == 0x5678,
+          "fact suffix preparation preserves the other CPU's origins");
+
+    /* Leave other cached when freeing, then reuse both env keys. */
+    osprey_free(ctx);
+    ctx = osprey_new(&c);
+    first = osprey_cpu_origin(env);
+    second = osprey_cpu_origin(other);
+    CHECK(first != second && !first->regs[R_EAX].address.valid &&
+          !second->regs[R_EAX].address.valid &&
+          g_hash_table_size(first->mem_slots) == 0 &&
+          g_hash_table_size(second->mem_slots) == 0,
+          "context teardown clears cached and noncached CPU origins");
+    CHECK(osprey_cpu_origin(other) == second,
+          "recreated table supports repeated last-env hits");
+    osprey_free(ctx);
+    g_free(run);
+    g_free(other);
+    g_free(env);
+}
+
 static void test_address_shadow_reload(void)
 {
     reset_log();
@@ -5122,6 +5180,115 @@ static void test_ordinary_f03_f04_publication(void)
     g_free(env);
 }
 
+/* Wide sparse removal after a dense population must preserve unrelated
+ * survivors and the surviving origin, including the shape where one tag
+ * remains after a wide removal and many small disjoint writes follow.
+ * The backing-table capacity itself is not observable through GLib's public
+ * API, so this is a correctness regression, not a timing acceptance test. */
+static void test_osprey_shadow_sparse_churn(void)
+{
+    reset_log();
+    OspreyConfig c;
+    OspreyContext *ctx;
+    OspreySharedRun *run;
+    CPUArchState *env;
+    stage23_setup(&c, &ctx, &run, &env);
+    OspreyCpuOriginState *st = osprey_cpu_origin(env);
+
+    /* Global origin: no provenance identity required, and a main-image
+     * store PC would publish extra facts this test does not need. */
+    OspreyRegionId G;
+    memset(&G, 0, sizeof(G));
+    G.kind = OSPREY_REGION_GLOBAL;
+    install_addr_origin(st, R_R12, 0x402010, &G, 0x2010, 0x300);
+    env->regs[R_R12] = 0x402010;
+
+    enum { POPULATION = 4096, REPEATS = 2000 };
+    const target_ulong dense = 0x1000000;
+    const target_ulong edge =
+        dense + (POPULATION + 15) * OSPREY_SHADOW_ALIGN;
+    const target_ulong keep_a = 0x2000000;
+    const target_ulong keep_b = 0x2000010;
+
+    for (unsigned i = 0; i < POPULATION; i++) {
+        osprey_on_mem_store(env, R_R12,
+                            dense + i * OSPREY_SHADOW_ALIGN,
+                            OSPREY_SHADOW_ALIGN, 0x402010, 0);
+    }
+    osprey_on_mem_store(env, R_R12, edge, OSPREY_SHADOW_ALIGN,
+                        0x402010, 0);
+    osprey_on_mem_store(env, R_R12, keep_a, OSPREY_SHADOW_ALIGN,
+                        0x402010, 0);
+    osprey_on_mem_store(env, R_R12, keep_b, OSPREY_SHADOW_ALIGN,
+                        0x402010, 0);
+    CHECK(g_hash_table_size(st->mem_slots) == POPULATION + 3,
+          "dense shadow plus endpoint and two survivors installed");
+
+    OspreyMemAddressOrigin *survivor_a =
+        g_hash_table_lookup(st->mem_slots, GSIZE_TO_POINTER(keep_a));
+    OspreyMemAddressOrigin *survivor_b =
+        g_hash_table_lookup(st->mem_slots, GSIZE_TO_POINTER(keep_b));
+    CHECK(survivor_a != NULL && survivor_b != NULL,
+          "both unrelated survivors present before churn");
+
+    /* Candidate slots exceed live slots, so this takes the wide sparse
+     * path.  Both dense endpoints are only partially covered. */
+    osprey_on_mem_overwrite(env, dense + 3,
+                            (POPULATION + 16) * OSPREY_SHADOW_ALIGN - 6);
+    CHECK(g_hash_table_size(st->mem_slots) == 2,
+          "wide partial overlap leaves exactly two survivors");
+    for (unsigned i = 0; i < POPULATION; i++) {
+        CHECK(g_hash_table_lookup(
+                  st->mem_slots,
+                  GSIZE_TO_POINTER(dense + i * OSPREY_SHADOW_ALIGN))
+                  == NULL,
+              "every dense overlapping slot removed");
+    }
+    CHECK(g_hash_table_lookup(st->mem_slots, GSIZE_TO_POINTER(edge)) == NULL,
+          "partially overlapped final slot removed");
+    CHECK(g_hash_table_lookup(st->mem_slots, GSIZE_TO_POINTER(keep_a))
+              == survivor_a &&
+          g_hash_table_lookup(st->mem_slots, GSIZE_TO_POINTER(keep_b))
+              == survivor_b,
+          "wide removal preserves unrelated shadow records");
+
+    for (unsigned i = 0; i < REPEATS; i++) {
+        osprey_on_mem_overwrite(env, 0x3000007 + (target_ulong)i * 16, 2);
+    }
+    CHECK(g_hash_table_size(st->mem_slots) == 2,
+          "repeated disjoint two-slot writes preserve both survivors");
+    survivor_a = g_hash_table_lookup(st->mem_slots, GSIZE_TO_POINTER(keep_a));
+    CHECK(survivor_a != NULL && survivor_a->valid &&
+          survivor_a->concrete_value == 0x402010 &&
+          survivor_a->canonical.region.kind == OSPREY_REGION_GLOBAL &&
+          survivor_a->canonical.offset == 0x2010,
+          "churn keeps the first survivor's exact origin");
+
+    /* One live slot: the old iterator removal left this shape scanning
+     * retained backing capacity for each two-slot write. */
+    osprey_on_mem_overwrite(env, keep_b + 7, 1);
+    CHECK(g_hash_table_size(st->mem_slots) == 1 &&
+          g_hash_table_lookup(st->mem_slots, GSIZE_TO_POINTER(keep_b))
+              == NULL,
+          "partial final-byte overwrite removes only the second survivor");
+    for (unsigned i = 0; i < REPEATS; i++) {
+        osprey_on_mem_overwrite(env, 0x3000007 + (target_ulong)i * 16, 2);
+    }
+    survivor_a = g_hash_table_lookup(st->mem_slots, GSIZE_TO_POINTER(keep_a));
+    CHECK(g_hash_table_size(st->mem_slots) == 1 && survivor_a != NULL &&
+          survivor_a->valid && survivor_a->concrete_value == 0x402010 &&
+          survivor_a->canonical.offset == 0x2010,
+          "single-survivor sparse churn preserves the exact origin");
+
+    osprey_on_mem_overwrite(env, keep_a, OSPREY_SHADOW_ALIGN);
+    CHECK(g_hash_table_size(st->mem_slots) == 0,
+          "final survivor remains removable");
+
+    osprey_free(ctx);
+    g_free(run);
+    g_free(env);
+}
+
 /* Exact sparse overlap invalidation: first/middle/final-byte overlap,
  * adjacent and zero-length no-ops, same-value partial writes, atomic,
  * MASKMOV selected bytes, external outputs, wrapping clears, and
@@ -5240,6 +5407,30 @@ static void test_osprey_shadow_overlap_invalidation(void)
     osprey_on_mem_overwrite(env, (target_ulong)-8, 16);
     CHECK(g_hash_table_size(st->mem_slots) == 0,
           "wrapping interval clears the whole shadow");
+
+    /* Ending exactly at TARGET_ULONG_MAX is not a wrapping write.  Keep
+     * the zero-address key live while removing the top slot using one,
+     * two (candidate == live), and three (candidate > live) candidate
+     * keys.  No path may increment the final aligned key and wrap to zero. */
+    const target_ulong top = (target_ulong)-1;
+    const target_ulong top_slot = top & ~(target_ulong)(OSPREY_SHADOW_ALIGN - 1);
+    osprey_on_mem_store(env, R_R12, 0, 8, 0x10000, 0);
+    osprey_on_mem_store(env, R_R12, top_slot, 8, 0x10000, 0);
+    osprey_on_mem_overwrite(env, top, 0);
+    CHECK(g_hash_table_size(st->mem_slots) == 2,
+          "zero-size write at address-space end preserves both slots");
+    for (target_ulong width = 1; width <= 17; width += 8) {
+        osprey_on_mem_store(env, R_R12, top_slot, 8, 0x10000, 0);
+        osprey_on_mem_overwrite(env, top - (width - 1), width);
+        CHECK(g_hash_table_size(st->mem_slots) == 1 &&
+              g_hash_table_lookup(st->mem_slots, GSIZE_TO_POINTER(0)) != NULL &&
+              g_hash_table_lookup(st->mem_slots,
+                                  GSIZE_TO_POINTER(top_slot)) == NULL,
+              "nonwrapping endpoint removes top slot without clearing zero");
+    }
+    osprey_on_mem_overwrite(env, top, 2);
+    CHECK(g_hash_table_size(st->mem_slots) == 0,
+          "one-byte wrapping overflow clears even the zero-address slot");
 
     /* A valid aligned typed store reinstalls exactly one slot after
      * invalidation. */

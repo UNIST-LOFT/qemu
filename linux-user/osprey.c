@@ -1107,7 +1107,19 @@ void osprey_clear_pre_sample_fatal(void) {
 
 static GHashTable *g_cpu_origins = NULL; /* env* -> OspreyCpuOriginState* */
 
+/* Supported OSPREY collection is single-threaded: CLONE_VM disables it
+ * before guest threads resume.  Semantic helpers normally reuse one env;
+ * cache that env, falling back to the table when CPUs switch.  Origin states
+ * live until osprey_free_cpu_origins(), which clears this cache before
+ * destroying them.  Forked samples inherit both the cache and its state;
+ * resetting the shared fact suffix must preserve those pre-snapshot origins. */
+static CPUArchState *g_cpu_origins_env = NULL;
+static OspreyCpuOriginState *g_cpu_origins_state = NULL;
+
 OspreyCpuOriginState *osprey_cpu_origin(CPUArchState *env) {
+    if (g_cpu_origins_env == env && g_cpu_origins_state != NULL) {
+        return g_cpu_origins_state;
+    }
     if (g_cpu_origins == NULL) {
         g_cpu_origins = g_hash_table_new_full(g_direct_hash, g_direct_equal,
                                               NULL, NULL);
@@ -1119,10 +1131,14 @@ OspreyCpuOriginState *osprey_cpu_origin(CPUArchState *env) {
                                               NULL, g_free);
         g_hash_table_insert(g_cpu_origins, env, st);
     }
+    g_cpu_origins_env = env;
+    g_cpu_origins_state = st;
     return st;
 }
 
 void osprey_free_cpu_origins(void) {
+    g_cpu_origins_env = NULL;
+    g_cpu_origins_state = NULL;
     if (g_cpu_origins == NULL) return;
     GHashTableIter it;
     gpointer k, v;

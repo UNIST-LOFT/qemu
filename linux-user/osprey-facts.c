@@ -1588,11 +1588,27 @@ bool osprey_address_origin_live(const OspreyAddressOrigin *o) {
     return origin_heap_prov_ok(o);
 }
 
+typedef struct OspreyShadowRange {
+    target_ulong first;
+    target_ulong final;
+} OspreyShadowRange;
+
+/* Inclusive aligned endpoints cover partial first/last slots without
+ * computing a wrapping slot end. */
+static gboolean origin_shadow_in_range(gpointer key, gpointer value,
+                                       gpointer opaque) {
+    const OspreyShadowRange *range = opaque;
+    target_ulong slot = (target_ulong)GPOINTER_TO_SIZE(key);
+    (void)value;
+    return slot >= range->first && slot <= range->final;
+}
+
 /* Exact sparse overlap invalidation: remove every live memory-shadow
  * slot overlapping [addr, addr+size).  A slot occupies
  * [slot_addr, slot_addr + OSPREY_SHADOW_ALIGN); the write occupies
- * [addr, addr + size).  Iterates the live slots only, never every
- * 8-byte slot in the interval.  Zero-size writes are no-ops.  A
+ * [addr, addr + size).  Probe candidate keys for narrow writes; wider
+ * writes scan the hash table's backing buckets, not every 8-byte slot in
+ * the interval.  Zero-size writes are no-ops.  A
  * wrapping write interval clears the entire shadow: the only safe
  * response when exact overlap cannot be represented. */
 static void origin_invalidate_mem_range(OspreyCpuOriginState *st,
@@ -1615,8 +1631,9 @@ static void origin_invalidate_mem_range(OspreyCpuOriginState *st,
     /* Slots are fixed-width and aligned.  Ordinary guest stores overlap at
      * most a few possible keys, so probe those keys directly instead of
      * scanning an ever-growing pointer-shadow table on every write.  For a
-     * bulk overwrite wider than the live shadow, scanning the live entries
-     * remains cheaper and preserves the same exact overlap predicate. */
+     * bulk overwrite wider than the live shadow, use a table scan with
+     * the same exact overlap predicate.  GLib checks for shrinking after
+     * removals, but a scan still visits backing buckets, not just live keys. */
     target_ulong first = addr & ~(target_ulong)(OSPREY_SHADOW_ALIGN - 1);
     target_ulong final = last & ~(target_ulong)(OSPREY_SHADOW_ALIGN - 1);
     uint64_t candidate_slots =
@@ -1631,24 +1648,12 @@ static void origin_invalidate_mem_range(OspreyCpuOriginState *st,
         return;
     }
 
-    GHashTableIter it;
-    gpointer key, value;
-    g_hash_table_iter_init(&it, st->mem_slots);
-    while (g_hash_table_iter_next(&it, &key, &value)) {
-        target_ulong slot = (target_ulong)GPOINTER_TO_SIZE(key);
-        /* Overlap: slot start at or before the inclusive write end AND
-         * write start strictly before the slot end
-         * [slot, slot + OSPREY_SHADOW_ALIGN).  slot is aligned so
-         * slot + ALIGN wraps only for the single top-of-space slot,
-         * whose span reaches 2^64 (treated as covering any write whose
-         * end is at or past the slot start). */
-        if (slot <= last) {
-            target_ulong slot_end = slot + OSPREY_SHADOW_ALIGN;
-            if (addr < slot_end || slot_end < slot) {
-                g_hash_table_iter_remove(&it);
-            }
-        }
-    }
+    /* foreach_remove checks for backing-table compaction after removal.
+     * Iterator removal retains high-water bucket capacity, so every later
+     * wide scan would keep walking a table that no live slot occupies. */
+    OspreyShadowRange range = { .first = first, .final = final };
+    g_hash_table_foreach_remove(st->mem_slots, origin_shadow_in_range,
+                                &range);
 }
 
 /* Install one aligned pointer-width memory-shadow slot from a live,

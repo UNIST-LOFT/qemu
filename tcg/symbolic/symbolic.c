@@ -92,6 +92,9 @@ static uintptr_t current_tb_pc = 0;
 static uintptr_t last_tb_pc    = 0;
 
 static inline Expr* new_expr(void);
+/* Cleared whenever the expression arena is rewound, because a cached
+ * entry would otherwise name a recycled node. */
+static inline void base_expr_cache_clear(void);
 
 typedef struct {
     Expr*        size_expr;
@@ -463,9 +466,16 @@ static bool plt_image_matches(const char *row_image, const char *loaded)
 
 inline static void parse_plt_info(char* path) 
 {
+    /* Unset/empty metadata is the explicit no-model lane. A configured path
+     * must be readable: silently running without allocator/libc models changes
+     * both checking coverage and symbolic work, invalidating comparisons. */
+    if (path[0] == '\0') return;
     FILE* fp = fopen(path, "r");
-    if (fp == NULL)
-        return;
+    if (fp == NULL) {
+        fprintf(stderr, "Cannot open PLT_INFO_FILE '%s': %s\n",
+                path, strerror(errno));
+        exit(EXIT_FAILURE);
+    }
 
     size_t len = 128;
     char* buffer = g_malloc0(len);
@@ -548,7 +558,15 @@ inline static void parse_plt_info(char* path)
         plt->offset = strtoull(token, NULL, 16);
         plt_info = g_slist_append(plt_info, plt);
     }
+    bool read_failed = !feof(fp);
+    int read_errno = errno;
     free(buffer);
+    if (read_failed) {
+        fprintf(stderr, "Cannot read PLT_INFO_FILE '%s': %s\n",
+                path, strerror(read_errno ? read_errno : EIO));
+        fclose(fp);
+        exit(EXIT_FAILURE);
+    }
 
 #if 0
     GSList* el = plt_info;
@@ -999,6 +1017,7 @@ void init_symbolic_mode(void)
 
     next_free_expr = pool;
     next_query     = query_queue;
+    base_expr_cache_clear();
 
     if (!symbolic_transport_wait_ready(&symbolic_transport)) {
         exit(EXIT_FAILURE);
@@ -3459,16 +3478,65 @@ static MemorySlice const_mem_map[CONST_MAP_SIZE] = {0};
 #endif
 static uintptr_t   slices_count                  = 0;
 
+/* Constant-side ADD stripping is pure: the resolved root depends only on the
+ * input expression.  Address expressions in a scanline loop grow as
+ * ADD(previous, constant), so walking the whole chain on every load is
+ * quadratic in the loop iteration count.  Memoize the resolved root for the
+ * most recent input node and for the chain being resolved.  A direct-mapped
+ * cache keyed by node pointer is not possible without extra storage, so this
+ * keeps a single-entry "previous input -> root" edge: a repeated load through
+ * an already-resolved chain becomes constant work, while any other shape
+ * still walks and then refreshes the entry.
+ *
+ * Correctness never depends on the cache: it stores only the same root the
+ * full walk would produce, and it is cleared whenever the arena is rewound. */
+static Expr *base_expr_cache_input = NULL;
+static Expr *base_expr_cache_root = NULL;
+
+static inline void base_expr_cache_clear(void)
+{
+    base_expr_cache_input = NULL;
+    base_expr_cache_root = NULL;
+}
+
 static inline Expr* get_base_expr(Expr* e)
 {
-    if (e->opkind == ADD) {
-        if (e->op1_is_const) {
-            return get_base_expr(e->op2);
-        } else if (e->op2_is_const) {
-            return get_base_expr(e->op1);
+    if (e == NULL) return NULL;
+
+    /* Walk iteratively: an ADD chain is arbitrarily deep, and the previous
+     * recursive form could exhaust the host stack before collection froze.
+     * Stop as soon as the walk reaches the previously resolved input node and
+     * jump straight to its root; a chain that grows by one ADD per iteration
+     * then costs constant work instead of re-walking the whole prefix. */
+    Expr *node = e;
+    Expr *root = NULL;
+    for (;;) {
+        if (node == base_expr_cache_input) {
+            root = base_expr_cache_root;
+            break;
         }
+        if (node->opkind != ADD) {
+            root = node;
+            break;
+        }
+        Expr *next;
+        if (node->op1_is_const) {
+            next = node->op2;
+        } else if (node->op2_is_const) {
+            next = node->op1;
+        } else {
+            root = node;
+            break;
+        }
+        if (next == NULL) {
+            root = node;
+            break;
+        }
+        node = next;
     }
-    return e;
+    base_expr_cache_input = e;
+    base_expr_cache_root = root;
+    return root;
 }
 
 static Expr*       last_load_concretization = NULL;
@@ -3748,6 +3816,8 @@ static inline void qemu_load_helper(CPUArchState *env, uintptr_t orig_addr,
                 memset(initial_free_expr, 0,
                        ((char*)next_free_expr) - ((char*)initial_free_expr));
                 next_free_expr = initial_free_expr;
+                /* The arena now reuses node memory for new expressions. */
+                base_expr_cache_clear();
 
 #if SYMBOLIC_INPUT_ACCESS
                 // address is within input bytes and input bytes are constant
