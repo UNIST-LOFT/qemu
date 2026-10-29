@@ -664,7 +664,24 @@ out:
          * staged feedback pairs become committed sweep evidence.  Failure is
          * fatal to the phase and rolls back every moved pair. */
         ok = binradar_cache_feedback_publish(manager);
-        if (ok) binradar_cache_clear_iteration(manager);
+        if (ok) {
+            if (cur_iter == 1) {
+                /* Only the committed selected-artifact patch-zero execution
+                 * defines the mutation oracle, even without feedback capture.
+                 * Later mutated patch-zero runs must never replace it. */
+                const PatchedResult *baseline =
+                    &manager->current->patch_results[0];
+                manager->poc_fault_valid = baseline->is_crash;
+                manager->poc_fault_source = baseline->is_crash
+                    ? baseline->fault_reference_source
+                    : SNAPSHOT_FAULT_REFERENCE_UNAVAILABLE;
+                manager->poc_fault_addr = baseline->is_crash
+                    ? baseline->fault_loc : 0;
+                manager->poc_fault_site = baseline->is_crash
+                    ? baseline->fault_site : (ProvenanceFaultSite){0};
+            }
+            binradar_cache_clear_iteration(manager);
+        }
     }
     return ok;
 }
@@ -966,7 +983,8 @@ bool binradar_cache_load_manifest(BinradarManager *manager,
     Error *json_error = NULL;
     QObject *root = NULL;
     bool ok = false;
-    size_t max_descriptor = 0;
+    /* Patch zero publishes p0 even when the manifest has no candidates. */
+    size_t max_descriptor = sizeof("p0") - 1u;
 
     if (!g_file_get_contents(path, &content, &content_len, &file_error)) {
         log_msg("[binradar] [cache-manifest] [error %s]\n",

@@ -510,82 +510,8 @@ void snapshot_init_binradar_patch_shm(uintptr_t key) {
             log_msg("[binradar] [feedback] [disabled] "
                     "[reason brcached-required]\n");
         } else {
-            const char *valid_text = getenv("BINRADAR_POC_FAULT_VALID");
-            const char *source_text = getenv("BINRADAR_POC_FAULT_SOURCE");
-            const char *fault_text = getenv("BINRADAR_POC_FAULT_ADDR");
-            const char *image_text = getenv("BINRADAR_POC_FAULT_IMAGE");
-            const char *offset_text = getenv("BINRADAR_POC_FAULT_IMAGE_OFFSET");
-            ProvenanceFaultSite site = {0};
-            char *end = NULL;
-            unsigned long long fault = 0;
-            bool valid;
-            SnapshotFaultReferenceSource source =
-                SNAPSHOT_FAULT_REFERENCE_UNAVAILABLE;
-
-            if (valid_text == NULL ||
-                (strcmp(valid_text, "0") != 0 && strcmp(valid_text, "1") != 0) ||
-                source_text == NULL ||
-                !g_file_test(feedback_dir, G_FILE_TEST_IS_DIR)) {
+            if (!g_file_test(feedback_dir, G_FILE_TEST_IS_DIR)) {
                 log_msg("[binradar] [feedback] [error configuration]\n");
-                exit_with_status(1);
-            }
-            valid = strcmp(valid_text, "1") == 0;
-            if (strcmp(source_text, "guest-signal") == 0) {
-                source = SNAPSHOT_FAULT_REFERENCE_GUEST_SIGNAL;
-            } else if (strcmp(source_text, "provenance-access") == 0) {
-                source = SNAPSHOT_FAULT_REFERENCE_PROVENANCE_ACCESS;
-            } else if (strcmp(source_text, "syscall-request") == 0) {
-                source = SNAPSHOT_FAULT_REFERENCE_SYSCALL_REQUEST;
-            } else if (strcmp(source_text, "unavailable") != 0) {
-                log_msg("[binradar] [feedback] [error configuration]\n");
-                exit_with_status(1);
-            }
-            if (valid != (source != SNAPSHOT_FAULT_REFERENCE_UNAVAILABLE)) {
-                log_msg("[binradar] [feedback] [error configuration]\n");
-                exit_with_status(1);
-            }
-            if (valid) {
-                errno = 0;
-                fault = strtoull(fault_text != NULL ? fault_text : "",
-                                 &end, 0);
-                if (fault_text == NULL || fault_text[0] == '\0' ||
-                    errno != 0 || end == fault_text || *end != '\0' ||
-                    (target_ulong)fault != fault) {
-                    log_msg("[binradar] [feedback] [error configuration]\n");
-                    exit_with_status(1);
-                }
-            }
-            /* Offset is mandatory in the current live contract, even when
-             * zero for main/unavailable identities. Do not accept old numeric
-             * configuration as a potentially missing DSO identity. */
-            errno = 0;
-            unsigned long long offset = strtoull(
-                offset_text != NULL ? offset_text : "", &end, 0);
-            if (offset_text == NULL || offset_text[0] < '0' ||
-                offset_text[0] > '9' || errno != 0 ||
-                end == offset_text || *end != '\0') {
-                log_msg("[binradar] [feedback] [error fault-site-configuration]\n");
-                exit_with_status(1);
-            }
-            if (image_text != NULL) {
-                if (!valid || strlen(image_text) != 64) {
-                    log_msg("[binradar] [feedback] [error fault-site-configuration]\n");
-                    exit_with_status(1);
-                }
-                for (size_t i = 0; i < 64; i++) {
-                    char c = image_text[i];
-                    if (!((c >= '0' && c <= '9') ||
-                          (c >= 'a' && c <= 'f'))) {
-                        log_msg("[binradar] [feedback] [error fault-site-configuration]\n");
-                        exit_with_status(1);
-                    }
-                    uint8_t nibble = c <= '9' ? c - '0' : c - 'a' + 10;
-                    site.image_id[i / 2] |= nibble << (i % 2 == 0 ? 4 : 0);
-                }
-                site.valid = true;
-                site.image_offset = offset;
-            } else if (offset != 0) {
-                log_msg("[binradar] [feedback] [error fault-site-configuration]\n");
                 exit_with_status(1);
             }
             binradar_manager->feedback_dir = g_strdup(feedback_dir);
@@ -609,16 +535,8 @@ void snapshot_init_binradar_patch_shm(uintptr_t key) {
                 rmdir(stale);
             }
             g_free(stale);
-            binradar_manager->poc_fault_source = source;
-            binradar_manager->poc_fault_addr = (target_ulong)fault;
-            binradar_manager->poc_fault_site = site;
-            binradar_manager->poc_fault_valid = valid;
-            log_msg("[binradar] [feedback] [enabled] [dir %s] "
-                    "[poc-fault-valid %s] [poc-fault-source %s] "
-                    "[poc-fault-addr %lx]\n", feedback_dir,
-                    valid ? "true" : "false",
-                    snapshot_fault_reference_source_name(source),
-                    binradar_manager->poc_fault_addr);
+            log_msg("[binradar] [feedback] [enabled] [dir %s]\n",
+                    feedback_dir);
         }
     }
 

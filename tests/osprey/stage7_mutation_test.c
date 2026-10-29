@@ -2994,6 +2994,176 @@ static void test_cached_request_evidence(void)
     fclose(manager.evidence_file);
 }
 
+/* Exercise the production commit -> feedback path, not a hand-installed
+ * oracle. A stale original/external reference must lose to selected-artifact
+ * attempt 1, and mutated patch zero must never become a new reference. */
+static void test_cached_artifact_fault_oracle(void)
+{
+    for (unsigned scenario = 0; scenario < 3; scenario++) {
+        uint32_t iteration = 1;
+        BinradarManager manager = {0};
+        SnapshotExitInfo baseline = { .valid = 1 };
+        const bool crash = scenario != 0;
+        GError *error = NULL;
+        char *directory = g_dir_make_tmp("binradar-oracle-XXXXXX", &error);
+        CHECK(directory != NULL && error == NULL,
+              "artifact oracle creates a private feedback directory");
+        if (directory == NULL) {
+            if (error != NULL) g_error_free(error);
+            continue;
+        }
+        manager.patch_max_id = 1;
+        manager.patch_cnt = 1;
+        manager.cur_iter = &iteration;
+        manager.current = binradar_cache_new_iteration(&manager);
+        manager.evidence_file = tmpfile();
+        CHECK(manager.evidence_file != NULL,
+              "artifact oracle opens a private evidence stream");
+        if (manager.evidence_file == NULL) {
+            g_free(manager.current->patch_results);
+            g_free(manager.current);
+            rmdir(directory);
+            g_free(directory);
+            continue;
+        }
+        CHECK(br_evidence_write_header(manager.evidence_file,
+                                      BR_EVIDENCE_KIND_BINRADAR),
+              "artifact oracle writes the canonical evidence header");
+
+        /* Model a differing reference inherited from original PROBE/external
+         * configuration, including a DSO identity that must be cleared. */
+        manager.poc_fault_valid = true;
+        manager.poc_fault_source = SNAPSHOT_FAULT_REFERENCE_PROVENANCE_ACCESS;
+        manager.poc_fault_addr = 0x7777;
+        manager.poc_fault_site.valid = true;
+        manager.poc_fault_site.image_offset = 0x77;
+        memset(manager.poc_fault_site.image_id, 0xcc, 32);
+        baseline.crashed = crash;
+        baseline.fault_reference_valid = crash;
+        baseline.fault_reference_source = !crash
+            ? SNAPSHOT_FAULT_REFERENCE_UNAVAILABLE
+            : scenario == 1 ? SNAPSHOT_FAULT_REFERENCE_GUEST_SIGNAL
+                            : SNAPSHOT_FAULT_REFERENCE_SYSCALL_REQUEST;
+        baseline.fault_addr = scenario == 2 ? 0x40001234 : 0;
+        if (scenario == 2) {
+            baseline.fault_site.valid = true;
+            baseline.fault_site.image_offset = 0x1234;
+            memset(baseline.fault_site.image_id, 0xab, 32);
+        }
+        if (scenario == 1) {
+            SnapshotExitInfo invalid = baseline;
+            invalid.fault_reference_source = SNAPSHOT_FAULT_REFERENCE_UNAVAILABLE;
+            binradar_cache_record_outcome(&manager, 0, &invalid);
+            CHECK(!binradar_cache_commit(&manager) &&
+                      manager.poc_fault_valid &&
+                      manager.poc_fault_addr == 0x7777 &&
+                      manager.poc_fault_source ==
+                          SNAPSHOT_FAULT_REFERENCE_PROVENANCE_ACCESS,
+                  "rejected baseline does not initialize the artifact oracle");
+        }
+        binradar_cache_record_outcome(&manager, 0, &baseline);
+        CHECK(binradar_cache_commit(&manager),
+              "artifact baseline commits without feedback or branch hits");
+        CHECK(manager.poc_fault_valid == crash &&
+                  manager.poc_fault_source == baseline.fault_reference_source &&
+                  manager.poc_fault_addr == baseline.fault_addr &&
+                  manager.poc_fault_site.valid == baseline.fault_site.valid &&
+                  manager.poc_fault_site.image_offset ==
+                      baseline.fault_site.image_offset &&
+                  memcmp(manager.poc_fault_site.image_id,
+                         baseline.fault_site.image_id, 32) == 0,
+              "committed artifact baseline replaces the external oracle");
+
+        manager.feedback_dir = directory;
+        manager.cache_bytes = g_byte_array_new();
+        const uint8_t snapshot[] = {'B', 'R', 'C', 'H'};
+        g_byte_array_append(manager.cache_bytes, snapshot, sizeof(snapshot));
+        GArray *branches = g_array_new(FALSE, FALSE, sizeof(int));
+        for (iteration = 2; iteration <= 3; iteration++) {
+            for (uint32_t patch = 0; patch <= 1; patch++) {
+                const bool matching = patch == (iteration == 2 ? 1u : 0u);
+                SnapshotExitInfo info = baseline;
+                info.crashed = 1;
+                info.fault_reference_valid = 1;
+                if (!crash || !matching) {
+                    info.fault_reference_source =
+                        SNAPSHOT_FAULT_REFERENCE_PROVENANCE_ACCESS;
+                    info.fault_addr = 0x7777;
+                    info.fault_site = (ProvenanceFaultSite){0};
+                } else if (info.fault_site.valid) {
+                    /* DSO identity matches despite a different load address. */
+                    info.fault_addr += 0x100000;
+                }
+                binradar_cache_record_outcome(&manager, patch, &info);
+                CHECK(binradar_cache_feedback_write(
+                          &manager, iteration, patch, branches, NULL),
+                      "artifact oracle stages patch-zero and representative feedback");
+            }
+            CHECK(binradar_cache_commit(&manager),
+                  "mutated attempt commits and publishes its feedback");
+            CHECK(manager.poc_fault_valid == crash &&
+                      manager.poc_fault_source == baseline.fault_reference_source &&
+                      manager.poc_fault_addr == baseline.fault_addr &&
+                      manager.poc_fault_site.valid == baseline.fault_site.valid &&
+                      manager.poc_fault_site.image_offset ==
+                          baseline.fault_site.image_offset &&
+                      memcmp(manager.poc_fault_site.image_id,
+                             baseline.fault_site.image_id, 32) == 0,
+                  "later commits cannot replace even an unavailable baseline");
+            for (uint32_t patch = 0; patch <= 1; patch++) {
+                char *name = g_strdup_printf(
+                    "iteration-%08u-patch-%08u.sbsv", iteration, patch);
+                char *path = g_build_filename(directory, name, NULL);
+                char *metadata = NULL;
+                const bool matching = patch == (iteration == 2 ? 1u : 0u);
+                CHECK(g_file_get_contents(path, &metadata, NULL, NULL),
+                      "committed artifact feedback is consumer-visible");
+                if (metadata != NULL) {
+                    CHECK(strstr(metadata, crash && matching
+                              ? "[same-fault true] [result malicious]"
+                              : "[same-fault false] [result ignored]") != NULL,
+                          "consumer classification uses only immutable artifact baseline");
+                    char *reference = g_strdup_printf(
+                        "[poc-fault-addr %lx] [poc-fault-valid %s] "
+                        "[poc-fault-source %s]", baseline.fault_addr,
+                        crash ? "true" : "false",
+                        snapshot_fault_reference_source_name(
+                            baseline.fault_reference_source));
+                    CHECK(strstr(metadata, reference) != NULL,
+                          "feedback preserves baseline source and valid zero address");
+                    g_free(reference);
+                    char image[65];
+                    snapshot_fault_site_image_text(&baseline.fault_site, image);
+                    reference = g_strdup_printf(
+                        "[poc-fault-image %s] [poc-fault-image-offset %"
+                        PRIx64 "]", image, baseline.fault_site.image_offset);
+                    CHECK(strstr(metadata, reference) != NULL,
+                          "consumer feedback retains baseline DSO identity or none");
+                    g_free(reference);
+                }
+                g_free(metadata);
+                unlink(path);
+                g_free(path);
+                g_free(name);
+                name = g_strdup_printf(
+                    "iteration-%08u-patch-%08u.brch", iteration, patch);
+                path = g_build_filename(directory, name, NULL);
+                unlink(path);
+                g_free(path);
+                g_free(name);
+            }
+        }
+        binradar_cache_feedback_release(&manager);
+        g_array_free(branches, TRUE);
+        g_byte_array_free(manager.cache_bytes, TRUE);
+        g_free(manager.current->patch_results);
+        g_free(manager.current);
+        fclose(manager.evidence_file);
+        rmdir(directory);
+        g_free(directory);
+    }
+}
+
 static void test_cached_feedback_writer(void)
 {
     GError *error = NULL;
@@ -5546,6 +5716,7 @@ int main(void)
     test_raw_first_real_regions();
     test_request_metadata_real_regions();
     test_cached_request_evidence();
+    test_cached_artifact_fault_oracle();
     test_cached_feedback_writer();
     test_symbolic_feedback_matches_applied_plan();
     test_feedback_requires_representative_child();
