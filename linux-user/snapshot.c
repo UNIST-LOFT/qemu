@@ -2589,6 +2589,16 @@ SnapshotReadToken snapshot_read_access(CPUArchState *env, SnapshotMemAccess *mem
 //     fflush(stderr);
 // }
 
+/* Values obtained in the immutable prefix are inherited safely.  Only an
+ * active generation/replay child can invalidate reusable observations. */
+void snapshot_replay_mark_external(void)
+{
+    if (afl_fork_child && snapshot_replay_active &&
+        snapshot_replay_external != NULL) {
+        __atomic_store_n(snapshot_replay_external, 1u, __ATOMIC_RELEASE);
+    }
+}
+
 // Syscall Hook
 static target_ulong last_brk_end;  /* previous brk end (for shrink detection) */
 void snapshot_syscall(CPUArchState *env, uintptr_t syscall_no,
@@ -2618,17 +2628,18 @@ void snapshot_syscall(CPUArchState *env, uintptr_t syscall_no,
             bool supported = true;
             switch (syscall_no) {
             case TARGET_NR_read: case TARGET_NR_pread64:
-            case TARGET_NR_readv: case TARGET_NR_preadv:
-            case TARGET_NR_open: case TARGET_NR_openat: {
-                /* Only seekable read-only regular files are repeatable. */
-                int fd = (syscall_no == TARGET_NR_open ||
-                          syscall_no == TARGET_NR_openat)
-                    ? (int)ret_val : (int)syscall_arg0;
-                if (fd >= 0 && (long)ret_val >= 0) {
-                    struct stat st;
-                    int flags = fcntl(fd, F_GETFL);
-                    supported = fstat(fd, &st) == 0 && S_ISREG(st.st_mode) &&
-                        flags >= 0 && (flags & O_ACCMODE) == O_RDONLY;
+            case TARGET_NR_readv: case TARGET_NR_preadv: {
+                /* Only inputs whose identity and initial offset the parent
+                 * audited can be restored.  A newly opened regular file is
+                 * not made immutable merely by opening it read-only. */
+                supported = false;
+                for (guint i = 0; i < snapshot_replay_inputs->len; i++) {
+                    SnapshotReplayInput *input = &g_array_index(
+                        snapshot_replay_inputs, SnapshotReplayInput, i);
+                    if (input->fd == (int)syscall_arg0) {
+                        supported = true;
+                        break;
+                    }
                 }
                 break;
             }
@@ -2643,29 +2654,21 @@ void snapshot_syscall(CPUArchState *env, uintptr_t syscall_no,
                          (uintptr_t)atoi(getenv("PATCH_CACHED_FD")));
                 break;
             case TARGET_NR_mmap:
-                supported = !(syscall_arg3 & MAP_SHARED);
+                supported = (syscall_arg3 & MAP_ANONYMOUS) &&
+                    !(syscall_arg3 & MAP_SHARED);
                 break;
-            /* Pure-information syscalls.  Their values (identity, entropy,
-             * clocks) need not repeat across children; equivalence is decided
-             * by the complete branch vector, never by assuming determinism,
-             * so a divergent fresh child simply misses the cache. */
-            case TARGET_NR_getpid: case TARGET_NR_getppid:
-            case TARGET_NR_gettid: case TARGET_NR_getuid:
-            case TARGET_NR_geteuid: case TARGET_NR_getgid:
-            case TARGET_NR_getegid: case TARGET_NR_getrandom:
-            case TARGET_NR_gettimeofday: case TARGET_NR_time:
-            case TARGET_NR_clock_gettime: case TARGET_NR_clock_getres:
+            /* Only fork-local operations are accepted below.  Clock, entropy
+             * and process-identity queries deliberately fall through to the
+             * unsupported default: an old branch vector cannot establish the
+             * determinism of a child that has not executed yet. */
             case TARGET_NR_close: case TARGET_NR_lseek:
-            case TARGET_NR_fstat: case TARGET_NR_stat: case TARGET_NR_lstat:
-            case TARGET_NR_newfstatat: case TARGET_NR_access:
             case TARGET_NR_brk: case TARGET_NR_munmap: case TARGET_NR_mprotect:
             case TARGET_NR_mremap: case TARGET_NR_madvise:
             case TARGET_NR_rt_sigaction: case TARGET_NR_rt_sigprocmask:
             case TARGET_NR_rt_sigreturn: case TARGET_NR_sigaltstack:
-            case TARGET_NR_tgkill: case TARGET_NR_tkill:
             case TARGET_NR_exit: case TARGET_NR_exit_group:
             case TARGET_NR_set_tid_address: case TARGET_NR_set_robust_list:
-            case TARGET_NR_arch_prctl: case TARGET_NR_futex:
+            case TARGET_NR_arch_prctl:
                 break;
             default:
                 supported = false;
@@ -5030,7 +5033,9 @@ static void snapshot_replay_audit(void)
     /* Standard input matters only when it is a regular seekable input; a
      * pipe or terminal read is rejected by the child syscall audit on use. */
     SnapshotReplayInput input = {.fd = 0};
-    if (fstat(0, &input.identity) == 0 && S_ISREG(input.identity.st_mode) &&
+    int stdin_flags = fcntl(0, F_GETFL);
+    if (stdin_flags >= 0 && (stdin_flags & O_ACCMODE) == O_RDONLY &&
+        fstat(0, &input.identity) == 0 && S_ISREG(input.identity.st_mode) &&
         (input.offset = lseek(0, 0, SEEK_CUR)) >= 0) {
         g_array_append_val(snapshot_replay_inputs, input);
     }
@@ -5041,7 +5046,7 @@ static void snapshot_replay_audit(void)
 
 static bool snapshot_replay_restore_inputs(void)
 {
-    if (snapshot_replay_boundary_unsupported) return false;
+    bool supported = !snapshot_replay_boundary_unsupported;
     for (guint i = 0; i < snapshot_replay_inputs->len; i++) {
         SnapshotReplayInput *input = &g_array_index(snapshot_replay_inputs,
                                                    SnapshotReplayInput, i);
@@ -5053,12 +5058,14 @@ static bool snapshot_replay_restore_inputs(void)
             now.st_mtim.tv_sec != input->identity.st_mtim.tv_sec ||
             now.st_mtim.tv_nsec != input->identity.st_mtim.tv_nsec ||
             now.st_ctim.tv_sec != input->identity.st_ctim.tv_sec ||
-            now.st_ctim.tv_nsec != input->identity.st_ctim.tv_nsec ||
-            lseek(input->fd, input->offset, SEEK_SET) != input->offset) {
-            return false;
+            now.st_ctim.tv_nsec != input->identity.st_ctim.tv_nsec) {
+            supported = false;
+        }
+        if (lseek(input->fd, input->offset, SEEK_SET) != input->offset) {
+            supported = false;
         }
     }
-    return true;
+    return supported;
 }
 
 static SnapshotReplayPlan *snapshot_replay_plan(uint32_t mutation)
@@ -5078,7 +5085,8 @@ static SnapshotReplayPlan *snapshot_replay_plan(uint32_t mutation)
 static bool snapshot_replay_retain_plan(uint32_t mutation,
                                         const SnapshotMutationPlan *plan,
                                         const char *capture,
-                                        BinradarReplayOutcome outcome)
+                                        BinradarReplayOutcome outcome,
+                                        bool reusable)
 {
     SnapshotMutationPlan *copy;
     SnapshotReplayPlan retained = {.mutation = mutation};
@@ -5092,7 +5100,7 @@ static bool snapshot_replay_retain_plan(uint32_t mutation,
      * every request would then report unavailable. */
     if (capture == NULL || binradar_manager == NULL ||
         !binradar_replay_register_capture(binradar_manager, mutation,
-                                          capture, outcome)) {
+                                          capture, outcome, reusable)) {
         log_msg("[replay] [retain-error] [mutation %u] [reason capture]\n",
                 mutation);
         return false;
@@ -5109,7 +5117,7 @@ static bool snapshot_replay_retain_plan(uint32_t mutation,
         }
     }
     retained.plan = copy;
-    retained.external_unsupported = snapshot_replay_boundary_unsupported;
+    retained.external_unsupported = !reusable;
     g_array_append_val(snapshot_replay_plans, retained);
     return true;
 }
@@ -5149,7 +5157,7 @@ static void snapshot_replay_release_plans(void)
  * the representative for the retained mutation. */
 static void snapshot_replay_commit_plan(
     uint32_t attempt, const SnapshotPlanAttemptDiagnostic *diagnostic,
-    bool committed)
+    bool committed, bool reusable)
 {
     const char *feedback_dir = getenv("BINRADAR_FEEDBACK_DIR");
     SnapshotMutationPlan *plan;
@@ -5191,7 +5199,8 @@ static void snapshot_replay_commit_plan(
               &binradar_manager->poc_fault_site)
             ? BINRADAR_REPLAY_OUTCOME_TARGET_CRASH
             : BINRADAR_REPLAY_OUTCOME_OTHER_CRASH;
-    if (!snapshot_replay_retain_plan(attempt, plan, capture, outcome)) {
+    if (!snapshot_replay_retain_plan(attempt, plan, capture, outcome,
+                                     reusable)) {
         g_free(capture);
         log_msg("[replay] [retain-error] [mutation %u]\n", attempt);
         exit_with_status(1);
@@ -5303,6 +5312,7 @@ static bool snapshot_replay_case(BinradarForkserverDriver *driver,
     if (waited < 0) exit_with_status(6);
     SnapshotExitInfo *outcome = snapshot_exit_info_ptr();
     bool external = __atomic_load_n(snapshot_replay_external, __ATOMIC_ACQUIRE) != 0;
+    if (external) retained->external_unsupported = true;
     if (waited == 0 && !external &&
         __atomic_load_n(&shared_trace_data->mutation_plan_applied,
                         __ATOMIC_ACQUIRE)) {
@@ -5339,6 +5349,23 @@ static bool snapshot_replay_case(BinradarForkserverDriver *driver,
     return false;
 }
 
+/* VALIDATE shares CASE framing but never publishes a selector or forks. */
+static void snapshot_replay_validate(BinradarForkserverDriver *driver)
+{
+    uint32_t mutation = 0;
+    char *descriptor = NULL;
+    if (!binradar_forkserver_replay_case_request(driver, &mutation,
+                                                &descriptor)) {
+        exit_with_status(2);
+    }
+    bool valid = mutation == 0 &&
+        binradar_replay_descriptor(binradar_manager, descriptor);
+    g_free(descriptor);
+    if (!binradar_forkserver_send_ack(driver, valid ? 0 : 1)) {
+        exit_with_status(7);
+    }
+}
+
 static void snapshot_replay_serve(BinradarForkserverDriver *driver,
                                   CPUArchState *cpu_env)
 {
@@ -5359,6 +5386,10 @@ static void snapshot_replay_serve(BinradarForkserverDriver *driver,
             bool sent = binradar_forkserver_send_replay_list(driver, ids, count);
             g_free(ids);
             if (!sent) exit_with_status(7);
+            continue;
+        }
+        if (command == BINRADAR_REPLAY_VALIDATE) {
+            snapshot_replay_validate(driver);
             continue;
         }
         if (command == BINRADAR_REPLAY_CASE) {
@@ -5411,7 +5442,7 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
     log_msg("[forkserver] [start] [protocol %s]\n",
             driver.replay_mode ? "replay" : "5");
 
-    while (!generation_finished) {
+    while (driver.replay_mode || !generation_finished) {
         if (driver.replay_mode) {
             uint32_t command;
             if (!binradar_forkserver_next_command(&driver, &command)) {
@@ -5429,6 +5460,10 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
                 bool ok = binradar_forkserver_send_replay_list(&driver, ids, count);
                 g_free(ids);
                 if (!ok) exit_with_status(7);
+                continue;
+            }
+            if (command == BINRADAR_REPLAY_VALIDATE) {
+                snapshot_replay_validate(&driver);
                 continue;
             }
             if (command == BINRADAR_REPLAY_FINISH) {
@@ -5457,7 +5492,7 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
                 /* Only a disposable replay child returns here. */
                 return;
             }
-            if (command != BINRADAR_REPLAY_GENERATE) {
+            if (command != BINRADAR_REPLAY_GENERATE || generation_finished) {
                 log_msg("[forkserver] [exit] unsupported replay command\n");
                 exit_with_status(2);
             }
@@ -5483,6 +5518,7 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
          * aggregate deadline.  Counted once per attempt, not once per child. */
         bool deadline_kill = false;
         bool attempt_committed = false;
+        bool replay_reusable = !snapshot_replay_boundary_unsupported;
         SnapshotPlanAttemptDiagnostic attempt_diagnostic = {
             .patch0_witness_state = SNAPSHOT_MUTATION_READ_WITNESS_UNKNOWN,
         };
@@ -5568,6 +5604,15 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
                                           attempt);
             }
             snapshot_prepare_mutation_epoch();
+            if (driver.replay_mode) {
+                /* Inherited open-file descriptions share offsets across fork.
+                 * Restore before every child, including the generation baseline.
+                 * A failed audit does not discard useful diagnostic plans, but
+                 * their observations must never become reusable results. */
+                if (!snapshot_replay_restore_inputs()) replay_reusable = false;
+                __atomic_store_n(snapshot_replay_external, 0u, __ATOMIC_RELEASE);
+                snapshot_replay_active = true;
+            }
             pid_t child_pid = fork();
             if (child_pid < 0) exit_with_status(4);
             if (child_pid == 0) {
@@ -5592,16 +5637,18 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
             int wait_rc = binradar_forkserver_wait_child(
                 &driver, child_pid, binradar_manager, &child_status,
                 report_shared_prov_finding, NULL);
+            if (driver.replay_mode) {
+                snapshot_replay_active = false;
+                if (__atomic_load_n(snapshot_replay_external,
+                                    __ATOMIC_ACQUIRE) != 0) {
+                    replay_reusable = false;
+                }
+            }
             if (wait_rc < 0) exit_with_status(6);
             trace_mem_flush();
             if (driver.cancel_requested) {
-                /* The orchestrator interrupted generation: drop this
-                 * attempt's partial capture and consume its plan once, then
-                 * finish the attempt at the normal command boundary. */
-                binradar_cache_feedback_drop(binradar_manager);
-                binradar_cache_clear_iteration(binradar_manager);
-                remaining_plans = attempt == 1
-                    ? 0 : snapshot_advance_modification_plan();
+                /* Finish at the normal command boundary.  The common discard
+                 * owner below drops partial capture and advances exactly once. */
                 attempt_result = BINRADAR_FORKSERVER_ATTEMPT_TIMEOUT;
                 attempt_discarded = true;
                 log_msg("[binradar] [attempt-discarded] [iter %u] "
@@ -5800,6 +5847,7 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
                         exit_with_status(1);
                     }
                     if (binradar_manager->cache_inference_enabled &&
+                        (!driver.replay_mode || replay_reusable) &&
                         attempt > 1) {
                         for (uint32_t i = 0;
                              i < binradar_manager->patch_cnt; i++) {
@@ -5902,7 +5950,7 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
                     attempt_committed = true;
                     if (binradar_manager->replay_mode)
                         snapshot_replay_commit_plan(attempt, &attempt_diagnostic,
-                                                    true);
+                                                    true, replay_reusable);
                     remaining_plans = analyze_collected_data(
                         arg_info, num_arg_regs);
                 }

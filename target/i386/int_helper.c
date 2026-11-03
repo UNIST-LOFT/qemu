@@ -24,6 +24,9 @@
 #include "exec/helper-proto.h"
 #include "qapi/error.h"
 #include "qemu/guest-random.h"
+#ifdef SYMBOLIC_INSTRUMENTATION
+#include "../../linux-user/snapshot.h"
+#endif
 
 //#define DEBUG_MULDIV
 
@@ -478,6 +481,10 @@ target_ulong HELPER(rdrand)(CPUX86State *env)
     Error *err = NULL;
     target_ulong ret;
 
+#ifdef SYMBOLIC_INSTRUMENTATION
+    /* This helper implements both RDRAND and RDSEED. */
+    snapshot_replay_mark_external();
+#endif
     if (qemu_guest_getrandom(&ret, sizeof(ret), &err) < 0) {
         qemu_log_mask(LOG_UNIMP, "rdrand: Crypto failure: %s",
                       error_get_pretty(err));

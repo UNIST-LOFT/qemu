@@ -1670,10 +1670,13 @@ static bool binradar_replay_evaluate(BinradarManager *manager,
 {
     const size_t record_size = binradar_replay_record_size(manager);
     GArray *vector = NULL;
+    /* p0 is the reserved neutral baseline, not a family predicate.  In
+     * particular the CWE grammar has no p0 descriptor. */
+    const bool neutral = descriptor != NULL && strcmp(descriptor, "p0") == 0;
     if (vector_out == NULL || descriptor == NULL ||
         !binradar_replay_check_capture(manager, selected) ||
-        !binradar_replay_parse(manager, slot, descriptor) ||
-        !binradar_cache_vector(manager, selected, slot, &vector) ||
+        (!neutral && !binradar_replay_parse(manager, slot, descriptor)) ||
+        !binradar_cache_vector(manager, selected, neutral ? 0 : slot, &vector) ||
         vector->len == 0) {
         if (vector != NULL) g_array_free(vector, TRUE);
         return false;
@@ -1715,21 +1718,26 @@ static char *binradar_replay_capture_path(BinradarManager *manager,
 
 bool binradar_replay_register_capture(BinradarManager *manager,
                                       uint32_t mutation, const char *path,
-                                      BinradarReplayOutcome outcome)
+                                      BinradarReplayOutcome outcome,
+                                      bool reusable)
 {
     BinradarReplayRecord *record;
     if (manager == NULL || !manager->replay_mode || path == NULL ||
         path[0] != '/' || mutation == 0) {
         return false;
     }
-    binradar_replay_ensure_owned(manager);
-    /* Structural validation only: the capture belongs to a committed
-     * generation attempt whose patch-zero child is already gone. */
+    /* Structural validation is required even when the generation child's
+     * external-state audit makes its result ineligible for reuse. */
     if (!binradar_replay_load_capture(manager, path) ||
         !binradar_replay_check_capture(manager, 0)) {
         log_msg("[replay] [retain] [mutation %u] [error capture]\n", mutation);
         return false;
     }
+    if (!reusable || !manager->poc_fault_valid ||
+        outcome == BINRADAR_REPLAY_OUTCOME_UNAVAILABLE) {
+        return true;
+    }
+    binradar_replay_ensure_owned(manager);
     record = g_new0(BinradarReplayRecord, 1);
     record->mutation = mutation;
     record->selected = 0;
@@ -1752,7 +1760,8 @@ bool binradar_replay_lookup(BinradarManager *manager, uint32_t mutation,
     BinradarReplayRecord *exact;
     BinradarReplayRecord *fallback = NULL;
     char *key;
-    if (manager == NULL || result == NULL || manager->replay_records == NULL)
+    if (manager == NULL || result == NULL || !manager->poc_fault_valid ||
+        manager->replay_records == NULL)
         return false;
     memset(result, 0, sizeof(*result));
     binradar_replay_ensure_owned(manager);
@@ -1819,7 +1828,7 @@ bool binradar_replay_admit(BinradarManager *manager, uint32_t mutation,
     int fd;
     bool written;
     if (manager == NULL || result == NULL || outcome == NULL ||
-        descriptor == NULL || !outcome->valid ||
+        !manager->poc_fault_valid || descriptor == NULL || !outcome->valid ||
         (outcome->crashed && !outcome->fault_reference_valid)) {
         return false;
     }
@@ -1881,7 +1890,7 @@ bool binradar_replay_admit(BinradarManager *manager, uint32_t mutation,
     record->path = path;
     record->outcome = !outcome->crashed
         ? BINRADAR_REPLAY_OUTCOME_NORMAL
-        : manager->poc_fault_valid && snapshot_fault_reference_equal(
+        : snapshot_fault_reference_equal(
               outcome->fault_addr, &outcome->fault_site,
               manager->poc_fault_addr, &manager->poc_fault_site)
             ? BINRADAR_REPLAY_OUTCOME_TARGET_CRASH

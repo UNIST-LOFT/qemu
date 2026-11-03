@@ -89,6 +89,10 @@ SymbolicCollectionStopReason symbolic_get_collection_stop_reason(void)
 {
     return test_collection_reason;
 }
+void symbolic_replay_observation_only(void)
+{
+    test_collection_reason = SYMBOLIC_COLLECTION_REPLAY_OBSERVATION;
+}
 void symbolic_publish_collection_status(SymbolicCollectionStopReason reason,
                                         int64_t query_cursor,
                                         int64_t expr_cursor)
@@ -3969,6 +3973,122 @@ static void test_feedback_rejects_malformed_brch(void)
     g_byte_array_free(manager.cache_bytes, TRUE);
 }
 
+/* Drive the public replay cache API with immutable CWE captures.  Neutral
+ * representatives must not pass through the CWE predicate grammar. */
+static void test_replay_cache_neutral_and_eligibility(void)
+{
+    struct {
+        BinradarSnapshotHeader header;
+        uint64_t clamps[256][2];
+        uint64_t regs[16];
+        uint8_t stack[8];
+    } captures[2] = {0};
+    BinradarManager manager = {0};
+    BinradarReplayResult result = {0};
+    SnapshotExitInfo crash = {
+        .valid = 1, .crashed = 1, .fault_reference_valid = 1,
+        .fault_reference_source = SNAPSHOT_FAULT_REFERENCE_GUEST_SIGNAL,
+        .fault_addr = 0x1234,
+    };
+    char *directory = g_dir_make_tmp("binradar-replay-cache-XXXXXX", NULL);
+    char *path;
+
+    CHECK(directory != NULL, "replay cache creates a private capture directory");
+    if (directory == NULL) return;
+    path = g_build_filename(directory, "neutral.brch", NULL);
+    manager.replay_mode = true;
+    manager.cache_family = BRCACHE_FAMILY_CWE805;
+    manager.cache_stack_size = 8;
+    manager.cache_bytes = g_byte_array_new();
+    manager.cache_predicates = g_new0(BinradarCachePredicate,
+                                      BINRADAR_REPLAY_SLOT_COUNT);
+    manager.selector = g_new0(BinradarPatchSelector, 1);
+    for (unsigned i = 0; i < 2; i++) {
+        captures[i].header = (BinradarSnapshotHeader){
+            .magic = BRCACHE_SNAPSHOT_MAGIC,
+            .version = BRCACHE_SNAPSHOT_VERSION,
+            .stack_size = 8,
+            .flags = BRCACHE_FLAG_CWE805,
+        };
+        captures[i].clamps[0][0] = 100;
+        captures[i].clamps[0][1] = 200;
+        captures[i].regs[0] = 150;
+        captures[i].regs[1] = 50;
+        captures[i].regs[2] = UINT64_MAX;
+    }
+    CHECK(g_file_set_contents(path, (const char *)captures, sizeof(captures),
+                              NULL), "replay cache writes a complete capture");
+    CHECK(binradar_replay_register_capture(&manager, 1, path,
+              BINRADAR_REPLAY_OUTCOME_OTHER_CRASH, true) &&
+              manager.retained_mutations == 0 && manager.replay_records == NULL,
+          "missing baseline oracle validates but never retains a representative");
+    CHECK(!binradar_replay_admit(&manager, 1, 1, "c1p0", &crash, &result) &&
+              manager.replay_records == NULL,
+          "a real crash without the oracle is not classified as other-crash");
+    crash.crashed = 0;
+    CHECK(!binradar_replay_admit(&manager, 1, 1, "c1p0", &crash, &result),
+          "missing oracle also prevents reusable normal results");
+    manager.poc_fault_valid = true;
+    CHECK(binradar_replay_register_capture(&manager, 1, path,
+              BINRADAR_REPLAY_OUTCOME_TARGET_CRASH, false) &&
+              manager.retained_mutations == 0 && manager.replay_records == NULL,
+          "an externally ineligible capture validates without cache admission");
+    captures[1].header.flags |= BRCACHE_FLAG_TRUNCATED;
+    CHECK(g_file_set_contents(path, (const char *)captures, sizeof(captures),
+                              NULL) &&
+              !binradar_replay_register_capture(&manager, 1, path,
+                  BINRADAR_REPLAY_OUTCOME_TARGET_CRASH, false),
+          "validation-only mode still rejects a partial capture");
+    captures[1].header.flags = BRCACHE_FLAG_CWE805;
+    captures[1].header.branch = 2;
+    CHECK(g_file_set_contents(path, (const char *)captures, sizeof(captures),
+                              NULL) &&
+              !binradar_replay_register_capture(&manager, 1, path,
+                  BINRADAR_REPLAY_OUTCOME_TARGET_CRASH, false),
+          "validation-only mode still rejects a trapped branch");
+    captures[1].header.branch = 0;
+    CHECK(g_file_set_contents(path, (const char *)captures, sizeof(captures),
+                              NULL) &&
+              binradar_replay_register_capture(&manager, 1, path,
+                  BINRADAR_REPLAY_OUTCOME_TARGET_CRASH, true) &&
+              manager.retained_mutations == 1,
+          "an eligible CWE patch-zero capture becomes a representative");
+    CHECK(binradar_replay_lookup(&manager, 1, "c1p0", &result) &&
+              result.source == BINRADAR_REPLAY_SOURCE_CACHE &&
+              result.outcome == BINRADAR_REPLAY_OUTCOME_TARGET_CRASH &&
+              g_strcmp0(result.capture, path) == 0,
+          "CWE neutral-vector hit returns the representative's real outcome");
+    g_free(result.capture);
+    result.capture = NULL;
+    manager.poc_fault_valid = false;
+    CHECK(!binradar_replay_lookup(&manager, 1, "c1p0", &result) &&
+              !binradar_replay_lookup(&manager, 1, "c2p1q1", &result),
+          "an unavailable oracle refuses exact and vector classification");
+    manager.poc_fault_valid = true;
+    CHECK(!binradar_replay_lookup(&manager, 1, "c2p2q8", &result),
+          "a trapping CWE candidate cannot reuse the neutral outcome");
+    /* Use an uncached descriptor to make the second record decisive. */
+    captures[1].regs[1] = 150;
+    CHECK(g_file_set_contents(path, (const char *)captures, sizeof(captures),
+                              NULL) &&
+              !binradar_replay_lookup(&manager, 1, "c2p1q1", &result),
+          "matching the first branch does not hide a later vector mismatch");
+    binradar_replay_release(&manager);
+    for (unsigned i = 0; i < BINRADAR_REPLAY_SLOT_COUNT; i++) {
+        g_free(manager.cache_predicates[i].descriptor);
+        if (manager.cache_predicates[i].expr_nodes != NULL) {
+            g_array_free(manager.cache_predicates[i].expr_nodes, TRUE);
+        }
+    }
+    g_free(manager.cache_predicates);
+    g_free(manager.selector);
+    g_byte_array_free(manager.cache_bytes, TRUE);
+    unlink(path);
+    g_free(path);
+    rmdir(directory);
+    g_free(directory);
+}
+
 /* The canonical case: a 4-byte symbolic read compared against a constant with
  * an unsigned less-than.  The advisor must propose exactly the constant, as a
  * single 4-byte OBSERVED_READ write, and nothing else. */
@@ -5721,6 +5841,7 @@ int main(void)
     test_symbolic_feedback_matches_applied_plan();
     test_feedback_requires_representative_child();
     test_feedback_rejects_malformed_brch();
+    test_replay_cache_neutral_and_eligibility();
     test_symbolic_boundary_unsigned();
     test_symbolic_no_false_side();
     test_symbolic_transform_chain();

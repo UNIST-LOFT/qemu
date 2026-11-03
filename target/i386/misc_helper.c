@@ -24,6 +24,9 @@
 #include "exec/exec-all.h"
 #include "exec/cpu_ldst.h"
 #include "exec/address-spaces.h"
+#ifdef SYMBOLIC_INSTRUMENTATION
+#include "../../linux-user/snapshot.h"
+#endif
 
 void helper_outb(CPUX86State *env, uint32_t port, uint32_t data)
 {
@@ -195,6 +198,10 @@ void helper_rdtsc(CPUX86State *env)
     }
     cpu_svm_check_intercept_param(env, SVM_EXIT_RDTSC, 0, GETPC());
 
+#ifdef SYMBOLIC_INSTRUMENTATION
+    /* RDTSCP also passes through this helper. */
+    snapshot_replay_mark_external();
+#endif
     val = cpu_get_tsc(env) + env->tsc_offset;
     env->regs[R_EAX] = (uint32_t)(val);
     env->regs[R_EDX] = (uint32_t)(val >> 32);

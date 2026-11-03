@@ -202,11 +202,14 @@ bool binradar_replay_admit(BinradarManager *manager, uint32_t mutation,
                            uint32_t selected, const char *descriptor,
                            const SnapshotExitInfo *outcome,
                            BinradarReplayResult *result);
-/* Register a committed generation patch-zero capture as a representative.
- * The file remains authoritative; no BRCH bytes are copied here. */
+/* Validate a committed generation patch-zero capture, registering it as a
+ * representative only when reusable and the immutable oracle is available.
+ * A valid but ineligible capture still returns true. The file remains
+ * authoritative; no BRCH bytes are copied here. */
 bool binradar_replay_register_capture(BinradarManager *manager,
                                      uint32_t mutation, const char *path,
-                                     BinradarReplayOutcome outcome);
+                                     BinradarReplayOutcome outcome,
+                                     bool reusable);
 const char *binradar_replay_outcome_name(BinradarReplayOutcome outcome);
 const char *binradar_replay_reason_name(BinradarReplayReason reason);
 void binradar_replay_release(BinradarManager *manager);

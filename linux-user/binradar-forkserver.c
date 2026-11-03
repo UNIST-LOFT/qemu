@@ -159,11 +159,17 @@ bool binradar_forkserver_next_command(BinradarForkserverDriver *driver,
                                        sizeof(*command)) < 0) {
         return false;
     }
+    uint32_t request_id;
+    if (binradar_forkserver_read_exact(driver->control_fd, &request_id,
+                                       sizeof(request_id)) < 0 ||
+        request_id == 0 || request_id <= driver->request_id) return false;
+    driver->request_id = request_id;
     if (*command == BINRADAR_REPLAY_SHUTDOWN) return true;
     if (*command != BINRADAR_REPLAY_GENERATE &&
         *command != BINRADAR_REPLAY_FINISH &&
         *command != BINRADAR_REPLAY_CASE &&
-        *command != BINRADAR_REPLAY_LIST) return false;
+        *command != BINRADAR_REPLAY_LIST &&
+        *command != BINRADAR_REPLAY_VALIDATE) return false;
     driver->cancel_requested = false;
     return true;
 }
@@ -195,7 +201,8 @@ bool binradar_forkserver_replay_case_request(BinradarForkserverDriver *driver,
 bool binradar_forkserver_send_ack(BinradarForkserverDriver *driver,
                                   uint32_t code)
 {
-    uint32_t reply[2] = {BINRADAR_REPLAY_REPLY_ACK, code};
+    if (driver == NULL) return false;
+    uint32_t reply[3] = {BINRADAR_REPLAY_REPLY_ACK, driver->request_id, code};
     return driver != NULL &&
            binradar_forkserver_write_exact(driver->status_fd, reply,
                                             sizeof(reply)) == 0;
@@ -205,7 +212,7 @@ bool binradar_forkserver_send_replay_list(BinradarForkserverDriver *driver,
                                           const uint32_t *ids, uint32_t count)
 {
     if (driver == NULL || (ids == NULL && count != 0)) return false;
-    uint32_t header[2] = {BINRADAR_REPLAY_REPLY_LIST, count};
+    uint32_t header[3] = {BINRADAR_REPLAY_REPLY_LIST, driver->request_id, count};
     if (binradar_forkserver_write_exact(driver->status_fd, header,
                                          sizeof(header)) != 0) {
         return false;
@@ -221,7 +228,7 @@ bool binradar_forkserver_send_replay_case(BinradarForkserverDriver *driver,
 {
     const size_t length = text != NULL ? strlen(text) : 0;
     if (driver == NULL || length > BRCACHE_MAX_DESCRIPTOR + 256u) return false;
-    uint32_t header[5] = {BINRADAR_REPLAY_REPLY_CASE, source, outcome,
+    uint32_t header[6] = {BINRADAR_REPLAY_REPLY_CASE, driver->request_id, source, outcome,
                           reason, (uint32_t)length};
     return binradar_forkserver_write_exact(driver->status_fd, header,
                                             sizeof(header)) == 0 &&
@@ -263,9 +270,16 @@ int binradar_forkserver_wait_child(
 
     for (;;) {
         if (driver->cancel_fd >= 0) {
-            unsigned char byte;
-            ssize_t cancelled = read(driver->cancel_fd, &byte, 1);
-            if (cancelled == 1) {
+            ssize_t cancelled = read(driver->cancel_fd,
+                driver->cancel_bytes + driver->cancel_bytes_used,
+                sizeof(uint32_t) - driver->cancel_bytes_used);
+            if (cancelled > 0) driver->cancel_bytes_used += (size_t)cancelled;
+            uint32_t cancel_id = 0;
+            if (driver->cancel_bytes_used == sizeof(uint32_t)) {
+                memcpy(&cancel_id, driver->cancel_bytes, sizeof(cancel_id));
+                driver->cancel_bytes_used = 0;
+            }
+            if (cancel_id != 0 && cancel_id == driver->request_id) {
                 kill(child_pid, SIGKILL);
                 while (waitpid(child_pid, &status, 0) < 0) {
                     if (errno != EINTR) return -1;
@@ -278,7 +292,9 @@ int binradar_forkserver_wait_child(
                 *status_out = (uint32_t)status;
                 return 3;
             }
-            if (cancelled == 0) return -1;
+            if (cancelled == 0 ||
+                (cancelled < 0 && errno != EINTR &&
+                 errno != EAGAIN && errno != EWOULDBLOCK)) return -1;
         }
         pid_t waited = waitpid(child_pid, &status, WNOHANG);
         if (waited == child_pid) break;
@@ -379,15 +395,15 @@ bool binradar_forkserver_send_summary(
     size_t words;
     if (driver == NULL) return false;
     if (driver->replay_mode) {
-        /* Resident mode prefixes every reply with its kind so a case reply
-         * can never be parsed as a generation summary. */
+        /* Bind every resident reply to its command before payload parsing. */
         summary[0] = BINRADAR_REPLAY_REPLY_SUMMARY;
-        summary[1] = driver->attempt;
-        summary[2] = representative_runs;
-        summary[3] = remaining_plans;
-        summary[4] = driver->attempt_result;
-        summary[5] = (uint32_t)stop_reason;
-        summary[6] = driver->retained_mutations;
+        summary[1] = driver->request_id;
+        summary[2] = driver->attempt;
+        summary[3] = representative_runs;
+        summary[4] = remaining_plans;
+        summary[5] = driver->attempt_result;
+        summary[6] = (uint32_t)stop_reason;
+        summary[7] = driver->retained_mutations;
         words = BINRADAR_REPLAY_SUMMARY_WORDS;
     } else {
         summary[0] = driver->attempt;
@@ -407,13 +423,6 @@ bool binradar_forkserver_send_summary(
             binradar_forkserver_attempt_result_name(driver->attempt_result),
             binradar_forkserver_stop_reason_name((uint32_t)stop_reason));
     return true;
-}
-
-void binradar_forkserver_drain_cancel(BinradarForkserverDriver *driver)
-{
-    if (driver->cancel_fd < 0) return;
-    unsigned char bytes[64];
-    while (read(driver->cancel_fd, bytes, sizeof(bytes)) > 0) {}
 }
 
 void binradar_forkserver_child_close(const BinradarForkserverDriver *driver)
