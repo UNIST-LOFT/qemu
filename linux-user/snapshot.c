@@ -186,6 +186,26 @@ static uint64_t snapshot_child_read_witness_epoch;
 static bool snapshot_child_read_witness_armed;
 
 static BinradarManager *binradar_manager = NULL;
+typedef struct SnapshotReplayPlan {
+    uint32_t mutation;
+    SnapshotMutationPlan *plan;
+    bool external_unsupported;
+} SnapshotReplayPlan;
+static GArray *snapshot_replay_plans;
+static GHashTable *snapshot_guest_fds;
+typedef struct SnapshotReplayInput {
+    int fd;
+    off_t offset;
+    struct stat identity;
+} SnapshotReplayInput;
+static GArray *snapshot_replay_inputs;
+static uint32_t *snapshot_replay_external;
+static bool snapshot_replay_boundary_unsupported;
+static bool snapshot_replay_active;
+
+static void snapshot_replay_release_plans(void);
+static uint32_t snapshot_replay_plan_ids(uint32_t **ids_out);
+
 
 bool snapshot_is_binradar(void)
 {
@@ -402,6 +422,19 @@ bool snapshot_addr_is_protected(target_ulong addr) {
 
 static void exit_with_status(int status) {
     trace_mem_flush();
+    if (!afl_fork_child) {
+        if (snapshot_replay_active && mod_manager != NULL)
+            mod_manager->current = NULL;
+        snapshot_replay_release_plans();
+    }
+    if (!afl_fork_child && binradar_manager != NULL)
+        binradar_replay_release(binradar_manager);
+    if (!afl_fork_child && snapshot_replay_inputs != NULL)
+        g_array_free(snapshot_replay_inputs, TRUE);
+    if (!afl_fork_child && snapshot_guest_fds != NULL)
+        g_hash_table_destroy(snapshot_guest_fds);
+    if (!afl_fork_child && snapshot_replay_external != NULL)
+        munmap(snapshot_replay_external, sizeof(*snapshot_replay_external));
     snapshot_modification_manager_reset(false);
     /* Only the snapshot parent owns the feedback staging tree.  A forkserver
      * child inherits the manager through fork() but must never unlink or
@@ -417,6 +450,8 @@ void snapshot_init_binradar_patch_shm(uintptr_t key) {
     const char *var;
     size_t shm_size = sizeof(uint32_t) * 2u;
     binradar_manager = g_new0(BinradarManager, 1);
+    binradar_manager->replay_mode =
+        g_strcmp0(getenv("BINRADAR_REPLAY_SERVER"), "1") == 0;
     binradar_manager->patch_cnt = 1;
     binradar_manager->patch_fd_r = -1;
     binradar_manager->cache_fd_r = -1;
@@ -427,7 +462,8 @@ void snapshot_init_binradar_patch_shm(uintptr_t key) {
         exit_with_status(1);
     }
     binradar_manager->patch_cnt = (uint32_t)atoi(var);
-    binradar_manager->patch_max_id = binradar_manager->patch_cnt;
+    binradar_manager->patch_max_id = binradar_manager->replay_mode
+        ? 1u : binradar_manager->patch_cnt;
     var = getenv("BINRADAR_PATCH_FILTER_FILE");
     if (var != NULL && var[0] != '\0' &&
         !binradar_cache_load_filter(binradar_manager, var)) {
@@ -454,6 +490,12 @@ void snapshot_init_binradar_patch_shm(uintptr_t key) {
     binradar_manager->cache_enabled = var != NULL && strcmp(var, "1") == 0;
     binradar_manager->cache_inference_enabled =
         binradar_manager->cache_enabled;
+    if (binradar_manager->replay_mode &&
+        (!binradar_manager->cache_enabled || binradar_manager->patch_cnt != 0 ||
+         getenv("BINRADAR_REPLAY_DIR") == NULL)) {
+        log_msg("[replay] [fatal invalid-mode]\n");
+        exit_with_status(1);
+    }
     if (binradar_manager->cache_enabled) {
         const char *manifest = getenv("BINRADAR_PATCH_MANIFEST");
         const char *cache_fd = getenv("BINRADAR_PATCH_CACHED_FD_R");
@@ -2554,6 +2596,88 @@ void snapshot_syscall(CPUArchState *env, uintptr_t syscall_no,
                       uintptr_t syscall_arg2, uintptr_t syscall_arg3,
                       uintptr_t syscall_arg4, uintptr_t syscall_arg5,
                       uintptr_t syscall_arg6, uintptr_t ret_val) {
+    if (g_strcmp0(getenv("BINRADAR_REPLAY_SERVER"), "1") == 0) {
+        if (snapshot_guest_fds == NULL)
+            snapshot_guest_fds = g_hash_table_new(g_direct_hash, g_direct_equal);
+        if (!afl_fork_child &&
+            ((syscall_no == TARGET_NR_mmap && (syscall_arg3 & MAP_SHARED)) ||
+             syscall_no == TARGET_NR_clone || syscall_no == TARGET_NR_fork ||
+             syscall_no == TARGET_NR_vfork))
+            snapshot_replay_boundary_unsupported = true;
+        if ((syscall_no == TARGET_NR_open || syscall_no == TARGET_NR_openat ||
+             syscall_no == TARGET_NR_dup || syscall_no == TARGET_NR_dup2 ||
+             syscall_no == TARGET_NR_dup3) && (long)ret_val >= 0)
+            g_hash_table_add(snapshot_guest_fds, GINT_TO_POINTER((int)ret_val));
+        if (syscall_no == TARGET_NR_close && (long)ret_val == 0)
+            g_hash_table_remove(snapshot_guest_fds, GINT_TO_POINTER((int)syscall_arg0));
+        /* A replay child may only repeat work whose observable effect is
+         * local to this fork.  Anything it cannot isolate marks the case
+         * unavailable instead of returning an unrepeatable result. */
+        if (afl_fork_child && snapshot_replay_active &&
+            snapshot_replay_external != NULL) {
+            bool supported = true;
+            switch (syscall_no) {
+            case TARGET_NR_read: case TARGET_NR_pread64:
+            case TARGET_NR_readv: case TARGET_NR_preadv:
+            case TARGET_NR_open: case TARGET_NR_openat: {
+                /* Only seekable read-only regular files are repeatable. */
+                int fd = (syscall_no == TARGET_NR_open ||
+                          syscall_no == TARGET_NR_openat)
+                    ? (int)ret_val : (int)syscall_arg0;
+                if (fd >= 0 && (long)ret_val >= 0) {
+                    struct stat st;
+                    int flags = fcntl(fd, F_GETFL);
+                    supported = fstat(fd, &st) == 0 && S_ISREG(st.st_mode) &&
+                        flags >= 0 && (flags & O_ACCMODE) == O_RDONLY;
+                }
+                break;
+            }
+            case TARGET_NR_write: case TARGET_NR_writev:
+                /* Captured channels and the inherited standard streams are
+                 * the only writes whose repetition is harmless. */
+                supported = syscall_arg0 == 1 || syscall_arg0 == 2 ||
+                    (getenv("PATCH_FD") != NULL &&
+                     syscall_arg0 == (uintptr_t)atoi(getenv("PATCH_FD"))) ||
+                    (getenv("PATCH_CACHED_FD") != NULL &&
+                     syscall_arg0 ==
+                         (uintptr_t)atoi(getenv("PATCH_CACHED_FD")));
+                break;
+            case TARGET_NR_mmap:
+                supported = !(syscall_arg3 & MAP_SHARED);
+                break;
+            /* Pure-information syscalls.  Their values (identity, entropy,
+             * clocks) need not repeat across children; equivalence is decided
+             * by the complete branch vector, never by assuming determinism,
+             * so a divergent fresh child simply misses the cache. */
+            case TARGET_NR_getpid: case TARGET_NR_getppid:
+            case TARGET_NR_gettid: case TARGET_NR_getuid:
+            case TARGET_NR_geteuid: case TARGET_NR_getgid:
+            case TARGET_NR_getegid: case TARGET_NR_getrandom:
+            case TARGET_NR_gettimeofday: case TARGET_NR_time:
+            case TARGET_NR_clock_gettime: case TARGET_NR_clock_getres:
+            case TARGET_NR_close: case TARGET_NR_lseek:
+            case TARGET_NR_fstat: case TARGET_NR_stat: case TARGET_NR_lstat:
+            case TARGET_NR_newfstatat: case TARGET_NR_access:
+            case TARGET_NR_brk: case TARGET_NR_munmap: case TARGET_NR_mprotect:
+            case TARGET_NR_mremap: case TARGET_NR_madvise:
+            case TARGET_NR_rt_sigaction: case TARGET_NR_rt_sigprocmask:
+            case TARGET_NR_rt_sigreturn: case TARGET_NR_sigaltstack:
+            case TARGET_NR_tgkill: case TARGET_NR_tkill:
+            case TARGET_NR_exit: case TARGET_NR_exit_group:
+            case TARGET_NR_set_tid_address: case TARGET_NR_set_robust_list:
+            case TARGET_NR_arch_prctl: case TARGET_NR_futex:
+                break;
+            default:
+                supported = false;
+                break;
+            }
+            if (!supported) {
+                log_msg("[replay] [unsupported-syscall] [nr %lu] [arg0 %lx]\n",
+                        (unsigned long)syscall_no, (unsigned long)syscall_arg0);
+                __atomic_store_n(snapshot_replay_external, 1u, __ATOMIC_RELEASE);
+            }
+        }
+    }
     switch (syscall_no) {
     case TARGET_NR_read:
     case TARGET_NR_pread64: // read from file (write to buffer)
@@ -3806,7 +3930,8 @@ static int select_next_modification(SnapshotExitInfo *exit_info) {
         if (shared_trace_data != NULL) {
             memset(shared_trace_data, 0, sizeof(SharedTraceData));
         }
-        snapshot_modification_manager_reset(true);
+        if (binradar_manager == NULL || !binradar_manager->replay_mode)
+            snapshot_modification_manager_reset(true);
         return 0;
     }
 
@@ -4868,6 +4993,393 @@ static void snapshot_plan_attempt_log(
             committed);
 }
 
+/* Resident replay audit: record which inherited guest descriptors and
+ * syscall families can be reproduced by another fork from this parent.  The
+ * check is conservative: anything it cannot isolate marks the boundary
+ * unsupported instead of promising a repeatable external state. */
+static void snapshot_replay_audit(void)
+{
+    snapshot_replay_plans = g_array_new(FALSE, FALSE, sizeof(SnapshotReplayPlan));
+    snapshot_replay_inputs = g_array_new(FALSE, FALSE, sizeof(SnapshotReplayInput));
+    snapshot_replay_external = mmap(NULL, sizeof(*snapshot_replay_external),
+        PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (snapshot_replay_external == MAP_FAILED) {
+        snapshot_replay_external = NULL;
+        exit_with_status(1);
+    }
+    if (snapshot_guest_fds != NULL) {
+        GHashTableIter iter;
+        gpointer key;
+        g_hash_table_iter_init(&iter, snapshot_guest_fds);
+        while (g_hash_table_iter_next(&iter, &key, NULL)) {
+            int fd = GPOINTER_TO_INT(key);
+            SnapshotReplayInput input = {.fd = fd};
+            int flags = fcntl(fd, F_GETFL);
+            if (fd < 3 || flags < 0) continue; /* Guest descriptor closed. */
+            if (fstat(fd, &input.identity) != 0 ||
+                !S_ISREG(input.identity.st_mode) ||
+                (flags & O_ACCMODE) != O_RDONLY ||
+                (input.offset = lseek(fd, 0, SEEK_CUR)) < 0) {
+                snapshot_replay_boundary_unsupported = true;
+                log_msg("[replay] [unsupported inherited-fd] [fd %d]\n", fd);
+                continue;
+            }
+            g_array_append_val(snapshot_replay_inputs, input);
+        }
+    }
+    /* Standard input matters only when it is a regular seekable input; a
+     * pipe or terminal read is rejected by the child syscall audit on use. */
+    SnapshotReplayInput input = {.fd = 0};
+    if (fstat(0, &input.identity) == 0 && S_ISREG(input.identity.st_mode) &&
+        (input.offset = lseek(0, 0, SEEK_CUR)) >= 0) {
+        g_array_append_val(snapshot_replay_inputs, input);
+    }
+    log_msg("[replay] [audit] [inputs %u] [unsupported %s]\n",
+            snapshot_replay_inputs->len,
+            snapshot_replay_boundary_unsupported ? "true" : "false");
+}
+
+static bool snapshot_replay_restore_inputs(void)
+{
+    if (snapshot_replay_boundary_unsupported) return false;
+    for (guint i = 0; i < snapshot_replay_inputs->len; i++) {
+        SnapshotReplayInput *input = &g_array_index(snapshot_replay_inputs,
+                                                   SnapshotReplayInput, i);
+        struct stat now;
+        if (fstat(input->fd, &now) != 0 ||
+            now.st_dev != input->identity.st_dev ||
+            now.st_ino != input->identity.st_ino ||
+            now.st_size != input->identity.st_size ||
+            now.st_mtim.tv_sec != input->identity.st_mtim.tv_sec ||
+            now.st_mtim.tv_nsec != input->identity.st_mtim.tv_nsec ||
+            now.st_ctim.tv_sec != input->identity.st_ctim.tv_sec ||
+            now.st_ctim.tv_nsec != input->identity.st_ctim.tv_nsec ||
+            lseek(input->fd, input->offset, SEEK_SET) != input->offset) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static SnapshotReplayPlan *snapshot_replay_plan(uint32_t mutation)
+{
+    if (snapshot_replay_plans == NULL) return NULL;
+    for (guint i = 0; i < snapshot_replay_plans->len; i++) {
+        SnapshotReplayPlan *plan = &g_array_index(snapshot_replay_plans,
+                                                  SnapshotReplayPlan, i);
+        if (plan->mutation == mutation) return plan;
+    }
+    return NULL;
+}
+
+/* Retain one committed generation attempt's complete plan.  The plan must
+ * still be owned by the parent at this point; the queue entry is replaced by
+ * a copy so advancing the generation queue can never free replay state. */
+static bool snapshot_replay_retain_plan(uint32_t mutation,
+                                        const SnapshotMutationPlan *plan,
+                                        const char *capture,
+                                        BinradarReplayOutcome outcome)
+{
+    SnapshotMutationPlan *copy;
+    SnapshotReplayPlan retained = {.mutation = mutation};
+    if (snapshot_replay_plans == NULL || plan == NULL || plan->mods == NULL ||
+        plan->num_mods == 0 || snapshot_replay_plan(mutation) != NULL) {
+        return true;
+    }
+    /* The representative capture is the only record of the executed
+     * pre-branch state.  Without it the plan cannot be replayed from this
+     * snapshot, so retention fails loudly instead of advertising a case that
+     * every request would then report unavailable. */
+    if (capture == NULL || binradar_manager == NULL ||
+        !binradar_replay_register_capture(binradar_manager, mutation,
+                                          capture, outcome)) {
+        log_msg("[replay] [retain-error] [mutation %u] [reason capture]\n",
+                mutation);
+        return false;
+    }
+    copy = g_new0(SnapshotMutationPlan, 1);
+    *copy = *plan;
+    copy->mods = g_new0(SnapshotMutationWrite, plan->num_mods);
+    for (uint32_t i = 0; i < plan->num_mods; i++) {
+        copy->mods[i] = plan->mods[i];
+        if (plan->mods[i].target.bytes != NULL && plan->mods[i].target.extent) {
+            copy->mods[i].target.bytes = g_malloc(plan->mods[i].target.extent);
+            memcpy(copy->mods[i].target.bytes, plan->mods[i].target.bytes,
+                   plan->mods[i].target.extent);
+        }
+    }
+    retained.plan = copy;
+    retained.external_unsupported = snapshot_replay_boundary_unsupported;
+    g_array_append_val(snapshot_replay_plans, retained);
+    return true;
+}
+
+static uint32_t snapshot_replay_plan_ids(uint32_t **ids_out)
+{
+    uint32_t *ids = NULL;
+    if (snapshot_replay_plans == NULL) {
+        if (ids_out != NULL) *ids_out = NULL;
+        return 0;
+    }
+    if (snapshot_replay_plans->len != 0) {
+        ids = g_new(uint32_t, snapshot_replay_plans->len);
+        for (guint i = 0; i < snapshot_replay_plans->len; i++) {
+            ids[i] = g_array_index(snapshot_replay_plans,
+                                   SnapshotReplayPlan, i).mutation;
+        }
+    }
+    if (ids_out != NULL) *ids_out = ids;
+    return snapshot_replay_plans->len;
+}
+
+static void snapshot_replay_release_plans(void)
+{
+    if (snapshot_replay_plans == NULL) return;
+    for (guint i = 0; i < snapshot_replay_plans->len; i++) {
+        snapshot_mutation_free(g_array_index(snapshot_replay_plans,
+                                             SnapshotReplayPlan, i).plan);
+    }
+    g_array_free(snapshot_replay_plans, TRUE);
+    snapshot_replay_plans = NULL;
+}
+
+/* Retain one committed useful mutation.  The accepted plan is copied into
+ * parent ownership before the generation queue advances, so queue exhaustion
+ * can never free replay state.  Its committed patch-zero feedback capture is
+ * the representative for the retained mutation. */
+static void snapshot_replay_commit_plan(
+    uint32_t attempt, const SnapshotPlanAttemptDiagnostic *diagnostic,
+    bool committed)
+{
+    const char *feedback_dir = getenv("BINRADAR_FEEDBACK_DIR");
+    SnapshotMutationPlan *plan;
+    char *capture = NULL;
+    bool useful;
+    if (binradar_manager == NULL || mod_manager == NULL ||
+        mod_manager->current == NULL || diagnostic == NULL) {
+        return;
+    }
+    /* Existing committed-useful meaning: patch 0 applied, site observed, and
+     * the patch-0 exit normal or a validated target crash. */
+    useful = committed && diagnostic->patch0_applied_known &&
+        diagnostic->patch0_applied && diagnostic->patch0_site_known &&
+        diagnostic->patch0_site && diagnostic->patch0_exit_record_valid &&
+        (!diagnostic->patch0_exit.crashed ||
+         (diagnostic->patch0_exit.fault_reference_valid &&
+          binradar_manager->poc_fault_valid &&
+          snapshot_fault_reference_equal(
+              diagnostic->patch0_exit.fault_addr,
+              &diagnostic->patch0_exit.fault_site,
+              binradar_manager->poc_fault_addr,
+              &binradar_manager->poc_fault_site)));
+    if (!useful) {
+        log_msg("[replay] [retain-skip] [mutation %u] [reason not-useful]\n",
+                attempt);
+        return;
+    }
+    if (feedback_dir != NULL && feedback_dir[0] == '/') {
+        capture = g_strdup_printf("%s/iteration-%08u-patch-%08u.brch",
+                                  feedback_dir, attempt, 0u);
+    }
+    plan = mod_manager->current;
+    BinradarReplayOutcome outcome = !diagnostic->patch0_exit.crashed
+        ? BINRADAR_REPLAY_OUTCOME_NORMAL
+        : binradar_manager->poc_fault_valid && snapshot_fault_reference_equal(
+              diagnostic->patch0_exit.fault_addr,
+              &diagnostic->patch0_exit.fault_site,
+              binradar_manager->poc_fault_addr,
+              &binradar_manager->poc_fault_site)
+            ? BINRADAR_REPLAY_OUTCOME_TARGET_CRASH
+            : BINRADAR_REPLAY_OUTCOME_OTHER_CRASH;
+    if (!snapshot_replay_retain_plan(attempt, plan, capture, outcome)) {
+        g_free(capture);
+        log_msg("[replay] [retain-error] [mutation %u]\n", attempt);
+        exit_with_status(1);
+    }
+    g_free(capture);
+}
+
+static void snapshot_replay_case_reply(BinradarForkserverDriver *driver,
+                                       uint32_t mutation, uint32_t source,
+                                       BinradarReplayOutcome outcome,
+                                       BinradarReplayReason reason)
+{
+    log_msg("[replay] [case] [mutation %u] [source %s] [outcome %s] "
+            "[reason %s]\n", mutation,
+            source == BINRADAR_REPLAY_SOURCE_CACHE ? "cache" : "executed",
+            binradar_replay_outcome_name(outcome),
+            binradar_replay_reason_name(reason));
+    char *text = g_strdup_printf(
+        "{\"mutation\":%u,\"outcome\":\"%s\",\"reason\":\"%s\"}",
+        mutation, binradar_replay_outcome_name(outcome),
+        binradar_replay_reason_name(reason));
+    if (!binradar_forkserver_send_replay_case(driver, source, (uint32_t)outcome,
+                                              (uint32_t)reason, text)) {
+        g_free(text);
+        exit_with_status(7);
+    }
+    g_free(text);
+}
+
+/* Run one requested predicate against one retained mutation.  Returns true
+ * only in the disposable child, which then resumes guest execution from the
+ * unchanged snapshot; the parent always frames the complete reply. */
+static bool snapshot_replay_case(BinradarForkserverDriver *driver,
+                                 CPUArchState *cpu_env, uint32_t mutation,
+                                 const char *descriptor)
+{
+    BinradarManager *manager = binradar_manager;
+    SnapshotReplayPlan *retained = snapshot_replay_plan(mutation);
+    BinradarReplayResult result = {0};
+
+    if (retained == NULL) {
+        snapshot_replay_case_reply(driver, mutation,
+            BINRADAR_REPLAY_SOURCE_EXECUTED,
+            BINRADAR_REPLAY_OUTCOME_UNAVAILABLE,
+            BINRADAR_REPLAY_REASON_UNKNOWN_MUTATION);
+        return false;
+    }
+    if (!binradar_replay_descriptor(manager, descriptor)) {
+        snapshot_replay_case_reply(driver, mutation,
+            BINRADAR_REPLAY_SOURCE_EXECUTED,
+            BINRADAR_REPLAY_OUTCOME_UNAVAILABLE,
+            BINRADAR_REPLAY_REASON_INVALID_DESCRIPTOR);
+        return false;
+    }
+    if (retained->external_unsupported || !snapshot_replay_restore_inputs()) {
+        snapshot_replay_case_reply(driver, mutation,
+            BINRADAR_REPLAY_SOURCE_EXECUTED,
+            BINRADAR_REPLAY_OUTCOME_UNAVAILABLE,
+            BINRADAR_REPLAY_REASON_UNSUPPORTED_EXTERNAL_STATE);
+        return false;
+    }
+    if (binradar_replay_lookup(manager, mutation, descriptor, &result)) {
+        g_free(result.capture);
+        snapshot_replay_case_reply(driver, mutation,
+            BINRADAR_REPLAY_SOURCE_CACHE, result.outcome,
+            BINRADAR_REPLAY_REASON_NONE);
+        return false;
+    }
+    /* One child owns the selector and both capture channels. */
+    if (manager->current == NULL ||
+        !binradar_cache_publish_selector(manager, 1, mutation)) {
+        log_msg("[replay] [error selector-publication]\n");
+        exit_with_status(5);
+    }
+    binradar_cache_reset_child(manager);
+    memset(&shared_trace_data->exit_info, 0, sizeof(shared_trace_data->exit_info));
+    __atomic_store_n(&shared_trace_data->mutation_plan_applied, 0,
+                     __ATOMIC_RELAXED);
+    __atomic_store_n(snapshot_replay_external, 0u, __ATOMIC_RELEASE);
+    provenance_clear_pending_fault();
+    snapshot_prepare_mutation_epoch();
+    mod_manager->current = retained->plan;
+    snapshot_replay_active = true;
+    /* One replay child keeps the configured per-child cap; the expired
+     * generation attempt budget never applies here. */
+    driver->attempt_deadline_us = -1;
+    fflush(NULL);
+    trace_mem_flush();
+    log_msg_flush();
+    pid_t child = fork();
+    if (child < 0) exit_with_status(4);
+    if (child == 0) {
+        afl_fork_child = 1;
+        osprey_collect_enabled = 0;
+        /* Replay is observation only: no new symbolic or advisor work is
+         * recorded, but memcheck/provenance and allocator tracking stay on. */
+        symbolic_replay_observation_only();
+        snapshot_modify_memory(cpu_env);
+        snapshot_mutation_read_witness_disarm();
+        provenance_clear_pending_fault();
+        binradar_forkserver_child_close(driver);
+        return true;
+    }
+    uint32_t status = 0;
+    int waited = binradar_forkserver_wait_child(
+        driver, child, manager, &status, NULL, NULL);
+    mod_manager->current = NULL;
+    snapshot_replay_active = false;
+    if (waited < 0) exit_with_status(6);
+    SnapshotExitInfo *outcome = snapshot_exit_info_ptr();
+    bool external = __atomic_load_n(snapshot_replay_external, __ATOMIC_ACQUIRE) != 0;
+    if (waited == 0 && !external &&
+        __atomic_load_n(&shared_trace_data->mutation_plan_applied,
+                        __ATOMIC_ACQUIRE)) {
+        binradar_cache_record_outcome(manager, 1, outcome);
+        if (binradar_replay_admit(manager, mutation, 1, descriptor, outcome,
+                                  &result)) {
+            g_free(result.capture);
+            snapshot_replay_case_reply(driver, mutation,
+                BINRADAR_REPLAY_SOURCE_EXECUTED, result.outcome,
+                BINRADAR_REPLAY_REASON_NONE);
+        } else {
+            snapshot_replay_case_reply(driver, mutation,
+                BINRADAR_REPLAY_SOURCE_EXECUTED,
+                BINRADAR_REPLAY_OUTCOME_UNAVAILABLE,
+                BINRADAR_REPLAY_REASON_INCOMPLETE_OBSERVATION);
+        }
+    } else {
+        BinradarReplayReason reason = external
+            ? BINRADAR_REPLAY_REASON_UNSUPPORTED_EXTERNAL_STATE
+            : driver->cancel_requested ? BINRADAR_REPLAY_REASON_CANCELLED
+            : waited > 0 ? BINRADAR_REPLAY_REASON_TIMEOUT
+            : BINRADAR_REPLAY_REASON_INCOMPLETE_OBSERVATION;
+        snapshot_replay_case_reply(driver, mutation,
+            BINRADAR_REPLAY_SOURCE_EXECUTED,
+            BINRADAR_REPLAY_OUTCOME_UNAVAILABLE, reason);
+    }
+    /* Reset transient shared state, never the retained plans or their
+     * admitted captures. */
+    binradar_cache_clear_iteration(manager);
+    binradar_cache_reset_child(manager);
+    binradar_cache_iteration(manager, 0);
+    provenance_clear_pending_fault();
+    memset(&shared_trace_data->exit_info, 0, sizeof(shared_trace_data->exit_info));
+    return false;
+}
+
+static void snapshot_replay_serve(BinradarForkserverDriver *driver,
+                                  CPUArchState *cpu_env)
+{
+    for (;;) {
+        uint32_t command = 0;
+        if (!binradar_forkserver_next_command(driver, &command)) {
+            log_msg("[forkserver] [exit] replay parent dead or invalid command\n");
+            exit_with_status(2);
+        }
+        if (command == BINRADAR_REPLAY_SHUTDOWN) {
+            log_msg("[forkserver] [shutdown] [state ready]\n");
+            if (!binradar_forkserver_send_ack(driver, 0)) exit_with_status(7);
+            exit_with_status(0);
+        }
+        if (command == BINRADAR_REPLAY_LIST) {
+            uint32_t *ids = NULL;
+            uint32_t count = snapshot_replay_plan_ids(&ids);
+            bool sent = binradar_forkserver_send_replay_list(driver, ids, count);
+            g_free(ids);
+            if (!sent) exit_with_status(7);
+            continue;
+        }
+        if (command == BINRADAR_REPLAY_CASE) {
+            uint32_t mutation = 0;
+            char *descriptor = NULL;
+            bool child;
+            if (!binradar_forkserver_replay_case_request(
+                    driver, &mutation, &descriptor)) {
+                log_msg("[forkserver] [exit] invalid replay case request\n");
+                exit_with_status(2);
+            }
+            child = snapshot_replay_case(driver, cpu_env, mutation, descriptor);
+            g_free(descriptor);
+            if (child) return;
+            continue;
+        }
+        log_msg("[forkserver] [exit] generation command in ready state\n");
+        exit_with_status(2);
+    }
+}
+
 void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
                          const ArgumentInfo *arg_info, size_t num_arg_regs) {
     log_msg("[snapshot] [forkserver] [called %d]\n", forkserver_installed);
@@ -4884,18 +5396,78 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
     }
 
     bool binradar_mode = binradar_manager != NULL;
+    bool generation_finished = false;
+    bool generation_baseline_ready = false;
+    uint32_t generation_remaining = 0;
+    if (driver.replay_mode) {
+        if (!binradar_mode || !binradar_manager->replay_mode) exit_with_status(1);
+        snapshot_replay_audit();
+    }
     afl_forksrv_pid = getpid();
     if (!binradar_forkserver_handshake(&driver)) {
         log_msg("[snapshot] [forkserver] [error] protocol-v5 handshake\n");
         exit_with_status(1);
     }
-    log_msg("[forkserver] [start] [protocol 5]\n");
+    log_msg("[forkserver] [start] [protocol %s]\n",
+            driver.replay_mode ? "replay" : "5");
 
-    for (;;) {
-        uint32_t was_killed;
-        if (!binradar_forkserver_next(&driver, &was_killed)) {
-            log_msg("[forkserver] [exit] parent (fuzzolic) dead or exit\n");
-            exit_with_status(2);
+    while (!generation_finished) {
+        if (driver.replay_mode) {
+            uint32_t command;
+            if (!binradar_forkserver_next_command(&driver, &command)) {
+                log_msg("[forkserver] [exit] parent dead or invalid command\n");
+                exit_with_status(2);
+            }
+            if (command == BINRADAR_REPLAY_SHUTDOWN) {
+                log_msg("[forkserver] [shutdown] [state generating]\n");
+                binradar_forkserver_send_ack(&driver, 0);
+                exit_with_status(0);
+            }
+            if (command == BINRADAR_REPLAY_LIST) {
+                uint32_t *ids = NULL;
+                uint32_t count = snapshot_replay_plan_ids(&ids);
+                bool ok = binradar_forkserver_send_replay_list(&driver, ids, count);
+                g_free(ids);
+                if (!ok) exit_with_status(7);
+                continue;
+            }
+            if (command == BINRADAR_REPLAY_FINISH) {
+                /* A missing baseline leaves zero retained mutations; the
+                 * snapshot parent is still alive and serves explicit zero
+                 * coverage instead of exiting as if generation succeeded. */
+                if (!generation_baseline_ready) {
+                    log_msg("[forkserver] [finish] [baseline-unavailable] "
+                            "[retained 0]\n");
+                }
+                log_msg("[forkserver] [finish] [retained %u] [remaining %u]\n",
+                        snapshot_replay_plans != NULL
+                            ? snapshot_replay_plans->len : 0,
+                        generation_remaining);
+                {
+                    uint32_t *ids = NULL;
+                    uint32_t count = snapshot_replay_plan_ids(&ids);
+                    bool sent = binradar_forkserver_send_ack(&driver, 0) &&
+                        binradar_forkserver_send_replay_list(&driver, ids, count);
+                    g_free(ids);
+                    if (!sent) exit_with_status(7);
+                }
+                /* Generation is over; the snapshot parent now serves replay
+                 * requests until an explicit shutdown. */
+                snapshot_replay_serve(&driver, cpu_env);
+                /* Only a disposable replay child returns here. */
+                return;
+            }
+            if (command != BINRADAR_REPLAY_GENERATE) {
+                log_msg("[forkserver] [exit] unsupported replay command\n");
+                exit_with_status(2);
+            }
+            binradar_forkserver_begin_attempt(&driver);
+        } else {
+            uint32_t was_killed;
+            if (!binradar_forkserver_next(&driver, &was_killed)) {
+                log_msg("[forkserver] [exit] parent (fuzzolic) dead or exit\n");
+                exit_with_status(2);
+            }
         }
         const uint32_t attempt = driver.attempt;
         uint32_t representative_runs = 0;
@@ -5022,6 +5594,21 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
                 report_shared_prov_finding, NULL);
             if (wait_rc < 0) exit_with_status(6);
             trace_mem_flush();
+            if (driver.cancel_requested) {
+                /* The orchestrator interrupted generation: drop this
+                 * attempt's partial capture and consume its plan once, then
+                 * finish the attempt at the normal command boundary. */
+                binradar_cache_feedback_drop(binradar_manager);
+                binradar_cache_clear_iteration(binradar_manager);
+                remaining_plans = attempt == 1
+                    ? 0 : snapshot_advance_modification_plan();
+                attempt_result = BINRADAR_FORKSERVER_ATTEMPT_TIMEOUT;
+                attempt_discarded = true;
+                log_msg("[binradar] [attempt-discarded] [iter %u] "
+                        "[reason cancelled] [patch %u]\n", attempt,
+                        selected_patch);
+                break;
+            }
             if (shared_trace_data != NULL &&
                 shared_trace_data->symbolic_advisor_plan_applied) {
                 symbolic_advisor_child_uses++;
@@ -5298,6 +5885,7 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
                             osprey_analyze(g_osprey_ctx);
                         }
                     }
+                    generation_baseline_ready = true;
                     /* The initial unmutated baseline only has to produce a
                      * sound observation set; it is normal for it not to
                      * reach the patch site, because reaching it is what the
@@ -5312,6 +5900,9 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
                         exit_with_status(1);
                     }
                     attempt_committed = true;
+                    if (binradar_manager->replay_mode)
+                        snapshot_replay_commit_plan(attempt, &attempt_diagnostic,
+                                                    true);
                     remaining_plans = analyze_collected_data(
                         arg_info, num_arg_regs);
                 }
@@ -5333,6 +5924,14 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
         }
         g_free(executed);
         g_free(uncovered);
+        generation_remaining = remaining_plans;
+        if (binradar_mode) {
+            /* One source of truth: the parent-owned retained plan count, which
+             * `LIST` also reports. */
+            binradar_manager->retained_mutations = snapshot_replay_plans != NULL
+                ? snapshot_replay_plans->len : 0;
+            driver.retained_mutations = binradar_manager->retained_mutations;
+        }
 
         BinradarForkserverStopReason stop_reason =
             binradar_forkserver_stop_reason(
@@ -5348,12 +5947,22 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
             exit_with_status(7);
         }
         if (stop_reason != BINRADAR_FORKSERVER_STOP_CONTINUE) {
-            /* Terminal reply delivered.  This process only ever leaves the
-             * forkserver loop by exiting: returning would resume guest
-             * execution inside the snapshot parent. */
-            log_msg("[forkserver] [exiting] [stop %s]\n",
-                    binradar_forkserver_stop_reason_name(stop_reason));
-            exit_with_status(0);
+            if (!driver.replay_mode) {
+                /* Terminal reply delivered.  This process only ever leaves the
+                 * forkserver loop by exiting: returning would resume guest
+                 * execution inside the snapshot parent. */
+                log_msg("[forkserver] [exiting] [stop %s]\n",
+                        binradar_forkserver_stop_reason_name(stop_reason));
+                exit_with_status(0);
+            }
+            /* Resident mode keeps the baseline and retained plans alive; the
+             * orchestrator decides when generation is over (FINISH). */
+            log_msg("[forkserver] [generation-stop] [stop %s] [remaining %u] "
+                    "[retained %u]\n",
+                    binradar_forkserver_stop_reason_name(stop_reason),
+                    generation_remaining,
+                    binradar_manager->retained_mutations);
+            generation_finished = true;
         }
     }
 }

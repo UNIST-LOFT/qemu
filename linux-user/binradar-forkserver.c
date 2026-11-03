@@ -6,7 +6,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-static int binradar_forkserver_read_exact(int fd, void *buffer, size_t length)
+int binradar_forkserver_read_exact(int fd, void *buffer, size_t length)
 {
     uint8_t *bytes = buffer;
     size_t total = 0;
@@ -19,7 +19,7 @@ static int binradar_forkserver_read_exact(int fd, void *buffer, size_t length)
     return 0;
 }
 
-static int binradar_forkserver_write_exact(int fd, const void *buffer,
+int binradar_forkserver_write_exact(int fd, const void *buffer,
                                             size_t length)
 {
     const uint8_t *bytes = buffer;
@@ -91,6 +91,14 @@ bool binradar_forkserver_driver_init(BinradarForkserverDriver *driver,
     memset(driver, 0, sizeof(*driver));
     driver->control_fd = control_fd;
     driver->status_fd = status_fd;
+    driver->replay_mode = g_strcmp0(getenv("BINRADAR_REPLAY_SERVER"), "1") == 0;
+    driver->cancel_fd = -1;
+    if (driver->replay_mode) {
+        const char *fd = getenv("BINRADAR_REPLAY_CANCEL_FD");
+        if (fd == NULL || atoi(fd) < 3) return false;
+        driver->cancel_fd = atoi(fd);
+        if (!binradar_forkserver_set_nonblock(driver->cancel_fd)) return false;
+    }
     /* Consecutive-bad-attempt limit.  Child timeouts and unusable exits
      * advance it; a committed attempt resets it; an ordinary no-observation
      * miss leaves it alone so a long tail of mutation misses cannot stop a
@@ -104,7 +112,8 @@ bool binradar_forkserver_driver_init(BinradarForkserverDriver *driver,
 
 bool binradar_forkserver_handshake(BinradarForkserverDriver *driver)
 {
-    const uint32_t version = BINRADAR_FORKSERVER_PROTOCOL_V5;
+    const uint32_t version = driver != NULL && driver->replay_mode
+        ? BINRADAR_FORKSERVER_PROTOCOL_REPLAY : BINRADAR_FORKSERVER_PROTOCOL_V5;
     const uint32_t expected = version ^ UINT32_MAX;
     uint32_t reply = 0;
     return driver != NULL &&
@@ -125,12 +134,99 @@ bool binradar_forkserver_next(BinradarForkserverDriver *driver,
                                        sizeof(*was_killed)) < 0) {
         return false;
     }
+    binradar_forkserver_begin_attempt(driver);
+    return true;
+}
+
+void binradar_forkserver_begin_attempt(BinradarForkserverDriver *driver)
+{
+    if (driver == NULL) return;
     driver->attempt++;
     driver->next_attempt = driver->attempt + 1u;
     driver->attempt_result = BINRADAR_FORKSERVER_ATTEMPT_COMPLETED;
     driver->last_wait_result = 0;
+    driver->cancel_requested = false;
+    /* A cancel token is consumed by wait_child for the request it targets;
+     * draining here would silently drop a cutoff that arrived before fork. */
     driver->attempt_deadline_us = binradar_forkserver_attempt_deadline();
+}
+
+bool binradar_forkserver_next_command(BinradarForkserverDriver *driver,
+                                      uint32_t *command)
+{
+    if (driver == NULL || command == NULL) return false;
+    if (binradar_forkserver_read_exact(driver->control_fd, command,
+                                       sizeof(*command)) < 0) {
+        return false;
+    }
+    if (*command == BINRADAR_REPLAY_SHUTDOWN) return true;
+    if (*command != BINRADAR_REPLAY_GENERATE &&
+        *command != BINRADAR_REPLAY_FINISH &&
+        *command != BINRADAR_REPLAY_CASE &&
+        *command != BINRADAR_REPLAY_LIST) return false;
+    driver->cancel_requested = false;
     return true;
+}
+
+bool binradar_forkserver_replay_case_request(BinradarForkserverDriver *driver,
+                                             uint32_t *mutation,
+                                             char **descriptor)
+{
+    uint32_t length = 0;
+    if (driver == NULL || mutation == NULL || descriptor == NULL) return false;
+    if (binradar_forkserver_read_exact(driver->control_fd, mutation,
+                                       sizeof(*mutation)) < 0 ||
+        binradar_forkserver_read_exact(driver->control_fd, &length,
+                                       sizeof(length)) < 0) {
+        return false;
+    }
+    if (length > BRCACHE_MAX_DESCRIPTOR) return false;
+    char *text = g_malloc0((gsize)length + 1u);
+    if (length > 0 &&
+        binradar_forkserver_read_exact(driver->control_fd, text, length) < 0) {
+        g_free(text);
+        return false;
+    }
+    text[length] = '\0';
+    *descriptor = text;
+    return true;
+}
+
+bool binradar_forkserver_send_ack(BinradarForkserverDriver *driver,
+                                  uint32_t code)
+{
+    uint32_t reply[2] = {BINRADAR_REPLAY_REPLY_ACK, code};
+    return driver != NULL &&
+           binradar_forkserver_write_exact(driver->status_fd, reply,
+                                            sizeof(reply)) == 0;
+}
+
+bool binradar_forkserver_send_replay_list(BinradarForkserverDriver *driver,
+                                          const uint32_t *ids, uint32_t count)
+{
+    if (driver == NULL || (ids == NULL && count != 0)) return false;
+    uint32_t header[2] = {BINRADAR_REPLAY_REPLY_LIST, count};
+    if (binradar_forkserver_write_exact(driver->status_fd, header,
+                                         sizeof(header)) != 0) {
+        return false;
+    }
+    return count == 0 ||
+        binradar_forkserver_write_exact(driver->status_fd, ids,
+                                         count * sizeof(*ids)) == 0;
+}
+
+bool binradar_forkserver_send_replay_case(BinradarForkserverDriver *driver,
+                                          uint32_t source, uint32_t outcome,
+                                          uint32_t reason, const char *text)
+{
+    const size_t length = text != NULL ? strlen(text) : 0;
+    if (driver == NULL || length > BRCACHE_MAX_DESCRIPTOR + 256u) return false;
+    uint32_t header[5] = {BINRADAR_REPLAY_REPLY_CASE, source, outcome,
+                          reason, (uint32_t)length};
+    return binradar_forkserver_write_exact(driver->status_fd, header,
+                                            sizeof(header)) == 0 &&
+        (length == 0 ||
+         binradar_forkserver_write_exact(driver->status_fd, text, length) == 0);
 }
 
 int binradar_forkserver_wait_child(
@@ -146,6 +242,8 @@ int binradar_forkserver_wait_child(
     nfds_t count = 0;
 
     if (driver == NULL || status_out == NULL) return -1;
+    log_msg("[forkserver] [wait-child] [pid %d] [cache %p]\n", (int)child_pid,
+            (void *)cache);
     if (cache != NULL) {
         if (!binradar_forkserver_set_nonblock(cache->patch_fd_r)) return -1;
         poll_fds[count++] = (struct pollfd){
@@ -164,6 +262,24 @@ int binradar_forkserver_wait_child(
     }
 
     for (;;) {
+        if (driver->cancel_fd >= 0) {
+            unsigned char byte;
+            ssize_t cancelled = read(driver->cancel_fd, &byte, 1);
+            if (cancelled == 1) {
+                kill(child_pid, SIGKILL);
+                while (waitpid(child_pid, &status, 0) < 0) {
+                    if (errno != EINTR) return -1;
+                }
+                if (cache != NULL) {
+                    binradar_cache_drain_patch(cache);
+                    binradar_cache_drain_capture(cache);
+                }
+                driver->cancel_requested = true;
+                *status_out = (uint32_t)status;
+                return 3;
+            }
+            if (cancelled == 0) return -1;
+        }
         pid_t waited = waitpid(child_pid, &status, WNOHANG);
         if (waited == child_pid) break;
         if (waited < 0) return -1;
@@ -259,15 +375,30 @@ bool binradar_forkserver_send_summary(
     BinradarForkserverDriver *driver, uint32_t representative_runs,
     uint32_t remaining_plans, BinradarForkserverStopReason stop_reason)
 {
-    uint32_t summary[BINRADAR_FORKSERVER_SUMMARY_WORDS];
+    uint32_t summary[BINRADAR_REPLAY_SUMMARY_WORDS];
+    size_t words;
     if (driver == NULL) return false;
-    summary[0] = driver->attempt;
-    summary[1] = representative_runs;
-    summary[2] = remaining_plans;
-    summary[3] = driver->attempt_result;
-    summary[4] = (uint32_t)stop_reason;
+    if (driver->replay_mode) {
+        /* Resident mode prefixes every reply with its kind so a case reply
+         * can never be parsed as a generation summary. */
+        summary[0] = BINRADAR_REPLAY_REPLY_SUMMARY;
+        summary[1] = driver->attempt;
+        summary[2] = representative_runs;
+        summary[3] = remaining_plans;
+        summary[4] = driver->attempt_result;
+        summary[5] = (uint32_t)stop_reason;
+        summary[6] = driver->retained_mutations;
+        words = BINRADAR_REPLAY_SUMMARY_WORDS;
+    } else {
+        summary[0] = driver->attempt;
+        summary[1] = representative_runs;
+        summary[2] = remaining_plans;
+        summary[3] = driver->attempt_result;
+        summary[4] = (uint32_t)stop_reason;
+        words = BINRADAR_FORKSERVER_SUMMARY_WORDS;
+    }
     if (binradar_forkserver_write_exact(driver->status_fd, summary,
-                                         sizeof(summary)) != 0) {
+            words * sizeof(uint32_t)) != 0) {
         return false;
     }
     log_msg("[forkserver] [summary] [attempt %u] [runs %u] "
@@ -276,6 +407,13 @@ bool binradar_forkserver_send_summary(
             binradar_forkserver_attempt_result_name(driver->attempt_result),
             binradar_forkserver_stop_reason_name((uint32_t)stop_reason));
     return true;
+}
+
+void binradar_forkserver_drain_cancel(BinradarForkserverDriver *driver)
+{
+    if (driver->cancel_fd < 0) return;
+    unsigned char bytes[64];
+    while (read(driver->cancel_fd, bytes, sizeof(bytes)) > 0) {}
 }
 
 void binradar_forkserver_child_close(const BinradarForkserverDriver *driver)

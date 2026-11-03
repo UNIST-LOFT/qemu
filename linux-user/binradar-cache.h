@@ -14,6 +14,9 @@
 #define BRCACHE_MAX_MANIFEST_TOKENS (4ULL << 20)
 #define BRCACHE_MAX_DESCRIPTOR 4095u
 #define BRCACHE_MAX_EXPR_DEPTH 256u
+/* Reserved baseline, evaluated candidate, and representative re-evaluation.
+ * Replay widens the manifest's own predicate table to this minimum. */
+#define BINRADAR_REPLAY_SLOT_COUNT 3u
 
 typedef struct PatchedResult {
     uint32_t patch_id;
@@ -136,6 +139,13 @@ typedef struct BinradarManager {
      * never appears as committed sweep evidence. */
     char *feedback_staging_dir;
     GPtrArray *feedback_staged_pairs;
+    bool replay_mode;
+    /* Resident replay retains complete admitted plans and their immutable
+     * captures for the life of the parent, never for one request only. */
+    GPtrArray *replay_records;
+    GHashTable *replay_exact;
+    uint32_t replay_serial;
+    uint32_t retained_mutations;
     bool poc_fault_valid;
     SnapshotFaultReferenceSource poc_fault_source;
     target_ulong poc_fault_addr;
@@ -148,6 +158,58 @@ typedef struct BinradarMutationFeedbackView {
     uint32_t write_count;
 } BinradarMutationFeedbackView;
 
+/* Resident replay case outcomes.  These are the wire enum table shared with
+ * binradar/binradar_replay.py; callers never see a fabricated success. */
+typedef enum BinradarReplayOutcome {
+    BINRADAR_REPLAY_OUTCOME_NORMAL = 0,
+    BINRADAR_REPLAY_OUTCOME_TARGET_CRASH = 1,
+    BINRADAR_REPLAY_OUTCOME_OTHER_CRASH = 2,
+    BINRADAR_REPLAY_OUTCOME_UNAVAILABLE = 3,
+} BinradarReplayOutcome;
+
+typedef enum BinradarReplayReason {
+    BINRADAR_REPLAY_REASON_NONE = 0,
+    BINRADAR_REPLAY_REASON_UNKNOWN_MUTATION = 1,
+    BINRADAR_REPLAY_REASON_INVALID_DESCRIPTOR = 2,
+    BINRADAR_REPLAY_REASON_UNSUPPORTED_EXTERNAL_STATE = 3,
+    BINRADAR_REPLAY_REASON_CANCELLED = 4,
+    BINRADAR_REPLAY_REASON_TIMEOUT = 5,
+    BINRADAR_REPLAY_REASON_INCOMPLETE_OBSERVATION = 6,
+} BinradarReplayReason;
+
+typedef enum BinradarReplaySource {
+    BINRADAR_REPLAY_SOURCE_EXECUTED = 0,
+    BINRADAR_REPLAY_SOURCE_CACHE = 1,
+} BinradarReplaySource;
+
+typedef struct BinradarReplayResult {
+    BinradarReplaySource source;
+    BinradarReplayOutcome outcome;
+    BinradarReplayReason reason;
+    /* Owned absolute capture path, or NULL when nothing was retained. */
+    char *capture;
+} BinradarReplayResult;
+
+bool binradar_replay_descriptor(BinradarManager *manager, const char *descriptor);
+/* Exact-descriptor or full-vector reuse from previously admitted captures.
+ * Returns true on a hit and fills ``result``. */
+bool binradar_replay_lookup(BinradarManager *manager, uint32_t mutation,
+                            const char *descriptor,
+                            BinradarReplayResult *result);
+/* Admit one completed real child. Returns false when the capture/outcome is
+ * not reusable; the caller then reports an unavailable observation. */
+bool binradar_replay_admit(BinradarManager *manager, uint32_t mutation,
+                           uint32_t selected, const char *descriptor,
+                           const SnapshotExitInfo *outcome,
+                           BinradarReplayResult *result);
+/* Register a committed generation patch-zero capture as a representative.
+ * The file remains authoritative; no BRCH bytes are copied here. */
+bool binradar_replay_register_capture(BinradarManager *manager,
+                                     uint32_t mutation, const char *path,
+                                     BinradarReplayOutcome outcome);
+const char *binradar_replay_outcome_name(BinradarReplayOutcome outcome);
+const char *binradar_replay_reason_name(BinradarReplayReason reason);
+void binradar_replay_release(BinradarManager *manager);
 BinradarResult *binradar_cache_new_iteration(BinradarManager *manager);
 int binradar_cache_patch_id(BinradarManager *manager, int new_patch_id);
 int binradar_cache_iteration(BinradarManager *manager, int new_iteration);

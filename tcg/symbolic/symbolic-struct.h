@@ -25,6 +25,7 @@ typedef enum SymbolicCollectionStopReason {
     SYMBOLIC_COLLECTION_COMPLETE = 0,
     SYMBOLIC_COLLECTION_QUERY_CAPACITY = 1,
     SYMBOLIC_COLLECTION_EXPR_CAPACITY = 2,
+    SYMBOLIC_COLLECTION_REPLAY_OBSERVATION = 3,
 } SymbolicCollectionStopReason;
 
 static inline const char *symbolic_collection_reason_name(
@@ -34,6 +35,7 @@ static inline const char *symbolic_collection_reason_name(
     case SYMBOLIC_COLLECTION_COMPLETE: return "none";
     case SYMBOLIC_COLLECTION_QUERY_CAPACITY: return "query-capacity";
     case SYMBOLIC_COLLECTION_EXPR_CAPACITY: return "expr-capacity";
+    case SYMBOLIC_COLLECTION_REPLAY_OBSERVATION: return "replay-observation";
     }
     return "invalid";
 }
@@ -305,6 +307,7 @@ extern Expr* next_free_expr;
 
 /* Collection can freeze while BINRADAR concrete observation continues. */
 bool symbolic_collection_active(void);
+void symbolic_replay_observation_only(void);
 SymbolicCollectionStopReason symbolic_get_collection_stop_reason(void);
 void symbolic_publish_collection_status(SymbolicCollectionStopReason reason,
                                         int64_t query_cursor,

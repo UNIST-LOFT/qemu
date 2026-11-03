@@ -593,6 +593,13 @@ static void print_query_loc(Query *query, uint64_t pc, const char *msg) {
 static void end_symbolic_mode(void);
 static SymbolicCollectionStopReason collection_stop_reason;
 
+void symbolic_replay_observation_only(void)
+{
+    collection_stop_reason = SYMBOLIC_COLLECTION_REPLAY_OBSERVATION;
+    memset(s_temps, 0, sizeof(s_temps));
+    last_expr = NULL;
+}
+
 bool symbolic_collection_active(void)
 {
     return collection_stop_reason == SYMBOLIC_COLLECTION_COMPLETE;
@@ -5707,6 +5714,7 @@ void symbolic_publish_collection_status(SymbolicCollectionStopReason reason,
 static int finalization_done;
 static void end_symbolic_mode(void)
 {
+    if (collection_stop_reason == SYMBOLIC_COLLECTION_REPLAY_OBSERVATION) return;
     if (finalization_done) return;
 
     uintptr_t cursor = (uintptr_t)next_query;

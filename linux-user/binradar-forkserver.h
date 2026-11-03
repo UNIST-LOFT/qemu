@@ -20,7 +20,40 @@
  * remaining_plans is the number of mutation plans that have not been executed
  * yet, including the plan popped for the next attempt. */
 #define BINRADAR_FORKSERVER_PROTOCOL_V5 0x41464c04u
+/* Resident patch-zero mode has an independent command protocol so generation
+ * completion and service termination are distinct.  Ordinary
+ * directed/binradar peers retain v5 and its five-word summary.
+ *
+ * Request on the control pipe:
+ *
+ *     GENERATE              - run one generation attempt
+ *     FINISH                - generation is over; enter the ready state
+ *     CASE    id, len, text - run one retained mutation with this descriptor
+ *     SHUTDOWN              - acknowledge and exit 0
+ *     LIST                  - report the retained mutation ids
+ *
+ * Reply on the status pipe starts with a reply-kind word:
+ *
+ *     1 SUMMARY: attempt, representative_runs, remaining_plans,
+ *                attempt_result, stop_reason, retained_mutations
+ *     2 ACK:     code
+ *     3 CASE:    source, outcome, reason, text_length, text
+ *     4 LIST:    count, count * mutation_id
+ */
+#define BINRADAR_FORKSERVER_PROTOCOL_REPLAY 0x41464c05u
+#define BINRADAR_REPLAY_GENERATE 0u
+#define BINRADAR_REPLAY_FINISH 1u
+#define BINRADAR_REPLAY_CASE 2u
+#define BINRADAR_REPLAY_SHUTDOWN 3u
+#define BINRADAR_REPLAY_LIST 4u
+#define BINRADAR_REPLAY_REPLY_SUMMARY 1u
+#define BINRADAR_REPLAY_REPLY_ACK 2u
+#define BINRADAR_REPLAY_REPLY_CASE 3u
+#define BINRADAR_REPLAY_REPLY_LIST 4u
 #define BINRADAR_FORKSERVER_SUMMARY_WORDS 5u
+/* kind, attempt, representative_runs, remaining_plans, attempt_result,
+ * stop_reason, retained_mutations */
+#define BINRADAR_REPLAY_SUMMARY_WORDS 7u
 #define BINRADAR_FORKSERVER_BAD_ATTEMPT_DEFAULT 10
 
 typedef enum BinradarForkserverAttemptResult {
@@ -58,6 +91,12 @@ typedef enum BinradarForkserverStopReason {
 typedef struct BinradarForkserverDriver {
     int control_fd;
     int status_fd;
+    int cancel_fd;
+    bool replay_mode;
+    /* Set when a cancellation token killed the child of the current child
+     * wait.  Cleared by the attempt/replay owner. */
+    bool cancel_requested;
+    uint32_t retained_mutations;
     /* Attempt id reported for the attempt being run. */
     uint32_t attempt;
     /* Attempt id published for the attempt after this one. */
@@ -72,6 +111,9 @@ typedef struct BinradarForkserverDriver {
 typedef bool (*BinradarForkserverSalvage)(void *opaque,
                                           uint32_t *status_out);
 
+int binradar_forkserver_read_exact(int fd, void *buffer, size_t length);
+int binradar_forkserver_write_exact(int fd, const void *buffer, size_t length);
+void binradar_forkserver_drain_cancel(BinradarForkserverDriver *driver);
 const char *binradar_forkserver_attempt_result_name(uint32_t result);
 const char *binradar_forkserver_stop_reason_name(uint32_t reason);
 
@@ -80,6 +122,22 @@ bool binradar_forkserver_driver_init(BinradarForkserverDriver *driver,
 bool binradar_forkserver_handshake(BinradarForkserverDriver *driver);
 bool binradar_forkserver_next(BinradarForkserverDriver *driver,
                               uint32_t *was_killed);
+/* Start the next generation attempt without reading a command word. */
+void binradar_forkserver_begin_attempt(BinradarForkserverDriver *driver);
+/* Resident-mode command framing.  Each reply is kind-prefixed; the caller
+ * must match the kind before interpreting payload words. */
+bool binradar_forkserver_next_command(BinradarForkserverDriver *driver,
+                                      uint32_t *command);
+bool binradar_forkserver_replay_case_request(BinradarForkserverDriver *driver,
+                                             uint32_t *mutation,
+                                             char **descriptor);
+bool binradar_forkserver_send_ack(BinradarForkserverDriver *driver,
+                                  uint32_t code);
+bool binradar_forkserver_send_replay_list(BinradarForkserverDriver *driver,
+                                          const uint32_t *ids, uint32_t count);
+bool binradar_forkserver_send_replay_case(BinradarForkserverDriver *driver,
+                                          uint32_t source, uint32_t outcome,
+                                          uint32_t reason, const char *text);
 /* Reap or kill one representative child and drain both evidence channels.
  * Returns 0 reaped, 1 child/2 aggregate attempt timeout, <0 wait failure. */
 int binradar_forkserver_wait_child(
