@@ -872,6 +872,8 @@ static bool binradar_parse_expr(BinradarExprParser *parser,
         case '*': node.op = BRCACHE_EXPR_MUL; break;
         case '/': node.op = BRCACHE_EXPR_DIV; break;
         case '%': node.op = BRCACHE_EXPR_REM; break;
+        case 'A': node.op = BRCACHE_EXPR_LOGICAL_AND; break;
+        case 'O': node.op = BRCACHE_EXPR_LOGICAL_OR; break;
         case '&': node.op = BRCACHE_EXPR_AND; break;
         case '|': node.op = BRCACHE_EXPR_OR; break;
         case '^': node.op = BRCACHE_EXPR_XOR; break;
@@ -916,52 +918,96 @@ static bool binradar_parse_decimal_u32(const char **cursor, uint32_t *value)
     return true;
 }
 
+static bool binradar_parse_cwe_node(BinradarExprParser *parser,
+                                    uint32_t *index, uint32_t *stack_bytes)
+{
+    BinradarExprNode node = {0};
+    uint32_t value, width = 0;
+    const char *p = parser->cursor;
+    if (parser->depth++ >= BRCACHE_MAX_EXPR_DEPTH) goto invalid;
+    if (*p == 'A' || *p == 'O') {
+        node.op = *p == 'A' ? BRCACHE_EXPR_LOGICAL_AND :
+                             BRCACHE_EXPR_LOGICAL_OR;
+        parser->cursor = p + 1;
+        if (!binradar_parse_cwe_node(parser, &node.left, stack_bytes) ||
+            !binradar_parse_cwe_node(parser, &node.right, stack_bytes)) {
+            goto invalid;
+        }
+    } else {
+        if (*p++ != 'c' || (*p != '1' && *p != '2')) goto invalid;
+        node.op = *p++ == '1' ? BRCACHE_EXPR_POINTER : BRCACHE_EXPR_SIZE;
+        if (*p == 'p') {
+            p++;
+            node.cell_kind = BRCACHE_CELL_REGISTER;
+            if (!binradar_parse_decimal_u32(&p, &value) || value > 15) {
+                goto invalid;
+            }
+            node.cell_index = value;
+        } else if (*p == 's') {
+            p++;
+            if (!binradar_parse_decimal_u32(&p, &value) || *p != 'i') {
+                goto invalid;
+            }
+            p++;
+            switch (value) {
+            case 8: node.cell_kind = BRCACHE_CELL_STACK8; width = 1; break;
+            case 16: node.cell_kind = BRCACHE_CELL_STACK16; width = 2; break;
+            case 32: node.cell_kind = BRCACHE_CELL_STACK32; width = 4; break;
+            case 64: node.cell_kind = BRCACHE_CELL_STACK64; width = 8; break;
+            default: goto invalid;
+            }
+            if (!binradar_parse_decimal_u32(&p, &value) || value > 65535) {
+                goto invalid;
+            }
+            node.cell_index = value;
+            *stack_bytes = MAX(*stack_bytes, (value + 1u) * width);
+        } else {
+            goto invalid;
+        }
+        if (node.op == BRCACHE_EXPR_POINTER) {
+            if (width != 0 && width != 8) goto invalid;
+            node.scale = 1;
+        } else {
+            if (width == 8 || *p != 'q') goto invalid;
+            p++;
+            if (!binradar_parse_decimal_u32(&p, &value) ||
+                (value != 1 && value != 2 && value != 4 && value != 8)) {
+                goto invalid;
+            }
+            node.scale = value;
+        }
+        parser->cursor = p;
+    }
+    g_array_append_val(parser->nodes, node);
+    *index = parser->nodes->len - 1u;
+    parser->depth--;
+    return true;
+invalid:
+    parser->depth--;
+    return false;
+}
+
 static bool binradar_parse_cwe_predicate(BinradarCachePredicate *predicate,
                                          const char *descriptor)
 {
-    const char *p = descriptor;
-    uint32_t value;
-    if (p[0] != 'c' || (p[1] != '1' && p[1] != '2')) return false;
-    predicate->cwe_kind = (uint8_t)(p[1] - '0');
-    p += 2;
-    if (*p == 'p') {
-        p++;
-        predicate->cell_kind = BRCACHE_CELL_REGISTER;
-        if (!binradar_parse_decimal_u32(&p, &value) || value > 15) {
-            return false;
-        }
-        predicate->cell_index = value;
-    } else if (*p == 's') {
-        p++;
-        if (!binradar_parse_decimal_u32(&p, &value) || *p++ != 'i') {
-            return false;
-        }
-        switch (value) {
-        case 8: predicate->cell_kind = BRCACHE_CELL_STACK8; break;
-        case 16: predicate->cell_kind = BRCACHE_CELL_STACK16; break;
-        case 32: predicate->cell_kind = BRCACHE_CELL_STACK32; break;
-        case 64: predicate->cell_kind = BRCACHE_CELL_STACK64; break;
-        default: return false;
-        }
-        if (!binradar_parse_decimal_u32(&p, &predicate->cell_index)) {
-            return false;
-        }
-    } else {
+    BinradarExprParser parser = { .cursor = descriptor };
+    uint32_t stack_bytes = 0, root;
+    if (g_str_has_prefix(descriptor, "c3")) {
+        parser.cursor += 2;
+        if (*parser.cursor != 'A' && *parser.cursor != 'O') return false;
+    } else if (*descriptor != 'c') {
         return false;
     }
-    if (predicate->cwe_kind == 1) {
-        if (predicate->cell_kind != BRCACHE_CELL_REGISTER &&
-            predicate->cell_kind != BRCACHE_CELL_STACK64) return false;
-        predicate->scale = 1;
-    } else {
-        if (predicate->cell_kind == BRCACHE_CELL_STACK64 || *p++ != 'q' ||
-            !binradar_parse_decimal_u32(&p, &value) ||
-            (value != 1 && value != 2 && value != 4 && value != 8)) {
-            return false;
-        }
-        predicate->scale = (uint8_t)value;
+    parser.nodes = g_array_new(FALSE, FALSE, sizeof(BinradarExprNode));
+    if (!binradar_parse_cwe_node(&parser, &root, &stack_bytes) ||
+        *parser.cursor != '\0') {
+        g_array_free(parser.nodes, TRUE);
+        return false;
     }
-    return *p == '\0';
+    predicate->expr_nodes = parser.nodes;
+    predicate->expr_root = root;
+    predicate->stack_bytes = stack_bytes;
+    return true;
 }
 
 static bool binradar_qnum_positive_u32(QObject *obj, uint32_t *value)
@@ -1077,6 +1123,19 @@ out:
         log_msg("[binradar] [cache-manifest] [json-error %s]\n",
                 error_get_pretty(json_error));
         error_free(json_error);
+    }
+    if (!ok && manager->cache_predicates != NULL) {
+        uint32_t slots = MAX(manager->cache_predicate_count + 1u,
+                            manager->replay_mode ? 3u : 1u);
+        for (uint32_t i = 0; i < slots; i++) {
+            g_free(manager->cache_predicates[i].descriptor);
+            if (manager->cache_predicates[i].expr_nodes != NULL) {
+                g_array_free(manager->cache_predicates[i].expr_nodes, TRUE);
+            }
+        }
+        g_free(manager->cache_predicates);
+        manager->cache_predicates = NULL;
+        manager->cache_predicate_count = 0;
     }
     if (file_error != NULL) g_error_free(file_error);
     qobject_unref(root);
@@ -1266,14 +1325,23 @@ static bool binradar_eval_expr(const BinradarCachePredicate *predicate,
     if (!binradar_eval_expr(predicate, node->left, regs, &left, crashed)) {
         return false;
     }
+    if (*crashed) { *value = 0; return true; }
     if (node->op == BRCACHE_EXPR_NOT) {
         *value = ~left;
+        return true;
+    }
+    if ((node->op == BRCACHE_EXPR_LOGICAL_AND && left == 0) ||
+        (node->op == BRCACHE_EXPR_LOGICAL_OR && left != 0)) {
+        *value = left != 0;
         return true;
     }
     if (!binradar_eval_expr(predicate, node->right, regs, &right, crashed)) {
         return false;
     }
+    if (*crashed) { *value = 0; return true; }
     switch (node->op) {
+    case BRCACHE_EXPR_LOGICAL_AND:
+    case BRCACHE_EXPR_LOGICAL_OR: *value = right != 0; break;
     case BRCACHE_EXPR_EQ: *value = left == right; break;
     case BRCACHE_EXPR_NE: *value = left != right; break;
     case BRCACHE_EXPR_GT: *value = left > right; break;
@@ -1317,7 +1385,7 @@ typedef struct BinradarCacheClamp {
     uint64_t end;
 } BinradarCacheClamp;
 
-static bool binradar_cache_read_cell(const BinradarCachePredicate *predicate,
+static bool binradar_cache_read_cell(const BinradarExprNode *predicate,
                                      const uint64_t regs[16],
                                      const uint8_t *stack, size_t stack_size,
                                      uint64_t *value)
@@ -1334,6 +1402,47 @@ static bool binradar_cache_read_cell(const BinradarCachePredicate *predicate,
     if (offset > stack_size || width > stack_size - offset) return false;
     *value = 0;
     memcpy(value, stack + offset, width);
+    return true;
+}
+
+/* Values are cached only after a visited leaf loads successfully.  This
+ * scratch belongs to one hit, never to the immutable descriptor or capture. */
+static bool binradar_eval_cwe_node(
+        const BinradarCachePredicate *predicate, uint32_t index,
+        const uint64_t regs[16], const uint8_t *stack, size_t stack_size,
+        const BinradarCacheClamp *clamp, uint64_t *values, uint8_t *ready,
+        bool *safe, bool *crashed)
+{
+    const BinradarExprNode *node = &g_array_index(
+        predicate->expr_nodes, BinradarExprNode, index);
+    if (node->op == BRCACHE_EXPR_LOGICAL_AND ||
+        node->op == BRCACHE_EXPR_LOGICAL_OR) {
+        if (!binradar_eval_cwe_node(predicate, node->left, regs, stack,
+                stack_size, clamp, values, ready, safe, crashed)) return false;
+        if (*crashed ||
+            (node->op == BRCACHE_EXPR_LOGICAL_AND && !*safe) ||
+            (node->op == BRCACHE_EXPR_LOGICAL_OR && *safe)) return true;
+        return binradar_eval_cwe_node(predicate, node->right, regs, stack,
+                stack_size, clamp, values, ready, safe, crashed);
+    }
+    if (node->op != BRCACHE_EXPR_POINTER && node->op != BRCACHE_EXPR_SIZE) {
+        return false;
+    }
+    if (!ready[index]) {
+        if (!binradar_cache_read_cell(node, regs, stack, stack_size,
+                                      &values[index])) return false;
+        if (node->op == BRCACHE_EXPR_SIZE) {
+            if (values[index] > UINT64_MAX / node->scale) {
+                *crashed = true;
+                return true;
+            }
+            values[index] *= node->scale;
+        }
+        ready[index] = 1;
+    }
+    *safe = node->op == BRCACHE_EXPR_POINTER
+        ? values[index] >= clamp->begin && values[index] < clamp->end
+        : values[index] < clamp->end - clamp->begin;
     return true;
 }
 
@@ -1357,25 +1466,20 @@ static bool binradar_eval_cache_predicate(
         *branch = crashed ? 2 : value != 0;
         return true;
     }
-    uint64_t value;
-    if (clamps == NULL ||
-        !binradar_cache_read_cell(predicate, regs, stack, stack_size,
-                                  &value)) return false;
-    if (predicate->cwe_kind == 2) {
-        if (value > UINT64_MAX / predicate->scale) {
-            *branch = 2;
-            return true;
-        }
-        value *= predicate->scale;
-    }
+    if (clamps == NULL || predicate->expr_nodes == NULL ||
+        predicate->expr_nodes->len == 0 ||
+        predicate->stack_bytes > stack_size) return false;
+    /* Allocate only actual CWE node count, not a maximum generic arena. */
+    uint64_t values[predicate->expr_nodes->len];
+    uint8_t ready[predicate->expr_nodes->len];
+    memset(ready, 0, sizeof(ready));
     for (size_t i = 256; i-- > 0;) {
-        if (predicate->cwe_kind == 1) {
-            if (value >= clamps[i].begin && value < clamps[i].end) {
-                *branch = 0;
-                return true;
-            }
-        } else if (value < clamps[i].end - clamps[i].begin) {
-            *branch = 0;
+        bool safe = false, crashed = false;
+        if (!binradar_eval_cwe_node(predicate, predicate->expr_root, regs,
+                stack, stack_size, &clamps[i], values, ready, &safe,
+                &crashed)) return false;
+        if (crashed || safe) {
+            *branch = crashed ? 2 : 0;
             return true;
         }
     }
@@ -1574,13 +1678,8 @@ static bool binradar_replay_parse(BinradarManager *manager, uint32_t slot,
     parsed = manager->cache_family == BRCACHE_FAMILY_GENERIC
         ? binradar_parse_generic_predicate(predicate, descriptor)
         : binradar_parse_cwe_predicate(predicate, descriptor);
-    if (parsed && manager->cache_family == BRCACHE_FAMILY_CWE805 &&
-        predicate->cell_kind != BRCACHE_CELL_REGISTER) {
-        uint64_t width = predicate->cell_kind == BRCACHE_CELL_STACK8 ? 1 :
-            predicate->cell_kind == BRCACHE_CELL_STACK16 ? 2 :
-            predicate->cell_kind == BRCACHE_CELL_STACK32 ? 4 : 8;
-        parsed = ((uint64_t)predicate->cell_index + 1u) * width <=
-            manager->cache_stack_size;
+    if (parsed && manager->cache_family == BRCACHE_FAMILY_CWE805) {
+        parsed = predicate->stack_bytes <= manager->cache_stack_size;
     }
     if (!parsed) binradar_replay_predicate_clear(predicate);
     return parsed;
@@ -1598,8 +1697,15 @@ bool binradar_replay_descriptor(BinradarManager *manager, const char *descriptor
         manager->cache_predicate_count = BINRADAR_REPLAY_SLOT_COUNT - 1u;
     }
     /* Only slots 1 and 2 change; the reserved baseline slot stays zero. */
-    if (!binradar_replay_parse(manager, 2, descriptor)) return false;
-    return binradar_replay_parse(manager, 1, descriptor);
+    if (!binradar_replay_parse(manager, 2, descriptor)) {
+        binradar_replay_predicate_clear(&manager->cache_predicates[1]);
+        return false;
+    }
+    if (!binradar_replay_parse(manager, 1, descriptor)) {
+        binradar_replay_predicate_clear(&manager->cache_predicates[2]);
+        return false;
+    }
+    return true;
 }
 
 static bool binradar_replay_load_capture(BinradarManager *manager,

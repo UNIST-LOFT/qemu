@@ -513,19 +513,7 @@ void snapshot_init_binradar_patch_shm(uintptr_t key) {
                     ? binradar_manager->patch_list[i] : i + 1u;
                 BinradarCachePredicate *predicate =
                     &binradar_manager->cache_predicates[id];
-                uint64_t width;
-                switch (predicate->cell_kind) {
-                case BRCACHE_CELL_REGISTER: width = 0; break;
-                case BRCACHE_CELL_STACK8: width = 1; break;
-                case BRCACHE_CELL_STACK16: width = 2; break;
-                case BRCACHE_CELL_STACK32: width = 4; break;
-                case BRCACHE_CELL_STACK64: width = 8; break;
-                default: width = UINT64_MAX; break;
-                }
-                uint64_t bytes = width == UINT64_MAX ? UINT64_MAX :
-                    (width == 0 ? 0 :
-                     ((uint64_t)predicate->cell_index + 1u) * width);
-                required = MAX(required, bytes);
+                required = MAX(required, predicate->stack_bytes);
             }
             const char *stack_size = getenv("BRCACHE_STACK_SIZE");
             char *end = NULL;

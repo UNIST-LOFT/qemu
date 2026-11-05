@@ -3973,6 +3973,169 @@ static void test_feedback_rejects_malformed_brch(void)
     g_byte_array_free(manager.cache_bytes, TRUE);
 }
 
+/* Mirror a real BRCH branch label, rather than only checking parser admission. */
+static bool predicate_branch_matches(BinradarManager *manager,
+                                      const char *descriptor,
+                                      const uint64_t regs[16],
+                                      const uint64_t clamps[256][2],
+                                      int branch)
+{
+    BinradarSnapshotHeader header = {
+        .magic = BRCACHE_SNAPSHOT_MAGIC,
+        .version = BRCACHE_SNAPSHOT_VERSION,
+        .patch_id = 1,
+        .branch = branch,
+        .stack_size = manager->cache_family == BRCACHE_FAMILY_CWE805
+            ? manager->cache_stack_size : 0,
+        .flags = manager->cache_family == BRCACHE_FAMILY_CWE805
+            ? BRCACHE_FLAG_CWE805 : 0,
+    };
+    uint8_t stack[8] = {0};
+    GArray *vector = NULL;
+    if (!binradar_replay_descriptor(manager, descriptor)) return false;
+    g_byte_array_set_size(manager->cache_bytes, 0);
+    g_byte_array_append(manager->cache_bytes, (const uint8_t *)&header,
+                        sizeof(header));
+    if (header.flags != 0) {
+        g_byte_array_append(manager->cache_bytes, (const uint8_t *)clamps,
+                            256u * 2u * sizeof(uint64_t));
+    }
+    g_byte_array_append(manager->cache_bytes, (const uint8_t *)regs,
+                        16u * sizeof(uint64_t));
+    if (header.flags != 0) {
+        g_assert(manager->cache_stack_size <= sizeof(stack));
+        g_byte_array_append(manager->cache_bytes, stack,
+                            manager->cache_stack_size);
+    }
+    bool ok = binradar_cache_vector(manager, 1, 1, &vector) &&
+        vector->len == 1 && g_array_index(vector, int, 0) == branch;
+    if (vector != NULL) g_array_free(vector, TRUE);
+    return ok;
+}
+
+static void test_logical_predicate_native(void)
+{
+    BinradarManager manager = {
+        .replay_mode = true, .cache_family = BRCACHE_FAMILY_GENERIC,
+        .cache_stack_size = 8,
+    };
+    uint64_t regs[16] = {0};
+    uint64_t clamps[256][2] = {{0}};
+    manager.cache_predicates = g_new0(BinradarCachePredicate,
+                                      BINRADAR_REPLAY_SLOT_COUNT);
+    manager.selector = g_new0(BinradarPatchSelector, 1);
+    manager.cache_bytes = g_byte_array_new();
+    const struct { const char *descriptor; int branch; } generic[] = {
+        {"Ap0/p1p0", 0}, {"Op7/p1p0", 1},
+        {"A/p1p0p0", 2}, {"O/p1p0p1", 2},
+        {"&p0/p1p0", 2}, {"|p1/p1p0", 2},
+        {"=Op7p0p1", 1}, {"=Ap7n2p1", 1},
+        {"+Ap0/p1p0p2", 1}, {"OAp0/p1p0p1", 1},
+        {"On9223372036854775808p0", 1},
+    };
+    for (size_t i = 0; i < G_N_ELEMENTS(generic); i++) {
+        CHECK(predicate_branch_matches(&manager, generic[i].descriptor,
+                  regs, clamps, generic[i].branch),
+              "native generic logical branch agrees with BRCH label");
+    }
+    CHECK(!predicate_branch_matches(&manager, "Op1p0", regs, clamps, 0),
+          "native mirror rejects a wrong recorded logical branch");
+    const char *invalid_generic[] = {
+        "Ap0", "Op1v16", "Op1c1p0", "p18446744073709551616", "Ap0p1x",
+    };
+    for (size_t i = 0; i < G_N_ELEMENTS(invalid_generic); i++) {
+        CHECK(!binradar_replay_descriptor(&manager, invalid_generic[i]) &&
+                  manager.cache_predicates[2].expr_nodes == NULL,
+              "generic validation includes skipped operands and clears slot");
+    }
+    char depth[260];
+    memset(depth, '~', 255);
+    memcpy(depth + 255, "p0", 3);
+    CHECK(binradar_replay_descriptor(&manager, depth),
+          "generic root-one depth 256 is accepted");
+    memset(depth, '~', 256);
+    memcpy(depth + 256, "p0", 3);
+    CHECK(!binradar_replay_descriptor(&manager, depth),
+          "generic depth 257 is rejected");
+    char *long_descriptor = g_malloc0(BRCACHE_MAX_DESCRIPTOR + 2u);
+    memset(long_descriptor, '0', BRCACHE_MAX_DESCRIPTOR + 1u);
+    long_descriptor[0] = 'p';
+    long_descriptor[BRCACHE_MAX_DESCRIPTOR] = '\0';
+    CHECK(binradar_replay_descriptor(&manager, long_descriptor),
+          "descriptor length 4095 is accepted");
+    long_descriptor[BRCACHE_MAX_DESCRIPTOR] = '0';
+    CHECK(!binradar_replay_descriptor(&manager, long_descriptor),
+          "descriptor length 4096 is rejected");
+    g_free(long_descriptor);
+
+    manager.cache_family = BRCACHE_FAMILY_CWE805;
+    regs[0] = 150; regs[1] = 50; regs[2] = UINT64_MAX;
+    clamps[255][0] = 100; clamps[255][1] = 200;
+    CHECK(predicate_branch_matches(&manager, "c3Ac1p0c2p1q1", regs,
+              clamps, 0), "CWE conjunction uses the same safe clamp");
+    CHECK(predicate_branch_matches(&manager, "c3Oc1p0c2p2q8", regs,
+              clamps, 0), "CWE true LHS skips overflow on the first clamp");
+    CHECK(predicate_branch_matches(&manager, "c3Ac1p3c2p2q8", regs,
+              clamps, 1), "CWE false pointer skips every overflowing RHS");
+    CHECK(predicate_branch_matches(&manager, "c3Oc2p2q8c1p0", regs,
+              clamps, 2), "CWE visited overflow stays trapped before safe RHS");
+    clamps[255][0] = 0; clamps[255][1] = 10;
+    clamps[0][0] = 100; clamps[0][1] = 200;
+    CHECK(predicate_branch_matches(&manager, "c3Oc1p0c2p2q8", regs,
+              clamps, 2), "reverse clamp traversal cannot cancel prior trap");
+    regs[1] = 20;
+    CHECK(predicate_branch_matches(&manager, "c3Ac1p0c2p1q1", regs,
+              clamps, 0), "later same-clamp conjunction may still succeed");
+    clamps[0][1] = 110;
+    regs[0] = 105;
+    clamps[255][1] = 50;
+    CHECK(predicate_branch_matches(&manager, "c3Ac1p0c2p1q1", regs,
+              clamps, 1), "separate pointer and size witnesses are not combined");
+    clamps[255][0] = 100; clamps[255][1] = 200;
+    CHECK(predicate_branch_matches(&manager, "c3AOc1p0c2p2q8c2p2q8", regs,
+              clamps, 2), "nested skipped RHS preserves its following sibling");
+    const char *invalid_cwe[] = {
+        "p0", "c3c1p0", "Ac1p0c1p1", "c3Ac1p0", "c3Oc1p0p0",
+        "c3Oc1p0c2p16q1", "c3Oc1p0c2s8i65536q1",
+        "c3Oc1p0c1s32i0", "c3Oc1p0c2s64i0q1",
+        "c3Oc1p0c2s8i0q3", "c3Oc1p0c1s64i1",
+    };
+    for (size_t i = 0; i < G_N_ELEMENTS(invalid_cwe); i++) {
+        CHECK(!binradar_replay_descriptor(&manager, invalid_cwe[i]),
+              "CWE rejects malformed or uncaptured skipped leaf");
+    }
+    CHECK(binradar_replay_descriptor(&manager, "c3Oc1p0c1s64i0") &&
+              manager.cache_predicates[1].stack_bytes == 8,
+          "whole-tree extent includes a skipped last byte");
+    manager.cache_stack_size = 524288;
+    CHECK(binradar_replay_descriptor(&manager, "c1s64i65535") &&
+              manager.cache_predicates[1].stack_bytes == 524288,
+          "CWE maximum stack index is accepted with full extent");
+    manager.cache_stack_size--;
+    CHECK(!binradar_replay_descriptor(&manager, "c1s64i65535"),
+          "CWE maximum cell must fit its entire width");
+    manager.cache_stack_size = 8;
+    GString *tree = g_string_new("c3");
+    for (unsigned i = 0; i < 255; i++) g_string_append(tree, "Ac1p0");
+    g_string_append(tree, "c1p0");
+    CHECK(binradar_replay_descriptor(&manager, tree->str),
+          "CWE envelope does not count toward depth 256");
+    g_string_insert(tree, 2, "Ac1p0");
+    CHECK(!binradar_replay_descriptor(&manager, tree->str),
+          "CWE depth 257 is rejected");
+    g_string_free(tree, TRUE);
+    binradar_replay_release(&manager);
+    for (unsigned i = 0; i < BINRADAR_REPLAY_SLOT_COUNT; i++) {
+        g_free(manager.cache_predicates[i].descriptor);
+        if (manager.cache_predicates[i].expr_nodes != NULL) {
+            g_array_free(manager.cache_predicates[i].expr_nodes, TRUE);
+        }
+    }
+    g_free(manager.cache_predicates);
+    g_free(manager.selector);
+    g_byte_array_free(manager.cache_bytes, TRUE);
+}
+
 /* Drive the public replay cache API with immutable CWE captures.  Neutral
  * representatives must not pass through the CWE predicate grammar. */
 static void test_replay_cache_neutral_and_eligibility(void)
@@ -4060,6 +4223,20 @@ static void test_replay_cache_neutral_and_eligibility(void)
           "CWE neutral-vector hit returns the representative's real outcome");
     g_free(result.capture);
     result.capture = NULL;
+    CHECK(binradar_replay_lookup(&manager, 1, "c3Ac1p0c2p1q1", &result) &&
+              result.source == BINRADAR_REPLAY_SOURCE_CACHE &&
+              result.outcome == BINRADAR_REPLAY_OUTCOME_TARGET_CRASH,
+          "composite complete-vector parity reuses the real neutral outcome");
+    g_free(result.capture);
+    result.capture = NULL;
+    CHECK(binradar_replay_lookup(&manager, 1, "c3Ac1p0c2p1q1", &result),
+          "composite exact descriptor cache retains canonical identity");
+    g_free(result.capture);
+    result.capture = NULL;
+    CHECK(!binradar_replay_lookup(&manager, 1, "c3Oc1p0c2p2q8", &result),
+          "composite visited trap prevents resident outcome reuse");
+    CHECK(!binradar_replay_lookup(&manager, 2, "c3Ac1p0c2p1q1", &result),
+          "composite exact cache remains scoped to retained mutation");
     manager.poc_fault_valid = false;
     CHECK(!binradar_replay_lookup(&manager, 1, "c1p0", &result) &&
               !binradar_replay_lookup(&manager, 1, "c2p1q1", &result),
@@ -5841,6 +6018,7 @@ int main(void)
     test_symbolic_feedback_matches_applied_plan();
     test_feedback_requires_representative_child();
     test_feedback_rejects_malformed_brch();
+    test_logical_predicate_native();
     test_replay_cache_neutral_and_eligibility();
     test_symbolic_boundary_unsigned();
     test_symbolic_no_false_side();

@@ -60,6 +60,10 @@ typedef enum BinradarExprOp {
     BRCACHE_EXPR_XOR,
     BRCACHE_EXPR_SHL,
     BRCACHE_EXPR_SHR,
+    BRCACHE_EXPR_LOGICAL_AND,
+    BRCACHE_EXPR_LOGICAL_OR,
+    BRCACHE_EXPR_POINTER,
+    BRCACHE_EXPR_SIZE,
 } BinradarExprOp;
 
 typedef struct BinradarExprNode {
@@ -68,6 +72,9 @@ typedef struct BinradarExprNode {
     uint32_t right;
     uint16_t variable;
     int64_t literal;
+    uint8_t cell_kind;
+    uint8_t scale;
+    uint16_t cell_index;
 } BinradarExprNode;
 
 typedef enum BinradarCacheCellKind {
@@ -82,10 +89,7 @@ typedef struct BinradarCachePredicate {
     char *descriptor;
     GArray *expr_nodes;
     uint32_t expr_root;
-    uint8_t cwe_kind;
-    BinradarCacheCellKind cell_kind;
-    uint32_t cell_index;
-    uint8_t scale;
+    uint32_t stack_bytes;
 } BinradarCachePredicate;
 
 typedef struct BinradarPatchSelector {
