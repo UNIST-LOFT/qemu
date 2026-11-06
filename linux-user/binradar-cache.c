@@ -1716,9 +1716,9 @@ static bool binradar_replay_load_capture(BinradarManager *manager,
     int fd;
     if (manager == NULL || manager->cache_bytes == NULL || path == NULL)
         return false;
-    fd = open(path, O_RDONLY);
+    fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
     if (fd < 0) return false;
-    if (fstat(fd, &info) != 0 || info.st_size <= 0 ||
+    if (fstat(fd, &info) != 0 || !S_ISREG(info.st_mode) || info.st_size <= 0 ||
         (uint64_t)info.st_size > BRCACHE_MAX_CAPTURE_BYTES) {
         close(fd);
         return false;
@@ -1843,12 +1843,28 @@ bool binradar_replay_register_capture(BinradarManager *manager,
         outcome == BINRADAR_REPLAY_OUTCOME_UNAVAILABLE) {
         return true;
     }
+    char *owned_path = binradar_replay_capture_path(manager, mutation);
+    if (owned_path == NULL ||
+        g_mkdir_with_parents(getenv("BINRADAR_REPLAY_DIR"), 0700) != 0) {
+        g_free(owned_path);
+        return false;
+    }
+    int fd = open(owned_path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    bool written = fd >= 0 &&
+        binradar_cache_write_exact(fd, manager->cache_bytes->data,
+                                   manager->cache_bytes->len) == 0;
+    if (fd >= 0 && close(fd) != 0) written = false;
+    if (!written) {
+        if (fd >= 0) unlink(owned_path);
+        g_free(owned_path);
+        return false;
+    }
     binradar_replay_ensure_owned(manager);
     record = g_new0(BinradarReplayRecord, 1);
     record->mutation = mutation;
     record->selected = 0;
     record->descriptor = g_strdup("p0");
-    record->path = g_strdup(path);
+    record->path = owned_path;
     /* The representative outcome is the real observation of the child that
      * produced this capture; a mutated patch-zero run may itself crash. */
     record->outcome = outcome;
@@ -1857,6 +1873,24 @@ bool binradar_replay_register_capture(BinradarManager *manager,
     log_msg("[replay] [retain] [mutation %u] [retained %u]\n", mutation,
             manager->retained_mutations);
     return true;
+}
+
+static void binradar_replay_result(BinradarManager *manager,
+                                    const BinradarReplayRecord *record,
+                                    BinradarReplaySource source,
+                                    const char *reuse,
+                                    BinradarReplayResult *result)
+{
+    char *digest = g_compute_checksum_for_data(G_CHECKSUM_SHA256,
+        manager->cache_bytes->data, manager->cache_bytes->len);
+    result->source = source;
+    result->outcome = record->outcome;
+    result->capture = g_strdup(record->path);
+    result->descriptor = record->descriptor;
+    result->selected = record->selected;
+    result->reuse = reuse;
+    g_strlcpy(result->sha256, digest, sizeof(result->sha256));
+    g_free(digest);
 }
 
 bool binradar_replay_lookup(BinradarManager *manager, uint32_t mutation,
@@ -1876,9 +1910,16 @@ bool binradar_replay_lookup(BinradarManager *manager, uint32_t mutation,
     exact = g_hash_table_lookup(manager->replay_exact, key);
     g_free(key);
     if (exact != NULL) {
-        result->source = BINRADAR_REPLAY_SOURCE_CACHE;
-        result->outcome = exact->outcome;
-        result->capture = g_strdup(exact->path);
+        GArray *vector = NULL;
+        if (!binradar_replay_load_capture(manager, exact->path) ||
+            !binradar_replay_evaluate(manager, exact->selected,
+                                      exact->descriptor, 2, true, &vector)) {
+            return false;
+        }
+        g_array_free(vector, TRUE);
+        binradar_replay_result(manager, exact, BINRADAR_REPLAY_SOURCE_CACHE,
+                               "exact-descriptor", result);
+        binradar_cache_reset_child(manager);
         return true;
     }
     /* Canonical lowering does not promise algebraic equivalence, so compare
@@ -1912,15 +1953,15 @@ bool binradar_replay_lookup(BinradarManager *manager, uint32_t mutation,
             break;
         }
     }
+    if (fallback != NULL) {
+        g_hash_table_insert(manager->replay_exact,
+                            g_strdup_printf("%u:%s", mutation, descriptor),
+                            fallback);
+        binradar_replay_result(manager, fallback, BINRADAR_REPLAY_SOURCE_CACHE,
+                               "full-vector-equivalent", result);
+    }
     binradar_cache_reset_child(manager);
-    if (fallback == NULL) return false;
-    g_hash_table_insert(manager->replay_exact,
-                        g_strdup_printf("%u:%s", mutation, descriptor),
-                        fallback);
-    result->source = BINRADAR_REPLAY_SOURCE_CACHE;
-    result->outcome = fallback->outcome;
-    result->capture = g_strdup(fallback->path);
-    return true;
+    return fallback != NULL;
 }
 
 bool binradar_replay_admit(BinradarManager *manager, uint32_t mutation,
@@ -2006,9 +2047,8 @@ bool binradar_replay_admit(BinradarManager *manager, uint32_t mutation,
                         g_strdup_printf("%u:%s", mutation, descriptor),
                         record);
     manager->retained_mutations = manager->replay_records->len;
-    result->source = BINRADAR_REPLAY_SOURCE_EXECUTED;
-    result->outcome = record->outcome;
-    result->capture = g_strdup(record->path);
+    binradar_replay_result(manager, record, BINRADAR_REPLAY_SOURCE_EXECUTED,
+                           "fresh", result);
     return true;
 }
 

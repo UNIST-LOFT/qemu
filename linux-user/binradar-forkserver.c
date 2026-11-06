@@ -227,7 +227,7 @@ bool binradar_forkserver_send_replay_case(BinradarForkserverDriver *driver,
                                           uint32_t reason, const char *text)
 {
     const size_t length = text != NULL ? strlen(text) : 0;
-    if (driver == NULL || length > BRCACHE_MAX_DESCRIPTOR + 256u) return false;
+    if (driver == NULL || length > BINRADAR_REPLAY_CASE_TEXT_MAX) return false;
     uint32_t header[6] = {BINRADAR_REPLAY_REPLY_CASE, driver->request_id, source, outcome,
                           reason, (uint32_t)length};
     return binradar_forkserver_write_exact(driver->status_fd, header,

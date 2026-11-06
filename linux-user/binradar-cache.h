@@ -192,6 +192,11 @@ typedef struct BinradarReplayResult {
     BinradarReplayReason reason;
     /* Owned absolute capture path, or NULL when nothing was retained. */
     char *capture;
+    /* Borrowed immutable representative identity; never relabel on reuse. */
+    const char *descriptor;
+    const char *reuse;
+    uint32_t selected;
+    char sha256[65];
 } BinradarReplayResult;
 
 bool binradar_replay_descriptor(BinradarManager *manager, const char *descriptor);
@@ -208,8 +213,8 @@ bool binradar_replay_admit(BinradarManager *manager, uint32_t mutation,
                            BinradarReplayResult *result);
 /* Validate a committed generation patch-zero capture, registering it as a
  * representative only when reusable and the immutable oracle is available.
- * A valid but ineligible capture still returns true. The file remains
- * authoritative; no BRCH bytes are copied here. */
+ * A valid but ineligible capture still returns true. Eligible captures are
+ * copied into the private replay directory before becoming representatives. */
 bool binradar_replay_register_capture(BinradarManager *manager,
                                      uint32_t mutation, const char *path,
                                      BinradarReplayOutcome outcome,

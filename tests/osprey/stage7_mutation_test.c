@@ -4154,10 +4154,13 @@ static void test_replay_cache_neutral_and_eligibility(void)
         .fault_addr = 0x1234,
     };
     char *directory = g_dir_make_tmp("binradar-replay-cache-XXXXXX", NULL);
+    char *saved_replay_dir = g_strdup(getenv("BINRADAR_REPLAY_DIR"));
+    char *representative_path = NULL;
     char *path;
 
     CHECK(directory != NULL, "replay cache creates a private capture directory");
     if (directory == NULL) return;
+    g_setenv("BINRADAR_REPLAY_DIR", directory, TRUE);
     path = g_build_filename(directory, "neutral.brch", NULL);
     manager.replay_mode = true;
     manager.cache_family = BRCACHE_FAMILY_CWE805;
@@ -4219,8 +4222,13 @@ static void test_replay_cache_neutral_and_eligibility(void)
     CHECK(binradar_replay_lookup(&manager, 1, "c1p0", &result) &&
               result.source == BINRADAR_REPLAY_SOURCE_CACHE &&
               result.outcome == BINRADAR_REPLAY_OUTCOME_TARGET_CRASH &&
-              g_strcmp0(result.capture, path) == 0,
-          "CWE neutral-vector hit returns the representative's real outcome");
+              result.selected == 0 && g_strcmp0(result.descriptor, "p0") == 0 &&
+              g_strcmp0(result.reuse, "full-vector-equivalent") == 0 &&
+              strlen(result.sha256) == 64 &&
+              g_str_has_prefix(result.capture, directory) &&
+              g_strcmp0(result.capture, path) != 0,
+          "CWE vector hit preserves the owned representative and selector");
+    representative_path = g_strdup(result.capture);
     g_free(result.capture);
     result.capture = NULL;
     CHECK(binradar_replay_lookup(&manager, 1, "c3Ac1p0c2p1q1", &result) &&
@@ -4229,8 +4237,11 @@ static void test_replay_cache_neutral_and_eligibility(void)
           "composite complete-vector parity reuses the real neutral outcome");
     g_free(result.capture);
     result.capture = NULL;
-    CHECK(binradar_replay_lookup(&manager, 1, "c3Ac1p0c2p1q1", &result),
-          "composite exact descriptor cache retains canonical identity");
+    CHECK(binradar_replay_lookup(&manager, 1, "c3Ac1p0c2p1q1", &result) &&
+              result.selected == 0 && g_strcmp0(result.descriptor, "p0") == 0 &&
+              g_strcmp0(result.capture, representative_path) == 0 &&
+              g_strcmp0(result.reuse, "exact-descriptor") == 0,
+          "composite exact hit retains original representative identity");
     g_free(result.capture);
     result.capture = NULL;
     CHECK(!binradar_replay_lookup(&manager, 1, "c3Oc1p0c2p2q8", &result),
@@ -4246,7 +4257,7 @@ static void test_replay_cache_neutral_and_eligibility(void)
           "a trapping CWE candidate cannot reuse the neutral outcome");
     /* Use an uncached descriptor to make the second record decisive. */
     captures[1].regs[1] = 150;
-    CHECK(g_file_set_contents(path, (const char *)captures, sizeof(captures),
+    CHECK(g_file_set_contents(representative_path, (const char *)captures, sizeof(captures),
                               NULL) &&
               !binradar_replay_lookup(&manager, 1, "c2p1q1", &result),
           "matching the first branch does not hide a later vector mismatch");
@@ -4262,8 +4273,16 @@ static void test_replay_cache_neutral_and_eligibility(void)
     g_byte_array_free(manager.cache_bytes, TRUE);
     unlink(path);
     g_free(path);
+    unlink(representative_path);
+    g_free(representative_path);
     rmdir(directory);
     g_free(directory);
+    if (saved_replay_dir != NULL) {
+        g_setenv("BINRADAR_REPLAY_DIR", saved_replay_dir, TRUE);
+    } else {
+        g_unsetenv("BINRADAR_REPLAY_DIR");
+    }
+    g_free(saved_replay_dir);
 }
 
 /* The canonical case: a 4-byte symbolic read compared against a constant with

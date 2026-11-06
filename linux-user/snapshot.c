@@ -5196,20 +5196,51 @@ static void snapshot_replay_commit_plan(
     g_free(capture);
 }
 
+/* JSON quoting for trusted filesystem paths as well as ASCII descriptors. */
+static char *snapshot_replay_quote(const char *value)
+{
+    GString *quoted = g_string_new("\"");
+    for (const unsigned char *p = (const unsigned char *)value; *p; p++) {
+        if (*p == '"' || *p == '\\') {
+            g_string_append_c(quoted, '\\');
+            g_string_append_c(quoted, *p);
+        } else if (*p < 0x20) {
+            g_string_append_printf(quoted, "\\u%04x", *p);
+        } else {
+            g_string_append_c(quoted, *p);
+        }
+    }
+    g_string_append_c(quoted, '"');
+    return g_string_free(quoted, FALSE);
+}
+
 static void snapshot_replay_case_reply(BinradarForkserverDriver *driver,
                                        uint32_t mutation, uint32_t source,
                                        BinradarReplayOutcome outcome,
-                                       BinradarReplayReason reason)
+                                       BinradarReplayReason reason,
+                                       const BinradarReplayResult *result)
 {
     log_msg("[replay] [case] [mutation %u] [source %s] [outcome %s] "
             "[reason %s]\n", mutation,
             source == BINRADAR_REPLAY_SOURCE_CACHE ? "cache" : "executed",
             binradar_replay_outcome_name(outcome),
             binradar_replay_reason_name(reason));
+    char *capture = g_strdup("null");
+    if (result != NULL && result->capture != NULL) {
+        char *path = snapshot_replay_quote(result->capture);
+        char *descriptor = snapshot_replay_quote(result->descriptor);
+        g_free(capture);
+        capture = g_strdup_printf(
+            "{\"mutation\":%u,\"path\":%s,\"sha256\":\"%s\","
+            "\"descriptor\":%s,\"patch_id\":%u,\"reuse\":\"%s\"}",
+            mutation, path, result->sha256, descriptor, result->selected,
+            result->reuse);
+        g_free(path);
+        g_free(descriptor);
+    }
     char *text = g_strdup_printf(
-        "{\"mutation\":%u,\"outcome\":\"%s\",\"reason\":\"%s\"}",
-        mutation, binradar_replay_outcome_name(outcome),
-        binradar_replay_reason_name(reason));
+        "{\"mutation\":%u,\"capture\":%s}", mutation, capture);
+    g_free(capture);
     if (!binradar_forkserver_send_replay_case(driver, source, (uint32_t)outcome,
                                               (uint32_t)reason, text)) {
         g_free(text);
@@ -5233,28 +5264,28 @@ static bool snapshot_replay_case(BinradarForkserverDriver *driver,
         snapshot_replay_case_reply(driver, mutation,
             BINRADAR_REPLAY_SOURCE_EXECUTED,
             BINRADAR_REPLAY_OUTCOME_UNAVAILABLE,
-            BINRADAR_REPLAY_REASON_UNKNOWN_MUTATION);
+            BINRADAR_REPLAY_REASON_UNKNOWN_MUTATION, NULL);
         return false;
     }
     if (!binradar_replay_descriptor(manager, descriptor)) {
         snapshot_replay_case_reply(driver, mutation,
             BINRADAR_REPLAY_SOURCE_EXECUTED,
             BINRADAR_REPLAY_OUTCOME_UNAVAILABLE,
-            BINRADAR_REPLAY_REASON_INVALID_DESCRIPTOR);
+            BINRADAR_REPLAY_REASON_INVALID_DESCRIPTOR, NULL);
         return false;
     }
     if (retained->external_unsupported || !snapshot_replay_restore_inputs()) {
         snapshot_replay_case_reply(driver, mutation,
             BINRADAR_REPLAY_SOURCE_EXECUTED,
             BINRADAR_REPLAY_OUTCOME_UNAVAILABLE,
-            BINRADAR_REPLAY_REASON_UNSUPPORTED_EXTERNAL_STATE);
+            BINRADAR_REPLAY_REASON_UNSUPPORTED_EXTERNAL_STATE, NULL);
         return false;
     }
     if (binradar_replay_lookup(manager, mutation, descriptor, &result)) {
-        g_free(result.capture);
         snapshot_replay_case_reply(driver, mutation,
             BINRADAR_REPLAY_SOURCE_CACHE, result.outcome,
-            BINRADAR_REPLAY_REASON_NONE);
+            BINRADAR_REPLAY_REASON_NONE, &result);
+        g_free(result.capture);
         return false;
     }
     /* One child owns the selector and both capture channels. */
@@ -5307,15 +5338,15 @@ static bool snapshot_replay_case(BinradarForkserverDriver *driver,
         binradar_cache_record_outcome(manager, 1, outcome);
         if (binradar_replay_admit(manager, mutation, 1, descriptor, outcome,
                                   &result)) {
-            g_free(result.capture);
             snapshot_replay_case_reply(driver, mutation,
                 BINRADAR_REPLAY_SOURCE_EXECUTED, result.outcome,
-                BINRADAR_REPLAY_REASON_NONE);
+                BINRADAR_REPLAY_REASON_NONE, &result);
+            g_free(result.capture);
         } else {
             snapshot_replay_case_reply(driver, mutation,
                 BINRADAR_REPLAY_SOURCE_EXECUTED,
                 BINRADAR_REPLAY_OUTCOME_UNAVAILABLE,
-                BINRADAR_REPLAY_REASON_INCOMPLETE_OBSERVATION);
+                BINRADAR_REPLAY_REASON_INCOMPLETE_OBSERVATION, NULL);
         }
     } else {
         BinradarReplayReason reason = external
@@ -5325,7 +5356,7 @@ static bool snapshot_replay_case(BinradarForkserverDriver *driver,
             : BINRADAR_REPLAY_REASON_INCOMPLETE_OBSERVATION;
         snapshot_replay_case_reply(driver, mutation,
             BINRADAR_REPLAY_SOURCE_EXECUTED,
-            BINRADAR_REPLAY_OUTCOME_UNAVAILABLE, reason);
+            BINRADAR_REPLAY_OUTCOME_UNAVAILABLE, reason, NULL);
     }
     /* Reset transient shared state, never the retained plans or their
      * admitted captures. */
