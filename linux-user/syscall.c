@@ -9270,6 +9270,10 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
     case TARGET_NR_fstat:
         {
             ret = get_errno(fstat(arg1, &st));
+#ifdef SYMBOLIC_INSTRUMENTATION
+            if (!is_error(ret))
+                snapshot_replay_project_stat((int)arg1, &st);
+#endif
 #if defined(TARGET_NR_stat) || defined(TARGET_NR_lstat)
         do_stat:
 #endif
@@ -10488,8 +10492,12 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
 #ifdef TARGET_NR_fstat64
     case TARGET_NR_fstat64:
         ret = get_errno(fstat(arg1, &st));
-        if (!is_error(ret))
+        if (!is_error(ret)) {
+#ifdef SYMBOLIC_INSTRUMENTATION
+            snapshot_replay_project_stat((int)arg1, &st);
+#endif
             ret = host_to_target_stat64(cpu_env, arg2, &st);
+        }
         return ret;
 #endif
 #if (defined(TARGET_NR_fstatat64) || defined(TARGET_NR_newfstatat))

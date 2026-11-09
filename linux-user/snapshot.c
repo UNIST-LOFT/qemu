@@ -26,6 +26,7 @@
 #include <stdint.h>
 #include <inttypes.h>
 #include <limits.h>
+#include <sys/sysmacros.h>
 
 #define SNAPSHOT_BT_DEPTH 64
 // #define SNAPSHOT_DEBUG
@@ -195,8 +196,12 @@ static GArray *snapshot_replay_plans;
 static GHashTable *snapshot_guest_fds;
 typedef struct SnapshotReplayInput {
     int fd;
+    int flags;
+    int fd_flags;
     off_t offset;
     struct stat identity;
+    bool null_device;
+    bool invalidated;
 } SnapshotReplayInput;
 static GArray *snapshot_replay_inputs;
 static uint32_t *snapshot_replay_external;
@@ -2587,6 +2592,72 @@ void snapshot_replay_mark_external(void)
     }
 }
 
+static SnapshotReplayInput *snapshot_replay_input(int fd)
+{
+    if (snapshot_replay_inputs != NULL) {
+        for (guint i = 0; i < snapshot_replay_inputs->len; i++) {
+            SnapshotReplayInput *input = &g_array_index(
+                snapshot_replay_inputs, SnapshotReplayInput, i);
+            if (input->fd == fd) return input;
+        }
+    }
+    return NULL;
+}
+
+/* atime may advance when an immutable input is read.  All other observable
+ * stat fields still describe the binding/content that the snapshot audited. */
+static bool snapshot_replay_same_stat(const struct stat *a, const struct stat *b)
+{
+    return a->st_dev == b->st_dev && a->st_ino == b->st_ino &&
+        a->st_mode == b->st_mode && a->st_nlink == b->st_nlink &&
+        a->st_uid == b->st_uid && a->st_gid == b->st_gid &&
+        a->st_rdev == b->st_rdev && a->st_size == b->st_size &&
+        a->st_blksize == b->st_blksize && a->st_blocks == b->st_blocks &&
+        a->st_mtim.tv_sec == b->st_mtim.tv_sec &&
+        a->st_mtim.tv_nsec == b->st_mtim.tv_nsec &&
+        a->st_ctim.tv_sec == b->st_ctim.tv_sec &&
+        a->st_ctim.tv_nsec == b->st_ctim.tv_nsec;
+}
+
+static const char *snapshot_replay_input_invalid(SnapshotReplayInput *input,
+                                                const struct stat *observed)
+{
+    struct stat now;
+    const char *reason = NULL;
+    int saved_errno = errno;
+    if (input == NULL) return "unaudited-fd";
+    if (input->invalidated) return "fd-rebound-or-flags-changed";
+    if (fcntl(input->fd, F_GETFL) != input->flags ||
+        fcntl(input->fd, F_GETFD) != input->fd_flags) {
+        reason = "fd-flags-changed";
+    } else if (observed == NULL && fstat(input->fd, &now) != 0) {
+        reason = "fd-stat-failed";
+    } else if (!snapshot_replay_same_stat(observed ? observed : &now,
+                                          &input->identity)) {
+        reason = "fd-binding-or-content-changed";
+    }
+    errno = saved_errno;
+    return reason;
+}
+
+/* Explicit resident metadata snapshot, not a fabricated syscall result.  The
+ * caller has already performed a real successful fstat.  Preserve the normal
+ * target conversion, guest-pointer checks, return value and provenance path. */
+void snapshot_replay_project_stat(int fd, struct stat *st)
+{
+    if (!afl_fork_child || !snapshot_replay_active ||
+        snapshot_replay_external == NULL) return;
+    SnapshotReplayInput *input = snapshot_replay_input(fd);
+    if (snapshot_replay_input_invalid(input, st) == NULL)
+        *st = input->identity;
+}
+
+static void snapshot_replay_invalidate_fd(int fd)
+{
+    SnapshotReplayInput *input = snapshot_replay_input(fd);
+    if (input != NULL) input->invalidated = true;
+}
+
 // Syscall Hook
 static target_ulong last_brk_end;  /* previous brk end (for shrink detection) */
 void snapshot_syscall(CPUArchState *env, uintptr_t syscall_no,
@@ -2597,49 +2668,112 @@ void snapshot_syscall(CPUArchState *env, uintptr_t syscall_no,
     if (g_strcmp0(getenv("BINRADAR_REPLAY_SERVER"), "1") == 0) {
         if (snapshot_guest_fds == NULL)
             snapshot_guest_fds = g_hash_table_new(g_direct_hash, g_direct_equal);
-        if (!afl_fork_child &&
+        abi_long result = (abi_long)ret_val;
+        /* Linux fd arguments are signed int, including on a 64-bit ABI. */
+        int fd = (int32_t)(uint32_t)syscall_arg0;
+        bool fcntl_call = syscall_no == TARGET_NR_fcntl;
+#ifdef TARGET_NR_fcntl64
+        fcntl_call |= syscall_no == TARGET_NR_fcntl64;
+#endif
+        if (!afl_fork_child && result >= 0 &&
             ((syscall_no == TARGET_NR_mmap && (syscall_arg3 & MAP_SHARED)) ||
              syscall_no == TARGET_NR_clone || syscall_no == TARGET_NR_fork ||
              syscall_no == TARGET_NR_vfork))
             snapshot_replay_boundary_unsupported = true;
         if ((syscall_no == TARGET_NR_open || syscall_no == TARGET_NR_openat ||
              syscall_no == TARGET_NR_dup || syscall_no == TARGET_NR_dup2 ||
-             syscall_no == TARGET_NR_dup3) && (long)ret_val >= 0)
-            g_hash_table_add(snapshot_guest_fds, GINT_TO_POINTER((int)ret_val));
-        if (syscall_no == TARGET_NR_close && (long)ret_val == 0)
-            g_hash_table_remove(snapshot_guest_fds, GINT_TO_POINTER((int)syscall_arg0));
+             syscall_no == TARGET_NR_dup3 ||
+             (fcntl_call && ((int)syscall_arg1 == TARGET_F_DUPFD ||
+                            (int)syscall_arg1 == TARGET_F_DUPFD_CLOEXEC))) &&
+            result >= 0) {
+            g_hash_table_add(snapshot_guest_fds, GINT_TO_POINTER((int)result));
+            /* Never grant an inherited capability to a replacement binding.
+             * dup2(fd, fd) is the one successful duplication with no rebind. */
+            if (syscall_no != TARGET_NR_dup2 || fd != (int)result)
+                snapshot_replay_invalidate_fd((int)result);
+        }
+        if (syscall_no == TARGET_NR_close && result == 0) {
+            g_hash_table_remove(snapshot_guest_fds, GINT_TO_POINTER(fd));
+            snapshot_replay_invalidate_fd(fd);
+        }
+        if (fcntl_call && result >= 0 &&
+            ((int)syscall_arg1 == TARGET_F_SETFL ||
+             (int)syscall_arg1 == TARGET_F_SETFD))
+            snapshot_replay_invalidate_fd(fd);
         /* A replay child may only repeat work whose observable effect is
          * local to this fork.  Anything it cannot isolate marks the case
          * unavailable instead of returning an unrepeatable result. */
         if (afl_fork_child && snapshot_replay_active &&
             snapshot_replay_external != NULL) {
             bool supported = true;
+            const char *reason = "unsupported-syscall-family";
+            SnapshotReplayInput *input;
             switch (syscall_no) {
             case TARGET_NR_read: case TARGET_NR_pread64:
-            case TARGET_NR_readv: case TARGET_NR_preadv: {
-                /* Only inputs whose identity and initial offset the parent
-                 * audited can be restored.  A newly opened regular file is
-                 * not made immutable merely by opening it read-only. */
-                supported = false;
-                for (guint i = 0; i < snapshot_replay_inputs->len; i++) {
-                    SnapshotReplayInput *input = &g_array_index(
-                        snapshot_replay_inputs, SnapshotReplayInput, i);
-                    if (input->fd == (int)syscall_arg0) {
-                        supported = true;
-                        break;
-                    }
+            case TARGET_NR_readv: case TARGET_NR_preadv:
+                if (fd < 0 && result == -TARGET_EBADF) break;
+                input = snapshot_replay_input(fd);
+                reason = snapshot_replay_input_invalid(input, NULL);
+                supported = reason == NULL;
+                if (supported && (input->flags & O_ACCMODE) == O_WRONLY) {
+                    supported = result == -TARGET_EBADF;
+                    reason = "read-on-write-only-fd";
                 }
                 break;
-            }
             case TARGET_NR_write: case TARGET_NR_writev:
-                /* Captured channels and the inherited standard streams are
-                 * the only writes whose repetition is harmless. */
-                supported = syscall_arg0 == 1 || syscall_arg0 == 2 ||
-                    (getenv("PATCH_FD") != NULL &&
-                     syscall_arg0 == (uintptr_t)atoi(getenv("PATCH_FD"))) ||
-                    (getenv("PATCH_CACHED_FD") != NULL &&
-                     syscall_arg0 ==
-                         (uintptr_t)atoi(getenv("PATCH_CACHED_FD")));
+            case TARGET_NR_pwrite64:
+#ifdef TARGET_NR_pwritev
+            case TARGET_NR_pwritev:
+#endif
+                if (fd < 0 && result == -TARGET_EBADF) break;
+                /* Preserve the existing captured-channel write exception;
+                 * it does not confer metadata or input capabilities. */
+                if ((syscall_no == TARGET_NR_write ||
+                     syscall_no == TARGET_NR_writev) &&
+                    (fd == 1 || fd == 2 ||
+                     (getenv("PATCH_FD") != NULL &&
+                      fd == atoi(getenv("PATCH_FD"))) ||
+                     (getenv("PATCH_CACHED_FD") != NULL &&
+                      fd == atoi(getenv("PATCH_CACHED_FD"))))) break;
+                input = snapshot_replay_input(fd);
+                reason = snapshot_replay_input_invalid(input, NULL);
+                supported = reason == NULL;
+                if (supported && (input->flags & O_ACCMODE) == O_RDONLY) {
+                    supported = result == -TARGET_EBADF;
+                    reason = "write-on-read-only-fd";
+                } else if (supported && !input->null_device) {
+                    supported = false;
+                    reason = "write-to-mutable-fd";
+                }
+                break;
+            case TARGET_NR_fstat:
+#ifdef TARGET_NR_fstat64
+            case TARGET_NR_fstat64:
+#endif
+                if (fd < 0 && result == -TARGET_EBADF) break;
+                reason = snapshot_replay_input_invalid(
+                    snapshot_replay_input(fd), NULL);
+                supported = reason == NULL && result == 0;
+                if (reason == NULL && result != 0)
+                    reason = "stat-result-not-success";
+                break;
+            case TARGET_NR_lseek:
+                if (fd < 0 && result == -TARGET_EBADF) break;
+                reason = snapshot_replay_input_invalid(
+                    snapshot_replay_input(fd), NULL);
+                supported = reason == NULL;
+                break;
+            case TARGET_NR_ioctl:
+                if (fd < 0 && result == -TARGET_EBADF) break;
+                input = snapshot_replay_input(fd);
+                reason = snapshot_replay_input_invalid(input, NULL);
+                supported = reason == NULL;
+                if (supported) {
+                    supported = input->null_device &&
+                        (uint32_t)syscall_arg1 == TARGET_TCGETS &&
+                        result == -TARGET_ENOTTY;
+                    reason = "ioctl-not-null-tcgets-enotty";
+                }
                 break;
             case TARGET_NR_mmap:
                 supported = (syscall_arg3 & MAP_ANONYMOUS) &&
@@ -2649,7 +2783,7 @@ void snapshot_syscall(CPUArchState *env, uintptr_t syscall_no,
              * and process-identity queries deliberately fall through to the
              * unsupported default: an old branch vector cannot establish the
              * determinism of a child that has not executed yet. */
-            case TARGET_NR_close: case TARGET_NR_lseek:
+            case TARGET_NR_close:
             case TARGET_NR_brk: case TARGET_NR_munmap: case TARGET_NR_mprotect:
             case TARGET_NR_mremap: case TARGET_NR_madvise:
             case TARGET_NR_rt_sigaction: case TARGET_NR_rt_sigprocmask:
@@ -2663,8 +2797,16 @@ void snapshot_syscall(CPUArchState *env, uintptr_t syscall_no,
                 break;
             }
             if (!supported) {
-                log_msg("[replay] [unsupported-syscall] [nr %lu] [arg0 %lx]\n",
-                        (unsigned long)syscall_no, (unsigned long)syscall_arg0);
+                log_msg("[replay] [unsupported-syscall] [nr %lu] "
+                        "[arg0 %lx] [arg1 %lx] [arg2 %lx] [arg3 %lx] "
+                        "[arg4 %lx] [arg5 %lx] [ret %lld] [errno %lld] "
+                        "[reason %s]\n",
+                        (unsigned long)syscall_no, (unsigned long)syscall_arg0,
+                        (unsigned long)syscall_arg1, (unsigned long)syscall_arg2,
+                        (unsigned long)syscall_arg3, (unsigned long)syscall_arg4,
+                        (unsigned long)syscall_arg5, (long long)result,
+                        result < 0 && result >= -4095 ? -(long long)result : 0,
+                        reason != NULL ? reason : "unsupported-fd-operation");
                 __atomic_store_n(snapshot_replay_external, 1u, __ATOMIC_RELEASE);
             }
         }
@@ -2753,6 +2895,14 @@ void snapshot_syscall(CPUArchState *env, uintptr_t syscall_no,
         // stat(pathname, statbuf) / lstat / fstat(fd, statbuf)
         if ((long)ret_val == 0) {
             sem_mem_overwrite(env, syscall_arg1, sizeof(struct target_stat), SEM_OP_SYSCALL);
+        }
+        break;
+#endif
+#if defined(TARGET_NR_fstat64)
+    case TARGET_NR_fstat64:
+        if ((abi_long)ret_val == 0) {
+            sem_mem_overwrite(env, syscall_arg1, sizeof(struct target_stat64),
+                              SEM_OP_SYSCALL);
         }
         break;
 #endif
@@ -4984,6 +5134,26 @@ static void snapshot_plan_attempt_log(
             committed);
 }
 
+static bool snapshot_replay_capture_input(int fd)
+{
+    SnapshotReplayInput input = {.fd = fd};
+    if (snapshot_replay_input(fd) != NULL) return true;
+    input.flags = fcntl(fd, F_GETFL);
+    input.fd_flags = fcntl(fd, F_GETFD);
+    if (input.flags < 0 || input.fd_flags < 0 ||
+        fstat(fd, &input.identity) != 0) return false;
+    /* Linux /dev/null is the immutable character device 1:3, not merely a
+     * pathname (which could have been replaced or redirected). */
+    input.null_device = S_ISCHR(input.identity.st_mode) &&
+        major(input.identity.st_rdev) == 1 && minor(input.identity.st_rdev) == 3;
+    if (!input.null_device &&
+        (!S_ISREG(input.identity.st_mode) ||
+         (input.flags & O_ACCMODE) != O_RDONLY ||
+         (input.offset = lseek(fd, 0, SEEK_CUR)) < 0)) return false;
+    g_array_append_val(snapshot_replay_inputs, input);
+    return true;
+}
+
 /* Resident replay audit: record which inherited guest descriptors and
  * syscall families can be reproduced by another fork from this parent.  The
  * check is conservative: anything it cannot isolate marks the boundary
@@ -5004,29 +5174,18 @@ static void snapshot_replay_audit(void)
         g_hash_table_iter_init(&iter, snapshot_guest_fds);
         while (g_hash_table_iter_next(&iter, &key, NULL)) {
             int fd = GPOINTER_TO_INT(key);
-            SnapshotReplayInput input = {.fd = fd};
-            int flags = fcntl(fd, F_GETFL);
-            if (fd < 3 || flags < 0) continue; /* Guest descriptor closed. */
-            if (fstat(fd, &input.identity) != 0 ||
-                !S_ISREG(input.identity.st_mode) ||
-                (flags & O_ACCMODE) != O_RDONLY ||
-                (input.offset = lseek(fd, 0, SEEK_CUR)) < 0) {
+            if (fd < 3 || fcntl(fd, F_GETFL) < 0) continue;
+            if (!snapshot_replay_capture_input(fd)) {
                 snapshot_replay_boundary_unsupported = true;
-                log_msg("[replay] [unsupported inherited-fd] [fd %d]\n", fd);
-                continue;
+                log_msg("[replay] [unsupported inherited-fd] [fd %d] "
+                        "[reason not-immutable-input-or-null]\n", fd);
             }
-            g_array_append_val(snapshot_replay_inputs, input);
         }
     }
-    /* Standard input matters only when it is a regular seekable input; a
-     * pipe or terminal read is rejected by the child syscall audit on use. */
-    SnapshotReplayInput input = {.fd = 0};
-    int stdin_flags = fcntl(0, F_GETFL);
-    if (stdin_flags >= 0 && (stdin_flags & O_ACCMODE) == O_RDONLY &&
-        fstat(0, &input.identity) == 0 && S_ISREG(input.identity.st_mode) &&
-        (input.offset = lseek(0, 0, SEEK_CUR)) >= 0) {
-        g_array_append_val(snapshot_replay_inputs, input);
-    }
+    /* Stdio may be a regular immutable input or /dev/null.  Other inherited
+     * streams gain no read/metadata capability and are rejected on use. */
+    for (int fd = 0; fd < 3; fd++)
+        snapshot_replay_capture_input(fd);
     log_msg("[replay] [audit] [inputs %u] [unsupported %s]\n",
             snapshot_replay_inputs->len,
             snapshot_replay_boundary_unsupported ? "true" : "false");
@@ -5038,18 +5197,13 @@ static bool snapshot_replay_restore_inputs(void)
     for (guint i = 0; i < snapshot_replay_inputs->len; i++) {
         SnapshotReplayInput *input = &g_array_index(snapshot_replay_inputs,
                                                    SnapshotReplayInput, i);
-        struct stat now;
-        if (fstat(input->fd, &now) != 0 ||
-            now.st_dev != input->identity.st_dev ||
-            now.st_ino != input->identity.st_ino ||
-            now.st_size != input->identity.st_size ||
-            now.st_mtim.tv_sec != input->identity.st_mtim.tv_sec ||
-            now.st_mtim.tv_nsec != input->identity.st_mtim.tv_nsec ||
-            now.st_ctim.tv_sec != input->identity.st_ctim.tv_sec ||
-            now.st_ctim.tv_nsec != input->identity.st_ctim.tv_nsec) {
-            supported = false;
-        }
-        if (lseek(input->fd, input->offset, SEEK_SET) != input->offset) {
+        const char *reason = snapshot_replay_input_invalid(input, NULL);
+        if (reason == NULL && !input->null_device &&
+            lseek(input->fd, input->offset, SEEK_SET) != input->offset)
+            reason = "input-offset-restore-failed";
+        if (reason != NULL) {
+            log_msg("[replay] [restore-failed] [fd %d] [reason %s]\n",
+                    input->fd, reason);
             supported = false;
         }
     }

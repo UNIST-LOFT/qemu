@@ -6128,6 +6128,11 @@ void qemu_syscall_helper(uintptr_t syscall_no, uintptr_t syscall_arg0,
         case SYS_READ:
             fp = syscall_arg0;
             printf("read from %d %s %lu bytes\n", fp, last_open_file, ret_val);
+            /* Failed/empty reads write no bytes.  In particular, a negative
+             * errno must never become an unsigned clear_mem length. */
+            if ((intptr_t)ret_val <= 0) {
+                break;
+            }
             if (fp >= 0 && !input_fp[fp]) {
                 // debug: check if we are reading from stdin
                 if (s_config.symbolic_inject_input_mode == READ_FD_0 &&
@@ -6138,12 +6143,10 @@ void qemu_syscall_helper(uintptr_t syscall_no, uintptr_t syscall_arg0,
                 }
                 printf("Not registered file: %lx %d\n", (uintptr_t)input_fp[fp], (int)fp);
                 clear_mem(syscall_arg1, ret_val);
-            } else if (((int)ret_val) >= 0) {
+            } else {
                 printf("read_from_input\n");
                 read_from_input(input_fp[fp]->offset, syscall_arg1, ret_val);
                 input_fp[fp]->offset += ret_val;
-            } else {
-                printf("read_from_input failed %d\n", (int)ret_val);
             }
             break;
         //

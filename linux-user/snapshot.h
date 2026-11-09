@@ -226,6 +226,8 @@ void snapshot_memcheck_helper(target_ulong addr, target_ulong size, target_ulong
 
 /* Mark post-snapshot nondeterminism without changing guest execution. */
 void snapshot_replay_mark_external(void);
+/* Only after a real successful fstat, before the existing target conversion. */
+void snapshot_replay_project_stat(int fd, struct stat *st);
 
 void snapshot_syscall(CPUArchState *env, uintptr_t syscall_no,
                       uintptr_t syscall_arg0, uintptr_t syscall_arg1,
