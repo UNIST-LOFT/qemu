@@ -147,7 +147,9 @@ bool binradar_forkserver_send_replay_case(BinradarForkserverDriver *driver,
                                           uint32_t source, uint32_t outcome,
                                           uint32_t reason, const char *text);
 /* Reap or kill one representative child and drain both evidence channels.
- * Returns 0 reaped, 1 child/2 aggregate attempt timeout, <0 wait failure. */
+ * Returns 0 reaped, 1 child/2 aggregate attempt timeout, 3 cancellation,
+ * <0 wait failure. Salvage may normalize status_out for diagnostics only;
+ * a nonzero return never authorizes a completed observation or replay reuse. */
 int binradar_forkserver_wait_child(
     BinradarForkserverDriver *driver, pid_t child_pid,
     BinradarManager *cache, uint32_t *status_out,

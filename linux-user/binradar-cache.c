@@ -151,8 +151,10 @@ static bool br_evidence_write_frame(FILE *fp, uint16_t type,
         BR_EVIDENCE_FRAME_HEADER_SIZE);
     br_evidence_append_u32(header, payload->len);
     br_evidence_append_u16(header, type);
-    br_evidence_append_u16(header, 0);
-    uint32_t crc = br_evidence_frame_crc(type, 0, payload->data, payload->len);
+    /* snapshot's commit gate discards the entire sweep on any timeout. */
+    uint16_t flags = BR_EVIDENCE_ITERATION_TIMEOUT_EXCLUDED;
+    br_evidence_append_u16(header, flags);
+    uint32_t crc = br_evidence_frame_crc(type, flags, payload->data, payload->len);
     uint8_t checksum[4] = {
         (uint8_t)crc, (uint8_t)(crc >> 8),
         (uint8_t)(crc >> 16), (uint8_t)(crc >> 24),

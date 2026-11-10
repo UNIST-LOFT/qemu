@@ -169,19 +169,17 @@ TESTS: list[dict[str, Any]] = [
          fault_reference=dict(valid="true", source="provenance-access"),
          note="timeout transport: deferred UAF surfaces as synthetic 139"),
     dict(name="t79_forkserver_abort", mode="fors", rc=(0,),
-         verdict="crash", fs_binradar=True, fs_abort_count=3,
+         verdict="crash", fs_binradar=True, fs_abort_count=0,
          fs_child_timeout=3, timeout=120,
-         fs_stop="failure-limit", fs_attempts=3,
-         fs_attempt_result=ATTEMPT_NO_OBSERVATION, fs_min_discarded=2,
-         fs_discard_reason="no-observation",
-         finding=dict(reason="heap-use-after-free", is_uaf=1, count=3,
+         fs_stop="baseline-unavailable", fs_attempts=1,
+         fs_attempt_result=ATTEMPT_TIMEOUT, fs_min_discarded=1,
+         fs_discard_reason="timeout", fs_committed=0, fs_evidence_attempts=(),
+         finding=dict(reason="heap-use-after-free", is_uaf=1, count=1,
                       fields={"obj_id": 1, "gen": 1, "size": 8, "offset": 0,
                               "width": 1}),
-         note="a hanging guest costs one deadline-killed child per attempt: "
-              "each attempt is still discarded and consumes exactly one plan "
-              "(remaining 2 -> 1 -> 0) instead of ending the sweep at the "
-              "first kill, and the consecutive-bad-attempt limit then stops "
-              "the tracer"),
+         note="the deadline-salvaged UAF remains a crash diagnostic, but the "
+              "baseline result stays timeout: no canonical frame, feedback, "
+              "mutation source or reusable replay case may be committed"),
     dict(name="t82_unusable_attempt_recovery", mode="fors", rc=(2,),
          verdict=None, fs_binradar=True, fs_patch_cnt=3, timeout=300,
          fs_max_attempts=8, fs_stop="continue", fs_min_attempts=8,

@@ -283,6 +283,8 @@ bool br_evidence_write_header(FILE *fp, uint16_t kind);
 #define BR_EVIDENCE_KIND_BINRADAR 3u
 #define BR_EVIDENCE_RECORD_FILTER 1u
 #define BR_EVIDENCE_RECORD_BINRADAR_ITERATION 4u
+/* CRC-covered proof: every representative completed without a deadline kill. */
+#define BR_EVIDENCE_ITERATION_TIMEOUT_EXCLUDED 1u
 #define BR_EVIDENCE_MAX_FRAME (256u * 1024u * 1024u)
 #define BR_EVIDENCE_GROUP_BRANCH_NULL 1u
 #define BR_EVIDENCE_GROUP_FAULT_SITE 2u

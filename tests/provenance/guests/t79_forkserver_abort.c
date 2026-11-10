@@ -1,10 +1,6 @@
-/* t48: forkserver consecutive-child-timeout abort.  The guest detects a
- * UAF and then loops forever, so every binradar-mode iteration hits the
- * forkserver child-timeout cap.  After
- * BINRADAR_FORKSERVER_TIMEOUT_ABORT_COUNT consecutive timeouts the
- * mutation plan must abort (remaining = 0, "[forkserver] [abort]
- * [consecutive-timeout N]") instead of burning one child timeout per
- * remaining patch id. */
+/* A deferred UAF followed by an infinite loop reaches the child deadline.
+ * The parent preserves the provenance diagnostic but must reject this timed-out
+ * BINRADAR baseline: no canonical evidence or replayable mutation source. */
 #include <stdlib.h>
 
 int main(void) {

@@ -5916,19 +5916,13 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
             }
             if (binradar_mode && (wait_rc > 0 || exit_unusable)) {
                 if (wait_rc > 0) {
-                    /* A deadline killed this child.  Salvage already gave
-                     * provenance its chance at a normalized record, so a
-                     * child-cap kill that still published one produced a
-                     * usable outcome - the documented deferred-finding
-                     * path.  An aggregate attempt-deadline kill ends the
-                     * sweep no matter what was salvaged, and a kill with no
-                     * publication at all is unusable. */
+                    /* Salvage preserves deferred-finding diagnostics, not a
+                     * naturally completed observation.  Every deadline kill
+                     * discards the sweep, even with a normalized crash record:
+                     * it cannot authorize evidence, feedback or replay reuse. */
                     deadline_kill = true;
-                    if (wait_rc == 2 || exit_unusable) {
-                        attempt_result =
-                            BINRADAR_FORKSERVER_ATTEMPT_TIMEOUT;
-                        attempt_discarded = true;
-                    }
+                    attempt_result = BINRADAR_FORKSERVER_ATTEMPT_TIMEOUT;
+                    attempt_discarded = true;
                 } else if (WIFSIGNALED(child_status)) {
                     /* The child died from a signal we never sent and never
                      * translated into a guest exit record: the engine
