@@ -426,6 +426,7 @@ BASE_ENV = {
     "BINRADAR_MEMCHECK_POLICY": "coverage-v7",
     "E9_RELOCATED_INSTRUCTIONS": "",
     "E9_RELOCATED_CALL_JUMPS": "",
+    "E9_ORIGINAL_ENTRYPOINT": "",
 }
 
 # ---------------------------------------------------------------------------
@@ -807,6 +808,40 @@ for mode in ("mem", "sym"):
         reference_pc_symbol="signal_data_return", distinct_raw_reference=True,
         fault_reference=dict(valid="true", source="guest-signal")))
 
+# An E9 ELF entry is an excluded initialization wrapper, not a main root.
+# Only authenticated original-entry metadata plus execution of that exact PC
+# can recover the root after an unmatched RET (including across a snapshot).
+for mode in ("mem", "sym"):
+    for control in ("restored", "missing", "unexecuted"):
+        TESTS.append(dict(
+            name=f"t94_e9_root_{control}_{mode}", guest="t94_signal_shadow",
+            args=["unmatched"], mode=mode, artifact_suffix=".brcached",
+            e9_entry=True, e9_entry_metadata=(control != "missing"),
+            e9_skip_entry=(control == "unexecuted"), rc=(-11, 139, -4, 132),
+            verdict="crash", finding=None, raw_pc_symbol="signal_data_pc",
+            reference_pc_symbol="signal_root_entry" if control == "restored" else None,
+            distinct_raw_reference=(control == "restored"),
+            fault_reference=dict(valid="true" if control == "restored" else "false",
+                                 source="guest-signal" if control == "restored" else "unavailable")))
+    for value in ("signal_e9_entry", "signal_data_pc", "fffffffffffffffff", "0x", "+1", "1junk", "0"):
+        TESTS.append(dict(
+            name=f"t94_e9_root_reject_{value}_{mode}", guest="t94_signal_shadow",
+            args=["unmatched"], mode=mode, artifact_suffix=".brcached", e9_entry=True,
+            e9_entry_value=value, rc=(1,), verdict=None, finding=None,
+            required_log="[memcheck] [e9-original-entrypoint] [invalid]"))
+    TESTS.append(dict(
+        name=f"t94_e9_root_reject_original_{mode}", guest="t94_signal_shadow",
+        args=["unmatched"], mode=mode, env={"E9_ORIGINAL_ENTRYPOINT": "1"},
+        rc=(1,), verdict=None, finding=None,
+        required_log="[memcheck] [e9-original-entrypoint] [invalid]"))
+
+TESTS.append(dict(
+    name="t94_e9_root_snapshot", guest="t94_signal_shadow", args=["unmatched"],
+    mode="fors", artifact_suffix=".brcached", e9_entry=True, rc=(0,),
+    verdict="crash", finding=None, raw_pc_symbol="signal_data_pc",
+    reference_pc_symbol="signal_root_entry", distinct_raw_reference=True,
+    fault_reference=dict(valid="true", source="guest-signal")))
+
 # Opaque allocator bodies use production metadata, not guest-only PLT tables.
 # The guest warms memcpy's PLT/GOT to register its resolved libc IFUNC body.
 # t89 is deliberately not skipped on libcs with a different realloc path:
@@ -1144,6 +1179,23 @@ def prepare_artifact(test, guest, env):
         binary = guest + suffix
         temporary = binary + ".tmp"
         shutil.copyfile(guest, temporary)
+        if test.get("e9_entry"):
+            symbols = resolve_symbols(guest, {
+                "signal_e9_entry", "signal_e9_skip_entry", "signal_e9_entry_end",
+                "signal_root_entry", "signal_data_pc"})
+            begin, end = symbols["signal_e9_entry"], symbols["signal_e9_entry_end"]
+            env["E9_EXCLUDE_RANGES"] = f"0x{begin:x}-0x{end:x}"
+            entry = symbols["signal_e9_skip_entry" if test.get("e9_skip_entry")
+                            else "signal_e9_entry"]
+            with open(temporary, "r+b") as image:
+                if image.read(6) != b"\x7fELF\x02\x01":
+                    raise RuntimeError("E9 entry control requires ELF64 little endian")
+                image.seek(24)  # ELF64 e_entry, independent of section layout.
+                image.write(struct.pack("<Q", entry))
+            if test.get("e9_entry_metadata", True):
+                value = test.get("e9_entry_value", "signal_root_entry")
+                env["E9_ORIGINAL_ENTRYPOINT"] = (
+                    f"0x{symbols[value]:x}" if value in symbols else value)
         os.chmod(temporary, 0o755)
         os.replace(temporary, binary)
     return binary

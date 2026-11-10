@@ -5,6 +5,11 @@
 __asm__(".data\n"
         ".global signal_data_pc\nsignal_data_pc: .byte 0x0f,0x0b\n"
         ".text\n"
+        /* Simulate E9's replacement ELF entry without requiring E9 tooling.
+         * The runner excludes only this wrapper and patches e_entry to it. */
+        ".global signal_e9_entry\nsignal_e9_entry: jmp signal_root_entry\n"
+        ".global signal_e9_skip_entry\nsignal_e9_skip_entry: jmp signal_unmatched\n"
+        ".global signal_e9_entry_end\nsignal_e9_entry_end:\n"
         ".global signal_root_entry\nsignal_root_entry:\n"
         "movq 16(%rsp),%rax\n movzbl (%rax),%r12d\n"
         "call main\n"

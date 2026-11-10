@@ -2854,9 +2854,35 @@ int load_elf_binary(struct linux_binprm *bprm, struct image_info *info)
                                 info, (elf_interpreter ? &interp_info : NULL));
     info->start_stack = bprm->p;
 
-    /* Signal shadow frames start at the executed main ELF entry, not the
-     * interpreter entry or the BINRADAR snapshot entrypoint. */
+    /* E9 replaces e_entry with an excluded initialization trampoline. The
+     * host supplies the original ELF entry only after authenticating that
+     * original against the selected artifact's map. Do not use the wrapper
+     * as a signal root, nor infer an entry from PATCH_LOC or guest data.
+     * The translator still initializes the root only when this exact
+     * instruction executes; merely loading metadata creates no frame. */
     provenance_main_entry = info->entry;
+    const char *original_entry = getenv("E9_ORIGINAL_ENTRYPOINT");
+    if (original_entry != NULL && *original_entry != '\0') {
+        const char *digits = original_entry;
+        if (digits[0] == '0' && (digits[1] == 'x' || digits[1] == 'X')) digits += 2;
+        const char *end = digits;
+        while (g_ascii_isxdigit(*end)) end++;
+        char *parsed_end;
+        errno = 0;
+        uint64_t entry = strtoull(original_entry, &parsed_end, 16);
+        bool valid = end != digits && *end == '\0' && parsed_end == end &&
+            errno == 0 && entry != 0 &&
+            entry <= (target_ulong)-1 - info->load_bias;
+        target_ulong resolved = valid ? entry + info->load_bias : 0;
+        if (!valid || !is_in_e9_exclude_region(info->entry) ||
+            resolved < symbolic_start_code || resolved >= symbolic_end_code ||
+            is_in_e9_exclude_region(resolved) ||
+            !(page_get_flags(resolved) & PAGE_EXEC)) {
+            log_msg("[memcheck] [e9-original-entrypoint] [invalid]\n");
+            exit(1);
+        }
+        provenance_main_entry = resolved;
+    }
 
     /* If we have an interpreter, set that as the program's entry point.
        Copy the load_bias as well, to help PPC64 interpret the entry
