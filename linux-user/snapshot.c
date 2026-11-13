@@ -2026,8 +2026,23 @@ void snapshot_trace_free(target_ulong base, target_ulong pc) {
 static SnapshotMemRegion *mr_manager_stack_search(target_ulong addr,
                                                    target_ulong size) {
     GArray *stack = mr_manager.stack_data;
+    DynStackFrame *top;
     if (stack == NULL || stack->len == 0 || size == 0) {
         return NULL;
+    }
+
+    target_ulong end = addr + size;
+    if (end < addr) {
+        return NULL;
+    }
+    /* Push, pop and growth maintain this envelope.  Heap/global accesses
+     * need not walk every frame, but a miss below it can still grow the top
+     * frame through the existing lazy window.  Never grow before checking
+     * existing frames: an older overlapping frame has precedence. */
+    target_ulong high = mr_manager.stack_region.base;
+    target_ulong low = high - mr_manager.stack_region.size;
+    if (addr < low || end > high) {
+        goto grow;
     }
 
     for (ssize_t i = stack->len - 1; i >= 0; i--) {
@@ -2035,7 +2050,6 @@ static SnapshotMemRegion *mr_manager_stack_search(target_ulong addr,
         if (frame == NULL) {
             continue;
         }
-        dyn_frame_sync_region(frame);
         if (dyn_frame_contains_access(frame, addr, size)) {
 #ifdef SNAPSHOT_STACK_TRACE_VERBOSE
             int64_t off = (int64_t)addr - (int64_t)frame->entry_sp;
@@ -2048,7 +2062,8 @@ static SnapshotMemRegion *mr_manager_stack_search(target_ulong addr,
         }
     }
 
-    DynStackFrame *top = dyn_stack_top();
+grow:
+    top = dyn_stack_top();
     if (dyn_frame_can_grow_for_access(top, addr, size)) {
         dyn_frame_grow_to_access(top, addr, size, "access-below-min-sp");
 #ifdef SNAPSHOT_STACK_TRACE_VERBOSE

@@ -59,6 +59,67 @@ static SnapshotMemRegion *lookup_base(target_ulong base)
     return g_tree_lookup(mr_manager.heap_data, &query);
 }
 
+static void test_stack_lookup(void)
+{
+    snapshot_trace_stack_call(0x1000000, 0x10, 0x20);
+    SnapshotMemRegion *outer = mr_manager_stack_search(0xfff000, 8);
+    CHECK(outer != NULL && outer->size == 0x1000,
+          "access below observed stack grows the top frame");
+    snapshot_trace_stack_call(0xfff800, 0x30, 0x40);
+    SnapshotMemRegion *inner = mr_manager_stack_search(0xfff7f8, 8);
+    CHECK(inner != NULL && inner != outer,
+          "newest containing frame wins overlapping lookup");
+    CHECK(mr_manager_stack_search(0xfff7ff, 2) == outer,
+          "whole access crossing inner end resolves to outer frame");
+    CHECK(mr_manager_stack_search(0xfff700, 8) == outer && inner->size == 8,
+          "existing outer coverage wins before lazy inner growth");
+    snapshot_trace_alloc(0xfff000, 0x1000, 0x50);
+    CHECK(snapshot_mem_region_search_with_size(0xfff7f8, 8) == inner,
+          "stack priority survives overlapping heap coverage");
+    snapshot_trace_free(0xfff000, 0x60);
+
+    target_ulong low = 0xfff7f8 - SNAPSHOT_STACK_LAZY_WINDOW;
+    CHECK(mr_manager_stack_search(low, 8) == inner &&
+              inner->size == 8 + SNAPSHOT_STACK_LAZY_WINDOW,
+          "envelope miss retains inclusive lazy-growth boundary");
+    CHECK(mr_manager_stack_search(low - SNAPSHOT_STACK_LAZY_WINDOW - 1, 1)
+              == NULL,
+          "access beyond lazy window remains unclassified");
+    CHECK(mr_manager_stack_search(0xfff7f8, 0) == NULL,
+          "zero-width stack access is rejected");
+    CHECK(mr_manager_stack_search((target_ulong)-4, 8) == NULL,
+          "wrapping stack interval is rejected");
+    CHECK(mr_manager_stack_search(0x1000000, 1) == NULL,
+          "stack upper endpoint remains excluded");
+    snapshot_trace_stack_ret(0xfff800, 0x40);
+    CHECK(mr_manager.stack_region.base == 0x1000000 &&
+              mr_manager.stack_region.size == 0x1000,
+          "pop removes the departed frame's envelope extension");
+    CHECK(mr_manager_stack_search(0xfff7f8, 8) == outer,
+          "pop restores the surviving frame identity");
+    snapshot_trace_stack_ret(0x1000000, 0x20);
+    CHECK(mr_manager_stack_search(0xfff7f8, 8) == NULL,
+          "empty stack retains no stale region");
+
+    snapshot_trace_stack_call(4, 0x70, 0x80);
+    CHECK(mr_manager_stack_search(0, 4) != NULL &&
+              mr_manager_stack_search(0, 5) == NULL,
+          "near-zero frame bounds do not wrap");
+    snapshot_trace_stack_ret(4, 0x80);
+
+    /* Non-top overlap: the newest frame does not contain the access, so an
+     * older frame must still be found even though the envelope check alone
+     * would have allowed a full scan. */
+    snapshot_trace_stack_call(0x3000000, 0xc0, 0xd0);
+    snapshot_trace_stack_call(0x2fff000, 0xe0, 0xf0);
+    snapshot_trace_stack_call(0x2ffe000, 0x100, 0x110);
+    CHECK(mr_manager_stack_search(0x2fff800, 8) != NULL,
+          "overlap resolves inside a non-top frame");
+    snapshot_trace_stack_ret(0x2ffe000, 0x110);
+    snapshot_trace_stack_ret(0x2fff000, 0xf0);
+    snapshot_trace_stack_ret(0x3000000, 0xd0);
+}
+
 int main(void)
 {
     init_mr_manager();
@@ -98,6 +159,8 @@ int main(void)
     SnapshotMemRegion *reused = mr_manager_heap_search(0x4007);
     CHECK(reused != NULL && reused->size == 8 && reused->pc == 10,
           "reuse installs a new live extent");
+
+    test_stack_lookup();
 
     g_tree_destroy(mr_manager.heap_data);
     g_array_free(mr_manager.stack_data, TRUE);

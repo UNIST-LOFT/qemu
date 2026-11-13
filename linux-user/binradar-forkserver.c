@@ -3,6 +3,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
+#include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -309,7 +310,21 @@ int binradar_forkserver_wait_child(
                     : "[forkserver] [child-timeout] killing child %d after %ld ms\n",
                     (int)child_pid, (long)child_timeout_ms);
             kill(child_pid, SIGKILL);
-            if (waitpid(child_pid, &status, 0) < 0) return -1;
+            /* A CPU-saturated child and a blocked child reach the same
+             * deadline and produce the same stop reason, so record the
+             * killed child's own CPU time.  wait4() reports exactly this
+             * child; RUSAGE_CHILDREN would accumulate every earlier
+             * attempt. */
+            struct rusage child_usage;
+            memset(&child_usage, 0, sizeof(child_usage));
+            if (wait4(child_pid, &status, 0, &child_usage) < 0) return -1;
+            log_msg("[forkserver] [child-cpu] [pid %d] [user-ms %ld] "
+                    "[sys-ms %ld] [max-rss-kb %ld]\n", (int)child_pid,
+                    (long)(child_usage.ru_utime.tv_sec * 1000 +
+                           child_usage.ru_utime.tv_usec / 1000),
+                    (long)(child_usage.ru_stime.tv_sec * 1000 +
+                           child_usage.ru_stime.tv_usec / 1000),
+                    (long)child_usage.ru_maxrss);
             if (salvage != NULL) salvage(salvage_opaque, (uint32_t *)&status);
             if (cache != NULL) {
                 binradar_cache_drain_patch(cache);
