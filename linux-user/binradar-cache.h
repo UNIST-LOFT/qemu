@@ -169,6 +169,7 @@ typedef enum BinradarReplayOutcome {
     BINRADAR_REPLAY_OUTCOME_TARGET_CRASH = 1,
     BINRADAR_REPLAY_OUTCOME_OTHER_CRASH = 2,
     BINRADAR_REPLAY_OUTCOME_UNAVAILABLE = 3,
+    BINRADAR_REPLAY_OUTCOME_IGNORED = 4,
 } BinradarReplayOutcome;
 
 typedef enum BinradarReplayReason {

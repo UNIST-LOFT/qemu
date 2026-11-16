@@ -5446,7 +5446,7 @@ static bool snapshot_replay_case(BinradarForkserverDriver *driver,
     if (retained->external_unsupported || !snapshot_replay_restore_inputs()) {
         snapshot_replay_case_reply(driver, mutation,
             BINRADAR_REPLAY_SOURCE_EXECUTED,
-            BINRADAR_REPLAY_OUTCOME_UNAVAILABLE,
+            BINRADAR_REPLAY_OUTCOME_IGNORED,
             BINRADAR_REPLAY_REASON_UNSUPPORTED_EXTERNAL_STATE, NULL);
         return false;
     }
@@ -5518,14 +5518,17 @@ static bool snapshot_replay_case(BinradarForkserverDriver *driver,
                 BINRADAR_REPLAY_REASON_INCOMPLETE_OBSERVATION, NULL);
         }
     } else {
-        BinradarReplayReason reason = external
-            ? BINRADAR_REPLAY_REASON_UNSUPPORTED_EXTERNAL_STATE
-            : driver->cancel_requested ? BINRADAR_REPLAY_REASON_CANCELLED
+        BinradarReplayReason reason = driver->cancel_requested
+            ? BINRADAR_REPLAY_REASON_CANCELLED
             : waited > 0 ? BINRADAR_REPLAY_REASON_TIMEOUT
+            : external ? BINRADAR_REPLAY_REASON_UNSUPPORTED_EXTERNAL_STATE
             : BINRADAR_REPLAY_REASON_INCOMPLETE_OBSERVATION;
+        bool ignored = reason == BINRADAR_REPLAY_REASON_TIMEOUT ||
+            reason == BINRADAR_REPLAY_REASON_UNSUPPORTED_EXTERNAL_STATE;
         snapshot_replay_case_reply(driver, mutation,
             BINRADAR_REPLAY_SOURCE_EXECUTED,
-            BINRADAR_REPLAY_OUTCOME_UNAVAILABLE, reason, NULL);
+            ignored ? BINRADAR_REPLAY_OUTCOME_IGNORED
+                    : BINRADAR_REPLAY_OUTCOME_UNAVAILABLE, reason, NULL);
     }
     /* Reset transient shared state, never the retained plans or their
      * admitted captures. */

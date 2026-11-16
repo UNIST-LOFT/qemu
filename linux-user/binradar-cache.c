@@ -1628,6 +1628,7 @@ const char *binradar_replay_outcome_name(BinradarReplayOutcome outcome)
     case BINRADAR_REPLAY_OUTCOME_TARGET_CRASH: return "target-crash";
     case BINRADAR_REPLAY_OUTCOME_OTHER_CRASH: return "other-crash";
     case BINRADAR_REPLAY_OUTCOME_UNAVAILABLE: return "unavailable";
+    case BINRADAR_REPLAY_OUTCOME_IGNORED: return "ignored";
     }
     return "unavailable";
 }
@@ -1842,7 +1843,9 @@ bool binradar_replay_register_capture(BinradarManager *manager,
         return false;
     }
     if (!reusable || !manager->poc_fault_valid ||
-        outcome == BINRADAR_REPLAY_OUTCOME_UNAVAILABLE) {
+        (outcome != BINRADAR_REPLAY_OUTCOME_NORMAL &&
+         outcome != BINRADAR_REPLAY_OUTCOME_TARGET_CRASH &&
+         outcome != BINRADAR_REPLAY_OUTCOME_OTHER_CRASH)) {
         return true;
     }
     char *owned_path = binradar_replay_capture_path(manager, mutation);

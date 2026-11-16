@@ -44,7 +44,7 @@
  */
 /* CASE text is bounded JSON {mutation,capture}; capture preserves the admitted
  * representative's path, SHA-256, descriptor, selector and reuse identity. */
-#define BINRADAR_FORKSERVER_PROTOCOL_REPLAY 0x41464c07u
+#define BINRADAR_FORKSERVER_PROTOCOL_REPLAY 0x41464c08u
 #define BINRADAR_REPLAY_CASE_TEXT_MAX 32768u
 #define BINRADAR_REPLAY_GENERATE 0u
 #define BINRADAR_REPLAY_FINISH 1u
