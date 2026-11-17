@@ -4136,6 +4136,152 @@ static void test_logical_predicate_native(void)
     g_byte_array_free(manager.cache_bytes, TRUE);
 }
 
+/* Positive trap evidence needs the complete executed request's channels, but
+ * not a process outcome or target oracle. It must never enter reusable state. */
+static void test_replay_predicate_trap_admission(void)
+{
+    struct {
+        BinradarSnapshotHeader header;
+        uint64_t regs[16];
+    } captures[2] = {0};
+    BinradarManager manager = {
+        .replay_mode = true, .cache_enabled = true,
+        .cache_family = BRCACHE_FAMILY_GENERIC, .patch_max_id = 1,
+    };
+    BinradarReplayResult result = {0};
+    SnapshotExitInfo outcome = {0};
+    const char *unsafe = "/v0v1";
+    const char *guarded = "A!v1p0/v0v1";
+    char *directory = g_dir_make_tmp("binradar-replay-trap-XXXXXX", NULL);
+    char *saved_replay_dir = g_strdup(getenv("BINRADAR_REPLAY_DIR"));
+    CHECK(directory != NULL, "trap replay creates a private directory");
+    if (directory == NULL) return;
+    g_setenv("BINRADAR_REPLAY_DIR", directory, TRUE);
+    manager.cache_bytes = g_byte_array_new();
+    manager.cache_predicates = g_new0(BinradarCachePredicate,
+                                      BINRADAR_REPLAY_SLOT_COUNT);
+    manager.selector_size = offsetof(BinradarPatchSelector, descriptor) +
+                            BRCACHE_MAX_DESCRIPTOR + 1u;
+    manager.selector = g_malloc0(manager.selector_size);
+    manager.selector->descriptor_capacity = BRCACHE_MAX_DESCRIPTOR + 1u;
+    manager.cur_patch_id = &manager.selector->patch_id;
+    manager.cur_iter = &manager.selector->iteration;
+    manager.current = g_new0(BinradarResult, 1);
+    manager.current->patch_results = g_new0(PatchedResult, 2);
+    GArray *observed = g_array_new(FALSE, FALSE, sizeof(int));
+    const int branches[] = {1, 2};
+    g_array_append_vals(observed, branches, 2);
+    manager.current->patch_results[1].br_taken = observed;
+    for (unsigned i = 0; i < 2; i++) {
+        captures[i].header = (BinradarSnapshotHeader){
+            .magic = BRCACHE_SNAPSHOT_MAGIC,
+            .version = BRCACHE_SNAPSHOT_VERSION,
+            .patch_id = 1, .branch = branches[i],
+        };
+        captures[i].regs[0] = 1;
+        captures[i].regs[1] = i == 0 ? 1 : 0;
+    }
+    CHECK(binradar_replay_descriptor(&manager, unsafe) &&
+              binradar_cache_publish_selector(&manager, 1, 7),
+          "trap test publishes its actual executed descriptor");
+    g_byte_array_append(manager.cache_bytes, (const uint8_t *)captures,
+                        sizeof(captures));
+    CHECK(binradar_replay_admit(&manager, 7, 1, unsafe, &outcome, &result) &&
+              result.outcome == BINRADAR_REPLAY_OUTCOME_UNAVAILABLE &&
+              result.reason == BINRADAR_REPLAY_REASON_PREDICATE_TRAP &&
+              result.capture == NULL,
+          "mixed normal/trap vector rejects even without exit or oracle");
+    CHECK(binradar_replay_admit(&manager, 7, 1, unsafe, NULL, &result) &&
+              result.reason == BINRADAR_REPLAY_REASON_PREDICATE_TRAP &&
+              result.capture == NULL,
+          "audit/deadline fallback cannot hide authenticated positive trap");
+    CHECK(manager.replay_records == NULL && manager.replay_exact == NULL &&
+              manager.replay_serial == 0,
+          "trap classification creates no cache record or capture file");
+
+    for (unsigned failure = 0; failure < 10; failure++) {
+        g_byte_array_set_size(manager.cache_bytes, 0);
+        g_byte_array_append(manager.cache_bytes, (const uint8_t *)captures,
+                            sizeof(captures));
+        g_array_index(observed, int, 1) = 2;
+        manager.selector->iteration = 7;
+        manager.selector->descriptor[0] = '/';
+        manager.line_idx = 0;
+        manager.cache_capture_overflow = false;
+        const char *descriptor = unsafe;
+        BinradarSnapshotHeader header = captures[1].header;
+        switch (failure) {
+        case 0: g_byte_array_set_size(manager.cache_bytes,
+                                     sizeof(captures) - 1u); break;
+        case 1: header.flags = BRCACHE_FLAG_TRUNCATED; break;
+        case 2: header.patch_id = 0; break;
+        case 3: g_array_index(observed, int, 1) = 0; break;
+        case 4: header.branch = 1; break;
+        case 5: descriptor = guarded; break;
+        case 6: manager.selector->iteration = 8; break;
+        case 7: manager.line_idx = 1; break;
+        case 8: manager.cache_capture_overflow = true; break;
+        case 9: manager.selector->descriptor[0] = '+'; break;
+        }
+        if (failure >= 1 && failure <= 4) {
+            memcpy(manager.cache_bytes->data + sizeof(captures[0]),
+                   &header, sizeof(header));
+        }
+        CHECK(!binradar_replay_admit(&manager, 7, 1, descriptor, NULL,
+                                     &result) && result.capture == NULL &&
+                  result.reason != BINRADAR_REPLAY_REASON_PREDICATE_TRAP,
+              "partial/corrupt/unbound captures never establish a trap");
+    }
+    manager.line_idx = 0;
+    manager.cache_capture_overflow = false;
+    CHECK(binradar_replay_descriptor(&manager, guarded) &&
+              binradar_cache_publish_selector(&manager, 1, 7),
+          "guard-before-danger is a separately executed complete descriptor");
+    captures[1].header.branch = 0;
+    g_array_index(observed, int, 1) = 0;
+    g_byte_array_set_size(manager.cache_bytes, 0);
+    g_byte_array_append(manager.cache_bytes, (const uint8_t *)captures,
+                        sizeof(captures));
+    CHECK(!binradar_replay_admit(&manager, 7, 1, guarded, NULL, &result),
+          "nontrapping timeout/audit observation is not promoted to reuse");
+    outcome.valid = 1;
+    CHECK(!binradar_replay_admit(&manager, 7, 1, guarded, &outcome, &result),
+          "normal guard observation still requires the immutable oracle");
+    manager.poc_fault_valid = true;
+    CHECK(binradar_replay_admit(&manager, 7, 1, guarded, &outcome, &result) &&
+              result.outcome == BINRADAR_REPLAY_OUTCOME_NORMAL &&
+              result.reason == BINRADAR_REPLAY_REASON_NONE &&
+              result.capture != NULL,
+          "guard-before-danger retains ordinary reusable normal behavior");
+    char *capture_path = result.capture;
+    CHECK(binradar_replay_lookup(&manager, 7, guarded, &result) &&
+              result.source == BINRADAR_REPLAY_SOURCE_CACHE &&
+              g_strcmp0(result.reuse, "exact-descriptor") == 0,
+          "guarded descriptor can reuse its own authenticated observation");
+    g_free(result.capture);
+    CHECK(!binradar_replay_lookup(&manager, 7, unsafe, &result),
+          "a trapping candidate cannot reuse a guarded representative");
+    binradar_replay_release(&manager);
+    unlink(capture_path);
+    g_free(capture_path);
+    binradar_cache_clear_iteration(&manager);
+    g_free(manager.current->patch_results);
+    g_free(manager.current);
+    for (unsigned i = 0; i < BINRADAR_REPLAY_SLOT_COUNT; i++) {
+        g_free(manager.cache_predicates[i].descriptor);
+        if (manager.cache_predicates[i].expr_nodes != NULL)
+            g_array_free(manager.cache_predicates[i].expr_nodes, TRUE);
+    }
+    g_free(manager.cache_predicates);
+    g_free(manager.selector);
+    g_byte_array_free(manager.cache_bytes, TRUE);
+    if (saved_replay_dir != NULL) g_setenv("BINRADAR_REPLAY_DIR", saved_replay_dir, TRUE);
+    else g_unsetenv("BINRADAR_REPLAY_DIR");
+    g_free(saved_replay_dir);
+    rmdir(directory);
+    g_free(directory);
+}
+
 /* Drive the public replay cache API with immutable CWE captures.  Neutral
  * representatives must not pass through the CWE predicate grammar. */
 static void test_replay_cache_neutral_and_eligibility(void)
@@ -6038,6 +6184,7 @@ int main(void)
     test_feedback_requires_representative_child();
     test_feedback_rejects_malformed_brch();
     test_logical_predicate_native();
+    test_replay_predicate_trap_admission();
     test_replay_cache_neutral_and_eligibility();
     test_symbolic_boundary_unsigned();
     test_symbolic_no_false_side();

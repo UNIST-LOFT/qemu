@@ -704,12 +704,23 @@ static void binradar_manager_handle_patch_line(BinradarManager *manager, const c
     log_msg("[binradar] [patch-res] %s\n", line);
     sbsv_parser_parse_line_detached(manager->patch_result_parser, line, 0, &row);
     int cur_iter = binradar_cache_iteration(manager, -1);
+    if (manager->replay_mode &&
+        (row == NULL || strcmp(sbsv_row_schema_name(row), "patch") != 0)) {
+        manager->cache_capture_overflow = true;
+    }
     if (row != NULL) {
         if (strcmp(sbsv_row_schema_name(row), "patch") == 0) {
             // Process patch row
             long long patch_id = sbsv_row_get_int(row, "id", NULL);
             long long br = sbsv_row_get_int(row, "br", NULL);
             long long iter = sbsv_row_get_int(row, "v", NULL);
+            if (manager->replay_mode &&
+                (iter != cur_iter || manager->selector == NULL ||
+                 patch_id != manager->selector->patch_id || br < 0 || br > 2)) {
+                manager->cache_capture_overflow = true;
+                sbsv_row_free(row);
+                return;
+            }
             if (iter != cur_iter) {
                 log_msg("[binradar] [iter-mismatch] [v %lld] [iter %d] [id %lld] [br %lld]\n", iter, cur_iter, patch_id, br);
                 sbsv_row_free(row);
@@ -737,6 +748,7 @@ static void binradar_manager_handle_patch_bytes(BinradarManager *manager, const 
         char c = buf[i];
 
         if (manager->line_idx + 1 >= sizeof(manager->line_buf)) {
+            if (manager->replay_mode) manager->cache_capture_overflow = true;
             // Line too long, reset buffer
             manager->line_buf[manager->line_idx] = '\0';
             binradar_manager_handle_patch_line(manager, manager->line_buf);
@@ -1617,6 +1629,7 @@ const char *binradar_replay_reason_name(BinradarReplayReason reason)
     case BINRADAR_REPLAY_REASON_TIMEOUT: return "timeout";
     case BINRADAR_REPLAY_REASON_INCOMPLETE_OBSERVATION:
         return "incomplete-observation";
+    case BINRADAR_REPLAY_REASON_PREDICATE_TRAP: return "predicate-trap";
     }
     return "unknown";
 }
@@ -1979,13 +1992,30 @@ bool binradar_replay_admit(BinradarManager *manager, uint32_t mutation,
     char *path;
     int fd;
     bool written;
-    if (manager == NULL || result == NULL || outcome == NULL ||
-        !manager->poc_fault_valid || descriptor == NULL || !outcome->valid ||
-        (outcome->crashed && !outcome->fault_reference_valid)) {
+    if (result == NULL) return false;
+    memset(result, 0, sizeof(*result));
+    /* Bind positive trap evidence to the executed request, not a descriptor
+     * evaluated over another representative's state or a stale selector. */
+    if (manager == NULL || !manager->replay_mode || !manager->cache_enabled ||
+        descriptor == NULL || mutation == 0 || selected != 1 ||
+        manager->current == NULL || selected > manager->patch_max_id ||
+        manager->cache_predicates == NULL ||
+        selected > manager->cache_predicate_count ||
+        g_strcmp0(manager->cache_predicates[selected].descriptor, descriptor) ||
+        manager->selector == NULL || manager->cache_bytes == NULL) {
         return false;
     }
-    memset(result, 0, sizeof(*result));
-    binradar_replay_ensure_owned(manager);
+    size_t length = strlen(descriptor);
+    if (length == 0 || length > BRCACHE_MAX_DESCRIPTOR ||
+        manager->selector_size < offsetof(BinradarPatchSelector, descriptor) +
+                                      length + 1u ||
+        manager->selector->descriptor_capacity <= length ||
+        manager->selector->descriptor_length != length ||
+        manager->selector->patch_id != selected ||
+        manager->selector->iteration != mutation ||
+        memcmp(manager->selector->descriptor, descriptor, length + 1u) != 0) {
+        return false;
+    }
     if (manager->cache_capture_overflow || manager->line_idx != 0 ||
         manager->cache_bytes->len == 0) {
         log_msg("[replay] [admit-skip] [overflow %d] [line-idx %zu] "
@@ -2007,10 +2037,20 @@ bool binradar_replay_admit(BinradarManager *manager, uint32_t mutation,
     for (guint i = 0; i < vector->len; i++) {
         if (g_array_index(vector, int, i) == 2) {
             g_array_free(vector, TRUE);
-            return false;
+            result->source = BINRADAR_REPLAY_SOURCE_EXECUTED;
+            result->outcome = BINRADAR_REPLAY_OUTCOME_UNAVAILABLE;
+            result->reason = BINRADAR_REPLAY_REASON_PREDICATE_TRAP;
+            return true;
         }
     }
     g_array_free(vector, TRUE);
+    /* Reuse additionally needs a complete reproducible child outcome and its
+     * oracle. These cannot hide independently authenticated positive traps. */
+    if (outcome == NULL || !manager->poc_fault_valid || !outcome->valid ||
+        (outcome->crashed && !outcome->fault_reference_valid)) {
+        return false;
+    }
+    binradar_replay_ensure_owned(manager);
     path = binradar_replay_capture_path(manager, mutation);
     if (path == NULL) {
         log_msg("[replay] [admit-skip] [mutation %u] [reason missing-dir]\n",

@@ -5501,22 +5501,19 @@ static bool snapshot_replay_case(BinradarForkserverDriver *driver,
     SnapshotExitInfo *outcome = snapshot_exit_info_ptr();
     bool external = __atomic_load_n(snapshot_replay_external, __ATOMIC_ACQUIRE) != 0;
     if (external) retained->external_unsupported = true;
-    if (waited == 0 && !external &&
-        __atomic_load_n(&shared_trace_data->mutation_plan_applied,
-                        __ATOMIC_ACQUIRE)) {
-        binradar_cache_record_outcome(manager, 1, outcome);
-        if (binradar_replay_admit(manager, mutation, 1, descriptor, outcome,
-                                  &result)) {
-            snapshot_replay_case_reply(driver, mutation,
-                BINRADAR_REPLAY_SOURCE_EXECUTED, result.outcome,
-                BINRADAR_REPLAY_REASON_NONE, &result);
-            g_free(result.capture);
-        } else {
-            snapshot_replay_case_reply(driver, mutation,
-                BINRADAR_REPLAY_SOURCE_EXECUTED,
-                BINRADAR_REPLAY_OUTCOME_UNAVAILABLE,
-                BINRADAR_REPLAY_REASON_INCOMPLETE_OBSERVATION, NULL);
-        }
+    bool applied = __atomic_load_n(&shared_trace_data->mutation_plan_applied,
+                                    __ATOMIC_ACQUIRE) != 0;
+    bool reusable = waited == 0 && !external && applied;
+    if (reusable) binradar_cache_record_outcome(manager, 1, outcome);
+    /* Complete authenticated br=2 evidence is a rejection even if no usable
+     * exit/oracle exists, or a later audit/deadline made the child unobserved.
+     * NULL outcome forbids reuse while preserving that positive evidence. */
+    if (applied && binradar_replay_admit(manager, mutation, 1, descriptor,
+                                         reusable ? outcome : NULL, &result)) {
+        snapshot_replay_case_reply(driver, mutation,
+            BINRADAR_REPLAY_SOURCE_EXECUTED, result.outcome,
+            result.reason, &result);
+        g_free(result.capture);
     } else {
         BinradarReplayReason reason = driver->cancel_requested
             ? BINRADAR_REPLAY_REASON_CANCELLED

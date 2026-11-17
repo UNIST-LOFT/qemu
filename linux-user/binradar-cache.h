@@ -180,6 +180,7 @@ typedef enum BinradarReplayReason {
     BINRADAR_REPLAY_REASON_CANCELLED = 4,
     BINRADAR_REPLAY_REASON_TIMEOUT = 5,
     BINRADAR_REPLAY_REASON_INCOMPLETE_OBSERVATION = 6,
+    BINRADAR_REPLAY_REASON_PREDICATE_TRAP = 7,
 } BinradarReplayReason;
 
 typedef enum BinradarReplaySource {
@@ -206,8 +207,11 @@ bool binradar_replay_descriptor(BinradarManager *manager, const char *descriptor
 bool binradar_replay_lookup(BinradarManager *manager, uint32_t mutation,
                             const char *descriptor,
                             BinradarReplayResult *result);
-/* Admit one completed real child. Returns false when the capture/outcome is
- * not reusable; the caller then reports an unavailable observation. */
+/* Authenticate one real child's complete capture before outcome admission.
+ * Returns true for a classified result: either a reusable observation or an
+ * unavailable predicate-trap with no retained capture. NULL outcome permits
+ * trap authentication only, never reuse (e.g. timeout/external-state failure).
+ * False means no classified result; the caller preserves its fallback reason. */
 bool binradar_replay_admit(BinradarManager *manager, uint32_t mutation,
                            uint32_t selected, const char *descriptor,
                            const SnapshotExitInfo *outcome,
