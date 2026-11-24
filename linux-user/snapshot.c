@@ -511,8 +511,8 @@ void snapshot_init_binradar_patch_shm(uintptr_t key) {
             exit_with_status(1);
         }
         binradar_manager->cache_fd_r = atoi(cache_fd);
+        uint64_t required = 0;
         if (binradar_manager->cache_family == BRCACHE_FAMILY_CWE805) {
-            uint64_t required = 0;
             for (uint32_t i = 0; i < binradar_manager->patch_cnt; i++) {
                 uint32_t id = binradar_manager->patch_list != NULL
                     ? binradar_manager->patch_list[i] : i + 1u;
@@ -520,21 +520,21 @@ void snapshot_init_binradar_patch_shm(uintptr_t key) {
                     &binradar_manager->cache_predicates[id];
                 required = MAX(required, predicate->stack_bytes);
             }
-            const char *stack_size = getenv("BRCACHE_STACK_SIZE");
-            char *end = NULL;
-            errno = 0;
-            uint64_t parsed = stack_size != NULL
-                ? strtoull(stack_size, &end, 0) : 0;
-            if (stack_size == NULL || stack_size[0] == '\0' || errno != 0 ||
-                end == stack_size || *end != '\0' || parsed < required ||
-                parsed > (1u << 20)) {
-                log_msg("[binradar] [cache-manifest] "
-                        "[error invalid-stack-size] [required %" PRIu64 "]\n",
-                        required);
-                exit_with_status(1);
-            }
-            binradar_manager->cache_stack_size = (uint32_t)parsed;
         }
+        const char *stack_size = getenv("BRCACHE_STACK_SIZE");
+        char *end = NULL;
+        errno = 0;
+        uint64_t parsed = stack_size != NULL
+            ? strtoull(stack_size, &end, 0) : 0;
+        if (stack_size == NULL || !g_ascii_isdigit(stack_size[0]) ||
+            errno != 0 || end == stack_size || *end != '\0' ||
+            parsed < required || parsed > (1u << 20)) {
+            log_msg("[binradar] [cache-manifest] "
+                    "[error invalid-stack-size] [required %" PRIu64 "]\n",
+                    required);
+            exit_with_status(1);
+        }
+        binradar_manager->cache_stack_size = (uint32_t)parsed;
         shm_size = binradar_manager->selector_size;
         binradar_manager->cache_bytes = g_byte_array_new();
     }

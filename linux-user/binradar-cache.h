@@ -6,7 +6,7 @@
 #include "sbsv.h"
 
 #define BRCACHE_SNAPSHOT_MAGIC 0x48435242u
-#define BRCACHE_SNAPSHOT_VERSION 1u
+#define BRCACHE_SNAPSHOT_VERSION 2u
 #define BRCACHE_FLAG_TRUNCATED 1u
 #define BRCACHE_FLAG_CWE805 2u
 #define BRCACHE_FLAG_INVALID 4u
@@ -100,6 +100,7 @@ typedef struct BinradarPatchSelector {
     char descriptor[];
 } BinradarPatchSelector;
 
+/* Payload: CWE805 clamps (if flagged), 16 registers, then stack_size bytes. */
 typedef struct BinradarSnapshotHeader {
     uint32_t magic;
     uint32_t version;

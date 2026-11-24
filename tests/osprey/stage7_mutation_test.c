@@ -3951,25 +3951,23 @@ static void test_feedback_rejects_malformed_brch(void)
                         sizeof(short_header));
     CHECK(!binradar_cache_vector(&manager, 1, 1, &vector) && vector == NULL,
           "a sub-header snapshot stream rejects cache evaluation");
-    /* Wrong magic with a complete-looking header must also fail closed. */
+    /* Both headers below have the complete register-only body. */
     g_byte_array_set_size(manager.cache_bytes, 0);
-    {
-        BinradarSnapshotHeader header = {
-            .magic = 0xdeadbeefu,
-            .version = BRCACHE_SNAPSHOT_VERSION,
-            .patch_id = 1,
-            .branch = 0,
-            .stack_size = 0,
-            .flags = 0,
-        };
-        uint8_t zero_payload[16 * sizeof(uint64_t)] = {0};
-        g_byte_array_append(manager.cache_bytes, (const uint8_t *)&header,
-                            sizeof(header));
-        g_byte_array_append(manager.cache_bytes, zero_payload,
-                            sizeof(zero_payload));
-    }
-    CHECK(!binradar_cache_vector(&manager, 1, 1, &vector) && vector == NULL,
+    BinradarSnapshotHeader header = {
+        .magic = 0xdeadbeefu,
+        .version = BRCACHE_SNAPSHOT_VERSION,
+    };
+    uint8_t zero_payload[16 * sizeof(uint64_t)] = {0};
+    g_byte_array_append(manager.cache_bytes, (const uint8_t *)&header,
+                        sizeof(header));
+    g_byte_array_append(manager.cache_bytes, zero_payload, sizeof(zero_payload));
+    CHECK(!binradar_cache_vector(&manager, 0, 0, &vector) && vector == NULL,
           "a bad-magic snapshot stream rejects cache evaluation");
+    header.magic = BRCACHE_SNAPSHOT_MAGIC;
+    header.version = 1u;
+    memcpy(manager.cache_bytes->data, &header, sizeof(header));
+    CHECK(!binradar_cache_vector(&manager, 0, 0, &vector) && vector == NULL,
+          "a complete legacy v1 register-only record rejects cache evaluation");
     g_byte_array_free(manager.cache_bytes, TRUE);
 }
 
@@ -3985,8 +3983,7 @@ static bool predicate_branch_matches(BinradarManager *manager,
         .version = BRCACHE_SNAPSHOT_VERSION,
         .patch_id = 1,
         .branch = branch,
-        .stack_size = manager->cache_family == BRCACHE_FAMILY_CWE805
-            ? manager->cache_stack_size : 0,
+        .stack_size = manager->cache_stack_size,
         .flags = manager->cache_family == BRCACHE_FAMILY_CWE805
             ? BRCACHE_FLAG_CWE805 : 0,
     };
@@ -4002,11 +3999,8 @@ static bool predicate_branch_matches(BinradarManager *manager,
     }
     g_byte_array_append(manager->cache_bytes, (const uint8_t *)regs,
                         16u * sizeof(uint64_t));
-    if (header.flags != 0) {
-        g_assert(manager->cache_stack_size <= sizeof(stack));
-        g_byte_array_append(manager->cache_bytes, stack,
-                            manager->cache_stack_size);
-    }
+    g_assert(manager->cache_stack_size <= sizeof(stack));
+    g_byte_array_append(manager->cache_bytes, stack, manager->cache_stack_size);
     bool ok = binradar_cache_vector(manager, 1, 1, &vector) &&
         vector->len == 1 && g_array_index(vector, int, 0) == branch;
     if (vector != NULL) g_array_free(vector, TRUE);
@@ -4017,7 +4011,7 @@ static void test_logical_predicate_native(void)
 {
     BinradarManager manager = {
         .replay_mode = true, .cache_family = BRCACHE_FAMILY_GENERIC,
-        .cache_stack_size = 8,
+        .cache_stack_size = 0,
     };
     uint64_t regs[16] = {0};
     uint64_t clamps[256][2] = {{0}};
@@ -4069,6 +4063,7 @@ static void test_logical_predicate_native(void)
     g_free(long_descriptor);
 
     manager.cache_family = BRCACHE_FAMILY_CWE805;
+    manager.cache_stack_size = 8;
     regs[0] = 150; regs[1] = 50; regs[2] = UINT64_MAX;
     clamps[255][0] = 100; clamps[255][1] = 200;
     CHECK(predicate_branch_matches(&manager, "c3Ac1p0c2p1q1", regs,
@@ -4143,10 +4138,12 @@ static void test_replay_predicate_trap_admission(void)
     struct {
         BinradarSnapshotHeader header;
         uint64_t regs[16];
+        uint8_t stack[8];
     } captures[2] = {0};
     BinradarManager manager = {
         .replay_mode = true, .cache_enabled = true,
         .cache_family = BRCACHE_FAMILY_GENERIC, .patch_max_id = 1,
+        .cache_stack_size = sizeof(captures[0].stack),
     };
     BinradarReplayResult result = {0};
     SnapshotExitInfo outcome = {0};
@@ -4177,10 +4174,12 @@ static void test_replay_predicate_trap_admission(void)
             .magic = BRCACHE_SNAPSHOT_MAGIC,
             .version = BRCACHE_SNAPSHOT_VERSION,
             .patch_id = 1, .branch = branches[i],
+            .stack_size = manager.cache_stack_size,
         };
         captures[i].regs[0] = 1;
         captures[i].regs[1] = i == 0 ? 1 : 0;
     }
+    memset(captures[1].stack, 0xff, sizeof(captures[1].stack));
     CHECK(binradar_replay_descriptor(&manager, unsafe) &&
               binradar_cache_publish_selector(&manager, 1, 7),
           "trap test publishes its actual executed descriptor");
@@ -4199,7 +4198,7 @@ static void test_replay_predicate_trap_admission(void)
               manager.replay_serial == 0,
           "trap classification creates no cache record or capture file");
 
-    for (unsigned failure = 0; failure < 10; failure++) {
+    for (unsigned failure = 0; failure < 12; failure++) {
         g_byte_array_set_size(manager.cache_bytes, 0);
         g_byte_array_append(manager.cache_bytes, (const uint8_t *)captures,
                             sizeof(captures));
@@ -4215,15 +4214,17 @@ static void test_replay_predicate_trap_admission(void)
                                      sizeof(captures) - 1u); break;
         case 1: header.flags = BRCACHE_FLAG_TRUNCATED; break;
         case 2: header.patch_id = 0; break;
-        case 3: g_array_index(observed, int, 1) = 0; break;
-        case 4: header.branch = 1; break;
-        case 5: descriptor = guarded; break;
-        case 6: manager.selector->iteration = 8; break;
-        case 7: manager.line_idx = 1; break;
-        case 8: manager.cache_capture_overflow = true; break;
-        case 9: manager.selector->descriptor[0] = '+'; break;
+        case 3: header.branch = 1; break;
+        case 4: header.stack_size--; break;
+        case 5: header.version = 1; break;
+        case 6: g_array_index(observed, int, 1) = 0; break;
+        case 7: descriptor = guarded; break;
+        case 8: manager.selector->iteration = 8; break;
+        case 9: manager.line_idx = 1; break;
+        case 10: manager.cache_capture_overflow = true; break;
+        case 11: manager.selector->descriptor[0] = '+'; break;
         }
-        if (failure >= 1 && failure <= 4) {
+        if (failure >= 1 && failure <= 5) {
             memcpy(manager.cache_bytes->data + sizeof(captures[0]),
                    &header, sizeof(header));
         }
@@ -4254,15 +4255,32 @@ static void test_replay_predicate_trap_admission(void)
               result.capture != NULL,
           "guard-before-danger retains ordinary reusable normal behavior");
     char *capture_path = result.capture;
+    char *bytes = NULL;
+    gsize size = 0;
+    CHECK(capture_path != NULL &&
+              g_file_get_contents(capture_path, &bytes, &size, NULL) &&
+              size == sizeof(captures) && memcmp(bytes, captures, size) == 0,
+          "resident replay preserves both generic stack payloads in hit order");
+    g_free(bytes);
     CHECK(binradar_replay_lookup(&manager, 7, guarded, &result) &&
               result.source == BINRADAR_REPLAY_SOURCE_CACHE &&
               g_strcmp0(result.reuse, "exact-descriptor") == 0,
           "guarded descriptor can reuse its own authenticated observation");
     g_free(result.capture);
+    CHECK(binradar_replay_lookup(&manager, 7, "!v1p0", &result) &&
+              g_strcmp0(result.reuse, "full-vector-equivalent") == 0,
+          "a different register-only predicate matches both ordered branches");
+    g_free(result.capture);
     CHECK(!binradar_replay_lookup(&manager, 7, unsafe, &result),
           "a trapping candidate cannot reuse a guarded representative");
+    captures[1].header.stack_size--;
+    CHECK(capture_path != NULL &&
+              g_file_set_contents(capture_path, (const char *)captures,
+                                  sizeof(captures), NULL) &&
+              !binradar_replay_lookup(&manager, 7, guarded, &result),
+          "resident replay rejects a complete file with a wrong stack size");
     binradar_replay_release(&manager);
-    unlink(capture_path);
+    if (capture_path != NULL) unlink(capture_path);
     g_free(capture_path);
     binradar_cache_clear_iteration(&manager);
     g_free(manager.current->patch_results);

@@ -1501,6 +1501,16 @@ static bool binradar_eval_cache_predicate(
     return true;
 }
 
+static size_t binradar_snapshot_record_size(const BinradarManager *manager)
+{
+    size_t size = sizeof(BinradarSnapshotHeader) + 16u * sizeof(uint64_t) +
+                  manager->cache_stack_size;
+    if (manager->cache_family == BRCACHE_FAMILY_CWE805) {
+        size += 256u * sizeof(BinradarCacheClamp);
+    }
+    return size;
+}
+
 bool binradar_cache_vector(BinradarManager *manager,
                                   uint32_t selected_patch,
                                   uint32_t evaluated_patch,
@@ -1510,12 +1520,7 @@ bool binradar_cache_vector(BinradarManager *manager,
     size_t offset = 0;
     uint64_t expected_flags = manager->cache_family == BRCACHE_FAMILY_CWE805
         ? BRCACHE_FLAG_CWE805 : 0;
-    size_t expected_record = sizeof(BinradarSnapshotHeader) +
-                             16u * sizeof(uint64_t);
-    if (manager->cache_family == BRCACHE_FAMILY_CWE805) {
-        expected_record += 256u * sizeof(BinradarCacheClamp) +
-                           manager->cache_stack_size;
-    }
+    size_t expected_record = binradar_snapshot_record_size(manager);
     while (offset < manager->cache_bytes->len) {
         if (manager->cache_bytes->len - offset <
             sizeof(BinradarSnapshotHeader)) goto invalid;
@@ -1525,9 +1530,7 @@ bool binradar_cache_vector(BinradarManager *manager,
             header.version != BRCACHE_SNAPSHOT_VERSION ||
             header.patch_id != selected_patch || header.branch > 2 ||
             header.flags != expected_flags ||
-            header.stack_size !=
-                (manager->cache_family == BRCACHE_FAMILY_CWE805
-                    ? manager->cache_stack_size : 0) ||
+            header.stack_size != manager->cache_stack_size ||
             expected_record > manager->cache_bytes->len - offset) {
             goto invalid;
         }
@@ -1546,9 +1549,7 @@ bool binradar_cache_vector(BinradarManager *manager,
         int evaluated;
         if (!binradar_eval_cache_predicate(
                 manager, evaluated_patch, regs, clamps, payload,
-                manager->cache_family == BRCACHE_FAMILY_CWE805
-                    ? manager->cache_stack_size : 0,
-                &evaluated)) goto invalid;
+                manager->cache_stack_size, &evaluated)) goto invalid;
         if (evaluated_patch == selected_patch &&
             evaluated != (int)header.branch) goto invalid;
         g_array_append_val(vector, evaluated);
@@ -1644,15 +1645,6 @@ const char *binradar_replay_outcome_name(BinradarReplayOutcome outcome)
     case BINRADAR_REPLAY_OUTCOME_IGNORED: return "ignored";
     }
     return "unavailable";
-}
-
-static size_t binradar_replay_record_size(const BinradarManager *manager)
-{
-    size_t size = sizeof(BinradarSnapshotHeader) + 16u * sizeof(uint64_t);
-    if (manager->cache_family == BRCACHE_FAMILY_CWE805) {
-        size += 256u * sizeof(BinradarCacheClamp) + manager->cache_stack_size;
-    }
-    return size;
 }
 
 static void binradar_replay_ensure_owned(BinradarManager *manager)
@@ -1757,7 +1749,7 @@ static bool binradar_replay_load_capture(BinradarManager *manager,
 static bool binradar_replay_check_capture(const BinradarManager *manager,
                                           uint32_t selected)
 {
-    const size_t record_size = binradar_replay_record_size(manager);
+    const size_t record_size = binradar_snapshot_record_size(manager);
     const uint64_t expected_flags = manager->cache_family == BRCACHE_FAMILY_CWE805
         ? BRCACHE_FLAG_CWE805 : 0;
     size_t offset = 0;
@@ -1772,9 +1764,7 @@ static bool binradar_replay_check_capture(const BinradarManager *manager,
             header.version != BRCACHE_SNAPSHOT_VERSION ||
             header.patch_id != selected || header.branch > 1 ||
             header.flags != expected_flags ||
-            header.stack_size != (manager->cache_family ==
-                                      BRCACHE_FAMILY_CWE805
-                                  ? manager->cache_stack_size : 0)) {
+            header.stack_size != manager->cache_stack_size) {
             return false;
         }
         offset += record_size;
@@ -1790,7 +1780,7 @@ static bool binradar_replay_evaluate(BinradarManager *manager,
                                      uint32_t slot, bool match_headers,
                                      GArray **vector_out)
 {
-    const size_t record_size = binradar_replay_record_size(manager);
+    const size_t record_size = binradar_snapshot_record_size(manager);
     GArray *vector = NULL;
     /* p0 is the reserved neutral baseline, not a family predicate.  In
      * particular the CWE grammar has no p0 descriptor. */
