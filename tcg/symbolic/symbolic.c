@@ -24,7 +24,6 @@
 //#define DISABLE_SOLVER
 #define SYMBOLIC_COSTANT_ACCESS 0
 #define SYMBOLIC_INPUT_ACCESS   0
-#define JUMP_TABLE_FINDER       0
 #define SYMBOLIC_PC_FINDER      0
 #define DEBUG_EXPR_CONSISTENCY  DEBUG_CONSISTENCY_CHECK
 #define LINEARIZATION           0
@@ -304,20 +303,6 @@ typedef struct TCGHelperInfo {
     unsigned    flags;
     unsigned    sizemask;
 } TCGHelperInfo;
-
-// Pattern:
-//      movq    0xBASE(, %REG, 8), %REG
-//      jmpq    *%rax
-//
-typedef struct {
-    TCGTemp*  index;
-    TCGTemp*  addr;
-    TCGTemp*  mov;
-    uint8_t   scale_is_addr_size;
-    uintptr_t displacement;
-    uint8_t   has_done_load;
-    uint8_t   need_to_free_addr;
-} JumpTableFinder;
 
 // from tcg.c
 extern GHashTable* helper_table;
@@ -3007,77 +2992,6 @@ static inline void qemu_pc_write(TCGTemp* t_op_a, TCGOp* op_in,
     tcg_print_const_str("\nSymbolic PC\n", op_in, &op, tcg_ctx);
     mark_insn_as_instrumentation(op);
 #endif
-    tcg_set_label(label_a_concrete, op_in, NULL, tcg_ctx);
-
-    CHECK_TEMPS_COUNT(tcg_ctx);
-}
-
-static inline void qemu_jump_table(TCGTemp* t_addr, TCGOp* op_in,
-                                   TCGContext* tcg_ctx)
-{
-    SAVE_TEMPS_COUNT(tcg_ctx);
-
-    size_t a = temp_idx(t_addr);
-
-    TCGTemp* t_a = new_non_conflicting_temp(TCG_TYPE_PTR);
-    tcg_movi(t_a, (uintptr_t)&s_temps[a], 0, op_in, NULL, tcg_ctx);
-    tcg_load_n(t_a, t_a, 0, 0, 0, sizeof(uintptr_t), op_in, NULL, tcg_ctx);
-
-    TCGTemp* t_zero = new_non_conflicting_temp(TCG_TYPE_I64);
-    tcg_movi(t_zero, 0, 0, op_in, NULL, tcg_ctx); // ToDo: make this smarter
-
-    TCGLabel* label_a_concrete = gen_new_label();
-    tcg_brcond(label_a_concrete, t_a, t_zero, TCG_COND_EQ, 0, 1, op_in, NULL,
-               tcg_ctx);
-
-    TCGOp* op;
-    tcg_print_const_str("\nSymbolic jump table\n", op_in, &op, tcg_ctx);
-    mark_insn_as_instrumentation(op);
-
-    TCGTemp* t_out = new_non_conflicting_temp(TCG_TYPE_I64);
-
-    // FixMe: we assume that Expr is zero-initialzed!
-    allocate_new_expr(t_out, op_in, tcg_ctx, label_a_concrete);
-
-    TCGTemp* t_opkind = new_non_conflicting_temp(TCG_TYPE_I64);
-    tcg_movi(t_opkind, SYMBOLIC_JUMP_TABLE_ACCESS, 0, op_in, NULL, tcg_ctx);
-    tcg_store_n(t_out, t_opkind, offsetof(Expr, opkind), 0, 1, sizeof(uint8_t),
-                op_in, NULL, tcg_ctx);
-
-    tcg_store_n(t_out, t_a, offsetof(Expr, op1), 0, 1, sizeof(uintptr_t), op_in,
-                NULL, tcg_ctx);
-
-    MARK_TEMP_AS_ALLOCATED(t_addr);
-    tcg_store_n(t_out, t_addr, offsetof(Expr, op2), 0, 0, sizeof(uintptr_t),
-                op_in, NULL, tcg_ctx);
-    MARK_TEMP_AS_NOT_ALLOCATED(t_addr);
-
-    TCGTemp* t_one = new_non_conflicting_temp(TCG_TYPE_I64);
-    tcg_movi(t_one, 1, 0, op_in, NULL, tcg_ctx);
-    tcg_store_n(t_out, t_one, offsetof(Expr, op2_is_const), 0, 1,
-                sizeof(uint8_t), op_in, NULL, tcg_ctx);
-
-    TCGTemp* t_query_addr = new_non_conflicting_temp(TCG_TYPE_I64);
-    tcg_movi(t_query_addr, (uintptr_t)&next_query, 0, op_in, NULL, tcg_ctx);
-
-    TCGTemp* t_query = new_non_conflicting_temp(TCG_TYPE_I64);
-    tcg_load_n(t_query_addr, t_query, 0, 0, 0, sizeof(uintptr_t), op_in, NULL,
-               tcg_ctx);
-#if 0
-    add_void_call_1(print_expr, t_out, op_in, &op, tcg_ctx);
-    mark_insn_as_instrumentation(op);
-#endif
-    tcg_store_n(t_query, t_out, offsetof(Query, query), 0, 1, sizeof(uintptr_t),
-                op_in, NULL, tcg_ctx);
-
-    TCGTemp* t_query_size = new_non_conflicting_temp(TCG_TYPE_I64);
-    tcg_movi(t_query_size, sizeof(Query), 0, op_in, NULL, tcg_ctx);
-    tcg_binop(t_query, t_query, t_query_size, 0, 0, 1, ADD, op_in, NULL,
-              tcg_ctx);
-
-    tcg_store_n(t_query_addr, t_query, 0, 1, 1, sizeof(uintptr_t), op_in, NULL,
-                tcg_ctx);
-
     tcg_set_label(label_a_concrete, op_in, NULL, tcg_ctx);
 
     CHECK_TEMPS_COUNT(tcg_ctx);
@@ -7552,9 +7466,6 @@ int        parse_translation_block(TranslationBlock* tb, uintptr_t tb_pc,
 
     register_helpers();
 
-    JumpTableFinder jump_table_finder_curr_instr = {0};
-    JumpTableFinder jump_table_finder_prev_instr = {0};
-
     TCGTempStaticState temp_static_state[TCG_MAX_TEMPS] = {0};
     TempAddrHint temp_addr_hint[TCG_MAX_TEMPS] = {0};
 
@@ -7653,10 +7564,6 @@ int        parse_translation_block(TranslationBlock* tb, uintptr_t tb_pc,
                     }
                 }
 
-
-                jump_table_finder_prev_instr = jump_table_finder_curr_instr;
-                memset(&jump_table_finder_curr_instr, 0,
-                       sizeof(JumpTableFinder));
 
                 if (instrument == 0 &&
                     (s_config.symbolic_exec_start_addr == 0x0 ||
@@ -7791,19 +7698,6 @@ int        parse_translation_block(TranslationBlock* tb, uintptr_t tb_pc,
                     tcg_temp_free_internal(t_to_idx);
                     tcg_temp_free_internal(t_from_idx);
 #endif
-                    // jump table finder
-                    if (jump_table_finder_curr_instr.displacement > 0 &&
-                        jump_table_finder_curr_instr.scale_is_addr_size &&
-                        jump_table_finder_curr_instr.index &&
-                        jump_table_finder_curr_instr.has_done_load &&
-                        jump_table_finder_curr_instr.addr &&
-                        jump_table_finder_curr_instr.mov == from) {
-
-                        jump_table_finder_curr_instr.mov = to;
-                        assert(to != from);
-                        assert(jump_table_finder_curr_instr.addr != to);
-                        assert(jump_table_finder_curr_instr.addr != from);
-                    }
                     temp_addr_hint[temp_idx(to)] =
                         temp_addr_hint[temp_idx(from)];
                 }
@@ -7921,26 +7815,6 @@ int        parse_translation_block(TranslationBlock* tb, uintptr_t tb_pc,
                         }
 
                         temp_addr_hint[out_idx] = hint;
-                    }
-                    // jump table finder
-                    if (op->opc == INDEX_op_shl_i64 &&
-                        t_a->name && // native register
-                        !temp_static_state[temp_idx(t_a)].is_const &&
-                        temp_static_state[temp_idx(t_b)].is_alive &&
-                        temp_static_state[temp_idx(t_b)].is_const &&
-                        temp_static_state[temp_idx(t_b)].const_value == 3) {
-
-                        jump_table_finder_curr_instr.index              = t_a;
-                        jump_table_finder_curr_instr.scale_is_addr_size = 1;
-                    }
-                    if (op->opc == INDEX_op_add_i64 &&
-                        temp_static_state[temp_idx(t_b)].is_alive &&
-                        temp_static_state[temp_idx(t_b)].is_const &&
-                        temp_static_state[temp_idx(t_b)].const_value > 0x1000) {
-
-                        jump_table_finder_curr_instr.displacement =
-                            temp_static_state[temp_idx(t_b)].const_value;
-                        jump_table_finder_curr_instr.addr = t_out;
                     }
                 }
                 break;
@@ -8077,29 +7951,6 @@ int        parse_translation_block(TranslationBlock* tb, uintptr_t tb_pc,
                         tcg_temp_free_internal(t_disp_pack);
                         tcg_temp_free_internal(t_cpu_env);
 #endif
-                        // jump table finder
-                        if (jump_table_finder_curr_instr.displacement > 0 &&
-                            jump_table_finder_curr_instr.scale_is_addr_size &&
-                            jump_table_finder_curr_instr.index &&
-                            t_ptr == jump_table_finder_curr_instr.addr) {
-
-                            jump_table_finder_curr_instr.has_done_load = 1;
-                            jump_table_finder_curr_instr.mov           = t_val;
-                            TCGTemp* t_addr =
-                                new_non_conflicting_temp(TCG_TYPE_PTR);
-                            MARK_TEMP_AS_ALLOCATED(t_ptr);
-                            tcg_mov(t_addr, t_ptr, 0, 0, op, NULL, tcg_ctx);
-                            MARK_TEMP_AS_NOT_ALLOCATED(t_ptr);
-
-                            assert(t_addr != t_val);
-
-                            move_temp(temp_idx(t_ptr), temp_idx(t_addr),
-                                      sizeof(uintptr_t), op, tcg_ctx);
-
-                            jump_table_finder_curr_instr.addr = t_addr;
-                            jump_table_finder_curr_instr.need_to_free_addr = 1;
-                            // printf("Jump table finder: load\n");
-                        }
                     }
                 }
                 break;
@@ -8359,8 +8210,8 @@ int        parse_translation_block(TranslationBlock* tb, uintptr_t tb_pc,
                 if (instrument) {
                     uintptr_t offset = (uintptr_t)op->args[2];
                     if (is_eip_offset(offset)) {
-                        TCGTemp* t_value = arg_temp(op->args[0]);
 #if SYMBOLIC_PC_FINDER
+                        TCGTemp* t_value = arg_temp(op->args[0]);
 #if 1
                         qemu_pc_write(t_value, op, tcg_ctx);
 #else
@@ -8370,26 +8221,6 @@ int        parse_translation_block(TranslationBlock* tb, uintptr_t tb_pc,
                         MARK_TEMP_AS_NOT_ALLOCATED(t_value);
 #endif
 #endif
-                        if (jump_table_finder_prev_instr.scale_is_addr_size &&
-                            jump_table_finder_prev_instr.displacement &&
-                            jump_table_finder_prev_instr.addr &&
-                            jump_table_finder_prev_instr.index &&
-                            jump_table_finder_prev_instr.has_done_load &&
-                            jump_table_finder_prev_instr.mov == t_value) {
-#if JUMP_TABLE_FINDER
-                            // printf("\nJump Table at %lx?\n", pc);
-                            qemu_jump_table(jump_table_finder_prev_instr.addr,
-                                            op, tcg_ctx);
-#endif
-                            if (jump_table_finder_prev_instr
-                                    .need_to_free_addr) {
-                                tcg_temp_free_internal(
-                                    jump_table_finder_prev_instr.addr);
-                                clear_temp(
-                                    temp_idx(jump_table_finder_prev_instr.addr),
-                                    op, tcg_ctx);
-                            }
-                        }
 #if 0
                         if (temp_static_state[temp_idx(t_value)].is_alive &&
                             temp_static_state[temp_idx(t_value)].is_const &&

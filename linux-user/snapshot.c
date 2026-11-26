@@ -5954,11 +5954,16 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
                 }
                 if (attempt_discarded) {
                     log_msg("[binradar] [attempt-discarded] [iter %u] "
-                            "[reason %s] [patch %u] [status %#x]\n",
+                            "[reason %s] [patch %u] [status %#x] "
+                            "[signal %d] [exit-code %d]\n",
                             attempt,
                             binradar_forkserver_attempt_result_name(
                                 (uint32_t)attempt_result),
-                            selected_patch, child_status);
+                            selected_patch, child_status,
+                            WIFSIGNALED(child_status)
+                                ? WTERMSIG(child_status) : 0,
+                            WIFEXITED(child_status)
+                                ? WEXITSTATUS(child_status) : -1);
                     break;
                 }
             }
