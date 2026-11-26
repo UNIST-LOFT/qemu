@@ -25,6 +25,7 @@
 #include "../tcg/symbolic/symbolic-instrumentation.h"
 #ifdef SYMBOLIC_INSTRUMENTATION
 #include "provenance.h"
+#include "observation-analysis.h"
 #endif
 #include "osprey.h"
 #include <elf.h>
@@ -7461,6 +7462,7 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
         }
 
         cpu_list_unlock();
+        observation_analysis_finish(env);
         snapshot_record_guest_normal_exit(cpu_env, arg1, "normal_exit");
         preexit_cleanup(cpu_env, arg1);
         _exit(arg1);
@@ -9449,6 +9451,7 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
 #ifdef __NR_exit_group
         /* new thread calls */
     case TARGET_NR_exit_group:
+        observation_analysis_finish(env);
         snapshot_record_guest_normal_exit(cpu_env, arg1, "normal_exit_group");
         preexit_cleanup(cpu_env, arg1);
         return get_errno(exit_group(arg1));
@@ -12277,6 +12280,22 @@ abi_long do_syscall(void *cpu_env, int num, abi_long arg1,
     }
 #endif
 
+    if (observation_analysis_enabled &&
+        (num == TARGET_NR_clone || num == TARGET_NR_execve
+#ifdef TARGET_NR_execveat
+         || num == TARGET_NR_execveat
+#endif
+#ifdef TARGET_NR_fork
+         || num == TARGET_NR_fork
+#endif
+#ifdef TARGET_NR_vfork
+         || num == TARGET_NR_vfork
+#endif
+        )) {
+        observation_analysis_unsupported("unsupported-process-or-thread-transition");
+        observation_analysis_finish(env);
+        _exit(1);
+    }
     trace_guest_user_syscall(cpu, num, arg1, arg2, arg3, arg4,
                              arg5, arg6, arg7, arg8);
 
@@ -12310,6 +12329,7 @@ abi_long do_syscall(void *cpu_env, int num, abi_long arg1,
     }
 #endif
 
+    observation_analysis_syscall_return();
     trace_guest_user_syscall_ret(cpu, num, ret);
     return ret;
 }

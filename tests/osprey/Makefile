@@ -30,7 +30,8 @@ OSPREY_OBJS := ../../build/x86_64-linux-user/linux-user/osprey.o \
                ../../build/x86_64-linux-user/linux-user/osprey-runtime.o \
                ../../build/x86_64-linux-user/linux-user/osprey-mutation.o \
                ../../build/x86_64-linux-user/linux-user/provenance.o \
-               ../../build/x86_64-linux-user/linux-user/sem-events.o
+               ../../build/x86_64-linux-user/linux-user/sem-events.o \
+               $(WORK)/observation_boundary.o
 # Stage 7 compiles e9-ranges.c itself; do not put it in shared OSPREY_OBJS.
 UNIT_E9_OBJ := ../../build/x86_64-linux-user/linux-user/e9-ranges.o
 UNIT_BIN   := $(WORK)/osprey_unit
@@ -70,8 +71,10 @@ OSPREY_HEADERS := ../../linux-user/osprey.h \
                   ../../linux-user/osprey-internal.h \
                   ../../linux-user/provenance.h \
                   ../../linux-user/e9-ranges.h \
-                  ../../linux-user/sem-events.h
-OSPREY_ASAN_OBJS := $(addprefix $(WORK)/,$(notdir $(OSPREY_SRCS:.c=.asan.o)))
+                  ../../linux-user/sem-events.h \
+                  ../../linux-user/observation-analysis.h
+OSPREY_ASAN_OBJS := $(addprefix $(WORK)/,$(notdir $(OSPREY_SRCS:.c=.asan.o))) \
+                    $(WORK)/observation_boundary.asan.o
 UNIT_CFLAGS := -iquote ../../build/linux-user -iquote ../../tcg \
                -iquote ../../tcg/i386 -iquote ../../ \
                -iquote ../../accel/tcg -iquote ../../include \
@@ -347,6 +350,12 @@ $(UNIT_ASAN_BIN): unit_test.c $(OSPREY_OBJS) $(UNIT_E9_OBJ) | $(WORK)
 $(WORK)/osprey_unit_asan_osprey: unit_test.c $(OSPREY_ASAN_OBJS) $(WORK)/e9-ranges.asan.o | $(WORK)
 	$(CC) $(ASAN_CFLAGS) -o $@ unit_test.c $(OSPREY_ASAN_OBJS) $(WORK)/e9-ranges.asan.o \
 		-lglib-2.0 -lpthread -lm
+
+$(WORK)/observation_boundary.o: observation_boundary.c $(OSPREY_HEADERS) | $(WORK)
+	$(CC) $(UNIT_CFLAGS) -c -o $@ $<
+
+$(WORK)/observation_boundary.asan.o: observation_boundary.c $(OSPREY_HEADERS) | $(WORK)
+	$(CC) $(ASAN_CFLAGS) -c -o $@ $<
 
 $(WORK)/%.asan.o: ../../linux-user/%.c $(OSPREY_HEADERS) | $(WORK)
 	$(CC) $(ASAN_CFLAGS) -c -o $@ $<

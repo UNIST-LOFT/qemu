@@ -10,6 +10,7 @@
 #include "cpu.h"
 #include "snapshot.h"
 #include "provenance.h"
+#include "observation-analysis.h"
 #include "tcg/symbolic/symbolic-struct.h"
 #include "exec/helper-head.h"
 #include "qemu/atomic.h"
@@ -211,6 +212,7 @@ PtrTag provenance_create_object(target_ulong base, target_ulong size,
     g_hash_table_insert(prov_live_by_base,
                         GINT_TO_POINTER((uintptr_t)base), obj_key_new(id, gen));
 
+    observation_analysis_alloc(base, size, pc, id, gen, kind);
     PtrTag tag = {
         .object_id = id,
         .generation = gen,
@@ -234,6 +236,7 @@ bool provenance_retire_object(target_ulong base) {
     if (obj == NULL) {
         return false;
     }
+    observation_analysis_free(base);
     obj->state = PROV_OBJ_FREED;
     /* Remove from live-by-base but keep in object table (for UAF). */
     g_hash_table_steal(prov_live_by_base, GINT_TO_POINTER((uintptr_t)base));
@@ -1255,6 +1258,7 @@ static void prov_fault_fill(PendingProvenanceFault *pf, CPUArchState *env,
     }
 
     atomic_store_release(&slot->ready, 1);
+    observation_analysis_finding();
     prov_log_committed_finding(slot);
 }
 

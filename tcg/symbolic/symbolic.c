@@ -17,6 +17,7 @@
 #include "../../linux-user/provenance.h"
 #include "../../linux-user/sem-events.h"
 #include "../../linux-user/osprey.h"
+#include "../../linux-user/observation-analysis.h"
 
 #define DEBUG_CONSISTENCY_CHECK 0
 
@@ -9870,7 +9871,7 @@ static void model_allocator_clear(CPUArchState *env, target_ulong base,
                                    target_ulong size)
 {
     if (size == 0) return;
-    sem_mem_overwrite(env, base, size, SEM_OP_LIBC_MODEL);
+    sem_mem_allocator_reset(env, base, size);
     if (symbolic_mode) {
         /* Avoid recursive whole-allocation clearing across 64-KiB leaves. */
         while (size != 0) {
@@ -10356,8 +10357,16 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
             .pending = provenance_get_reg_shadow(env)->pending,
             .write = model_write, .kind = model, .stack_low = rsp,
         };
-        if (model_is_allocator(model)) model_allocator_snapshot(env, &frame);
+        if (model == MEMCPY || model == MEMMOVE || model == MEMSET) {
+            observation_analysis_allocator(env, PROV_OP_NONE, 0);
+        }
+        if (model_is_allocator(model)) {
+            observation_analysis_allocator(env, frame.pending.kind, frame.pending.arg_ptr);
+            model_allocator_snapshot(env, &frame);
+        }
         g_array_append_val(model_frames, frame);
+        observation_analysis_model(true, model_is_allocator(model) ||
+            model == MEMMOVE || model == MEMCPY || model == MEMSET);
         return 1; /* repeated/nested calls must reenter dispatch */
     }
     if (returning) {
@@ -10368,6 +10377,7 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
         provenance_get_reg_shadow(env)->pending = frame.pending;
         model_write_complete(env, &frame.write);
         g_array_set_size(model_frames, model_frames->len - 1);
+        observation_analysis_model(model_frames->len != 0, true);
         // printf("Switch mode back\n");
         if (symbolic_mode) {
             Expr* ret_expr = take_pending_model_return_expr();
@@ -10384,6 +10394,9 @@ int is_symbolic_model(uintptr_t pc, CPUArchState *cpu) {
          * RCX, RDX, RSI, RDI, R8-R11) before installing the modeled
          * return; the pending-alloc return tag (below) re-tags RAX. */
         sem_clobber_caller_saved(env);
+        if (frame.kind == MEMCPY || frame.kind == MEMMOVE || frame.kind == MEMSET) {
+            observation_analysis_return_pointer();
+        }
         PendingAlloc alloc = frame.pending.valid && frame.kind != FREE ?
             snapshot_trace_get_pending_allocs(pc) : (PendingAlloc){0};
         target_ulong base = env->regs[R_EAX];

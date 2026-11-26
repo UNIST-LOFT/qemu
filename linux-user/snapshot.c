@@ -1,5 +1,6 @@
 #include "snapshot.h"
 #include "provenance.h"
+#include "observation-analysis.h"
 #include "sem-events.h"
 #include "osprey.h"
 #include "osprey-internal.h"
@@ -2362,6 +2363,7 @@ void snapshot_init(void) {
     /* Load binradar env vars early so binradar_memcheck_enabled is set
      * before any memory access instrumentation runs. */
     snapshot_load_binradar_env();
+    observation_analysis_init();
     /* Initialize PLT hooks for memcheck-only mode. */
     memcheck_init();
     /* OSPREY: parse config; when enabled, allocate the shared run and

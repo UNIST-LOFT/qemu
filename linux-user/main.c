@@ -45,6 +45,7 @@
 #include "cpu_loop-common.h"
 #include "crypto/init.h"
 #include "snapshot.h"
+#include "observation-analysis.h"
 
 char *exec_path;
 
@@ -376,6 +377,10 @@ static void handle_arg_singlestep(const char *arg)
 
 static void handle_arg_symbolic(const char *arg)
 {
+    if (observation_analysis_enabled) {
+        fprintf(stderr, "observation-analysis: incompatible -symbolic\n");
+        exit(1);
+    }
     enable_symbolic_mode();
 }
 

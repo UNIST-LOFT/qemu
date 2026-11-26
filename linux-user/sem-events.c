@@ -21,6 +21,7 @@
 
 #include "sem-events.h"
 #include "provenance.h"
+#include "observation-analysis.h"
 #include "osprey.h"
 #include "snapshot.h"
 #include "tcg/symbolic/symbolic-instrumentation.h"
@@ -393,6 +394,7 @@ void sem_mem_overwrite(CPUArchState *env, target_ulong addr,
         return;
     }
     bool valid_class = sem_op_class_is_valid(cls);
+    observation_analysis_overwrite(env, addr, size, cls);
     /* Invalid classes still invalidate active consumer state, but can
      * never authorize an OSPREY fact or a more precise transfer. */
     sem_memory_attempt_invalidate(addr, size);
@@ -402,6 +404,13 @@ void sem_mem_overwrite(CPUArchState *env, target_ulong addr,
      * for an invalid class. */
     sem_memory_success_commit(env, addr, size);
     (void)valid_class;
+}
+
+void sem_mem_allocator_reset(CPUArchState *env, target_ulong addr,
+                             target_ulong size) {
+    if (!sem_events_active()) return;
+    sem_memory_attempt_invalidate(addr, size);
+    sem_memory_success_commit(env, addr, size);
 }
 
 void sem_mem_helper_write_attempt(CPUArchState *env, target_ulong addr,
@@ -432,6 +441,8 @@ void sem_mem_copy(CPUArchState *env, target_ulong src, target_ulong dst,
         return;
     }
     bool valid_class = sem_op_class_is_valid(cls);
+    if (valid_class) observation_analysis_copy(env, src, dst, size);
+    else observation_analysis_unsupported("unknown-copy-semantics");
     sem_memory_attempt_invalidate(dst, size);
     if (osprey_collect_enabled && env != NULL) {
         if (valid_class) {
@@ -476,12 +487,14 @@ void sem_reg_overwrite(CPUArchState *env, int reg_idx, SemOpClass cls) {
 }
 
 void sem_mark_unsupported_execution(void) {
+    observation_analysis_unsupported("unsupported-semantic-producer");
     if (osprey_collect_enabled) {
         osprey_mark_unsupported_execution();
     }
 }
 
 void sem_context_replace(CPUArchState *env) {
+    observation_analysis_unsupported("unsupported-signal-context-replacement");
     if (env == NULL) {
         return;
     }
@@ -502,6 +515,7 @@ void sem_context_replace(CPUArchState *env) {
 }
 
 void sem_clobber_caller_saved(CPUArchState *env) {
+    observation_analysis_clobber();
     static const int caller_saved[] = {
         R_EAX, R_ECX, R_EDX, R_ESI, R_EDI,
 #ifdef TARGET_X86_64
@@ -933,6 +947,12 @@ void sem_mem_helper_access_part(CPUArchState *env, target_ulong addr,
     bool valid_class = sem_op_class_is_valid(cls);
     bool valid_policy = sem_interval_policy_declared(producer, cls, policy,
                                                      size);
+    if (observation_analysis_enabled) {
+        if (is_store) observation_analysis_store(addr, size);
+        if (!valid_class || !valid_policy) {
+            observation_analysis_unsupported("unsupported-helper-store-semantics");
+        }
+    }
     /* Helper-backed operations publish after the helper succeeds.  If the
      * translator supplied provenance EA metadata, consume it for the first
      * ordered interval even when OSPREY is disabled.  Later parts have no
@@ -993,6 +1013,15 @@ void sem_mem_maskmov(CPUArchState *env, target_ulong addr,
     if (sem_allocator_body) return;
     bool valid_class = sem_op_class_is_valid(cls);
     bool valid_policy = sem_interval_policy_declared(producer, cls, policy, 1);
+    if (observation_analysis_enabled) {
+        if (!valid_class || !valid_policy || (width != 8 && width != 16)) {
+            observation_analysis_unsupported("unsupported-sparse-store-semantics");
+        } else {
+            for (uint32_t i = 0; i < width; i++) {
+                if (selected_mask & (1u << i)) observation_analysis_store(addr + i, 1);
+            }
+        }
+    }
     if (binradar_memcheck_enabled && (width == 8 || width == 16)) {
         for (uint32_t i = 0; i < width; i++) {
             if (selected_mask & (1u << i)) {

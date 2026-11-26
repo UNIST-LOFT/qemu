@@ -26,6 +26,7 @@
 #include "snapshot.h"
 #include "osprey.h"
 #include "provenance.h"
+#include "observation-analysis.h"
 
 /* from personality.h */
 
@@ -2883,6 +2884,9 @@ int load_elf_binary(struct linux_binprm *bprm, struct image_info *info)
         }
         provenance_main_entry = resolved;
     }
+
+    observation_analysis_image(info->load_bias, info->start_code,
+                               info->end_code, info->start_data, info->brk);
 
     /* If we have an interpreter, set that as the program's entry point.
        Copy the load_bias as well, to help PPC64 interpret the entry

@@ -26,6 +26,7 @@
 #include "signal-common.h"
 #include "snapshot.h"
 #include "provenance.h"
+#include "observation-analysis.h"
 
 static struct target_sigaction sigact_table[TARGET_NSIG];
 
@@ -585,13 +586,17 @@ static void QEMU_NORETURN dump_core_and_abort(int target_sig, const target_sigin
 
     target_ulong fault_addr = info ? info->_sifields._sigfault._addr : 0;
     int si_code = info ? info->si_code : 0;
+    observation_analysis_signal(env, target_sig, fault_addr);
     /* Dual-record policy (§8): if a provenance finding is pending, emit
      * its structured record before the real crash wins the verdict. */
         provenance_report_pending_finding();
     snapshot_record_guest_crash(env, target_sig, host_sig, si_code,
                                 fault_addr, 0, "unhandled_target_signal");
 
-    if (afl_fork_child) {
+    if (afl_fork_child || observation_analysis_enabled) {
+        /* The offline collector already committed the genuine fatal guest
+         * signal. Its unchanged seccomp policy denies host kill(), so host
+         * signal reraising would wait forever. Do not weaken that policy. */
         _exit(128 + host_sig);
     }
 

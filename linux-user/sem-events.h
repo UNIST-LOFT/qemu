@@ -187,6 +187,11 @@ void sem_allocator_scope(CPUArchState *env, target_ulong *stack_low);
 void sem_mem_overwrite(CPUArchState *env, target_ulong addr,
                        target_ulong size, SemOpClass cls);
 
+/* Allocation/lifetime shadow invalidation is not a successful guest write.
+ * In particular, realloc clearing must not initialize its new tail bytes. */
+void sem_mem_allocator_reset(CPUArchState *env, target_ulong addr,
+                             target_ulong size);
+
 /* Helper-owned store attempt.  Provenance invalidates before the host
  * store so a partially committed helper cannot retain stale tags.
  * OSPREY deliberately waits for the corresponding post-success

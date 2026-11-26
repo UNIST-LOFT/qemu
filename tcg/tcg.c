@@ -69,6 +69,7 @@
 // added due to inline functions in symbolic.h
 
 #include "symbolic/symbolic.h"
+#include "../linux-user/observation-analysis.h"
 #ifdef TCG_INSTRUMENTATION
 int symbolic_force_flush_cache = 0;
 extern int binradar_memcheck_enabled;
@@ -4369,6 +4370,9 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, CPUArchState *cpu_env)
     atomic_set(&prof->opt_time, prof->opt_time - profile_getclock());
 #endif
 
+#ifdef CONFIG_USER_ONLY
+    if (observation_analysis_enabled) observation_analysis_instrument(s);
+#endif
 #ifdef USE_TCG_OPTIMIZATIONS
     tcg_optimize(s);
 #endif
