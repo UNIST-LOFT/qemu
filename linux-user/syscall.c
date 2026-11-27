@@ -7485,7 +7485,10 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
         if (arg2 == 0 && arg3 == 0) {
             return get_errno(safe_write(arg1, 0, 0));
         }
-        memcheck_syscall_request(env, arg2, arg3, syscall_buffer_reg());
+#ifdef SYMBOLIC_INSTRUMENTATION
+        if (!snapshot_observation_probe(env, TARGET_NR_write, arg1, arg2, arg3))
+#endif
+            memcheck_syscall_request(env, arg2, arg3, syscall_buffer_reg());
         if (!(p = lock_user(VERIFY_READ, arg2, arg3, 1)))
             return -TARGET_EFAULT;
         if (fd_trans_target_to_host_data(arg1)) {

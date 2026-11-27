@@ -377,7 +377,183 @@ void check_all_env_var(void) {
     check_env_var("BINRADAR_SYMBOLIC_TEST_DETAIL");
 }
 
+/* A single image-bound syscall instruction is a capability, never an E9 range
+ * or an fd number. Pipe identity is established only by its real prefix pipe2. */
+static struct {
+    target_ulong pc;
+    bool configured, bound, invalidated, attempted;
+    int fd[2];
+    dev_t dev;
+    ino_t ino;
+} brobs_channel;
+
+static void snapshot_brobs_configure(uintptr_t load_bias)
+{
+    const char *pc = getenv("BINRADAR_BROBS_PC");
+    const char *count = getenv("BINRADAR_BROBS_COUNT");
+    const char *crc = getenv("BINRADAR_BROBS_CRC32");
+    const char *sha = getenv("BINRADAR_BROBS_SHA256");
+    char *end;
+    if (!pc && !count && !crc && !sha) return;
+    if (!pc || !count || !crc || !sha || !g_ascii_isdigit(*count) ||
+        !g_ascii_isdigit(*crc) || !g_ascii_isxdigit(*pc) || strlen(sha) != 64)
+        goto invalid;
+    for (size_t i = 0; i < 64; i++)
+        if (!((sha[i] >= '0' && sha[i] <= '9') ||
+              (sha[i] >= 'a' && sha[i] <= 'f'))) goto invalid;
+    errno = 0;
+    unsigned long long n = strtoull(count, &end, 10);
+    if (errno || *end || n > BRCACHE_MAX_OBSERVATIONS) goto invalid;
+    errno = 0;
+    unsigned long long checksum = strtoull(crc, &end, 10);
+    if (errno || *end || checksum > UINT32_MAX) goto invalid;
+    errno = 0;
+    unsigned long long value = strtoull(pc, &end, 16);
+    if (errno || *end || value > UINT64_MAX - load_bias) goto invalid;
+    if (n == 0) {
+        if (value || checksum || strspn(sha, "0") != 64) goto invalid;
+        return;
+    }
+    if (value < 8) goto invalid;
+    brobs_channel.pc = value + load_bias;
+    brobs_channel.configured = true;
+    return;
+invalid:
+    log_msg("[brobs] [fatal invalid-capability]\n");
+    exit_with_status(1);
+}
+
+static bool snapshot_brobs_pc(CPUArchState *env)
+{
+#if defined(TARGET_X86_64) && !defined(TARGET_ABI32)
+    static const uint8_t marker[] = {0x0f,0x1f,0x84,0x00,0x42,0x52,0x4f,0x42,0x0f,0x05,0xc3};
+    target_ulong pc = brobs_channel.pc;
+    if (!brobs_channel.configured || !env ||
+        (env->eip != pc && env->eip != pc + 2) ||
+        !is_in_e9_exclude_region(pc - 8) ||
+        !is_in_e9_exclude_region(pc + 2)) return false;
+    for (target_ulong p = pc - 8; p <= pc + 2; p++) {
+        int flags = page_get_flags(p);
+        if ((flags & (PAGE_VALID | PAGE_READ | PAGE_EXEC | PAGE_WRITE)) !=
+            (PAGE_VALID | PAGE_READ | PAGE_EXEC)) return false;
+    }
+    const uint8_t *bytes = lock_user(VERIFY_READ, pc - 8, sizeof(marker), 1);
+    if (!bytes) return false;
+    bool same = memcmp(bytes, marker, sizeof(marker)) == 0;
+    unlock_user((void *)bytes, pc - 8, 0);
+    return same;
+#else
+    return false;
+#endif
+}
+
+static bool snapshot_brobs_binding(void)
+{
+    if (!brobs_channel.bound || brobs_channel.invalidated) return false;
+    int saved = errno;
+    bool valid = true;
+    for (size_t i = 0; i < 2; i++) {
+        struct stat st;
+        int flags = fcntl(brobs_channel.fd[i], F_GETFL);
+        if (fstat(brobs_channel.fd[i], &st) || !S_ISFIFO(st.st_mode) ||
+            st.st_dev != brobs_channel.dev || st.st_ino != brobs_channel.ino ||
+            flags != ((i ? O_WRONLY : O_RDONLY) | O_NONBLOCK) ||
+            fcntl(brobs_channel.fd[i], F_GETFD) != FD_CLOEXEC) valid = false;
+    }
+    errno = saved;
+    if (!valid) brobs_channel.invalidated = true;
+    return valid;
+}
+
+bool snapshot_observation_probe(CPUArchState *env, uintptr_t nr,
+                                 uintptr_t fd, uintptr_t arg1, uintptr_t arg2)
+{
+    if (!snapshot_brobs_pc(env) || !snapshot_brobs_binding()) return false;
+    int endpoint = (int32_t)(uint32_t)fd;
+    if (nr == TARGET_NR_read || nr == TARGET_NR_write)
+        return arg2 >= 1 && arg2 <= 8 &&
+            endpoint == brobs_channel.fd[nr == TARGET_NR_write];
+    if (endpoint != brobs_channel.fd[0] && endpoint != brobs_channel.fd[1])
+        return false;
+    return nr == TARGET_NR_fstat ||
+        (nr == TARGET_NR_fcntl && (arg1 == TARGET_F_GETFD || arg1 == TARGET_F_GETFL));
+}
+
+static bool snapshot_brobs_syscall(CPUArchState *env, uintptr_t nr,
+                                  uintptr_t a0, uintptr_t a1, uintptr_t a2,
+                                  abi_long result)
+{
+    bool probe = snapshot_observation_probe(env, nr, a0, a1, a2);
+    if (nr == TARGET_NR_pipe2 && snapshot_brobs_pc(env) &&
+        !afl_fork_child && !brobs_channel.attempted) {
+        brobs_channel.attempted = true;
+        if (result == 0 && a1 == (TARGET_O_NONBLOCK | TARGET_O_CLOEXEC)) {
+            uint32_t r, w;
+            if (!get_user_u32(r, a0) && !get_user_u32(w, a0 + 4) &&
+                r != w && r <= INT_MAX && w <= INT_MAX) {
+                struct stat st;
+                brobs_channel.fd[0] = r;
+                brobs_channel.fd[1] = w;
+                if (fstat(r, &st) == 0) {
+                    brobs_channel.dev = st.st_dev;
+                    brobs_channel.ino = st.st_ino;
+                    brobs_channel.bound = true;
+                    if (!snapshot_brobs_binding()) brobs_channel.bound = false;
+                }
+            }
+        }
+    }
+    if (result >= 0 && brobs_channel.bound) {
+        /* Permission restoration must not resurrect rewritten/rebound thunk
+         * pages. Observe successful mapping changes even outside replay. */
+        target_ulong begin = brobs_channel.pc - 8, end = brobs_channel.pc + 3;
+        bool source_overlap = a1 && a0 < end &&
+            (a0 >= begin || a1 > begin - a0);
+        if ((nr == TARGET_NR_mprotect || nr == TARGET_NR_munmap ||
+             nr == TARGET_NR_mremap) && source_overlap)
+            brobs_channel.invalidated = true;
+        uintptr_t length = nr == TARGET_NR_mremap ? a2 : a1;
+        if ((nr == TARGET_NR_mmap || nr == TARGET_NR_mremap) && length &&
+            (uintptr_t)result < end && ((uintptr_t)result >= begin ||
+                                       length > begin - (uintptr_t)result))
+            brobs_channel.invalidated = true;
+        int fd = (int32_t)(uint32_t)a0;
+        if ((nr == TARGET_NR_close ||
+             (nr == TARGET_NR_fcntl && (a1 == TARGET_F_SETFL || a1 == TARGET_F_SETFD))) &&
+            (fd == brobs_channel.fd[0] || fd == brobs_channel.fd[1]))
+            brobs_channel.invalidated = true;
+        if ((nr == TARGET_NR_dup || nr == TARGET_NR_dup2 || nr == TARGET_NR_dup3 ||
+             (nr == TARGET_NR_fcntl && (a1 == TARGET_F_DUPFD || a1 == TARGET_F_DUPFD_CLOEXEC))) &&
+            (result == brobs_channel.fd[0] || result == brobs_channel.fd[1]) &&
+            !(nr == TARGET_NR_dup2 && fd == result)) brobs_channel.invalidated = true;
+    }
+    if (!probe) return false;
+    if (nr == TARGET_NR_read || nr == TARGET_NR_write)
+        return (result >= 0 && (uint64_t)result <= a2) ||
+            result == -TARGET_EAGAIN || result == -TARGET_EFAULT || result == -TARGET_EINTR;
+    if (nr == TARGET_NR_fstat) return result == 0;
+    return result >= 0;
+}
+
+/* No child runs concurrently with this drain. A killed child may leave a
+ * partial scalar in the shared pipe; it must never reach the next child. */
+static bool snapshot_brobs_drain(void)
+{
+    if (!brobs_channel.configured) return true;
+    if (!snapshot_brobs_binding()) return false;
+    uint8_t bytes[256];
+    for (size_t n = 0; n < 4096; n++) {
+        ssize_t got = read(brobs_channel.fd[0], bytes, sizeof(bytes));
+        if (got < 0 && errno == EINTR) continue;
+        if (got < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return true;
+        if (got <= 0) break;
+    }
+    brobs_channel.invalidated = true;
+    return false;
+}
+
 void add_exclude_regions(uintptr_t load_bias) {
+    snapshot_brobs_configure(load_bias);
     parse_e9_exclude_ranges(load_bias);
     const char *value = getenv("E9_RELOCATED_INSTRUCTIONS");
     if (e9_parse_relocated_instructions(value, load_bias,
@@ -2682,6 +2858,8 @@ void snapshot_syscall(CPUArchState *env, uintptr_t syscall_no,
                       uintptr_t syscall_arg2, uintptr_t syscall_arg3,
                       uintptr_t syscall_arg4, uintptr_t syscall_arg5,
                       uintptr_t syscall_arg6, uintptr_t ret_val) {
+    bool observation_probe = snapshot_brobs_syscall(env, syscall_no,
+        syscall_arg0, syscall_arg1, syscall_arg2, (abi_long)ret_val);
     if (g_strcmp0(getenv("BINRADAR_REPLAY_SERVER"), "1") == 0) {
         if (snapshot_guest_fds == NULL)
             snapshot_guest_fds = g_hash_table_new(g_direct_hash, g_direct_equal);
@@ -2725,7 +2903,7 @@ void snapshot_syscall(CPUArchState *env, uintptr_t syscall_no,
             bool supported = true;
             const char *reason = "unsupported-syscall-family";
             SnapshotReplayInput *input;
-            switch (syscall_no) {
+            if (!observation_probe) switch (syscall_no) {
             case TARGET_NR_read: case TARGET_NR_pread64:
             case TARGET_NR_readv: case TARGET_NR_preadv:
                 if (fd < 0 && result == -TARGET_EBADF) break;
@@ -2871,7 +3049,7 @@ void snapshot_syscall(CPUArchState *env, uintptr_t syscall_no,
                 memcpy(mem_access.target, buf, ret_val);
                 mem_access.observed_valid = true;
             }
-            (void)snapshot_read_access(env, &mem_access);
+            if (!observation_probe) (void)snapshot_read_access(env, &mem_access);
         }
         break;
 #if defined(TARGET_NR_futex)
@@ -5403,9 +5581,12 @@ static void snapshot_replay_case_reply(BinradarForkserverDriver *driver,
         g_free(capture);
         capture = g_strdup_printf(
             "{\"mutation\":%u,\"path\":%s,\"sha256\":\"%s\","
-            "\"descriptor\":%s,\"patch_id\":%u,\"reuse\":\"%s\"}",
+            "\"descriptor\":%s,\"patch_id\":%u,\"reuse\":\"%s\","
+            "\"observation\":{\"schema_version\":1,\"count\":%u,"
+            "\"plan_sha256\":\"%s\",\"plan_crc32\":%u}}",
             mutation, path, result->sha256, descriptor, result->selected,
-            result->reuse);
+            result->reuse, binradar_manager->observation_count,
+            binradar_manager->observation_sha256, binradar_manager->observation_crc32);
         g_free(path);
         g_free(descriptor);
     }
@@ -5480,6 +5661,10 @@ static bool snapshot_replay_case(BinradarForkserverDriver *driver,
     fflush(NULL);
     trace_mem_flush();
     log_msg_flush();
+    if (!snapshot_brobs_drain()) {
+        manager->cache_capture_overflow = true;
+        __atomic_store_n(snapshot_replay_external, 1u, __ATOMIC_RELEASE);
+    }
     pid_t child = fork();
     if (child < 0) exit_with_status(4);
     if (child == 0) {
@@ -5497,6 +5682,8 @@ static bool snapshot_replay_case(BinradarForkserverDriver *driver,
     uint32_t status = 0;
     int waited = binradar_forkserver_wait_child(
         driver, child, manager, &status, NULL, NULL);
+    if (!snapshot_brobs_drain())
+        __atomic_store_n(snapshot_replay_external, 1u, __ATOMIC_RELEASE);
     mod_manager->current = NULL;
     snapshot_replay_active = false;
     if (waited < 0) exit_with_status(6);
@@ -5803,6 +5990,10 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
                 __atomic_store_n(snapshot_replay_external, 0u, __ATOMIC_RELEASE);
                 snapshot_replay_active = true;
             }
+            if (!snapshot_brobs_drain()) {
+                replay_reusable = false;
+                if (binradar_manager) binradar_manager->cache_capture_overflow = true;
+            }
             pid_t child_pid = fork();
             if (child_pid < 0) exit_with_status(4);
             if (child_pid == 0) {
@@ -5827,6 +6018,10 @@ void snapshot_forkserver(CPUState *cpu, CPUArchState *cpu_env,
             int wait_rc = binradar_forkserver_wait_child(
                 &driver, child_pid, binradar_manager, &child_status,
                 report_shared_prov_finding, NULL);
+            if (!snapshot_brobs_drain()) {
+                replay_reusable = false;
+                if (binradar_manager) binradar_manager->cache_capture_overflow = true;
+            }
             if (driver.replay_mode) {
                 snapshot_replay_active = false;
                 if (__atomic_load_n(snapshot_replay_external,

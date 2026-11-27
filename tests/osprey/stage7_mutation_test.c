@@ -4131,6 +4131,103 @@ static void test_logical_predicate_native(void)
     g_byte_array_free(manager.cache_bytes, TRUE);
 }
 
+/* Real native evaluator framing and short circuit cases with plan-bound slots. */
+static void test_observation_predicate_native(void)
+{
+    struct {
+        BinradarSnapshotHeader header;
+        uint64_t regs[16];
+        uint8_t status[8];
+        uint64_t values[2];
+    } record = {0};
+    BinradarManager manager = {
+        .replay_mode = true, .cache_family = BRCACHE_FAMILY_GENERIC,
+        .observation_count = 2, .observation_crc32 = 1234,
+    };
+    manager.cache_predicates = g_new0(BinradarCachePredicate, BINRADAR_REPLAY_SLOT_COUNT);
+    manager.selector = g_new0(BinradarPatchSelector, 1);
+    manager.cache_bytes = g_byte_array_new();
+    record.header = (BinradarSnapshotHeader){
+        .magic = BRCACHE_SNAPSHOT_MAGIC, .version = BRCACHE_SNAPSHOT_VERSION,
+        .patch_id = 1, .flags = BRCACHE_FLAG_HAS_OBS,
+        .obs_count = 2, .obs_plan_crc32 = 1234,
+    };
+    const struct { const char *descriptor; int branch; } cases[] = {
+        {"=o0p7", 1}, {"AV1o1", 0}, {"OV0o1", 1},
+        {"o1", 2}, {"Ao1p0", 2}, {"Ap0o1", 0}, {"V1", 0},
+    };
+    record.values[0] = 7;
+    record.status[1] = 3;
+    for (size_t i = 0; i < G_N_ELEMENTS(cases); i++) {
+        GArray *vector = NULL;
+        record.header.branch = cases[i].branch;
+        g_byte_array_set_size(manager.cache_bytes, 0);
+        g_byte_array_append(manager.cache_bytes, (uint8_t *)&record, sizeof(record));
+        CHECK(binradar_replay_descriptor(&manager, cases[i].descriptor) &&
+              binradar_cache_vector(&manager, 1, 1, &vector) &&
+              vector->len == 1 && g_array_index(vector, int, 0) == cases[i].branch,
+              "native observation evaluates real bound statuses and short circuit order");
+        if (vector) g_array_free(vector, TRUE);
+    }
+    CHECK(!binradar_replay_descriptor(&manager, "Op1o2") &&
+          !binradar_replay_descriptor(&manager, "AV0V64"),
+          "native bounds checks skipped observation and validity leaves");
+    record.header.branch = 0;
+    CHECK(binradar_replay_descriptor(&manager, "Ap0o1"), "native invalid capture descriptor set");
+    for (unsigned failure = 0; failure < 8; failure++) {
+        typeof(record) bad = record;
+        switch (failure) {
+        case 0: bad.header.version = 2; break;
+        case 1: bad.header.obs_count = 1; break;
+        case 2: bad.header.obs_plan_crc32++; break;
+        case 3: bad.status[2] = 1; break;
+        case 4: bad.status[1] = 5; break;
+        case 5: bad.values[1] = 1; break;
+        case 6: bad.header.flags = 0; break;
+        case 7: bad.header.flags |= 16; break;
+        }
+        GArray *vector = NULL;
+        g_byte_array_set_size(manager.cache_bytes, 0);
+        g_byte_array_append(manager.cache_bytes, (uint8_t *)&bad, sizeof(bad));
+        CHECK(!binradar_cache_vector(&manager, 1, 1, &vector),
+              "native rejects legacy, mismatch, padding, status, value and flag corruption");
+    }
+    /* Observation pointer and size must be safe in one and the same clamp. */
+    manager.cache_family = BRCACHE_FAMILY_CWE805;
+    uint64_t clamps[256][2] = {{0}};
+    clamps[0][0] = 100; clamps[0][1] = 110;
+    clamps[255][0] = 0; clamps[255][1] = 100;
+    record.header.flags |= BRCACHE_FLAG_CWE805;
+    record.values[0] = 105; record.values[1] = 20; record.status[1] = 0;
+    const struct { const char *descriptor; int branch; } cwe[] = {
+        {"c3Ac1o0c2o1q1", 1}, {"c3Oc1o0c2o1q1", 0},
+        {"c3AV1c1o0", 0}, {"c3V1", 0},
+    };
+    for (size_t i = 0; i < G_N_ELEMENTS(cwe); i++) {
+        GArray *vector = NULL;
+        record.header.branch = cwe[i].branch;
+        g_byte_array_set_size(manager.cache_bytes, 0);
+        g_byte_array_append(manager.cache_bytes, (uint8_t *)&record.header, sizeof(record.header));
+        g_byte_array_append(manager.cache_bytes, (uint8_t *)clamps, sizeof(clamps));
+        g_byte_array_append(manager.cache_bytes, (uint8_t *)record.regs,
+                            sizeof(record) - sizeof(record.header));
+        CHECK(binradar_replay_descriptor(&manager, cwe[i].descriptor) &&
+              binradar_cache_vector(&manager, 1, 1, &vector),
+              "native CWE observation and validity retain same-clamp semantics");
+        if (vector) g_array_free(vector, TRUE);
+    }
+    CHECK(!binradar_replay_descriptor(&manager, "c3Oc1o0c1o2"),
+          "native CWE bounds checks unvisited observation leaves");
+    for (unsigned i = 0; i < BINRADAR_REPLAY_SLOT_COUNT; i++) {
+        g_free(manager.cache_predicates[i].descriptor);
+        if (manager.cache_predicates[i].expr_nodes)
+            g_array_free(manager.cache_predicates[i].expr_nodes, TRUE);
+    }
+    g_free(manager.cache_predicates);
+    g_free(manager.selector);
+    g_byte_array_free(manager.cache_bytes, TRUE);
+}
+
 /* Positive trap evidence needs the complete executed request's channels, but
  * not a process outcome or target oracle. It must never enter reusable state. */
 static void test_replay_predicate_trap_admission(void)
@@ -6202,6 +6299,7 @@ int main(void)
     test_feedback_requires_representative_child();
     test_feedback_rejects_malformed_brch();
     test_logical_predicate_native();
+    test_observation_predicate_native();
     test_replay_predicate_trap_admission();
     test_replay_cache_neutral_and_eligibility();
     test_symbolic_boundary_unsigned();

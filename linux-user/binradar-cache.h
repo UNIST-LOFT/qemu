@@ -6,10 +6,12 @@
 #include "sbsv.h"
 
 #define BRCACHE_SNAPSHOT_MAGIC 0x48435242u
-#define BRCACHE_SNAPSHOT_VERSION 2u
+#define BRCACHE_SNAPSHOT_VERSION 3u
 #define BRCACHE_FLAG_TRUNCATED 1u
 #define BRCACHE_FLAG_CWE805 2u
 #define BRCACHE_FLAG_INVALID 4u
+#define BRCACHE_FLAG_HAS_OBS 8u
+#define BRCACHE_MAX_OBSERVATIONS 64u
 #define BRCACHE_MAX_CAPTURE_BYTES (64u * 1024u * 1024u)
 #define BRCACHE_MAX_MANIFEST_TOKENS (4ULL << 20)
 #define BRCACHE_MAX_DESCRIPTOR 4095u
@@ -43,6 +45,8 @@ typedef enum BinradarCacheFamily {
 typedef enum BinradarExprOp {
     BRCACHE_EXPR_LITERAL,
     BRCACHE_EXPR_VARIABLE,
+    BRCACHE_EXPR_OBSERVATION,
+    BRCACHE_EXPR_VALID,
     BRCACHE_EXPR_NOT,
     BRCACHE_EXPR_EQ,
     BRCACHE_EXPR_NE,
@@ -79,6 +83,7 @@ typedef struct BinradarExprNode {
 
 typedef enum BinradarCacheCellKind {
     BRCACHE_CELL_REGISTER,
+    BRCACHE_CELL_OBSERVATION,
     BRCACHE_CELL_STACK8,
     BRCACHE_CELL_STACK16,
     BRCACHE_CELL_STACK32,
@@ -100,7 +105,7 @@ typedef struct BinradarPatchSelector {
     char descriptor[];
 } BinradarPatchSelector;
 
-/* Payload: CWE805 clamps (if flagged), 16 registers, then stack_size bytes. */
+/* Payload: clamps if flagged, registers, stack, padded statuses, u64 values. */
 typedef struct BinradarSnapshotHeader {
     uint32_t magic;
     uint32_t version;
@@ -108,9 +113,11 @@ typedef struct BinradarSnapshotHeader {
     uint32_t branch;
     uint64_t stack_size;
     uint64_t flags;
+    uint32_t obs_count;
+    uint32_t obs_plan_crc32;
 } BinradarSnapshotHeader;
 
-_Static_assert(sizeof(BinradarSnapshotHeader) == 32,
+_Static_assert(sizeof(BinradarSnapshotHeader) == 40,
                "cached snapshot header layout changed");
 _Static_assert(offsetof(BinradarPatchSelector, descriptor) == 16,
                "cached selector prefix changed");
@@ -133,6 +140,9 @@ typedef struct BinradarManager {
     BinradarCachePredicate *cache_predicates;
     uint32_t cache_predicate_count;
     uint32_t cache_stack_size;
+    uint32_t observation_count;
+    uint32_t observation_crc32;
+    char observation_sha256[65];
     int cache_fd_r;
     GByteArray *cache_bytes;
     bool cache_capture_overflow;

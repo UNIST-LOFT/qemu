@@ -226,6 +226,9 @@ void snapshot_memcheck_helper(target_ulong addr, target_ulong size, target_ulong
 
 /* Mark post-snapshot nondeterminism without changing guest execution. */
 void snapshot_replay_mark_external(void);
+/* Exact marked thunk plus live private pipe identity; never a generic fd exemption. */
+bool snapshot_observation_probe(CPUArchState *env, uintptr_t nr,
+                                 uintptr_t fd, uintptr_t arg1, uintptr_t arg2);
 /* Only after a real successful fstat, before the existing target conversion. */
 void snapshot_replay_project_stat(int fd, struct stat *st);
 
